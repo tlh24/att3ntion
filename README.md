@@ -4,6 +4,7 @@ Hypergraph attention: attention between three tokens.
 Normal attention measures the dot-product similarity between two projected versions the tokens, $Q,K$.  This is passed through a softmax to set the weighting of the $V$ associated with each $K$ - hence vanilla attention acts as a conditional 'get' operator, where information is fetched from key tokens to query tokens.  Explicitly: 
 
 ```math
+\large
 \displaylines{
 A[b,h,i,j] = \sum_d Q[b,h,i,d] * K[b,h,j,d] \\
 
@@ -23,6 +24,7 @@ An obvious and very experimental solution to this problem is to allow for higher
 Therefore assume that you measure some similarity between three tokens, $Q,K,R$  where $R$ is euphemistically-hopefully called 'reason'.  The above summations then become: 
 
 ```math
+\large
 \displaylines{
 A[..,i,j,k] = \sum_d Q[..,i,d] * K[..,j,d] * R[..,k,d] \\
 
