@@ -54,19 +54,19 @@ A_s[..,i,j,k] = \frac{ e^{A[..,i,j,k]} }{ \sum_{i,j} e^{A[..,i,j,k]} } \\
 O_s[..,i,d] = \sum_{i,j} A_s[..,i,j,k] ( V_q[..,i,d] \circ V_r[;;,j,d] )\\
 }
 ```
-Where $\circ$ is either $+$ or $*$.  
+Where $\large \circ$ is either $\large +$ or $large *$.  
 Scatter operations: 
 ```math
 \large
 \displaylines{
 O'_r[..,j,d] = \sum_{i,k} A_q[..,i,j,k] * V'_q[..,i,d] 
-				+ \sum{i,k} A_s[..,i,j,k] * V'_s[..,k,d] \\
+				+ \sum_{i,k} A_s[..,i,j,k] * V'_s[..,k,d] \\
 
 O'_s[..,k,d] = \sum_{i,j} A_q[..,i,j,k] * V'_q[..,i,d] 
-				+ \sum{i,j} A_r[..,i,j,k] * V'_r[..,k,d] \\
+				+ \sum_{i,j} A_r[..,i,j,k] * V'_r[..,k,d] \\
 
 O'_q[..,i,d] = \sum_{j,k} A_r[..,i,j,k] * V'_r[..,j,d] 
-				+ \sum{j,k} A_s[..,i,j,k] * V'_s[..,k,d] \\
+				+ \sum_{j,k} A_s[..,i,j,k] * V'_s[..,k,d] \\
 }
 ```
 Finally: 
