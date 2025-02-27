@@ -92,5 +92,5 @@ The above summations would suggest that a full $\large A[..]$ is required for ca
 
 -------
 
-[^1] Normal transformers can have limitless computation via autoregression, but are highly limited in internal memory by their fixed latent space.  Sure, you can have an expanding list of tokens in the (also limited) context window, but each head is  limited in the number of latent-space "named" global variables.  This is a deep problem for another time. 
+[^1]: Normal transformers can have limitless computation via autoregression, but are highly limited in internal memory by their fixed latent space.  Sure, you can have an expanding list of tokens in the (also limited) context window, but each head is  limited in the number of latent-space "named" global variables.  This is a deep problem for another time. 
 
