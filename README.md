@@ -49,4 +49,5 @@ O_q[..,i,d] = \sum_j A'_{qk}[..,i,j] * V_k[..,j,d] + \sum_k A'_{qr}[..,i,k] * V_
 O_k[..,j,d] = \sum_i A'_{kq}[..,i,j] * V_q[..,i,d] + \sum_k A'_{kr}[..,j,k] * V_r[..,k,d] \\
 
 O_r[..,k,d] = \sum_i A'_{rq}[..,i,k] * V_q[..,i,d] + \sum_j A'_{rk}[..,j,k] * V_k[..,j,d] \\
+}
 ```
