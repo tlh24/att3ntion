@@ -48,7 +48,7 @@ Gather operations:
 ```math
 \large
 \displaylines{
-V_q = W_{vq} X ; V_r = W_{vr} X ; V_s = W_{vs} X \\
+V_q = W_{vq} X \quad V_r = W_{vr} X \quad V_s = W_{vs} X \\
 
 A_q[..,i,j,k] = \frac{ e^{A[..,i,j,k]} }{ \sum_{j,k} e^{A[..,i,j,k]} } \\
 
@@ -68,7 +68,7 @@ Scatter operations:
 ```math
 \large
 \displaylines{
-V'_q = W'_vq X ; V'_r = W'_vr X ; V'_s = W'_vs X \\
+V'_q = W'_vq X \quad V'_r = W'_vr X \quad V'_s = W'_vs X \\
 
 Y'_r[..,j,d] = \sum_{i,k} A_q[..,i,j,k] * V'_q[..,i,d] 
 				+ A_s[..,i,j,k] * V'_s[..,k,d] \\
@@ -88,4 +88,4 @@ Y = Y_q + Y'_q + Y_r + Y'_r + Y_s + Y'_s
 ```
 
 The obvious problem with calculating directly via above is that you don't want to instantiate a $\large A[b,h,i,j,k]$ tensor -- if the number of tokens is large, this is a huge tensor!  
-The above summations would suggest that a full $\large A[]$ is required for calculating the various softmaxes -- but, given enough floating-point resolution (and stability), all of these operations and their inverses can be calculated in-place, without blowing up GPU memory. 
+The above summations would suggest that a full $\large A[..]$ is required for calculating the various softmaxes -- but, given enough floating-point resolution (and stability), all of these operations and their inverses can be calculated in-place, without blowing up GPU memory. 
