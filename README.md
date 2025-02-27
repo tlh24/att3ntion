@@ -6,7 +6,7 @@ Normal attention measures the dot-product similarity between two projected versi
 ```math
 \large
 \displaylines{
-Q = W_Q X ; K = W_K X ; V = W_V X \\
+Q = W_Q X \qquad K = W_K X \qquad V = W_V X \\
 
 A[b,h,i,j] = \sum_d Q[b,h,i,d] * K[b,h,j,d] \\
 
@@ -29,7 +29,7 @@ Therefore assume that you measure some similarity between three tokens, $Q,R,S$ 
 ```math
 \large
 \displaylines{
-Q = W_Q X ; R = W_R X ; S = W_S X \\
+Q = W_Q X \qquad R = W_R X \qquad S = W_S X \\
 
 A[..,i,j,k] = \sum_d Q[..,i,d] * R[..,j,d] * S[..,k,d] \\
 }
@@ -48,7 +48,7 @@ Gather operations:
 ```math
 \large
 \displaylines{
-V_q = W_{vq} X \quad V_r = W_{vr} X \quad V_s = W_{vs} X \\
+V_q = W_{vq} X \qquad V_r = W_{vr} X \qquad V_s = W_{vs} X \\
 
 A_q[..,i,j,k] = \frac{ e^{A[..,i,j,k]} }{ \sum_{j,k} e^{A[..,i,j,k]} } \\
 
@@ -68,7 +68,7 @@ Scatter operations:
 ```math
 \large
 \displaylines{
-V'_q = W'_vq X \quad V'_r = W'_vr X \quad V'_s = W'_vs X \\
+V'_q = W'_vq X \qquad V'_r = W'_vr X \qquad V'_s = W'_vs X \\
 
 Y'_r[..,j,d] = \sum_{i,k} A_q[..,i,j,k] * V'_q[..,i,d] 
 				+ A_s[..,i,j,k] * V'_s[..,k,d] \\
