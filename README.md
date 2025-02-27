@@ -6,8 +6,7 @@ Normal attention measures the dot-product similarity between two projected versi
 ```math
 \large
 \displaylines{
-Y[b,h,i,d] = Attention(X) \\
-Q = W_Q X ; K = W_K X ; V = W_K X \\
+Q = W_Q X ; K = W_K X ; V = W_V X \\
 
 A[b,h,i,j] = \sum_d Q[b,h,i,d] * K[b,h,j,d] \\
 
@@ -49,6 +48,8 @@ Gather operations:
 ```math
 \large
 \displaylines{
+V_q = W_vq X ; V_r = W_vr X ; V_s = W_vs X \\
+
 A_q[..,i,j,k] = \frac{ e^{A[..,i,j,k]} }{ \sum_{j,k} e^{A[..,i,j,k]} } \\
 
 Y_q[..,i,d] = \sum_{j,k} A_q[..,i,j,k] ( V_r[..,j,d] \diamond V_s[;;,k,d] )\\
@@ -67,6 +68,8 @@ Scatter operations:
 ```math
 \large
 \displaylines{
+V'_q = W'_vq X ; V'_r = W'_vr X ; V'_s = W'_vs X \\
+
 Y'_r[..,j,d] = \sum_{i,k} A_q[..,i,j,k] * V'_q[..,i,d] 
 				+ A_s[..,i,j,k] * V'_s[..,k,d] \\
 
@@ -77,6 +80,8 @@ Y'_q[..,i,d] = \sum_{j,k} A_r[..,i,j,k] * V'_r[..,j,d]
 				+ A_s[..,i,j,k] * V'_s[..,k,d] \\
 }
 ```
+As mentioned above, $\large W'_{??}$ and $\large V'_{??}$ can be tied to W_{??}$ and $\large V_{??}$.  
+
 Finally: 
 ```math
 \large
