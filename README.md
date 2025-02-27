@@ -48,7 +48,7 @@ Gather operations:
 ```math
 \large
 \displaylines{
-V_q = W_vq X ; V_r = W_vr X ; V_s = W_vs X \\
+V_q = W_{vq} X ; V_r = W_{vr} X ; V_s = W_{vs} X \\
 
 A_q[..,i,j,k] = \frac{ e^{A[..,i,j,k]} }{ \sum_{j,k} e^{A[..,i,j,k]} } \\
 
@@ -80,9 +80,7 @@ Y'_q[..,i,d] = \sum_{j,k} A_r[..,i,j,k] * V'_r[..,j,d]
 				+ A_s[..,i,j,k] * V'_s[..,k,d] \\
 }
 ```
-As mentioned above, $\large W'_{??}$ and $\large V'_{??}$ can be tied to W_{??}$ and $\large V_{??}$.  
-
-Finally: 
+As mentioned above, the scatter $V$ and $W$ tensors can be tied to the gather $V$ and $W$.  Finally: 
 ```math
 \large
 Y = Y_q + Y'_q + Y_r + Y'_r + Y_s + Y'_s 
