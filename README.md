@@ -34,6 +34,7 @@ I.e. attention is just one more term in the summation (this is no longer a dot-p
 * Reduce and softmax along two dimensions: for Q-R-S interactions, softmax over R-S dimensions, selecting one pair $V_r,V_s$ for writing to Q)
 * Reduce and softmax along two dimensions; for Q-R-S interactions, softmax over R-S dimensons, select $V_q$ for writing to the pair R,S.
 ```math
+\large
 \displaylines{
 A_{qs}[..,i,j] = \sum_{k} A[..,i,j,k] \\
 
