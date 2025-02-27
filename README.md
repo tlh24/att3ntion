@@ -43,18 +43,18 @@ Gather operations:
 \displaylines{
 A_q[..,i,j,k] = \frac{ e^{A[..,i,j,k]} }{ \sum_{j,k} e^{A[..,i,j,k]} } \\
 
-O_q[..,i,d] = \sum_{j,k} A_q[..,i,j,k] ( V_r[..,j,d] \circ V_s[;;,k,d] )\\
+O_q[..,i,d] = \sum_{j,k} A_q[..,i,j,k] ( V_r[..,j,d] \diamond V_s[;;,k,d] )\\
 
 A_r[..,i,j,k] = \frac{ e^{A[..,i,j,k]} }{ \sum_{i,k} e^{A[..,i,j,k]} } \\
 
-O_r[..,i,d] = \sum_{i,k} A_r[..,i,j,k] ( V_q[..,i,d] \circ V_s[;;,k,d] )\\
+O_r[..,i,d] = \sum_{i,k} A_r[..,i,j,k] ( V_q[..,i,d] \diamond V_s[;;,k,d] )\\
 
 A_s[..,i,j,k] = \frac{ e^{A[..,i,j,k]} }{ \sum_{i,j} e^{A[..,i,j,k]} } \\
 
-O_s[..,i,d] = \sum_{i,j} A_s[..,i,j,k] ( V_q[..,i,d] \circ V_r[;;,j,d] )\\
+O_s[..,i,d] = \sum_{i,j} A_s[..,i,j,k] ( V_q[..,i,d] \diamond V_r[;;,j,d] )\\
 }
 ```
-Where $\large \circ$ is either $\large +$ or $large *$.  
+Where $\large \diamond$ is either $\large +$ or $\large *$.  
 Scatter operations: 
 ```math
 \large
