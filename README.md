@@ -21,18 +21,25 @@ Conditional scatter and gather operations are core elements of CS algorithms, an
 
 An obvious and very experimental solution to this problem is to allow for higher-order operations on the graph of relations between tokens; the first step of which is to increase the arity of the opeartion.  
 
-Therefore assume that you measure some similarity between three tokens, $Q,K,R$  where $R$ is euphemistically-hopefully called 'reason'.  The above summations then become: 
+Therefore assume that you measure some similarity between three tokens, $Q,R,S$  ('K' is replaced by 'S' to avoid indexing confusion - the corresponding natural indexes are then $i,j,k$).  Raw attention becomes:
 
 ```math
 \large
+A[..,i,j,k] = \sum_d Q[..,i,d] * R[..,j,d] * S[..,k,d] \\
+```
+I.e. attention is just one more term in the summation (this is no longer a dot-product!), and the resulting tensor is one higher dimension.  To get the pairwise interactions, we can do three things:
+* Reduce along one dimension: e.g. for conventinal Q-R interactions, we sum over all possible R's), then apply softmax to the K dimension, selecting one $V_K$ to write to Q.)
+* Reduce and softmax along one dimension, but write twice: for Q-R and Q-S interactions, reduce over S and R, then softmax over R and S, selecting a pair $V_r,V_s$ for writing
+* Softmax serially along two dimensions, write twice: for Q-R and Q-S interactions, softmax over S and R, then softmax over R and S, selecting a pair $V_r,V_s$ for writing
+* Reduce and softmax along two dimensions: for Q-R-S interactions, softmax over R-S dimensions, selecting one pair $V_r,V_s$ for writing to Q)
+* Reduce and softmax along two dimensions; for Q-R-S interactions, softmax over R-S dimensons, select $V_q$ for writing to the pair R,S.
+```math
 \displaylines{
-A[..,i,j,k] = \sum_d Q[..,i,d] * K[..,j,d] * R[..,k,d] \\
-
-A_{qk}[..,i,j] = \sum_{k} A[..,i,j,k] \\
+A_{qs}[..,i,j] = \sum_{k} A[..,i,j,k] \\
 
 A_{qr}[..,i,k] = \sum_{k} A[..,i,j,k] \\
 
-A_{kr}[..,j,k] = \sum_{i} A[..,i,j,k] \\
+A_{sr}[..,j,k] = \sum_{i} A[..,i,j,k] \\
 
 A'_{qk}[..,i,j] = \frac{ e^{A_{qk}[..,i,j]} }{ \sum_j e^{A_{qk}[..,i,j]} } \\
 
