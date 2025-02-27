@@ -60,13 +60,13 @@ Scatter operations:
 \large
 \displaylines{
 O'_r[..,j,d] = \sum_{i,k} A_q[..,i,j,k] * V'_q[..,i,d] 
-				+ \sum_{i,k} A_s[..,i,j,k] * V'_s[..,k,d] \\
+				+ A_s[..,i,j,k] * V'_s[..,k,d] \\
 
 O'_s[..,k,d] = \sum_{i,j} A_q[..,i,j,k] * V'_q[..,i,d] 
-				+ \sum_{i,j} A_r[..,i,j,k] * V'_r[..,k,d] \\
+				+ A_r[..,i,j,k] * V'_r[..,k,d] \\
 
 O'_q[..,i,d] = \sum_{j,k} A_r[..,i,j,k] * V'_r[..,j,d] 
-				+ \sum_{j,k} A_s[..,i,j,k] * V'_s[..,k,d] \\
+				+ A_s[..,i,j,k] * V'_s[..,k,d] \\
 }
 ```
 Finally: 
