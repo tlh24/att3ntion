@@ -28,7 +28,7 @@ Therefore assume that you measure some similarity between three tokens, $Q,R,S$ 
 A[..,i,j,k] = \sum_d Q[..,i,d] * R[..,j,d] * S[..,k,d] 
 ```
 
-I.e. attention is one more term in the summation (this is no longer a dot-product!), and the resulting tensor is one higher dimension.  To propagate information between the tuple, we can do many things:
+I.e. attention is one more term in the summation (this is no longer a dot-product!), and the resulting tensor is one higher dimension.  To propagate information within the tuples, we can do many things:
 1. Reduce along one dimension: e.g. for 'conventional' Q-R interactions, we sum over all S's), then apply softmax to the R dimension, selecting one $V_R$ to write to Q.  *This just reduces to conventional attention by way of softmax.*
 2. Reduce and softmax along one dimension, but write twice: for Q-R and Q-S interactions, reduce over S and R, then softmax over R and S, selecting a pair $V_r,V_s$ for writing. *This reduces to conventional attention, with two writes per head.*
 3. Softmax serially along two dimensions, write twice: for Q-R and Q-S interactions, softmax over S and R, then softmax over R and S, selecting a pair $V_r,V_s$ for writing. *More interesting due to the (decomposed) 2D softmax, which supports interaction terms.*
@@ -43,17 +43,18 @@ Gather operations:
 \displaylines{
 A_q[..,i,j,k] = \frac{ e^{A[..,i,j,k]} }{ \sum_{j,k} e^{A[..,i,j,k]} } \\
 
-O_q[..,i,d] = \sum_{j,k} A_q[..,i,j,k] * V_r[..,j,d] * V_s[;;,k,d] \\
+O_q[..,i,d] = \sum_{j,k} A_q[..,i,j,k] ( V_r[..,j,d] \circ V_s[;;,k,d] )\\
 
 A_r[..,i,j,k] = \frac{ e^{A[..,i,j,k]} }{ \sum_{i,k} e^{A[..,i,j,k]} } \\
 
-O_r[..,i,d] = \sum_{i,k} A_r[..,i,j,k] * V_q[..,i,d] * V_s[;;,k,d] \\
+O_r[..,i,d] = \sum_{i,k} A_r[..,i,j,k] ( V_q[..,i,d] \circ V_s[;;,k,d] )\\
 
 A_s[..,i,j,k] = \frac{ e^{A[..,i,j,k]} }{ \sum_{i,j} e^{A[..,i,j,k]} } \\
 
-O_s[..,i,d] = \sum_{i,j} A_s[..,i,j,k] * V_q[..,i,d] * V_r[;;,j,d] \\
+O_s[..,i,d] = \sum_{i,j} A_s[..,i,j,k] ( V_q[..,i,d] \circ V_r[;;,j,d] )\\
 }
 ```
+Where $\circ$ is either $+$ or $*$.  
 Scatter operations: 
 ```math
 \large
@@ -71,6 +72,6 @@ O'_q[..,i,d] = \sum_{j,k} A_r[..,i,j,k] * V'_r[..,j,d]
 Finally: 
 ```math
 \large
-O[..,i,d] = O_q + O'_q + O_r + O'_r + O_s + O'_s 
+O = O_q + O'_q + O_r + O'_r + O_s + O'_s 
 
 ```
