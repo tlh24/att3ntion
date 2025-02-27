@@ -5,9 +5,9 @@ Normal attention measures the dot-product similarity between two projected versi
 
 ```math
 \displaylines{
-A[b,h,i,j] = \sum_d Q[b,h,i,d] * K[b,h,j,d] \\
+A[b,h,i,j] = \sum_d Q[b,h,i,d] * K[b,h,j,d]
 
-A_o[b,h,i,j] = \frac{e^{A[b,h,i,j]} }{ \sum_j e^{A[b,h,i,j]} } \\
+A_o[b,h,i,j] = \frac{e^{A[b,h,i,j]} }{ \sum_j e^{A[b,h,i,j]} }
 
 O[b,h,i,d] = \sum_j A_o[b,h,i,j] * V[b,h,j,d]
 }
