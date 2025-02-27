@@ -4,10 +4,10 @@ Hypergraph attention: attention between three tokens.
 Normal attention measures the dot-product similarity between two projected versions the tokens, $Q,K$.  This is passed through a softmax to set the weighting of the $V$ associated with each $K$ - hence vanilla attention acts as a conditional 'get' operator, where information is fetched from key tokens to query tokens.  Explicitly: 
 
 ```math
-A[b,h,i,j] = \sum_d Q[b,h,i,d] * K[b,h,j,d]
-\\
-A_o[b,h,i,j] = \frac{e^{A[b,h,i,j]} }{ \sum_j e^{A[b,h,i,j]} }
-\\
+A[b,h,i,j] = \sum_d Q[b,h,i,d] * K[b,h,j,d] \\
+
+A_o[b,h,i,j] = \frac{e^{A[b,h,i,j]} }{ \sum_j e^{A[b,h,i,j]} } \\
+
 O[b,h,i,d] = \sum_j A_o[b,h,i,j] * V[b,h,j,d]
 ```
 Above, $b$ is the batch dimension, $h$ head dim, $i$ ranges over the query token dim, $j$ over the key token dim, $A$ is raw DP, $A_o$ is attention post-softmax, and $O$ is the output. 
@@ -21,9 +21,9 @@ An obvious and very experimental solution to this problem is to allow for higher
 Therefore assume that you measure some similarity between three tokens, $Q,K,R$  where $R$ is euphemistically-hopefully called 'reason'.  The above summations then become: 
 
 ```math
-A[..,i,j,k] = \sum_d Q[..,i,d] * K[..,j,d] * R[..,k,d]
-\\
-A_{qk}[..,i,j] = \sum_{k} A[..,i,j,k]
+A[..,i,j,k] = \sum_d Q[..,i,d] * K[..,j,d] * R[..,k,d] \\
+
+A_{qk}[..,i,j] = \sum_{k} A[..,i,j,k] \\
 \\
 A_{qr}[..,i,k] = \sum_{k} A[..,i,j,k]
 \\
