@@ -1,7 +1,7 @@
 import numpy as np
 
 
-def genData(bs, md): 
+def genData(bs, md, do_print=False): 
 	'''
 	Problem is a 3-term analogy: 
 	if A `op B = C then D `op E = `F
@@ -55,20 +55,20 @@ def genData(bs, md):
 		x[b,6,ve+4] = 1
 		x[b,7,vf+4] = 1 # must be masked
 		
-		# print
-		match op: 
-			case 0: 
-				ops = '+'
-			case 1: 
-				ops = '-'
-			case 2: 
-				ops = '*'
-			case 3: 
-				ops = '/'
-		print(f"if {va} op {vb} = {vc} then {vd} op {ve} = f  (op = {ops}, f = {vf}")
+		if do_print: 
+			match op: 
+				case 0: 
+					ops = '+'
+				case 1: 
+					ops = '-'
+				case 2: 
+					ops = '*'
+				case 3: 
+					ops = '/'
+			print(f"if {va} op {vb} = {vc} then {vd} op {ve} = f  (op = {ops}, f = {vf}")
 	# endfor b
 	return x
 
 
 if __name__ == '__main__':
-	genData(10, 7)
+	genData(10, 7, True)
