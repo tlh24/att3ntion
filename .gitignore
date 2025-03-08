@@ -1,5 +1,6 @@
 myenv
 
+*.pt
 *.pyc
 *.pyo
 *.pyd
@@ -7,3 +8,4 @@ myenv
 *.pyz
 *.pywz
 *.pywzc
+losslog.txt
