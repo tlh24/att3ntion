@@ -71,8 +71,7 @@ if __name__ == '__main__':
 	cmd_args = parser.parse_args()
 	
 	if cmd_args.t: 
-		batch_size = 10
-		x, y = genData(batch_size, 7, do_print=True)
+		x = genData(10, 7, do_print=True)
 		exit()
 		
 	fd_losslog = open('losslog.txt', 'w')
