@@ -1,186 +1,140 @@
-import argparse
-from termcolor import colored
 import torch
-from torch import nn, optim
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
-import psgd
-import utils
-import pdb
-import threading
-import multiprocessing
+import argparse
 from hyper_attn_pytorch import HypergraphAttention
 from test import genData
 
-gendata_dim = 32
-
-class Transformer(nn.Module):
-	def __init__(self, d_model:int, layers:int, repeat:int, n_head:int):
+class SimpleAnalogyModel(nn.Module):
+	"""Simpler model with single hypergraph attention layer."""
+	
 		super().__init__()
-		self.d_model = d_model
-		self.n_head = n_head
-		self.layers = layers
-		self.repeat = repeat
-		self.resblocks = nn.ModuleList(\
-			[HypergraphAttention(d_model, n_head) \
-				for _ in range(layers)])
-		self.in_proj = nn.Linear(gendata_dim, d_model, bias=True)
-		self.out_proj = nn.Linear(d_model, gendata_dim, bias=True)
-
-	def forward(self, x:torch.Tensor):
-		# x is dtype int to interface with the embedding layer
-		bs,ntok,inw = x.shape
-		x = self.in_proj(x)
-		# x = torch.cat((x, torch.zeros(bs, ntok, self.d_model - inw, device=x.device)), axis=-1)
-		for i in range(self.repeat):
-			for j, layer in enumerate(self.resblocks):
-				y = layer(x)
-				x = x + y
-		return self.out_proj(x)
-
-	def fixedInit(self):
-		for layer in self.resblocks:
-			layer.fixedInit()
-
-	def printParamCount(self):
-		trainable_params = sum(
-			p.numel() for p in self.parameters() if p.requires_grad
+		self.embedding_proj = nn.Linear(input_dim, hidden_dim)
+		self.attention = HypergraphAttention(hidden_dim, num_heads)
+		
+		self.norm1 = nn.LayerNorm(hidden_dim)
+		self.ffn = nn.Sequential(
+			nn.Linear(hidden_dim, 4 * hidden_dim),
+			nn.ReLU(),
+			nn.Linear(4 * hidden_dim, hidden_dim)
 		)
-		print(f"Number of model parameters:{trainable_params}")
-
-class SimpleModel(nn.Module):
-	def __init__(self):
-		super(SimpleModel, self).__init__()
-		self.hyper_attn = HypergraphAttention(embedding_dim=32, num_heads=2)
-		self.output = nn.Linear(32, 32)
+		self.norm2 = nn.LayerNorm(hidden_dim)
+		
+		self.op_classifier = nn.Linear(hidden_dim, 4)
+		self.value_classifier = nn.Linear(hidden_dim, 28)
 		
 	def forward(self, x):
-		attn_output = self.hyper_attn(x)
-		self.attn_output_shape = attn_output.shape
-		return self.output(attn_output[:, 5]), self.output(attn_output[:, 7])
+		x = self.embedding_proj(x)
+		
+		attn_output = self.attention(x)
+		x = self.norm1(x + attn_output)
+		
+		ffn_output = self.ffn(x)
+		x = self.norm2(x + ffn_output)
+		
+		# Predict operators at positions 1 and 5, and value at position 7
+		op_pred1 = self.op_classifier(x[:, 1])
+		op_pred5 = self.op_classifier(x[:, 5])
+		value_pred = self.value_classifier(x[:, 7])
+		return op_pred1, op_pred5, value_pred
+
+def prepare_data(data_tensor, device):
+	inputs = data_tensor.copy()
+	# Mask the operators and final value that need to be predicted
+	inputs[:, 1, :4] = 0  
+	inputs[:, 5, :4] = 0  
+	inputs[:, 7] = 0     
+	
+	# Extract targets
+	op_targets = np.zeros((data_tensor.shape[0], 2), dtype=np.int64)
+	op_targets[:, 0] = np.argmax(data_tensor[:, 1, :4], axis=1)
+	op_targets[:, 1] = np.argmax(data_tensor[:, 5, :4], axis=1)
+	value_targets = np.argmax(data_tensor[:, 7, 4:], axis=1)
+	
+	return (torch.FloatTensor(inputs).to(device), 
+			torch.LongTensor(op_targets).to(device),
+			torch.LongTensor(value_targets).to(device))
+
+def train_model(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, device='cpu', modulo=20):
+	
+	if device == 'auto':
+		if torch.cuda.is_available():
+			device = torch.device('cuda')
+		elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+			device = torch.device('mps')
+		else:
+			device = torch.device('cpu')
+	else:
+		device = torch.device(device)
+	
+	print(f"Using device: {device}")
+	
+	
+	data = genData(batch_size * 10, modulo)
+	dataset = TensorDataset(torch.tensor(data))
+	train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+	
+	model = SimpleAnalogyModel(hidden_dim=hidden_dim, num_heads=num_heads).to(device)
+	optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+	criterion = nn.CrossEntropyLoss()
+	
+	print("\nTraining started...")
+	for epoch in range(num_epochs):
+		model.train()
+		total_loss = 0
+		correct_ops = 0
+		correct_vals = 0
+		total = 0
+		
+		for batch_idx, (inputs_np,) in enumerate(train_loader):
+			inputs, op_targets, value_targets = prepare_data(inputs_np.numpy(), device)
+			
+			optimizer.zero_grad()
+			op_pred1, op_pred5, value_pred = model(inputs)
+			
+			# Calculate losses
+			loss = (criterion(op_pred1, op_targets[:, 0]) + 
+				   criterion(op_pred5, op_targets[:, 1]) + 
+				   criterion(value_pred, value_targets))
+			
+			loss.backward()
+			optimizer.step()
+			
+			total_loss += loss.item()
+			total += inputs.size(0)
+			
+			# Calculate accuracies
+			correct_ops += ((torch.argmax(op_pred1, dim=1) == op_targets[:, 0]).sum().item() +
+						  (torch.argmax(op_pred5, dim=1) == op_targets[:, 1]).sum().item()) / 2
+			correct_vals += (torch.argmax(value_pred, dim=1) == value_targets).sum().item()
+		
+		if (epoch + 1) % 10 == 0:
+			avg_loss = total_loss / len(train_loader)
+			op_accuracy = 100 * correct_ops / total
+			val_accuracy = 100 * correct_vals / total
+			print(f'Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Op Acc: {op_accuracy:.2f}%, Result Acc: {val_accuracy:.2f}%')
+	
+	return model
 
 if __name__ == '__main__':
-	print("Demonstrating Hypergraph Attention Module")
-	print("----------------------------------------")
+	parser = argparse.ArgumentParser(description='Train analogy model')
+	parser.add_argument('--device', type=str, default='auto', choices=['cpu', 'mps', 'cuda', 'auto'],
+						help='Device to use (cpu, mps, cuda, auto)')
+	parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
+	parser.add_argument('--modulo', type=int, default=20, help='Modulo for arithmetic operations')
+	parser.add_argument('--hidden-dim', type=int, default=128, help='Hidden dimension size')
+	args = parser.parse_args()
 	
-	parser = argparse.ArgumentParser()
-	parser.add_argument('-t', action='store_true', help='make test data and print it')
-	parser.add_argument('-b', type=int, default=64, help='batch size')
-	parser.add_argument('-c', action='store_true', help='start fresh, dont load a model')
-	parser.add_argument('-a', action='store_true', help='use AdamW')
-	parser.add_argument('-v', action='store_true', help='validate only')
-	cmd_args = parser.parse_args()
+	torch.manual_seed(42)
+	np.random.seed(42)
 	
-	if cmd_args.t: 
-		x = genData(10, 7, do_print=True)
-		exit()
-		
-	fd_losslog = open('losslog.txt', 'w')
+	print("Example data points:")
+	print(genData(3, args.modulo, do_print=True))
 	
-	# this messes with pdb, but allows you to press enter to switch from training to validation.
-	input_thread = threading.Thread(target=utils.monitorInput, daemon=True)
-	input_thread.start()
-	
-	batch_size = cmd_args.b
-	modulo = 7
-	
-	model = Transformer(d_model=64, layers=2, repeat=1, n_head=4)
-	
-	if cmd_args.c: 
-		print(colored("not loading any model weights.", "blue"))
-	else: 
-		try: 
-			model.load_state_dict(\
-				torch.load('demo.pt',weights_only=True,map_location='cpu'))
-			print(colored("loaded model.", "green"))
-		except Exception as error:
-			print(error)
-			
-	model = model.cuda()
-	
-	if cmd_args.a: 
-		optimizer = optim.AdamW(model.parameters(), lr=2.5e-4, amsgrad=True)
-	else: 
-		optimizer = psgd.LRA(model.parameters(),\
-			lr_params=0.01,lr_preconditioner= 0.01, momentum=0.9,\
-			preconditioner_update_probability=0.25, \
-			exact_hessian_vector_product=False, \
-			rank_of_approximation=20, grad_clip_max_norm=5.0)
-	
-	def train(uu):
-		sample_data = genData(8*2048, modulo, do_print=False)
-		x = torch.tensor(sample_data, dtype=torch.float32)
-		x = x.cuda()
-		y = x.clone()
-		# mask the op and variable F in the expressions: 
-		#      0  1  2   3        4  5  6    7
-		# {if} A `op B = C {then} D `op E = `F
-		x[:,1,:] = 0
-		x[:,5,:] = 0
-		x[:,7,:] = 0
-		
-		for i in range(16*2000): # num iters
-			indx = torch.randperm(x.shape[0])
-			indx = indx[:batch_size]
-			xx = x[indx,:,:]
-			target = y[indx]
-			
-			if cmd_args.a: 
-				optimizer.zero_grad()
-				pred = model(xx)
-				loss = torch.sum( (pred[:,:4,:] - target[:,:4,:])**2 )
-				torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-				loss.backward()
-				optimizer.step()
-			else: 
-				def closure():
-					pred = model(xx)
-					# only look at the last token
-					loss = torch.sum( (pred[:,:4,:] - target[:,:4,:])**2 ) + \
-						sum( \
-							[torch.sum(5e-4 * torch.rand_like(param) * torch.abs(param) ) \
-						for param in model.parameters()])
-					return loss
-				loss = optimizer.step(closure)
-			lloss = loss.detach().cpu().item()
-			if i % 10 == 0:
-				print(lloss)
-				fd_losslog.write(f'{uu}\t{lloss}\n')
-				fd_losslog.flush()
-			uu += 1
-			if uu % 1000 == 0: 
-				torch.save(model.state_dict(), 'demo.pt')
-				print(colored('saved model', 'blue'))
-			if utils.switch_to_validation:
-				break
-		return uu
-		
-	def test(uu): 
-		sample_data = genData(4*2048, modulo)
-		x = torch.tensor(sample_data, dtype=torch.float32)
-		x = x.cuda()
-		y = x.clone()
-		# mask the op and variable F in the expressions: 
-		#      0  1  2   3        4  5  6    7
-		# {if} A `op B = C {then} D `op E = `F
-		x[:,1,:] = 0
-		x[:,5,:] = 0
-		x[:,7,:] = 0
-		
-		for i in range(4*2048 // batch_size):
-			indx = torch.arange(i*batch_size, (i+1)*batch_size)
-			xx = x[indx,:,:]
-			target = y[indx]
-			pred = model(xx)
-			loss = torch.sum( (pred[:,:4,:] - target[:,:4,:])**2 )
-			lloss = loss.detach().cpu().item()
-			print('v',lloss)
-			fd_losslog.write(f'{uu}\t{lloss}\n')
-			fd_losslog.flush()
-			uu += 1
-
-	uu = 0
-	if not cmd_args.v: 
-		uu = train(uu)
-	test(uu)
-	
-	fd_losslog.close()
+	model = train_model(
+		num_epochs=args.epochs,
+		device=args.device,
+		modulo=args.modulo,
+		hidden_dim=args.hidden_dim
+	)
