@@ -5,11 +5,13 @@ import numpy as np
 import argparse
 from hyper_attn_pytorch import HypergraphAttention
 from test import genData
+import pdb
 
 class SimpleAnalogyModel(nn.Module):
 	"""Simpler model with single hypergraph attention layer."""
-	
+	def __init__(self, hidden_dim:int, num_heads:int):
 		super().__init__()
+		input_dim = 32
 		self.embedding_proj = nn.Linear(input_dim, hidden_dim)
 		self.attention = HypergraphAttention(hidden_dim, num_heads)
 		
@@ -74,8 +76,8 @@ def train_model(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, dev
 	data = genData(batch_size * 10, modulo)
 	dataset = TensorDataset(torch.tensor(data))
 	train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-	
-	model = SimpleAnalogyModel(hidden_dim=hidden_dim, num_heads=num_heads).to(device)
+
+	model = SimpleAnalogyModel(hidden_dim, num_heads).to(device)
 	optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 	criterion = nn.CrossEntropyLoss()
 	
@@ -121,8 +123,8 @@ if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='Train analogy model')
 	parser.add_argument('--device', type=str, default='auto', choices=['cpu', 'mps', 'cuda', 'auto'],
 						help='Device to use (cpu, mps, cuda, auto)')
-	parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
-	parser.add_argument('--modulo', type=int, default=20, help='Modulo for arithmetic operations')
+	parser.add_argument('--epochs', type=int, default=200, help='Number of epochs')
+	parser.add_argument('--modulo', type=int, default=17, help='Modulo for arithmetic operations')
 	parser.add_argument('--hidden-dim', type=int, default=128, help='Hidden dimension size')
 	args = parser.parse_args()
 	
