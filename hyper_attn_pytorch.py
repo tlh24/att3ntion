@@ -9,6 +9,8 @@ class QuickGELU(nn.Module):
 class HypergraphAttention(nn.Module):
 	def __init__(self, d_model, n_heads, dropout_rate=0):
 		super(HypergraphAttention, self).__init__()
+
+		torch.manual_seed(42)
 		
 		# as with other small transformers, there are no head subg-spaces.
 		# Really need to test if this is necessary! 

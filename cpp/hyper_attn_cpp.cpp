@@ -4,7 +4,6 @@
 
 struct QuickGELUImpl : torch::nn::Module { //activation function
     torch::Tensor forward(torch::Tensor x) {
-        std::cout << "tada" << std::endl;
         return x * torch::sigmoid(1.702 * x);
     }
 };
@@ -14,6 +13,8 @@ TORCH_MODULE(QuickGELU);
 struct HypergraphAttentionImpl : torch::nn::Module {
     HypergraphAttentionImpl(int64_t d_model, int64_t n_heads, double dropout_rate = 0.0)
         : d_model(d_model), n_heads(n_heads), head_dim(d_model) {
+
+            torch::manual_seed(42);
         
         Wq = register_module("Wq", torch::nn::Linear(torch::nn::LinearOptions(d_model, d_model * n_heads).bias(false)));
         Wr = register_module("Wr", torch::nn::Linear(torch::nn::LinearOptions(d_model, d_model * n_heads).bias(false)));
