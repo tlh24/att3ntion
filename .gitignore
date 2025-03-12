@@ -9,3 +9,25 @@ myenv
 *.pywz
 *.pywzc
 losslog.txt
+
+# Build artifacts
+build/
+dist/
+*.so
+*.pyd
+*.dll
+*.dylib
+*.egg-info/
+
+# LibTorch
+libtorch/
+libtorch.zip
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary files
+*.log
+.DS_Store
