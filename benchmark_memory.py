@@ -89,35 +89,40 @@ def print_results_table(results, config):
     print(f"{'Implementation':<22} {'Time (s)':<10} {'GPU Mem (MB)':<15} {'CPU Mem (MB)':<15}")
     print("-" * 62)
     
-    # Print results in the specified order
+    # Print results in the specified order with cleaner display names
     ordered_keys = ["self attention pytorch", "3-attention pytorch", "3-attention c++"]
+    display_names = {
+        "self attention pytorch": "self attention pytorch",
+        "3-attention pytorch": "pytorch",
+        "3-attention c++": "cpp"
+    }
+    
     for name in ordered_keys:
         if name in results:
             result = results[name]
-            print(f"{name:<22} {result['execution_time']:.4f}     {result['used_memory']:.2f}         {result['peak_cpu_memory']:.2f}")
+            display_name = display_names[name]
+            print(f"{display_name:<22} {result['execution_time']:.4f}     {result['used_memory']:.2f}         {result['peak_cpu_memory']:.2f}")
     
-    # Print comparisons
-    if "3-attention pytorch" in results and "self attention pytorch" in results:
-        hyper = results["3-attention pytorch"]
-        self_attn = results["self attention pytorch"]
-        
-        time_diff = (1 - self_attn["execution_time"] / hyper["execution_time"]) * 100
-        mem_diff = (1 - self_attn["used_memory"] / hyper["used_memory"]) * 100
-        
-        print("\nself attention pytorch vs 3-attention pytorch:")
-        print(f"Time: {'faster' if time_diff > 0 else 'slower'} by {abs(time_diff):.1f}%")
-        print(f"Memory: {'less' if mem_diff > 0 else 'more'} by {abs(mem_diff):.1f}%")
-    
+    # Print comparisons between PyTorch and C++ implementations (both ways)
     if "3-attention pytorch" in results and "3-attention c++" in results:
-        hyper = results["3-attention pytorch"]
+        pytorch = results["3-attention pytorch"]
         cpp = results["3-attention c++"]
         
-        time_diff = (1 - cpp["execution_time"] / hyper["execution_time"]) * 100
-        mem_diff = (1 - cpp["used_memory"] / hyper["used_memory"]) * 100
+        # PyTorch compared to C++
+        time_diff_pytorch_vs_cpp = (1 - pytorch["execution_time"] / cpp["execution_time"]) * 100
+        mem_diff_pytorch_vs_cpp = (1 - pytorch["used_memory"] / cpp["used_memory"]) * 100
         
-        print("\n3-attention c++ vs 3-attention pytorch:")
-        print(f"Time: {'faster' if time_diff > 0 else 'slower'} by {abs(time_diff):.1f}%")
-        print(f"Memory: {'less' if mem_diff > 0 else 'more'} by {abs(mem_diff):.1f}%")
+        print("\npytorch vs cpp:")
+        print(f"Time: {'faster' if time_diff_pytorch_vs_cpp > 0 else 'slower'} by {abs(time_diff_pytorch_vs_cpp):.1f}%")
+        print(f"Memory: {'less' if mem_diff_pytorch_vs_cpp > 0 else 'more'} by {abs(mem_diff_pytorch_vs_cpp):.1f}%")
+        
+        # C++ compared to PyTorch
+        time_diff_cpp_vs_pytorch = (1 - cpp["execution_time"] / pytorch["execution_time"]) * 100
+        mem_diff_cpp_vs_pytorch = (1 - cpp["used_memory"] / pytorch["used_memory"]) * 100
+        
+        print("\ncpp vs pytorch:")
+        print(f"Time: {'faster' if time_diff_cpp_vs_pytorch > 0 else 'slower'} by {abs(time_diff_cpp_vs_pytorch):.1f}%")
+        print(f"Memory: {'less' if mem_diff_cpp_vs_pytorch > 0 else 'more'} by {abs(mem_diff_cpp_vs_pytorch):.1f}%")
 
 
 if __name__ == "__main__":
