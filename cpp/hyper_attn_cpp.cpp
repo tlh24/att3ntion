@@ -3,6 +3,33 @@
 #include <cmath> 
 #include <unordered_map>
 #include <mutex>
+#include <chrono>
+
+// Helper function to print memory usage of tensor
+void print_tensor_memory(const std::string& name, const torch::Tensor& tensor) {
+    size_t numel = tensor.numel();
+    size_t element_size = 0;
+    
+    if (tensor.dtype() == torch::kFloat32) {
+        element_size = 4;
+    } else if (tensor.dtype() == torch::kFloat64) {
+        element_size = 8;
+    } else if (tensor.dtype() == torch::kInt64) {
+        element_size = 8;
+    } else {
+        element_size = 4;  // Default assumption
+    }
+    
+    size_t memory_bytes = numel * element_size;
+    double memory_mb = static_cast<double>(memory_bytes) / (1024 * 1024);
+    
+    std::cout << name << " - Shape: [";
+    for (int i = 0; i < tensor.dim(); ++i) {
+        std::cout << tensor.size(i);
+        if (i < tensor.dim() - 1) std::cout << ", ";
+    }
+    std::cout << "], Memory: " << memory_mb << " MB" << std::endl;
+}
 
 struct QuickGELUImpl : torch::nn::Module { //activation function
     torch::Tensor forward(torch::Tensor x) {
@@ -81,15 +108,72 @@ struct HypergraphAttentionImpl : torch::nn::Module {
         Ar = dropout->forward(Ar);
         As = dropout->forward(As);
         
+        // Print memory usage of input tensors
+        std::cout << "\n==== Memory Usage Before Einsum Operations ====" << std::endl;
+        print_tensor_memory("Aq", Aq);
+        print_tensor_memory("Ar", Ar);
+        print_tensor_memory("As", As);
+        print_tensor_memory("Vq_1", Vq_1);
+        print_tensor_memory("Vr_1", Vr_1);
+        print_tensor_memory("Vs_1", Vs_1);
+        print_tensor_memory("Vq_2", Vq_2);
+        print_tensor_memory("Vr_2", Vr_2);
+        print_tensor_memory("Vs_2", Vs_2);
+        
+        // For timing the operations
+        auto start_time = std::chrono::high_resolution_clock::now();
+        auto end_time = std::chrono::high_resolution_clock::now();
+        
         // Gather operations
+        start_time = std::chrono::high_resolution_clock::now();
         auto Y_q = torch::einsum("bhijk,bhjd,bhkd->bhid", {Aq, Vr_1, Vs_1});
+        end_time = std::chrono::high_resolution_clock::now();
+        auto duration_Y_q = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+        std::cout << "Y_q einsum time: " << duration_Y_q << " microseconds" << std::endl;
+        
+        start_time = std::chrono::high_resolution_clock::now();
         auto Y_r = torch::einsum("bhijk,bhid,bhkd->bhjd", {Ar, Vq_1, Vs_1});
+        end_time = std::chrono::high_resolution_clock::now();
+        auto duration_Y_r = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+        std::cout << "Y_r einsum time: " << duration_Y_r << " microseconds" << std::endl;
+        
+        start_time = std::chrono::high_resolution_clock::now();
         auto Y_s = torch::einsum("bhijk,bhid,bhjd->bhkd", {As, Vq_1, Vr_1});
+        end_time = std::chrono::high_resolution_clock::now();
+        auto duration_Y_s = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+        std::cout << "Y_s einsum time: " << duration_Y_s << " microseconds" << std::endl;
         
         // Scatter operations
+        start_time = std::chrono::high_resolution_clock::now();
         auto Y_q_ = torch::einsum("bhijk,bhjd,bhijk,bhkd->bhid", {Ar, Vr_2, As, Vs_2});
+        end_time = std::chrono::high_resolution_clock::now();
+        auto duration_Y_q_ = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+        std::cout << "Y_q_ einsum time: " << duration_Y_q_ << " microseconds" << std::endl;
+        
+        start_time = std::chrono::high_resolution_clock::now();
         auto Y_r_ = torch::einsum("bhijk,bhid,bhijk,bhkd->bhjd", {Aq, Vq_2, As, Vs_2});
+        end_time = std::chrono::high_resolution_clock::now();
+        auto duration_Y_r_ = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+        std::cout << "Y_r_ einsum time: " << duration_Y_r_ << " microseconds" << std::endl;
+        
+        start_time = std::chrono::high_resolution_clock::now();
         auto Y_s_ = torch::einsum("bhijk,bhid,bhijk,bhjd->bhkd", {Aq, Vq_2, Ar, Vr_2});
+        end_time = std::chrono::high_resolution_clock::now();
+        auto duration_Y_s_ = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+        std::cout << "Y_s_ einsum time: " << duration_Y_s_ << " microseconds" << std::endl;
+        
+        // Print memory usage of output tensors
+        std::cout << "\n==== Memory Usage After Einsum Operations ====" << std::endl;
+        print_tensor_memory("Y_q", Y_q);
+        print_tensor_memory("Y_r", Y_r);
+        print_tensor_memory("Y_s", Y_s);
+        print_tensor_memory("Y_q_", Y_q_);
+        print_tensor_memory("Y_r_", Y_r_);
+        print_tensor_memory("Y_s_", Y_s_);
+        
+        // Total einsum time
+        auto total_einsum_time = duration_Y_q + duration_Y_r + duration_Y_s + duration_Y_q_ + duration_Y_r_ + duration_Y_s_;
+        std::cout << "Total einsum time: " << total_einsum_time << " microseconds" << std::endl;
         
         auto y = Y_q + Y_r + Y_s + Y_q_ + Y_r_ + Y_s_;
         
