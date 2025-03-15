@@ -1,6 +1,8 @@
 #include <torch/extension.h> 
 #include <iostream> 
 #include <cmath> 
+#include <unordered_map>
+#include <mutex>
 
 struct QuickGELUImpl : torch::nn::Module { //activation function
     torch::Tensor forward(torch::Tensor x) {
@@ -118,8 +120,34 @@ torch::Tensor hyper_attn_forward(
     int64_t n_heads,
     double dropout_rate = 0.0) {
     
-    HypergraphAttention model(d_model, n_heads, dropout_rate);
-    model->eval();
+    // Use static variables to create the model only once
+    static HypergraphAttention model(d_model, n_heads, dropout_rate);
+    static bool initialized = false;
+    static int64_t cached_d_model = d_model;
+    static int64_t cached_n_heads = n_heads;
+    static double cached_dropout_rate = dropout_rate;
+    
+    // If parameters have changed, we need to create a new model
+    if (!initialized || 
+        cached_d_model != d_model || 
+        cached_n_heads != n_heads || 
+        cached_dropout_rate != dropout_rate) {
+        
+        model = HypergraphAttention(d_model, n_heads, dropout_rate);
+        model->eval();
+        
+        // Update cached values
+        cached_d_model = d_model;
+        cached_n_heads = n_heads;
+        cached_dropout_rate = dropout_rate;
+        initialized = true;
+    }
+    
+    // Move model to the correct device if needed
+    auto params = model->parameters();
+    if (!params.empty() && params[0].device() != input.device()) {
+        model->to(input.device());
+    }
 
     torch::NoGradGuard no_grad;
     auto output = model->forward(input);
