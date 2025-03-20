@@ -23,12 +23,6 @@ void print_tensor_memory(const std::string& name, const torch::Tensor& tensor) {
     size_t memory_bytes = numel * element_size;
     double memory_mb = static_cast<double>(memory_bytes) / (1024 * 1024);
     
-    std::cout << name << " - Shape: [";
-    for (int i = 0; i < tensor.dim(); ++i) {
-        std::cout << tensor.size(i);
-        if (i < tensor.dim() - 1) std::cout << ", ";
-    }
-    std::cout << "], Memory: " << memory_mb << " MB" << std::endl;
 }
 
 struct QuickGELUImpl : torch::nn::Module { //activation function
@@ -108,17 +102,6 @@ struct HypergraphAttentionImpl : torch::nn::Module {
         Ar = dropout->forward(Ar);
         As = dropout->forward(As);
         
-        // Print memory usage of input tensors
-        std::cout << "\n==== Memory Usage Before Einsum Operations ====" << std::endl;
-        print_tensor_memory("Aq", Aq);
-        print_tensor_memory("Ar", Ar);
-        print_tensor_memory("As", As);
-        print_tensor_memory("Vq_1", Vq_1);
-        print_tensor_memory("Vr_1", Vr_1);
-        print_tensor_memory("Vs_1", Vs_1);
-        print_tensor_memory("Vq_2", Vq_2);
-        print_tensor_memory("Vr_2", Vr_2);
-        print_tensor_memory("Vs_2", Vs_2);
         
         // For timing the operations
         auto start_time = std::chrono::high_resolution_clock::now();
@@ -129,13 +112,11 @@ struct HypergraphAttentionImpl : torch::nn::Module {
         auto Y_q = torch::einsum("bhijk,bhjd,bhkd->bhid", {Aq, Vr_1, Vs_1});
         end_time = std::chrono::high_resolution_clock::now();
         auto duration_Y_q = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-        std::cout << "Y_q einsum time: " << duration_Y_q << " microseconds" << std::endl;
         
         start_time = std::chrono::high_resolution_clock::now();
         auto Y_r = torch::einsum("bhijk,bhid,bhkd->bhjd", {Ar, Vq_1, Vs_1});
         end_time = std::chrono::high_resolution_clock::now();
         auto duration_Y_r = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-        std::cout << "Y_r einsum time: " << duration_Y_r << " microseconds" << std::endl;
         
         start_time = std::chrono::high_resolution_clock::now();
         auto Y_s = torch::einsum("bhijk,bhid,bhjd->bhkd", {As, Vq_1, Vr_1});
