@@ -141,35 +141,34 @@ struct HypergraphAttentionImpl : torch::nn::Module {
         auto Y_s = torch::einsum("bhijk,bhid,bhjd->bhkd", {As, Vq_1, Vr_1});
         end_time = std::chrono::high_resolution_clock::now();
         auto duration_Y_s = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-        std::cout << "Y_s einsum time: " << duration_Y_s << " microseconds" << std::endl;
         
-        // Scatter operations
+        // Optimize scatter operations (Y_q_, Y_r_, Y_s_) while maintaining equivalence
+        
+        // For Y_x_: First compute element-wise multiplication of Ar and As
         start_time = std::chrono::high_resolution_clock::now();
-        auto Y_q_ = torch::einsum("bhijk,bhjd,bhijk,bhkd->bhid", {Ar, Vr_2, As, Vs_2});
+        
+        auto ArAs = Ar * As;
+        // Then perform the contraction with value tensors
+        auto Y_q_ = torch::einsum("bhijk,bhjd,bhkd->bhid", {ArAs, Vr_2, Vs_2});
+        
         end_time = std::chrono::high_resolution_clock::now();
         auto duration_Y_q_ = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-        std::cout << "Y_q_ einsum time: " << duration_Y_q_ << " microseconds" << std::endl;
         
         start_time = std::chrono::high_resolution_clock::now();
-        auto Y_r_ = torch::einsum("bhijk,bhid,bhijk,bhkd->bhjd", {Aq, Vq_2, As, Vs_2});
+        
+        auto AqAs = Aq * As;
+        auto Y_r_ = torch::einsum("bhijk,bhid,bhkd->bhjd", {AqAs, Vq_2, Vs_2});
+        
         end_time = std::chrono::high_resolution_clock::now();
         auto duration_Y_r_ = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-        std::cout << "Y_r_ einsum time: " << duration_Y_r_ << " microseconds" << std::endl;
         
         start_time = std::chrono::high_resolution_clock::now();
-        auto Y_s_ = torch::einsum("bhijk,bhid,bhijk,bhjd->bhkd", {Aq, Vq_2, Ar, Vr_2});
+        
+        auto AqAr = Aq * Ar;
+        auto Y_s_ = torch::einsum("bhijk,bhid,bhjd->bhkd", {AqAr, Vq_2, Vr_2});
+        
         end_time = std::chrono::high_resolution_clock::now();
         auto duration_Y_s_ = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-        std::cout << "Y_s_ einsum time: " << duration_Y_s_ << " microseconds" << std::endl;
-        
-        // Print memory usage of output tensors
-        std::cout << "\n==== Memory Usage After Einsum Operations ====" << std::endl;
-        print_tensor_memory("Y_q", Y_q);
-        print_tensor_memory("Y_r", Y_r);
-        print_tensor_memory("Y_s", Y_s);
-        print_tensor_memory("Y_q_", Y_q_);
-        print_tensor_memory("Y_r_", Y_r_);
-        print_tensor_memory("Y_s_", Y_s_);
         
         // Total einsum time
         auto total_einsum_time = duration_Y_q + duration_Y_r + duration_Y_s + duration_Y_q_ + duration_Y_r_ + duration_Y_s_;
