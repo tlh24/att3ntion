@@ -2,7 +2,7 @@
 #include <iostream> 
 #include <cmath> 
 
-torch::Tensor hyper_attn_forward(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> hyper_attn_forward(
     torch::Tensor Q,    // [batch_size, n_heads, seq_len, head_dim]   
     torch::Tensor R,       
     torch::Tensor S,       
@@ -22,28 +22,6 @@ torch::Tensor hyper_attn_forward(
     int seq_len_k = S.size(2);
     int head_dim = Q.size(3);
     
-    // Compute 3-way attention scores brute force first - don't run it though 
-    // auto dot_product = torch::zeros({batch_size, n_heads, seq_len_i, seq_len_j, seq_len_k}, Q.options());
-    // for (int b = 0; b < batch_size; b++) {
-    //     for (int h = 0; h < n_heads; h++) {
-    //         for (int i = 0; i < seq_len_i; i++) {
-    //             for (int j = 0; j < seq_len_j; j++) {
-    //                 for (int k = 0; k < seq_len_k; k++) {
-    //                     // Initialize accumulator for dot product
-    //                     float acc = 0.0;
-    //                     // Sum over head dimension:  Σ(d) Q[b,h,i,d] × R[b,h,j,d] × S[b,h,k,d]
-    //                     for (int d = 0; d < head_dim; d++) {
-    //                         acc += Q[b][h][i][d].item<float>() * 
-    //                             R[b][h][j][d].item<float>() * 
-    //                             S[b][h][k][d].item<float>();
-    //                     }
-    //                     dot_product[b][h][i][j][k] = acc;
-    //                 }
-    //             }
-    //         }
-    //     }
-    // }
-    // brute force 👆 -  creates a 5D attention tensor, and we want to avoid that!! 
 
     auto dot_product = torch::einsum("bhid,bhjd,bhkd->bhijk", {Q, R, S});
     dot_product = dot_product / std::sqrt(static_cast<double>(head_dim));
@@ -73,24 +51,25 @@ torch::Tensor hyper_attn_forward(
     auto Y_r = torch::einsum("bhijk,bhid,bhkd->bhjd", {Ar, Vq_1, Vs_1});
     auto Y_s = torch::einsum("bhijk,bhid,bhjd->bhkd", {As, Vq_1, Vr_1});
     
-    // Scatter operations
-    auto ArAs = Ar * As;
-    auto Y_q_ = torch::einsum("bhijk,bhjd,bhkd->bhid", {ArAs, Vr_2, Vs_2});
+    // Scatter operations// comment it out for testing gather for now
+    // auto ArAs = Ar * As;
+    // auto Y_q_ = torch::einsum("bhijk,bhjd,bhkd->bhid", {ArAs, Vr_2, Vs_2});
     
-    auto AqAs = Aq * As;
-    auto Y_r_ = torch::einsum("bhijk,bhid,bhkd->bhjd", {AqAs, Vq_2, Vs_2});
+    // auto AqAs = Aq * As;
+    // auto Y_r_ = torch::einsum("bhijk,bhid,bhkd->bhjd", {AqAs, Vq_2, Vs_2});
     
-    auto AqAr = Aq * Ar;
-    auto Y_s_ = torch::einsum("bhijk,bhid,bhjd->bhkd", {AqAr, Vq_2, Vr_2});
+    // auto AqAr = Aq * Ar;
+    // auto Y_s_ = torch::einsum("bhijk,bhid,bhjd->bhkd", {AqAr, Vq_2, Vr_2});
     
     // Combine results
-    auto y = Y_q + Y_r + Y_s + Y_q_ + Y_r_ + Y_s_;
+    //auto y = Y_q + Y_r + Y_s; //+ Y_q_ + Y_r_ + Y_s_;
     
-    return y;
+    return std::make_tuple(Y_q, Y_r, Y_s);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward", &hyper_attn_forward, "HypergraphAttention forward",
+    m.def("forward", &hyper_attn_forward,
+          "Hypergraph Attention forward (returns Y_q, Y_r, Y_s)",
           py::arg("Q"),
           py::arg("R"),
           py::arg("S"),
@@ -101,4 +80,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("Vs_1"),
           py::arg("Vs_2"),
           py::arg("dropout_rate") = 0.0);
-} 
+}
