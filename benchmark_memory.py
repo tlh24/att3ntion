@@ -150,7 +150,7 @@ def print_results_table(results, config):
 def save_results_to_csv(all_results):
     """Save benchmark results to a CSV file."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"benchmark_results_{timestamp}.csv"
+    filename = f"cpp_tests/benchmark_results_{timestamp}.csv"
     
     # Prepare CSV headers
     headers = [
