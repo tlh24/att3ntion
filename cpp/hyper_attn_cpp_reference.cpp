@@ -2,7 +2,7 @@
 #include <iostream> 
 #include <cmath> 
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> hyper_attn_forward(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> hyper_attn_forward(
     torch::Tensor Q,    // [batch_size, n_heads, seq_len, head_dim]   
     torch::Tensor R,       
     torch::Tensor S,       
@@ -13,16 +13,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> hyper_attn_forward(
     torch::Tensor Vs_1,    
     torch::Tensor Vs_2,    
     double dropout_rate = 0.0) {
-    
-    // get dimensions from input tensors
-    int batch_size = Q.size(0);
-    int n_heads = Q.size(1);
-    int seq_len_i = Q.size(2);
-    int seq_len_j = R.size(2);
-    int seq_len_k = S.size(2);
+
     int head_dim = Q.size(3);
     
-
+    // Gather operations
     auto dot_product = torch::einsum("bhid,bhjd,bhkd->bhijk", {Q, R, S});
     dot_product = dot_product / std::sqrt(static_cast<double>(head_dim));
 
@@ -46,30 +40,28 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> hyper_attn_forward(
         As = dropout->forward(As);
     }
     
-    // Gather operations
     auto Y_q = torch::einsum("bhijk,bhjd,bhkd->bhid", {Aq, Vr_1, Vs_1});
     auto Y_r = torch::einsum("bhijk,bhid,bhkd->bhjd", {Ar, Vq_1, Vs_1});
     auto Y_s = torch::einsum("bhijk,bhid,bhjd->bhkd", {As, Vq_1, Vr_1});
     
-    // Scatter operations// comment it out for testing gather for now
-    // auto ArAs = Ar * As;
-    // auto Y_q_ = torch::einsum("bhijk,bhjd,bhkd->bhid", {ArAs, Vr_2, Vs_2});
+    // Scatter operations
+    auto ArAs = Ar * As;
+    auto Y_q_ = torch::einsum("bhijk,bhjd,bhkd->bhid", {ArAs, Vr_2, Vs_2});
     
-    // auto AqAs = Aq * As;
-    // auto Y_r_ = torch::einsum("bhijk,bhid,bhkd->bhjd", {AqAs, Vq_2, Vs_2});
+    auto AqAs = Aq * As;
+    auto Y_r_ = torch::einsum("bhijk,bhid,bhkd->bhjd", {AqAs, Vq_2, Vs_2});
     
-    // auto AqAr = Aq * Ar;
-    // auto Y_s_ = torch::einsum("bhijk,bhid,bhjd->bhkd", {AqAr, Vq_2, Vr_2});
+    auto AqAr = Aq * Ar;
+    auto Y_s_ = torch::einsum("bhijk,bhid,bhjd->bhkd", {AqAr, Vq_2, Vr_2});
     
     // Combine results
     //auto y = Y_q + Y_r + Y_s; //+ Y_q_ + Y_r_ + Y_s_;
-    
-    return std::make_tuple(Y_q, Y_r, Y_s);
+    return std::make_tuple(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &hyper_attn_forward,
-          "Hypergraph Attention forward (returns Y_q, Y_r, Y_s)",
+          "Hypergraph Attention forward (returns Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_)",
           py::arg("Q"),
           py::arg("R"),
           py::arg("S"),
