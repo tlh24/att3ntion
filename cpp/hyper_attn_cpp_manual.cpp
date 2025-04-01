@@ -73,22 +73,21 @@ void compute_softmax_3d(
     }
 }
 
-// LATER: Remove redundant code for gather and scatter operations
-// separate dot product code from gather and scatter functions 
-void compute_Y_gather_q(
-    torch::Tensor& Y_q,
+void compute_Y_gather(
+    torch::Tensor& Y_out,      // Output tensor (Y_q, Y_r, or Y_s)
     const torch::Tensor& Q,
-    const torch::Tensor& R,
+    const torch::Tensor& R, 
     const torch::Tensor& S,
-    const torch::Tensor& Vr_1,
-    const torch::Tensor& Vs_1
+    const torch::Tensor& V1,   // First value tensor
+    const torch::Tensor& V2,   // Second value tensor
+    int fixed_dim              // Which dimension to fix (0=i/q, 1=j/r, 2=k/s)
 ) {
     auto Q_acc = Q.accessor<float, 4>();  
     auto R_acc = R.accessor<float, 4>();  
     auto S_acc = S.accessor<float, 4>();  
-    auto Vr_1_acc = Vr_1.accessor<float, 4>();         
-    auto Vs_1_acc = Vs_1.accessor<float, 4>();  
-    auto Y_q_acc = Y_q.accessor<float, 4>();
+    auto V1_acc = V1.accessor<float, 4>();  
+    auto V2_acc = V2.accessor<float, 4>();  
+    auto Y_out_acc = Y_out.accessor<float, 4>();
 
     int B = Q.size(0);
     int H = Q.size(1);
@@ -98,146 +97,61 @@ void compute_Y_gather_q(
     int D = Q.size(3);
     float scale = 1.0f / std::sqrt(static_cast<float>(D));
 
+    // Size of each dimension
+    int sizes[3] = {I, J, K};
+    
+    // For each batch and head
     for (int b = 0; b < B; b++) {
         for (int h = 0; h < H; h++) {
-            for (int i = 0; i < I; i++) {
-                // Use compute_softmax_3d instead of direct computation
-                // For compute_Y_gather_q, we fix dimension 0 (i) and compute softmax over j,k
+            // Loop over the fixed dimension
+            for (int fixed_idx = 0; fixed_idx < sizes[fixed_dim]; fixed_idx++) {
+                // Define variables for the other two dimensions based on the fixed dimension
+                int dim1, dim2;           // The two non-fixed dimensions
+                int dim1_size, dim2_size; // Their sizes
                 
-                // Allocate array for softmax attention values
-                std::vector<float> attn_values(J * K);
-                
-                // Compute softmax over j,k (dimensions 1 and 2) for fixed i (dimension 0)
-                compute_softmax_3d(
-                    Q_acc, R_acc, S_acc,
-                    b, h,
-                    0, i,  // fixed_dim = 0 (i), fixed_idx = i
-                    J, K,  // dim1_size = J, dim2_size = K
-                    1, 2, 0,  // dim1_idx_fn = 1 (j), dim2_idx_fn = 2 (k), fixed_dim_idx_fn = 0 (i)
-                    scale, attn_values.data()
-                );
-                
-                // Apply attention values to values and accumulate in Y_q
-                int idx = 0;
-                for (int j = 0; j < J; j++) {
-                    for (int k = 0; k < K; k++) {
-                        float attn = attn_values[idx++];
-                        for (int d = 0; d < D; d++) {
-                            Y_q_acc[b][h][i][d] += attn * Vr_1_acc[b][h][j][d] * Vs_1_acc[b][h][k][d];
-                        }
-                    }
+                if (fixed_dim == 0) {      // If i is fixed
+                    dim1 = 1; dim2 = 2;    // j and k are the other dimensions
+                    dim1_size = J; dim2_size = K;
+                } else if (fixed_dim == 1) { // If j is fixed
+                    dim1 = 0; dim2 = 2;    // i and k are the other dimensions
+                    dim1_size = I; dim2_size = K;
+                } else {                   // If k is fixed
+                    dim1 = 0; dim2 = 1;    // i and j are the other dimensions
+                    dim1_size = I; dim2_size = J;
                 }
-            }
-        }
-    }
-}
-
-void compute_Y_gather_r(
-    torch::Tensor& Y_r,
-    const torch::Tensor& Q,
-    const torch::Tensor& R,
-    const torch::Tensor& S,
-    const torch::Tensor& Vq_1,
-    const torch::Tensor& Vs_1
-) {
-    auto Q_acc = Q.accessor<float, 4>();  
-    auto R_acc = R.accessor<float, 4>();  
-    auto S_acc = S.accessor<float, 4>();  
-    auto Vq_1_acc = Vq_1.accessor<float, 4>();  
-    auto Vs_1_acc = Vs_1.accessor<float, 4>();  
-    auto Y_r_acc = Y_r.accessor<float, 4>();
-
-    int B = Q.size(0);
-    int H = Q.size(1);
-    int I = Q.size(2);
-    int J = R.size(2);
-    int K = S.size(2);
-    int D = Q.size(3);
-    float scale = 1.0f / std::sqrt(static_cast<float>(D));
-
-    for (int b = 0; b < B; b++) {
-        for (int h = 0; h < H; h++) {
-            for (int j = 0; j < J; j++) {
-                // Use compute_softmax_3d instead of direct computation
-                // For compute_Y_gather_r, we fix dimension 1 (j) and compute softmax over i,k
                 
                 // Allocate array for softmax attention values
-                std::vector<float> attn_values(I * K);
+                std::vector<float> attn_values(dim1_size * dim2_size);
                 
-                // Compute softmax over i,k (dimensions 0 and 2) for fixed j (dimension 1)
+                // Compute softmax over the two non-fixed dimensions
                 compute_softmax_3d(
                     Q_acc, R_acc, S_acc,
                     b, h,
-                    1, j,  // fixed_dim = 1 (j), fixed_idx = j
-                    I, K,  // dim1_size = I, dim2_size = K
-                    0, 2, 1,  // dim1_idx_fn = 0 (i), dim2_idx_fn = 2 (k), fixed_dim_idx_fn = 1 (j)
+                    fixed_dim, fixed_idx,  // fixed dimension and index
+                    dim1_size, dim2_size,  // sizes of the two non-fixed dimensions
+                    dim1, dim2, fixed_dim, // dimension mapping (dim1, dim2, fixed_dim)
                     scale, attn_values.data()
                 );
                 
-                // Apply attention values to values and accumulate in Y_r
+                // Apply attention values to values and accumulate in output
                 int idx = 0;
-                for (int i = 0; i < I; i++) {
-                    for (int k = 0; k < K; k++) {
+                for (int idx1 = 0; idx1 < dim1_size; idx1++) {
+                    for (int idx2 = 0; idx2 < dim2_size; idx2++) {
                         float attn = attn_values[idx++];
+                        
+                        // Map idx1, idx2 to i, j, k based on which dimensions they represent
+                        int i = (fixed_dim == 0) ? fixed_idx : (dim1 == 0) ? idx1 : idx2;
+                        int j = (fixed_dim == 1) ? fixed_idx : (dim1 == 1) ? idx1 : idx2;
+                        int k = (fixed_dim == 2) ? fixed_idx : (dim1 == 2) ? idx1 : idx2;
+                        
+                        // Update the output tensor with the weighted value tensors
                         for (int d = 0; d < D; d++) {
-                            Y_r_acc[b][h][j][d] += attn * Vq_1_acc[b][h][i][d] * Vs_1_acc[b][h][k][d];
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-void compute_Y_gather_s(
-    torch::Tensor& Y_s,
-    const torch::Tensor& Q,
-    const torch::Tensor& R,
-    const torch::Tensor& S,
-    const torch::Tensor& Vq_1,
-    const torch::Tensor& Vr_1
-) {
-    auto Q_acc = Q.accessor<float, 4>();  
-    auto R_acc = R.accessor<float, 4>();  
-    auto S_acc = S.accessor<float, 4>();  
-    auto Vq_1_acc = Vq_1.accessor<float, 4>();  
-    auto Vr_1_acc = Vr_1.accessor<float, 4>();  
-    auto Y_s_acc = Y_s.accessor<float, 4>();
-
-    int B = Q.size(0);
-    int H = Q.size(1);
-    int I = Q.size(2);
-    int J = R.size(2);
-    int K = S.size(2);
-    int D = Q.size(3);
-    float scale = 1.0f / std::sqrt(static_cast<float>(D));
-
-    for (int b = 0; b < B; b++) {
-        for (int h = 0; h < H; h++) {
-            for (int k = 0; k < K; k++) {
-                // Use compute_softmax_3d instead of direct computation
-                // For compute_Y_gather_s, we fix dimension 2 (k) and compute softmax over i,j
-                
-                // Allocate array for softmax attention values
-                std::vector<float> attn_values(I * J);
-                
-                // Compute softmax over i,j (dimensions 0 and 1) for fixed k (dimension 2)
-                compute_softmax_3d(
-                    Q_acc, R_acc, S_acc,
-                    b, h,
-                    2, k,  // fixed_dim = 2 (k), fixed_idx = k
-                    I, J,  // dim1_size = I, dim2_size = J
-                    0, 1, 2,  // dim1_idx_fn = 0 (i), dim2_idx_fn = 1 (j), fixed_dim_idx_fn = 2 (k)
-                    scale, attn_values.data()
-                );
-                
-                // Apply attention values to values and accumulate in Y_s
-                int idx = 0;
-                for (int i = 0; i < I; i++) {
-                    for (int j = 0; j < J; j++) {
-                        float attn = attn_values[idx++];
-                        for (int d = 0; d < D; d++) {
-                            Y_s_acc[b][h][k][d] += attn * Vq_1_acc[b][h][i][d] * Vr_1_acc[b][h][j][d];
+                            // For the value tensors, we need to index based on which dimensions are not fixed
+                            // V1 corresponds to the first non-fixed dimension, V2 to the second
+                            int v1_idx = (dim1 == 0) ? i : (dim1 == 1) ? j : k;
+                            int v2_idx = (dim2 == 0) ? i : (dim2 == 1) ? j : k;
+                            
+                            Y_out_acc[b][h][fixed_idx][d] += attn * V1_acc[b][h][v1_idx][d] * V2_acc[b][h][v2_idx][d];
                         }
                     }
                 }
@@ -540,9 +454,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     auto Y_r_ = torch::zeros({B, H, J, D}, options);
     auto Y_s_ = torch::zeros({B, H, K, D}, options);
 
-    compute_Y_gather_q(Y_q, Q, R, S, Vr_1, Vs_1);
-    compute_Y_gather_r(Y_r, Q, R, S, Vq_1, Vs_1);
-    compute_Y_gather_s(Y_s, Q, R, S, Vq_1, Vr_1);
+    compute_Y_gather(Y_q, Q, R, S, Vr_1, Vs_1, 0);
+    compute_Y_gather(Y_r, Q, R, S, Vq_1, Vs_1, 1);
+    compute_Y_gather(Y_s, Q, R, S, Vq_1, Vr_1, 2);
 
     compute_Y_scatter_q(Y_q_, Q, R, S, Vr_2, Vs_2);
     compute_Y_scatter_r(Y_r_, Q, R, S, Vq_2, Vs_2);
