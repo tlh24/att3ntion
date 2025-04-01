@@ -3,7 +3,78 @@
 #include <cmath> 
 #include <limits>
 
-// Helper to compute output tensor via 3-way softmax attention
+// Helper function to compute dot product between three vectors at specific indices
+template <typename T>
+inline float compute_dot_product(
+    const T& Q_acc,
+    const T& R_acc,
+    const T& S_acc,
+    int b, int h, int i, int j, int k, int D) {
+    
+    float dot = 0.0f;
+    for (int d = 0; d < D; d++) {
+        dot += Q_acc[b][h][i][d] * R_acc[b][h][j][d] * S_acc[b][h][k][d];
+    }
+    return dot;
+}
+
+// Helper function to compute 3D softmax with configurable dimensions
+template <typename T>
+void compute_softmax_3d(
+    const T& Q_acc,
+    const T& R_acc,
+    const T& S_acc,
+    int b, int h, 
+    int fixed_dim, int fixed_idx,
+    int dim1_size, int dim2_size,
+    int dim1_idx_fn, int dim2_idx_fn, int fixed_dim_idx_fn,
+    float scale, float* attn_out) {
+    
+    // Find max for numerical stability
+    float max_val = -std::numeric_limits<float>::infinity();
+    for (int idx1 = 0; idx1 < dim1_size; idx1++) {
+        for (int idx2 = 0; idx2 < dim2_size; idx2++) {
+            int i = fixed_dim == 0 ? fixed_idx : (dim1_idx_fn == 0 ? idx1 : (dim2_idx_fn == 0 ? idx2 : 0));
+            int j = fixed_dim == 1 ? fixed_idx : (dim1_idx_fn == 1 ? idx1 : (dim2_idx_fn == 1 ? idx2 : 0));
+            int k = fixed_dim == 2 ? fixed_idx : (dim1_idx_fn == 2 ? idx1 : (dim2_idx_fn == 2 ? idx2 : 0));
+            
+            float dot = compute_dot_product(Q_acc, R_acc, S_acc, b, h, i, j, k, Q_acc.size(3));
+            dot *= scale;
+            if (dot > max_val) max_val = dot;
+        }
+    }
+    
+    // Compute sum of exponentials
+    float sum_exp = 0.0f;
+    for (int idx1 = 0; idx1 < dim1_size; idx1++) {
+        for (int idx2 = 0; idx2 < dim2_size; idx2++) {
+            int i = fixed_dim == 0 ? fixed_idx : (dim1_idx_fn == 0 ? idx1 : (dim2_idx_fn == 0 ? idx2 : 0));
+            int j = fixed_dim == 1 ? fixed_idx : (dim1_idx_fn == 1 ? idx1 : (dim2_idx_fn == 1 ? idx2 : 0));
+            int k = fixed_dim == 2 ? fixed_idx : (dim1_idx_fn == 2 ? idx1 : (dim2_idx_fn == 2 ? idx2 : 0));
+            
+            float dot = compute_dot_product(Q_acc, R_acc, S_acc, b, h, i, j, k, Q_acc.size(3));
+            dot *= scale;
+            sum_exp += std::exp(dot - max_val);
+        }
+    }
+    
+    // Compute softmax values for each position
+    int idx = 0;
+    for (int idx1 = 0; idx1 < dim1_size; idx1++) {
+        for (int idx2 = 0; idx2 < dim2_size; idx2++) {
+            int i = fixed_dim == 0 ? fixed_idx : (dim1_idx_fn == 0 ? idx1 : (dim2_idx_fn == 0 ? idx2 : 0));
+            int j = fixed_dim == 1 ? fixed_idx : (dim1_idx_fn == 1 ? idx1 : (dim2_idx_fn == 1 ? idx2 : 0));
+            int k = fixed_dim == 2 ? fixed_idx : (dim1_idx_fn == 2 ? idx1 : (dim2_idx_fn == 2 ? idx2 : 0));
+            
+            float dot = compute_dot_product(Q_acc, R_acc, S_acc, b, h, i, j, k, Q_acc.size(3));
+            dot *= scale;
+            attn_out[idx++] = std::exp(dot - max_val) / sum_exp;
+        }
+    }
+}
+
+// LATER: Remove redundant code for gather and scatter operations
+// separate dot product code from gather and scatter functions 
 void compute_Y_gather_q(
     torch::Tensor& Y_q,
     const torch::Tensor& Q,
@@ -30,39 +101,30 @@ void compute_Y_gather_q(
     for (int b = 0; b < B; b++) {
         for (int h = 0; h < H; h++) {
             for (int i = 0; i < I; i++) {
-                // softmax over j,k
-                float max_val = -std::numeric_limits<float>::infinity();
+                // Use compute_softmax_3d instead of direct computation
+                // For compute_Y_gather_q, we fix dimension 0 (i) and compute softmax over j,k
+                
+                // Allocate array for softmax attention values
+                std::vector<float> attn_values(J * K);
+                
+                // Compute softmax over j,k (dimensions 1 and 2) for fixed i (dimension 0)
+                compute_softmax_3d(
+                    Q_acc, R_acc, S_acc,
+                    b, h,
+                    0, i,  // fixed_dim = 0 (i), fixed_idx = i
+                    J, K,  // dim1_size = J, dim2_size = K
+                    1, 2, 0,  // dim1_idx_fn = 1 (j), dim2_idx_fn = 2 (k), fixed_dim_idx_fn = 0 (i)
+                    scale, attn_values.data()
+                );
+                
+                // Apply attention values to values and accumulate in Y_q
+                int idx = 0;
                 for (int j = 0; j < J; j++) {
                     for (int k = 0; k < K; k++) {
-                        float dot = 0.0f;
-                        for (int d = 0; d < D; d++)
-                            dot += Q_acc[b][h][i][d] * R_acc[b][h][j][d] * S_acc[b][h][k][d];
-                        dot *= scale;
-                        if (dot > max_val) max_val = dot;
-                    }
-                }
-
-                float sum_exp = 0.0f;
-                for (int j = 0; j < J; j++) {
-                    for (int k = 0; k < K; k++) {
-                        float dot = 0.0f;
-                        for (int d = 0; d < D; d++)
-                            dot += Q_acc[b][h][i][d] * R_acc[b][h][j][d] * S_acc[b][h][k][d];
-                        dot *= scale;
-                        sum_exp += std::exp(dot - max_val);
-                    }
-                }
-
-                for (int j = 0; j < J; j++) {
-                    for (int k = 0; k < K; k++) {
-                        float dot = 0.0f;
-                        for (int d = 0; d < D; d++)
-                            dot += Q_acc[b][h][i][d] * R_acc[b][h][j][d] * S_acc[b][h][k][d];
-                        dot *= scale;
-                        float attn = std::exp(dot - max_val) / sum_exp;
-
-                        for (int d = 0; d < D; d++)
+                        float attn = attn_values[idx++];
+                        for (int d = 0; d < D; d++) {
                             Y_q_acc[b][h][i][d] += attn * Vr_1_acc[b][h][j][d] * Vs_1_acc[b][h][k][d];
+                        }
                     }
                 }
             }
@@ -96,39 +158,30 @@ void compute_Y_gather_r(
     for (int b = 0; b < B; b++) {
         for (int h = 0; h < H; h++) {
             for (int j = 0; j < J; j++) {
-                // softmax over i,k
-                float max_val = -std::numeric_limits<float>::infinity();
+                // Use compute_softmax_3d instead of direct computation
+                // For compute_Y_gather_r, we fix dimension 1 (j) and compute softmax over i,k
+                
+                // Allocate array for softmax attention values
+                std::vector<float> attn_values(I * K);
+                
+                // Compute softmax over i,k (dimensions 0 and 2) for fixed j (dimension 1)
+                compute_softmax_3d(
+                    Q_acc, R_acc, S_acc,
+                    b, h,
+                    1, j,  // fixed_dim = 1 (j), fixed_idx = j
+                    I, K,  // dim1_size = I, dim2_size = K
+                    0, 2, 1,  // dim1_idx_fn = 0 (i), dim2_idx_fn = 2 (k), fixed_dim_idx_fn = 1 (j)
+                    scale, attn_values.data()
+                );
+                
+                // Apply attention values to values and accumulate in Y_r
+                int idx = 0;
                 for (int i = 0; i < I; i++) {
                     for (int k = 0; k < K; k++) {
-                        float dot = 0.0f;
-                        for (int d = 0; d < D; d++)
-                            dot += Q_acc[b][h][i][d] * R_acc[b][h][j][d] * S_acc[b][h][k][d];
-                        dot *= scale;
-                        if (dot > max_val) max_val = dot;
-                    }
-                }
-
-                float sum_exp = 0.0f;
-                for (int i = 0; i < I; i++) {
-                    for (int k = 0; k < K; k++) {
-                        float dot = 0.0f;
-                        for (int d = 0; d < D; d++)
-                            dot += Q_acc[b][h][i][d] * R_acc[b][h][j][d] * S_acc[b][h][k][d];
-                        dot *= scale;
-                        sum_exp += std::exp(dot - max_val);
-                    }
-                }
-
-                for (int i = 0; i < I; i++) {
-                    for (int k = 0; k < K; k++) {
-                        float dot = 0.0f;
-                        for (int d = 0; d < D; d++)
-                            dot += Q_acc[b][h][i][d] * R_acc[b][h][j][d] * S_acc[b][h][k][d];
-                        dot *= scale;
-                        float attn = std::exp(dot - max_val) / sum_exp;
-
-                        for (int d = 0; d < D; d++)
+                        float attn = attn_values[idx++];
+                        for (int d = 0; d < D; d++) {
                             Y_r_acc[b][h][j][d] += attn * Vq_1_acc[b][h][i][d] * Vs_1_acc[b][h][k][d];
+                        }
                     }
                 }
             }
@@ -162,39 +215,30 @@ void compute_Y_gather_s(
     for (int b = 0; b < B; b++) {
         for (int h = 0; h < H; h++) {
             for (int k = 0; k < K; k++) {
-                // softmax over i,j
-                float max_val = -std::numeric_limits<float>::infinity();
+                // Use compute_softmax_3d instead of direct computation
+                // For compute_Y_gather_s, we fix dimension 2 (k) and compute softmax over i,j
+                
+                // Allocate array for softmax attention values
+                std::vector<float> attn_values(I * J);
+                
+                // Compute softmax over i,j (dimensions 0 and 1) for fixed k (dimension 2)
+                compute_softmax_3d(
+                    Q_acc, R_acc, S_acc,
+                    b, h,
+                    2, k,  // fixed_dim = 2 (k), fixed_idx = k
+                    I, J,  // dim1_size = I, dim2_size = J
+                    0, 1, 2,  // dim1_idx_fn = 0 (i), dim2_idx_fn = 1 (j), fixed_dim_idx_fn = 2 (k)
+                    scale, attn_values.data()
+                );
+                
+                // Apply attention values to values and accumulate in Y_s
+                int idx = 0;
                 for (int i = 0; i < I; i++) {
                     for (int j = 0; j < J; j++) {
-                        float dot = 0.0f;
-                        for (int d = 0; d < D; d++)
-                            dot += Q_acc[b][h][i][d] * R_acc[b][h][j][d] * S_acc[b][h][k][d];
-                        dot *= scale;
-                        if (dot > max_val) max_val = dot;
-                    }
-                }
-
-                float sum_exp = 0.0f;
-                for (int i = 0; i < I; i++) {
-                    for (int j = 0; j < J; j++) {
-                        float dot = 0.0f;
-                        for (int d = 0; d < D; d++)
-                            dot += Q_acc[b][h][i][d] * R_acc[b][h][j][d] * S_acc[b][h][k][d];
-                        dot *= scale;
-                        sum_exp += std::exp(dot - max_val);
-                    }
-                }
-
-                for (int i = 0; i < I; i++) {
-                    for (int j = 0; j < J; j++) {
-                        float dot = 0.0f;
-                        for (int d = 0; d < D; d++)
-                            dot += Q_acc[b][h][i][d] * R_acc[b][h][j][d] * S_acc[b][h][k][d];
-                        dot *= scale;
-                        float attn = std::exp(dot - max_val) / sum_exp;
-
-                        for (int d = 0; d < D; d++)
+                        float attn = attn_values[idx++];
+                        for (int d = 0; d < D; d++) {
                             Y_s_acc[b][h][k][d] += attn * Vq_1_acc[b][h][i][d] * Vr_1_acc[b][h][j][d];
+                        }
                     }
                 }
             }
@@ -236,72 +280,44 @@ void compute_Y_scatter_q(
                 // For each j, compute attention to js (softmax over i,k)
                 std::vector<std::vector<float>> Ar_values(J, std::vector<float>(K, 0.0f));
                 for (int j = 0; j < J; j++) {
-                    // Compute max for numerical stability for Ar (softmax over i,k)
-                    float max_val_j = -std::numeric_limits<float>::infinity();
-                    for (int i_idx = 0; i_idx < I; i_idx++) {
-                        for (int k = 0; k < K; k++) {
-                            float dot = 0.0f;
-                            for (int d = 0; d < D; d++)
-                                dot += Q_acc[b][h][i_idx][d] * R_acc[b][h][j][d] * S_acc[b][h][k][d];
-                            dot *= scale;
-                            if (dot > max_val_j) max_val_j = dot;
-                        }
-                    }
-
-                    float sum_exp_j = 0.0f;
-                    for (int i_idx = 0; i_idx < I; i_idx++) {
-                        for (int k = 0; k < K; k++) {
-                            float dot = 0.0f;
-                            for (int d = 0; d < D; d++)
-                                dot += Q_acc[b][h][i_idx][d] * R_acc[b][h][j][d] * S_acc[b][h][k][d];
-                            dot *= scale;
-                            sum_exp_j += std::exp(dot - max_val_j);
-                        }
-                    }
-
-                    // For each k, compute the partial Ar value (for this specific j)
+                    // Use compute_softmax_3d to compute Ar values (softmax over i,k for fixed j)
+                    std::vector<float> softmax_results(I * K);
+                    compute_softmax_3d(
+                        Q_acc, R_acc, S_acc,
+                        b, h,
+                        1, j,  // fixed_dim = 1 (j), fixed_idx = j
+                        I, K,  // dim1_size = I, dim2_size = K
+                        0, 2, 1,  // dim1_idx_fn = 0 (i), dim2_idx_fn = 2 (k), fixed_dim_idx_fn = 1 (j)
+                        scale, softmax_results.data()
+                    );
+                    
+                    // Extract the attention values for the current i
                     for (int k = 0; k < K; k++) {
-                        float dot = 0.0f;
-                        for (int d = 0; d < D; d++)
-                            dot += Q_acc[b][h][i][d] * R_acc[b][h][j][d] * S_acc[b][h][k][d];
-                        dot *= scale;
-                        Ar_values[j][k] = std::exp(dot - max_val_j) / sum_exp_j;
+                        // Find the index of (i,k) in the softmax_results array
+                        int idx = i * K + k;
+                        Ar_values[j][k] = softmax_results[idx];
                     }
                 }
 
                 // Now compute As values
                 std::vector<std::vector<float>> As_values(K, std::vector<float>(J, 0.0f));
                 for (int k = 0; k < K; k++) {
-                    // Compute max for numerical stability for As (softmax over i,j)
-                    float max_val_k = -std::numeric_limits<float>::infinity();
-                    for (int i_idx = 0; i_idx < I; i_idx++) {
-                        for (int j = 0; j < J; j++) {
-                            float dot = 0.0f;
-                            for (int d = 0; d < D; d++)
-                                dot += Q_acc[b][h][i_idx][d] * R_acc[b][h][j][d] * S_acc[b][h][k][d];
-                            dot *= scale;
-                            if (dot > max_val_k) max_val_k = dot;
-                        }
-                    }
-
-                    float sum_exp_k = 0.0f;
-                    for (int i_idx = 0; i_idx < I; i_idx++) {
-                        for (int j = 0; j < J; j++) {
-                            float dot = 0.0f;
-                            for (int d = 0; d < D; d++)
-                                dot += Q_acc[b][h][i_idx][d] * R_acc[b][h][j][d] * S_acc[b][h][k][d];
-                            dot *= scale;
-                            sum_exp_k += std::exp(dot - max_val_k);
-                        }
-                    }
-
-                    // For each j, compute the partial As value (for this specific k)
+                    // Use compute_softmax_3d to compute As values (softmax over i,j for fixed k)
+                    std::vector<float> softmax_results(I * J);
+                    compute_softmax_3d(
+                        Q_acc, R_acc, S_acc,
+                        b, h,
+                        2, k,  // fixed_dim = 2 (k), fixed_idx = k
+                        I, J,  // dim1_size = I, dim2_size = J
+                        0, 1, 2,  // dim1_idx_fn = 0 (i), dim2_idx_fn = 1 (j), fixed_dim_idx_fn = 2 (k)
+                        scale, softmax_results.data()
+                    );
+                    
+                    // Extract the attention values for the current i
                     for (int j = 0; j < J; j++) {
-                        float dot = 0.0f;
-                        for (int d = 0; d < D; d++)
-                            dot += Q_acc[b][h][i][d] * R_acc[b][h][j][d] * S_acc[b][h][k][d];
-                        dot *= scale;
-                        As_values[k][j] = std::exp(dot - max_val_k) / sum_exp_k;
+                        // Find the index of (i,j) in the softmax_results array
+                        int idx = i * J + j;
+                        As_values[k][j] = softmax_results[idx];
                     }
                 }
 
@@ -354,72 +370,44 @@ void compute_Y_scatter_r(
                 // For each i, compute attention to is (softmax over j,k)
                 std::vector<std::vector<float>> Aq_values(I, std::vector<float>(K, 0.0f));
                 for (int i = 0; i < I; i++) {
-                    // Compute max for numerical stability for Aq (softmax over j,k)
-                    float max_val_i = -std::numeric_limits<float>::infinity();
-                    for (int j_idx = 0; j_idx < J; j_idx++) {
-                        for (int k = 0; k < K; k++) {
-                            float dot = 0.0f;
-                            for (int d = 0; d < D; d++)
-                                dot += Q_acc[b][h][i][d] * R_acc[b][h][j_idx][d] * S_acc[b][h][k][d];
-                            dot *= scale;
-                            if (dot > max_val_i) max_val_i = dot;
-                        }
-                    }
-
-                    float sum_exp_i = 0.0f;
-                    for (int j_idx = 0; j_idx < J; j_idx++) {
-                        for (int k = 0; k < K; k++) {
-                            float dot = 0.0f;
-                            for (int d = 0; d < D; d++)
-                                dot += Q_acc[b][h][i][d] * R_acc[b][h][j_idx][d] * S_acc[b][h][k][d];
-                            dot *= scale;
-                            sum_exp_i += std::exp(dot - max_val_i);
-                        }
-                    }
-
-                    // For each k, compute the partial Aq value (for this specific i)
+                    // Use compute_softmax_3d to compute Aq values (softmax over j,k for fixed i)
+                    std::vector<float> softmax_results(J * K);
+                    compute_softmax_3d(
+                        Q_acc, R_acc, S_acc,
+                        b, h,
+                        0, i,  // fixed_dim = 0 (i), fixed_idx = i
+                        J, K,  // dim1_size = J, dim2_size = K
+                        1, 2, 0,  // dim1_idx_fn = 1 (j), dim2_idx_fn = 2 (k), fixed_dim_idx_fn = 0 (i)
+                        scale, softmax_results.data()
+                    );
+                    
+                    // Extract the attention values for the current j
                     for (int k = 0; k < K; k++) {
-                        float dot = 0.0f;
-                        for (int d = 0; d < D; d++)
-                            dot += Q_acc[b][h][i][d] * R_acc[b][h][j][d] * S_acc[b][h][k][d];
-                        dot *= scale;
-                        Aq_values[i][k] = std::exp(dot - max_val_i) / sum_exp_i;
+                        // Find the index of (j,k) in the softmax_results array
+                        int idx = j * K + k;
+                        Aq_values[i][k] = softmax_results[idx];
                     }
                 }
 
                 // Now compute As values
                 std::vector<std::vector<float>> As_values(K, std::vector<float>(I, 0.0f));
                 for (int k = 0; k < K; k++) {
-                    // Compute max for numerical stability for As (softmax over i,j)
-                    float max_val_k = -std::numeric_limits<float>::infinity();
+                    // Use compute_softmax_3d to compute As values (softmax over i,j for fixed k)
+                    std::vector<float> softmax_results(I * J);
+                    compute_softmax_3d(
+                        Q_acc, R_acc, S_acc,
+                        b, h,
+                        2, k,  // fixed_dim = 2 (k), fixed_idx = k
+                        I, J,  // dim1_size = I, dim2_size = J
+                        0, 1, 2,  // dim1_idx_fn = 0 (i), dim2_idx_fn = 1 (j), fixed_dim_idx_fn = 2 (k)
+                        scale, softmax_results.data()
+                    );
+                    
+                    // Extract the attention values for the current i and j
                     for (int i = 0; i < I; i++) {
-                        for (int j_idx = 0; j_idx < J; j_idx++) {
-                            float dot = 0.0f;
-                            for (int d = 0; d < D; d++)
-                                dot += Q_acc[b][h][i][d] * R_acc[b][h][j_idx][d] * S_acc[b][h][k][d];
-                            dot *= scale;
-                            if (dot > max_val_k) max_val_k = dot;
-                        }
-                    }
-
-                    float sum_exp_k = 0.0f;
-                    for (int i = 0; i < I; i++) {
-                        for (int j_idx = 0; j_idx < J; j_idx++) {
-                            float dot = 0.0f;
-                            for (int d = 0; d < D; d++)
-                                dot += Q_acc[b][h][i][d] * R_acc[b][h][j_idx][d] * S_acc[b][h][k][d];
-                            dot *= scale;
-                            sum_exp_k += std::exp(dot - max_val_k);
-                        }
-                    }
-
-                    // For each i, compute the partial As value (for this specific k)
-                    for (int i = 0; i < I; i++) {
-                        float dot = 0.0f;
-                        for (int d = 0; d < D; d++)
-                            dot += Q_acc[b][h][i][d] * R_acc[b][h][j][d] * S_acc[b][h][k][d];
-                        dot *= scale;
-                        As_values[k][i] = std::exp(dot - max_val_k) / sum_exp_k;
+                        // Find the index of (i,j) in the softmax_results array
+                        int idx = i * J + j;
+                        As_values[k][i] = softmax_results[idx];
                     }
                 }
 
@@ -471,72 +459,44 @@ void compute_Y_scatter_s(
                 // For each i, compute attention to is (softmax over j,k)
                 std::vector<std::vector<float>> Aq_values(I, std::vector<float>(J, 0.0f));
                 for (int i = 0; i < I; i++) {
-                    // Compute max for numerical stability for Aq (softmax over j,k)
-                    float max_val_i = -std::numeric_limits<float>::infinity();
+                    // Use compute_softmax_3d to compute Aq values (softmax over j,k for fixed i)
+                    std::vector<float> softmax_results(J * K);
+                    compute_softmax_3d(
+                        Q_acc, R_acc, S_acc,
+                        b, h,
+                        0, i,  // fixed_dim = 0 (i), fixed_idx = i
+                        J, K,  // dim1_size = J, dim2_size = K
+                        1, 2, 0,  // dim1_idx_fn = 1 (j), dim2_idx_fn = 2 (k), fixed_dim_idx_fn = 0 (i)
+                        scale, softmax_results.data()
+                    );
+                    
+                    // Extract the attention values for the current k
                     for (int j = 0; j < J; j++) {
-                        for (int k_idx = 0; k_idx < K; k_idx++) {
-                            float dot = 0.0f;
-                            for (int d = 0; d < D; d++)
-                                dot += Q_acc[b][h][i][d] * R_acc[b][h][j][d] * S_acc[b][h][k_idx][d];
-                            dot *= scale;
-                            if (dot > max_val_i) max_val_i = dot;
-                        }
-                    }
-
-                    float sum_exp_i = 0.0f;
-                    for (int j = 0; j < J; j++) {
-                        for (int k_idx = 0; k_idx < K; k_idx++) {
-                            float dot = 0.0f;
-                            for (int d = 0; d < D; d++)
-                                dot += Q_acc[b][h][i][d] * R_acc[b][h][j][d] * S_acc[b][h][k_idx][d];
-                            dot *= scale;
-                            sum_exp_i += std::exp(dot - max_val_i);
-                        }
-                    }
-
-                    // For each j, compute the partial Aq value (for this specific i)
-                    for (int j = 0; j < J; j++) {
-                        float dot = 0.0f;
-                        for (int d = 0; d < D; d++)
-                            dot += Q_acc[b][h][i][d] * R_acc[b][h][j][d] * S_acc[b][h][k][d];
-                        dot *= scale;
-                        Aq_values[i][j] = std::exp(dot - max_val_i) / sum_exp_i;
+                        // We're interested in the current k, so find the correct index
+                        int idx = j * K + k;  // Position for (j,k) in the softmax array
+                        Aq_values[i][j] = softmax_results[idx];
                     }
                 }
 
                 // Now compute Ar values
                 std::vector<std::vector<float>> Ar_values(J, std::vector<float>(I, 0.0f));
                 for (int j = 0; j < J; j++) {
-                    // Compute max for numerical stability for Ar (softmax over i,k)
-                    float max_val_j = -std::numeric_limits<float>::infinity();
+                    // Use compute_softmax_3d to compute Ar values (softmax over i,k for fixed j)
+                    std::vector<float> softmax_results(I * K);
+                    compute_softmax_3d(
+                        Q_acc, R_acc, S_acc,
+                        b, h,
+                        1, j,  // fixed_dim = 1 (j), fixed_idx = j
+                        I, K,  // dim1_size = I, dim2_size = K
+                        0, 2, 1,  // dim1_idx_fn = 0 (i), dim2_idx_fn = 2 (k), fixed_dim_idx_fn = 1 (j)
+                        scale, softmax_results.data()
+                    );
+                    
+                    // Extract the attention values for the current k
                     for (int i = 0; i < I; i++) {
-                        for (int k_idx = 0; k_idx < K; k_idx++) {
-                            float dot = 0.0f;
-                            for (int d = 0; d < D; d++)
-                                dot += Q_acc[b][h][i][d] * R_acc[b][h][j][d] * S_acc[b][h][k_idx][d];
-                            dot *= scale;
-                            if (dot > max_val_j) max_val_j = dot;
-                        }
-                    }
-
-                    float sum_exp_j = 0.0f;
-                    for (int i = 0; i < I; i++) {
-                        for (int k_idx = 0; k_idx < K; k_idx++) {
-                            float dot = 0.0f;
-                            for (int d = 0; d < D; d++)
-                                dot += Q_acc[b][h][i][d] * R_acc[b][h][j][d] * S_acc[b][h][k_idx][d];
-                            dot *= scale;
-                            sum_exp_j += std::exp(dot - max_val_j);
-                        }
-                    }
-
-                    // For each i, compute the partial Ar value (for this specific j)
-                    for (int i = 0; i < I; i++) {
-                        float dot = 0.0f;
-                        for (int d = 0; d < D; d++)
-                            dot += Q_acc[b][h][i][d] * R_acc[b][h][j][d] * S_acc[b][h][k][d];
-                        dot *= scale;
-                        Ar_values[j][i] = std::exp(dot - max_val_j) / sum_exp_j;
+                        // We're interested in the current k, so find the correct index
+                        int idx = i * K + k;  // Position for (i,k) in the softmax array
+                        Ar_values[j][i] = softmax_results[idx];
                     }
                 }
 
