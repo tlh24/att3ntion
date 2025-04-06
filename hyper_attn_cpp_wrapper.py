@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import math
-import hyper_attn_cpp
+import hyper_attn_cpp_manual
 
 class QuickGELU(nn.Module):
     def forward(self, x: torch.Tensor):
@@ -9,7 +9,7 @@ class QuickGELU(nn.Module):
 
 class HypergraphAttentionCPP(nn.Module):
     """
-    PyTorch wrapper for cpp/hyper_attn_cpp.cpp.
+    PyTorch wrapper for cpp/hyper_attn_cpp_manual.cpp.
     """
     def __init__(self, d_model, n_heads, dropout_rate=0):
         super(HypergraphAttentionCPP, self).__init__()
@@ -52,14 +52,16 @@ class HypergraphAttentionCPP(nn.Module):
         Vr_1, Vr_2 = Vr.reshape(batch_size, ntok, self.n_heads, self.head_dim*2).permute(0, 2, 1, 3).split(self.head_dim, dim=-1)
         Vs_1, Vs_2 = Vs.reshape(batch_size, ntok, self.n_heads, self.head_dim*2).permute(0, 2, 1, 3).split(self.head_dim, dim=-1)
         
-        # Call the C++ extension for the core 3-way attention computation
-        y = hyper_attn_cpp.forward(
+        # Call the manual C++ extension for the core 3-way attention computation
+        y_q, y_r, y_s, y_q_scatter, y_r_scatter, y_s_scatter = hyper_attn_cpp_manual.forward(
             Q, R, S,
             Vq_1, Vq_2, 
             Vr_1, Vr_2,
-            Vs_1, Vs_2,
-            self.dropout.p if self.training else 0.0
+            Vs_1, Vs_2
         )
+        
+        # Combine the outputs (assuming we want to use all of them)
+        y = y_q + y_r + y_s + y_q_scatter + y_r_scatter + y_s_scatter
         
         y = y.permute(0, 2, 1, 3).sum(dim=2).squeeze()
         y = self.gelu(y)
@@ -74,6 +76,7 @@ if __name__ == "__main__":
     from sklearn.metrics.pairwise import cosine_similarity
     from hyper_attn_pytorch import HypergraphAttention
     
+    print("Testing HypergraphAttentionCPPmanual")
     def compare_attention_patterns(output1, output2):
         """Compare outputs using cosine similarity."""
         out1_flat = output1.detach().cpu().numpy().reshape(output1.shape[0], -1)

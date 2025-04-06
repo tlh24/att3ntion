@@ -233,18 +233,7 @@ def train_and_compare(model, num_epochs=10, batch_size=32, learning_rate=0.001):
         print(f'  Manual Loss: {manual_avg_loss:.6f}')
         print(f'  Autograd Loss: {autograd_avg_loss:.6f}')
         print(f'  Difference: {loss_diff:.6f}')
-    
-    # Plot loss curves
-    # plt.figure(figsize=(12, 6))
-    # plt.plot(manual_losses, label='Manual Backward')
-    # plt.plot(autograd_losses, label='PyTorch Autograd')
-    # plt.title('Training Loss Comparison')
-    # plt.xlabel('Epoch')
-    # plt.ylabel('Loss')
-    # plt.legend()
-    # plt.grid(True)
-    # plt.savefig('loss_comparison.png')
-    # plt.show()
+
     
     return {
         'manual_model': model_manual,
