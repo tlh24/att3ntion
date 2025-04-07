@@ -120,7 +120,7 @@ def test_all_gradients():
     
     # Import the specific backward module
     try:
-        import hyper_attn_cpp_backward
+        import hyper_attn_cpp_manual
         print("Successfully imported hyper_attn_cpp_backward module")
     except ImportError:
         print("Failed to import hyper_attn_cpp_backward. Make sure it's compiled correctly.")
@@ -164,7 +164,7 @@ def test_all_gradients():
     
     # Call the C++ backward function directly to get gradients
     try:
-        cpp_grads_tuple = hyper_attn_cpp_backward.backward(
+        cpp_grads_tuple = hyper_attn_cpp_manual.backward(
             grad_output, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, 0.0
         )
         print("Successfully called backward function")
