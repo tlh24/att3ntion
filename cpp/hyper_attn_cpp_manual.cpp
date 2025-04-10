@@ -800,6 +800,465 @@ void compute_grad_Vs_1(
     }
 }
 
+void compute_grad_Vq_2(
+    torch::Tensor& grad_Vq_2,
+    const torch::Tensor& grad_output,
+    const torch::Tensor& Q,
+    const torch::Tensor& R,
+    const torch::Tensor& S,
+    const torch::Tensor& Vr_2,
+    const torch::Tensor& Vs_2,
+    double dropout_rate = 0.0)
+{
+    auto Q_acc = Q.accessor<float, 4>();
+    auto R_acc = R.accessor<float, 4>();
+    auto S_acc = S.accessor<float, 4>();
+    auto Vr_2_acc = Vr_2.accessor<float, 4>();
+    auto Vs_2_acc = Vs_2.accessor<float, 4>();
+    auto grad_output_acc = grad_output.accessor<float, 4>();
+    auto grad_Vq_2_acc = grad_Vq_2.accessor<float, 4>();
+
+    int B = Q.size(0);
+    int H = Q.size(1);
+    int I = Q.size(2);
+    int J = R.size(2);
+    int K = S.size(2);
+    int D = Q.size(3);
+    float scale = 1.0f / std::sqrt(static_cast<float>(D));
+
+    // First compute the attention scores (Q·R·S) once, then use for all calculations
+    // Creates a B×H×I×J×K tensor of attention scores
+    torch::Tensor attention_scores = torch::zeros({B, H, I, J, K}, Q.options());
+    
+    // Fill with attention scores
+    for (int b = 0; b < B; b++) {
+        for (int h = 0; h < H; h++) {
+            for (int i = 0; i < I; i++) {
+                for (int j = 0; j < J; j++) {
+                    for (int k = 0; k < K; k++) {
+                        float score = 0.0f;
+                        for (int d = 0; d < D; d++) {
+                            score += Q_acc[b][h][i][d] * R_acc[b][h][j][d] * S_acc[b][h][k][d];
+                        }
+                        attention_scores.accessor<float, 5>()[b][h][i][j][k] = score * scale;
+                    }
+                }
+            }
+        }
+    }
+
+    // Compute the attention weights (applying softmax)
+    // Note: This matches the PyTorch version's separate Aq, Ar, As computation
+    
+    // Aq: softmax over j,k for each i (for computing gradient contributions to Y_s_)
+    torch::Tensor Aq = torch::zeros_like(attention_scores);
+    for (int b = 0; b < B; b++) {
+        for (int h = 0; h < H; h++) {
+            for (int i = 0; i < I; i++) {
+                // Get the scores for this i
+                std::vector<float> scores(J * K);
+                int idx = 0;
+                for (int j = 0; j < J; j++) {
+                    for (int k = 0; k < K; k++) {
+                        scores[idx++] = attention_scores.accessor<float, 5>()[b][h][i][j][k];
+                    }
+                }
+                
+                // Compute softmax
+                float max_val = *std::max_element(scores.begin(), scores.end());
+                float sum_exp = 0.0f;
+                for (auto &score : scores) {
+                    sum_exp += std::exp(score - max_val);
+                }
+                
+                // Apply softmax and store in Aq
+                idx = 0;
+                for (int j = 0; j < J; j++) {
+                    for (int k = 0; k < K; k++) {
+                        Aq.accessor<float, 5>()[b][h][i][j][k] = 
+                            std::exp(scores[idx] - max_val) / sum_exp;
+                        idx++;
+                    }
+                }
+            }
+        }
+    }
+    
+    // As: softmax over i,j for each k (for computing gradient contributions to Y_r_)
+    torch::Tensor As = torch::zeros_like(attention_scores);
+    for (int b = 0; b < B; b++) {
+        for (int h = 0; h < H; h++) {
+            for (int k = 0; k < K; k++) {
+                // Get the scores for this k
+                std::vector<float> scores(I * J);
+                int idx = 0;
+                for (int i = 0; i < I; i++) {
+                    for (int j = 0; j < J; j++) {
+                        scores[idx++] = attention_scores.accessor<float, 5>()[b][h][i][j][k];
+                    }
+                }
+                
+                // Compute softmax
+                float max_val = *std::max_element(scores.begin(), scores.end());
+                float sum_exp = 0.0f;
+                for (auto &score : scores) {
+                    sum_exp += std::exp(score - max_val);
+                }
+                
+                // Apply softmax and store in As
+                idx = 0;
+                for (int i = 0; i < I; i++) {
+                    for (int j = 0; j < J; j++) {
+                        As.accessor<float, 5>()[b][h][i][j][k] = 
+                            std::exp(scores[idx] - max_val) / sum_exp;
+                        idx++;
+                    }
+                }
+            }
+        }
+    }
+
+    // Now compute the gradients
+    for (int b = 0; b < B; b++) {
+        for (int h = 0; h < H; h++) {
+            for (int i = 0; i < I; i++) {
+                for (int d = 0; d < D; d++) {
+                    // Initialize gradient for this position
+                    float grad_sum = 0.0f;
+                    
+                    // Contribution from Y_r_ (through As)
+                    for (int j = 0; j < J; j++) {
+                        float dy_r = grad_output_acc[b][h][j][d];
+                        for (int k = 0; k < K; k++) {
+                            // As[b,h,i,j,k] is the attention from i,j to k in Y_r_
+                            float attn = As.accessor<float, 5>()[b][h][i][j][k];
+                            grad_sum += dy_r * attn * Vs_2_acc[b][h][k][d];
+                        }
+                    }
+                    
+                    // Contribution from Y_s_ (through Aq)
+                    for (int k = 0; k < K; k++) {
+                        float dy_s = grad_output_acc[b][h][k][d];
+                        for (int j = 0; j < J; j++) {
+                            // Aq[b,h,i,j,k] is the attention from i,j to k in Y_s_
+                            float attn = Aq.accessor<float, 5>()[b][h][i][j][k];
+                            grad_sum += dy_s * attn * Vr_2_acc[b][h][j][d];
+                        }
+                    }
+                    
+                    // Assign the computed gradient
+                    grad_Vq_2_acc[b][h][i][d] = grad_sum;
+                }
+            }
+        }
+    }
+}
+
+void compute_grad_Vr_2(
+    torch::Tensor& grad_Vr_2,
+    const torch::Tensor& grad_output,
+    const torch::Tensor& Q,
+    const torch::Tensor& R,
+    const torch::Tensor& S,
+    const torch::Tensor& Vq_2,
+    const torch::Tensor& Vs_2,
+    double dropout_rate = 0.0)
+{
+    auto Q_acc = Q.accessor<float, 4>();
+    auto R_acc = R.accessor<float, 4>();
+    auto S_acc = S.accessor<float, 4>();
+    auto Vq_2_acc = Vq_2.accessor<float, 4>();
+    auto Vs_2_acc = Vs_2.accessor<float, 4>();
+    auto grad_output_acc = grad_output.accessor<float, 4>();
+    auto grad_Vr_2_acc = grad_Vr_2.accessor<float, 4>();
+
+    int B = Q.size(0);
+    int H = Q.size(1);
+    int I = Q.size(2);
+    int J = R.size(2);
+    int K = S.size(2);
+    int D = Q.size(3);
+    float scale = 1.0f / std::sqrt(static_cast<float>(D));
+
+    // First compute the attention scores (Q·R·S) once, then use for all calculations
+    // Creates a B×H×I×J×K tensor of attention scores
+    torch::Tensor attention_scores = torch::zeros({B, H, I, J, K}, Q.options());
+    
+    // Fill with attention scores
+    for (int b = 0; b < B; b++) {
+        for (int h = 0; h < H; h++) {
+            for (int i = 0; i < I; i++) {
+                for (int j = 0; j < J; j++) {
+                    for (int k = 0; k < K; k++) {
+                        float score = 0.0f;
+                        for (int d = 0; d < D; d++) {
+                            score += Q_acc[b][h][i][d] * R_acc[b][h][j][d] * S_acc[b][h][k][d];
+                        }
+                        attention_scores.accessor<float, 5>()[b][h][i][j][k] = score * scale;
+                    }
+                }
+            }
+        }
+    }
+
+    // Compute attention weights
+    
+    // Aq: softmax over j,k for each i (for computing gradient contributions to Y_s_)
+    torch::Tensor Aq = torch::zeros_like(attention_scores);
+    for (int b = 0; b < B; b++) {
+        for (int h = 0; h < H; h++) {
+            for (int i = 0; i < I; i++) {
+                // Get the scores for this i
+                std::vector<float> scores(J * K);
+                int idx = 0;
+                for (int j = 0; j < J; j++) {
+                    for (int k = 0; k < K; k++) {
+                        scores[idx++] = attention_scores.accessor<float, 5>()[b][h][i][j][k];
+                    }
+                }
+                
+                // Compute softmax
+                float max_val = *std::max_element(scores.begin(), scores.end());
+                float sum_exp = 0.0f;
+                for (auto &score : scores) {
+                    sum_exp += std::exp(score - max_val);
+                }
+                
+                // Apply softmax and store in Aq
+                idx = 0;
+                for (int j = 0; j < J; j++) {
+                    for (int k = 0; k < K; k++) {
+                        Aq.accessor<float, 5>()[b][h][i][j][k] = 
+                            std::exp(scores[idx] - max_val) / sum_exp;
+                        idx++;
+                    }
+                }
+            }
+        }
+    }
+    
+    // Ar: softmax over i,k for each j (for computing gradient contributions to Y_q_)
+    torch::Tensor Ar = torch::zeros_like(attention_scores);
+    for (int b = 0; b < B; b++) {
+        for (int h = 0; h < H; h++) {
+            for (int j = 0; j < J; j++) {
+                // Get the scores for this j
+                std::vector<float> scores(I * K);
+                int idx = 0;
+                for (int i = 0; i < I; i++) {
+                    for (int k = 0; k < K; k++) {
+                        scores[idx++] = attention_scores.accessor<float, 5>()[b][h][i][j][k];
+                    }
+                }
+                
+                // Compute softmax
+                float max_val = *std::max_element(scores.begin(), scores.end());
+                float sum_exp = 0.0f;
+                for (auto &score : scores) {
+                    sum_exp += std::exp(score - max_val);
+                }
+                
+                // Apply softmax and store in Ar
+                idx = 0;
+                for (int i = 0; i < I; i++) {
+                    for (int k = 0; k < K; k++) {
+                        Ar.accessor<float, 5>()[b][h][i][j][k] = 
+                            std::exp(scores[idx] - max_val) / sum_exp;
+                        idx++;
+                    }
+                }
+            }
+        }
+    }
+
+    // Now compute the gradients for Vr_2
+    for (int b = 0; b < B; b++) {
+        for (int h = 0; h < H; h++) {
+            for (int j = 0; j < J; j++) {
+                for (int d = 0; d < D; d++) {
+                    // Initialize gradient for this position
+                    float grad_sum = 0.0f;
+                    
+                    // Contribution from Y_q_ (through Ar)
+                    for (int i = 0; i < I; i++) {
+                        float dy_q = grad_output_acc[b][h][i][d];
+                        for (int k = 0; k < K; k++) {
+                            // Ar[b,h,i,j,k] is the attention from i,j to k 
+                            float attn = Ar.accessor<float, 5>()[b][h][i][j][k];
+                            grad_sum += dy_q * attn * Vs_2_acc[b][h][k][d];
+                        }
+                    }
+                    
+                    // Contribution from Y_s_ (through Aq)
+                    for (int k = 0; k < K; k++) {
+                        float dy_s = grad_output_acc[b][h][k][d];
+                        for (int i = 0; i < I; i++) {
+                            // Aq[b,h,i,j,k] is the attention
+                            float attn = Aq.accessor<float, 5>()[b][h][i][j][k];
+                            grad_sum += dy_s * attn * Vq_2_acc[b][h][i][d];
+                        }
+                    }
+                    
+                    // Assign the computed gradient
+                    grad_Vr_2_acc[b][h][j][d] = grad_sum;
+                }
+            }
+        }
+    }
+}
+
+void compute_grad_Vs_2(
+    torch::Tensor& grad_Vs_2,
+    const torch::Tensor& grad_output,
+    const torch::Tensor& Q,
+    const torch::Tensor& R,
+    const torch::Tensor& S,
+    const torch::Tensor& Vq_2,
+    const torch::Tensor& Vr_2,
+    double dropout_rate = 0.0)
+{
+    auto Q_acc = Q.accessor<float, 4>();
+    auto R_acc = R.accessor<float, 4>();
+    auto S_acc = S.accessor<float, 4>();
+    auto Vq_2_acc = Vq_2.accessor<float, 4>();
+    auto Vr_2_acc = Vr_2.accessor<float, 4>();
+    auto grad_output_acc = grad_output.accessor<float, 4>();
+    auto grad_Vs_2_acc = grad_Vs_2.accessor<float, 4>();
+
+    int B = Q.size(0);
+    int H = Q.size(1);
+    int I = Q.size(2);
+    int J = R.size(2);
+    int K = S.size(2);
+    int D = Q.size(3);
+    float scale = 1.0f / std::sqrt(static_cast<float>(D));
+
+    // First compute the attention scores (Q·R·S) once, then use for all calculations
+    // Creates a B×H×I×J×K tensor of attention scores
+    torch::Tensor attention_scores = torch::zeros({B, H, I, J, K}, Q.options());
+    
+    // Fill with attention scores
+    for (int b = 0; b < B; b++) {
+        for (int h = 0; h < H; h++) {
+            for (int i = 0; i < I; i++) {
+                for (int j = 0; j < J; j++) {
+                    for (int k = 0; k < K; k++) {
+                        float score = 0.0f;
+                        for (int d = 0; d < D; d++) {
+                            score += Q_acc[b][h][i][d] * R_acc[b][h][j][d] * S_acc[b][h][k][d];
+                        }
+                        attention_scores.accessor<float, 5>()[b][h][i][j][k] = score * scale;
+                    }
+                }
+            }
+        }
+    }
+
+    // Compute attention weights
+    
+    // Ar: softmax over i,k for each j (for computing gradient contributions to Y_q_)
+    torch::Tensor Ar = torch::zeros_like(attention_scores);
+    for (int b = 0; b < B; b++) {
+        for (int h = 0; h < H; h++) {
+            for (int j = 0; j < J; j++) {
+                // Get the scores for this j
+                std::vector<float> scores(I * K);
+                int idx = 0;
+                for (int i = 0; i < I; i++) {
+                    for (int k = 0; k < K; k++) {
+                        scores[idx++] = attention_scores.accessor<float, 5>()[b][h][i][j][k];
+                    }
+                }
+                
+                // Compute softmax
+                float max_val = *std::max_element(scores.begin(), scores.end());
+                float sum_exp = 0.0f;
+                for (auto &score : scores) {
+                    sum_exp += std::exp(score - max_val);
+                }
+                
+                // Apply softmax and store in Ar
+                idx = 0;
+                for (int i = 0; i < I; i++) {
+                    for (int k = 0; k < K; k++) {
+                        Ar.accessor<float, 5>()[b][h][i][j][k] = 
+                            std::exp(scores[idx] - max_val) / sum_exp;
+                        idx++;
+                    }
+                }
+            }
+        }
+    }
+    
+    // As: softmax over i,j for each k (for computing gradient contributions to Y_r_)
+    torch::Tensor As = torch::zeros_like(attention_scores);
+    for (int b = 0; b < B; b++) {
+        for (int h = 0; h < H; h++) {
+            for (int k = 0; k < K; k++) {
+                // Get the scores for this k
+                std::vector<float> scores(I * J);
+                int idx = 0;
+                for (int i = 0; i < I; i++) {
+                    for (int j = 0; j < J; j++) {
+                        scores[idx++] = attention_scores.accessor<float, 5>()[b][h][i][j][k];
+                    }
+                }
+                
+                // Compute softmax
+                float max_val = *std::max_element(scores.begin(), scores.end());
+                float sum_exp = 0.0f;
+                for (auto &score : scores) {
+                    sum_exp += std::exp(score - max_val);
+                }
+                
+                // Apply softmax and store in As
+                idx = 0;
+                for (int i = 0; i < I; i++) {
+                    for (int j = 0; j < J; j++) {
+                        As.accessor<float, 5>()[b][h][i][j][k] = 
+                            std::exp(scores[idx] - max_val) / sum_exp;
+                        idx++;
+                    }
+                }
+            }
+        }
+    }
+
+    // Now compute the gradients for Vs_2
+    for (int b = 0; b < B; b++) {
+        for (int h = 0; h < H; h++) {
+            for (int k = 0; k < K; k++) {
+                for (int d = 0; d < D; d++) {
+                    // Initialize gradient for this position
+                    float grad_sum = 0.0f;
+                    
+                    // Contribution from Y_q_ (through Ar)
+                    for (int i = 0; i < I; i++) {
+                        float dy_q = grad_output_acc[b][h][i][d];
+                        for (int j = 0; j < J; j++) {
+                            // Ar[b,h,i,j,k] is the attention
+                            float attn = Ar.accessor<float, 5>()[b][h][i][j][k];
+                            grad_sum += dy_q * attn * Vr_2_acc[b][h][j][d];
+                        }
+                    }
+                    
+                    // Contribution from Y_r_ (through As)
+                    for (int j = 0; j < J; j++) {
+                        float dy_r = grad_output_acc[b][h][j][d];
+                        for (int i = 0; i < I; i++) {
+                            // As[b,h,i,j,k] is the attention
+                            float attn = As.accessor<float, 5>()[b][h][i][j][k];
+                            grad_sum += dy_r * attn * Vq_2_acc[b][h][i][d];
+                        }
+                    }
+                    
+                    // Assign the computed gradient
+                    grad_Vs_2_acc[b][h][k][d] = grad_sum;
+                }
+            }
+        }
+    }
+}
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,  
           torch::Tensor, torch::Tensor,                  
@@ -832,7 +1291,10 @@ backward_pass(
     compute_grad_Vq_1(grad_Vq_1, grad_output, Q, R, S, Vr_1, Vs_1, dropout_rate);
     compute_grad_Vr_1(grad_Vr_1, grad_output, Q, R, S, Vq_1, Vs_1, dropout_rate);
     compute_grad_Vs_1(grad_Vs_1, grad_output, Q, R, S, Vq_1, Vr_1, dropout_rate);
-
+    
+    compute_grad_Vq_2(grad_Vq_2, grad_output, Q, R, S, Vr_2, Vs_2, dropout_rate);
+    compute_grad_Vr_2(grad_Vr_2, grad_output, Q, R, S, Vq_2, Vs_2, dropout_rate);
+    compute_grad_Vs_2(grad_Vs_2, grad_output, Q, R, S, Vq_2, Vr_2, dropout_rate);
     
     return std::make_tuple(
         grad_Q, grad_R, grad_S,
@@ -871,5 +1333,3 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("Vs_2"),
           py::arg("dropout_rate") = 0.0);
 }
-
-
