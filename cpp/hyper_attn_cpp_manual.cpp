@@ -2,6 +2,8 @@
 #include <iostream> 
 #include <cmath> 
 #include <limits>
+#include <vector> 
+#include <tuple>  
 
 // Helper function to compute dot product between three vectors at specific indices
 template <typename T>
@@ -1152,24 +1154,353 @@ void compute_grad_Vs_2(
     } // end batch loop
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,  
-          torch::Tensor, torch::Tensor,                  
-          torch::Tensor, torch::Tensor,                  
-          torch::Tensor, torch::Tensor>                  
+
+// Helper Function to compute full Attention Tensors (Aq, Ar, As)
+// Needed for grad_Q, grad_R, grad_S computation (for now)
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> compute_attention_tensors(
+    const torch::Tensor& Q,
+    const torch::Tensor& R,
+    const torch::Tensor& S
+) {
+    int B = Q.size(0);
+    int H = Q.size(1);
+    int I = Q.size(2);
+    int J = R.size(2);
+    int K = S.size(2);
+    int D = Q.size(3);
+    float scale = 1.0f / std::sqrt(static_cast<float>(D));
+    auto options = Q.options();
+
+    // 1. Compute the scaled dot-product tensor P (bhijk)
+    // Note: This materializes the potentially large P tensor.
+    auto P = torch::zeros({B, H, I, J, K}, options);
+    auto P_acc = P.accessor<float, 5>();
+    auto Q_acc = Q.accessor<float, 4>();
+    auto R_acc = R.accessor<float, 4>();
+    auto S_acc = S.accessor<float, 4>();
+
+    for (int b = 0; b < B; ++b) {
+        for (int h = 0; h < H; ++h) {
+            for (int i = 0; i < I; ++i) {
+                for (int j = 0; j < J; ++j) {
+                    for (int k = 0; k < K; ++k) {
+                        P_acc[b][h][i][j][k] = compute_dot_product(Q_acc, R_acc, S_acc, b, h, i, j, k, D) * scale;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Compute Aq (softmax over j, k for fixed i)
+    auto Aq = torch::softmax(P.reshape({B, H, I, J * K}), /*dim=*/3).reshape({B, H, I, J, K});
+
+    // 3. Compute Ar (softmax over i, k for fixed j)
+    // Permute P: bhijk -> bhjik
+    auto P_r_permuted = P.permute({0, 1, 3, 2, 4}).contiguous(); // contiguous() might be needed for reshape/softmax
+    auto Ar_permuted = torch::softmax(P_r_permuted.reshape({B, H, J, I * K}), /*dim=*/3).reshape({B, H, J, I, K});
+    // Permute Ar back: bhjik -> bhijk
+    auto Ar = Ar_permuted.permute({0, 1, 3, 2, 4});
+
+    // 4. Compute As (softmax over i, j for fixed k)
+    // Permute P: bhijk -> bhkij
+    auto P_s_permuted = P.permute({0, 1, 4, 2, 3}).contiguous();
+    auto As_permuted = torch::softmax(P_s_permuted.reshape({B, H, K, I * J}), /*dim=*/3).reshape({B, H, K, I, J});
+    // Permute As back: bhkij -> bhijk
+    auto As = As_permuted.permute({0, 1, 3, 4, 2});
+
+    return std::make_tuple(P, Aq, Ar, As); // Return P as well, useful for grad_Q
+}
+
+
+// Helper Function to compute Gradient w.r.t. Scaled Dot Product (P)
+// This performs Phases 1 and 2 of the grad_Q/R/S calculation plan.
+torch::Tensor compute_grad_P(
+    const torch::Tensor& grad_output, // Input: Gradient w.r.t. final output Y [B, H, N, D]
+    const torch::Tensor& Q,
+    const torch::Tensor& R,
+    const torch::Tensor& S,
+    const torch::Tensor& Vq_1,
+    const torch::Tensor& Vq_2,
+    const torch::Tensor& Vr_1,
+    const torch::Tensor& Vr_2,
+    const torch::Tensor& Vs_1,
+    const torch::Tensor& Vs_2,
+    const torch::Tensor& P,           // Precomputed scaled dot-product tensor
+    const torch::Tensor& Aq,          // Precomputed attention Aq
+    const torch::Tensor& Ar,          // Precomputed attention Ar
+    const torch::Tensor& As           // Precomputed attention As
+) {
+    // Get dimensions
+    const int B = Q.size(0);
+    const int H = Q.size(1);
+    const int I = Q.size(2);
+    const int J = R.size(2);
+    const int K = S.size(2);
+    const int D = Q.size(3);
+    const int N = grad_output.size(2); // Max sequence length from output grad
+    auto options = Q.options();
+
+    // Accessors for inputs
+    auto grad_output_acc = grad_output.accessor<float, 4>();
+    auto Vq_1_acc = Vq_1.accessor<float, 4>();
+    auto Vq_2_acc = Vq_2.accessor<float, 4>();
+    auto Vr_1_acc = Vr_1.accessor<float, 4>();
+    auto Vr_2_acc = Vr_2.accessor<float, 4>();
+    auto Vs_1_acc = Vs_1.accessor<float, 4>();
+    auto Vs_2_acc = Vs_2.accessor<float, 4>();
+
+    // Accessors for precomputed attention weights
+    auto Aq_acc = Aq.accessor<float, 5>();
+    auto Ar_acc = Ar.accessor<float, 5>();
+    auto As_acc = As.accessor<float, 5>();
+
+    // --- Phase 1: Compute Gradients w.r.t. Attention Weights ---
+    auto grad_Aq = torch::zeros_like(Aq);
+    auto grad_Ar = torch::zeros_like(Ar);
+    auto grad_As = torch::zeros_like(As);
+
+    auto grad_Aq_acc = grad_Aq.accessor<float, 5>();
+    auto grad_Ar_acc = grad_Ar.accessor<float, 5>();
+    auto grad_As_acc = grad_As.accessor<float, 5>();
+
+    // Using loops to mimic einsum (same as before)
+    for (int b = 0; b < B; ++b) {
+        for (int h = 0; h < H; ++h) {
+            // 1.a) grad_Aq from Yq
+            if (I <= N) {
+                for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) { for (int d = 0; d < D; ++d) {
+                    grad_Aq_acc[b][h][i][j][k] += grad_output_acc[b][h][i][d] * Vr_1_acc[b][h][j][d] * Vs_1_acc[b][h][k][d];
+                }}}}
+            }
+            // 1.b) grad_Aq from Yr'
+             if (J <= N) {
+                for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) {
+                    float grad_x_vals = 0.0f;
+                    for (int d = 0; d < D; ++d) { grad_x_vals += grad_output_acc[b][h][j][d] * Vq_2_acc[b][h][i][d] * Vs_2_acc[b][h][k][d]; }
+                    grad_Aq_acc[b][h][i][j][k] += grad_x_vals * As_acc[b][h][i][j][k];
+                }}}
+            }
+            // 1.c) grad_Aq from Ys'
+            if (K <= N) {
+                for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) {
+                    float grad_x_vals = 0.0f;
+                    for (int d = 0; d < D; ++d) { grad_x_vals += grad_output_acc[b][h][k][d] * Vq_2_acc[b][h][i][d] * Vr_2_acc[b][h][j][d]; }
+                    grad_Aq_acc[b][h][i][j][k] += grad_x_vals * Ar_acc[b][h][i][j][k];
+                }}}
+            }
+
+            // 2.a) grad_Ar from Yr
+            if (J <= N) {
+                for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) { for (int d = 0; d < D; ++d) {
+                    grad_Ar_acc[b][h][i][j][k] += grad_output_acc[b][h][j][d] * Vq_1_acc[b][h][i][d] * Vs_1_acc[b][h][k][d];
+                }}}}
+            }
+             // 2.b) grad_Ar from Yq'
+            if (I <= N) {
+                 for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) {
+                    float grad_x_vals = 0.0f;
+                    for (int d = 0; d < D; ++d) { grad_x_vals += grad_output_acc[b][h][i][d] * Vr_2_acc[b][h][j][d] * Vs_2_acc[b][h][k][d]; }
+                    grad_Ar_acc[b][h][i][j][k] += grad_x_vals * As_acc[b][h][i][j][k];
+                }}}
+            }
+             // 2.c) grad_Ar from Ys'
+             if (K <= N) {
+                 for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) {
+                    float grad_x_vals = 0.0f;
+                    for (int d = 0; d < D; ++d) { grad_x_vals += grad_output_acc[b][h][k][d] * Vq_2_acc[b][h][i][d] * Vr_2_acc[b][h][j][d]; }
+                    grad_Ar_acc[b][h][i][j][k] += grad_x_vals * Aq_acc[b][h][i][j][k];
+                }}}
+            }
+
+            // 3.a) grad_As from Ys
+            if (K <= N) {
+                for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) { for (int d = 0; d < D; ++d) {
+                    grad_As_acc[b][h][i][j][k] += grad_output_acc[b][h][k][d] * Vq_1_acc[b][h][i][d] * Vr_1_acc[b][h][j][d];
+                }}}}
+            }
+             // 3.b) grad_As from Yq'
+             if (I <= N) {
+                for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) {
+                    float grad_x_vals = 0.0f;
+                    for (int d = 0; d < D; ++d) { grad_x_vals += grad_output_acc[b][h][i][d] * Vr_2_acc[b][h][j][d] * Vs_2_acc[b][h][k][d]; }
+                    grad_As_acc[b][h][i][j][k] += grad_x_vals * Ar_acc[b][h][i][j][k];
+                }}}
+             }
+             // 3.c) grad_As from Yr'
+             if (J <= N) {
+                for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) {
+                    float grad_x_vals = 0.0f;
+                    for (int d = 0; d < D; ++d) { grad_x_vals += grad_output_acc[b][h][j][d] * Vq_2_acc[b][h][i][d] * Vs_2_acc[b][h][k][d]; }
+                    grad_As_acc[b][h][i][j][k] += grad_x_vals * Aq_acc[b][h][i][j][k];
+                }}}
+            }
+        } // end head
+    } // end batch
+
+    // --- Phase 2: Propagate Gradients Back Through Softmax to get grad_P ---
+    auto grad_P = torch::zeros_like(P);
+    auto grad_P_acc = grad_P.accessor<float, 5>();
+
+    // 2.1 Contribution from Aq (Softmax over j, k)
+    for (int b = 0; b < B; ++b) { for (int h = 0; h < H; ++h) { for (int i = 0; i < I; ++i) {
+        float sum_q = 0.0f;
+        for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) { sum_q += grad_Aq_acc[b][h][i][j][k] * Aq_acc[b][h][i][j][k]; }}
+        for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) { grad_P_acc[b][h][i][j][k] += (grad_Aq_acc[b][h][i][j][k] - sum_q) * Aq_acc[b][h][i][j][k]; }}
+    }}}
+
+    // 2.2 Contribution from Ar (Softmax over i, k)
+    for (int b = 0; b < B; ++b) { for (int h = 0; h < H; ++h) { for (int j = 0; j < J; ++j) {
+        float sum_r = 0.0f;
+        for (int i = 0; i < I; ++i) { for (int k = 0; k < K; ++k) { sum_r += grad_Ar_acc[b][h][i][j][k] * Ar_acc[b][h][i][j][k]; }}
+        for (int i = 0; i < I; ++i) { for (int k = 0; k < K; ++k) { grad_P_acc[b][h][i][j][k] += (grad_Ar_acc[b][h][i][j][k] - sum_r) * Ar_acc[b][h][i][j][k]; }}
+    }}}
+
+    // 2.3 Contribution from As (Softmax over i, j)
+    for (int b = 0; b < B; ++b) { for (int h = 0; h < H; ++h) { for (int k = 0; k < K; ++k) {
+        float sum_s = 0.0f;
+        for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { sum_s += grad_As_acc[b][h][i][j][k] * As_acc[b][h][i][j][k]; }}
+        for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { grad_P_acc[b][h][i][j][k] += (grad_As_acc[b][h][i][j][k] - sum_s) * As_acc[b][h][i][j][k]; }}
+    }}}
+
+    return grad_P;
+}
+
+
+void compute_grad_Q(
+    torch::Tensor& grad_Q,          // Output: Gradient w.r.t. Q [B, H, I, D]
+    const torch::Tensor& grad_P,    // Input: Gradient w.r.t. P [B, H, I, J, K]
+    const torch::Tensor& R,
+    const torch::Tensor& S,
+    float scale                       // Input: Scaling factor 1/sqrt(D)
+) {
+    const int B = grad_Q.size(0);
+    const int H = grad_Q.size(1);
+    const int I = grad_Q.size(2);
+    const int J = R.size(2);
+    const int K = S.size(2);
+    const int D = grad_Q.size(3);
+
+    auto grad_Q_acc = grad_Q.accessor<float, 4>();
+    auto grad_P_acc = grad_P.accessor<float, 5>();
+    auto R_acc = R.accessor<float, 4>();
+    auto S_acc = S.accessor<float, 4>();
+
+    // --- Phase 3: Compute grad_Q from grad_P ---
+    // grad_Q = scale * einsum("bhijk,bhjd,bhkd->bhid", grad_P, R, S)
+    for (int b = 0; b < B; ++b) {
+        for (int h = 0; h < H; ++h) {
+            for (int i = 0; i < I; ++i) {
+                for (int d = 0; d < D; ++d) {
+                    float sum_for_grad_q = 0.0f;
+                    for (int j = 0; j < J; ++j) {
+                        for (int k = 0; k < K; ++k) {
+                             sum_for_grad_q += grad_P_acc[b][h][i][j][k] * R_acc[b][h][j][d] * S_acc[b][h][k][d];
+                        }
+                    }
+                    grad_Q_acc[b][h][i][d] = scale * sum_for_grad_q; // Assign result (not accumulate)
+                }
+            }
+        }
+    }
+}
+
+void compute_grad_R(
+    torch::Tensor& grad_R,          // Output: Gradient w.r.t. R [B, H, J, D]
+    const torch::Tensor& grad_P,    // Input: Gradient w.r.t. P [B, H, I, J, K]
+    const torch::Tensor& Q,
+    const torch::Tensor& S,
+    float scale                       // Input: Scaling factor 1/sqrt(D)
+) {
+    const int B = grad_R.size(0);
+    const int H = grad_R.size(1);
+    const int J = grad_R.size(2); // Target dim J
+    const int I = Q.size(2);      // Other dims I, K
+    const int K = S.size(2);
+    const int D = grad_R.size(3);
+
+    auto grad_R_acc = grad_R.accessor<float, 4>();
+    auto grad_P_acc = grad_P.accessor<float, 5>();
+    auto Q_acc = Q.accessor<float, 4>();
+    auto S_acc = S.accessor<float, 4>();
+
+    // grad_R = scale * einsum("bhijk,bhid,bhkd->bhjd", grad_P, Q, S)
+    for (int b = 0; b < B; ++b) {
+        for (int h = 0; h < H; ++h) {
+            for (int j = 0; j < J; ++j) { // Loop over the target dimension J
+                for (int d = 0; d < D; ++d) {
+                    float sum_for_grad_r = 0.0f;
+                    for (int i = 0; i < I; ++i) { // Sum over other dimensions I, K
+                        for (int k = 0; k < K; ++k) {
+                             sum_for_grad_r += grad_P_acc[b][h][i][j][k] * Q_acc[b][h][i][d] * S_acc[b][h][k][d];
+                        }
+                    }
+                    grad_R_acc[b][h][j][d] = scale * sum_for_grad_r; // Assign result
+                }
+            }
+        }
+    }
+}
+
+void compute_grad_S(
+    torch::Tensor& grad_S,          // Output: Gradient w.r.t. S [B, H, K, D]
+    const torch::Tensor& grad_P,    // Input: Gradient w.r.t. P [B, H, I, J, K]
+    const torch::Tensor& Q,
+    const torch::Tensor& R,
+    float scale                       // Input: Scaling factor 1/sqrt(D)
+) {
+    const int B = grad_S.size(0);
+    const int H = grad_S.size(1);
+    const int K = grad_S.size(2); // Target dim K
+    const int I = Q.size(2);      // Other dims I, J
+    const int J = R.size(2);
+    const int D = grad_S.size(3);
+
+    auto grad_S_acc = grad_S.accessor<float, 4>();
+    auto grad_P_acc = grad_P.accessor<float, 5>();
+    auto Q_acc = Q.accessor<float, 4>();
+    auto R_acc = R.accessor<float, 4>();
+
+    // grad_S = scale * einsum("bhijk,bhid,bhjd->bhkd", grad_P, Q, R)
+    for (int b = 0; b < B; ++b) {
+        for (int h = 0; h < H; ++h) {
+            for (int k = 0; k < K; ++k) { // Loop over the target dimension K
+                for (int d = 0; d < D; ++d) {
+                    float sum_for_grad_s = 0.0f;
+                    for (int i = 0; i < I; ++i) { // Sum over other dimensions I, J
+                        for (int j = 0; j < J; ++j) {
+                             sum_for_grad_s += grad_P_acc[b][h][i][j][k] * Q_acc[b][h][i][d] * R_acc[b][h][j][d];
+                        }
+                    }
+                    grad_S_acc[b][h][k][d] = scale * sum_for_grad_s; // Assign result
+                }
+            }
+        }
+    }
+}
+
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
+          torch::Tensor, torch::Tensor,
+          torch::Tensor, torch::Tensor,
+          torch::Tensor, torch::Tensor>
 backward_pass(
-    torch::Tensor grad_output,    
-    torch::Tensor Q,              
+    torch::Tensor grad_output,
+    torch::Tensor Q,
     torch::Tensor R,
     torch::Tensor S,
-    torch::Tensor Vq_1,          
+    torch::Tensor Vq_1,
     torch::Tensor Vq_2,
     torch::Tensor Vr_1,
     torch::Tensor Vr_2,
     torch::Tensor Vs_1,
     torch::Tensor Vs_2,
-    double dropout_rate = 0.0)
+    double dropout_rate = 0.0) // Dropout not handled in backward yet
 {
-    // Create tensors to store gradients
+    // Get scale factor
+    const int D = Q.size(3);
+    const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+
+    // Create tensors to store gradients, initialized to zero
     auto grad_Q = torch::zeros_like(Q);
     auto grad_R = torch::zeros_like(R);
     auto grad_S = torch::zeros_like(S);
@@ -1180,22 +1511,42 @@ backward_pass(
     auto grad_Vs_1 = torch::zeros_like(Vs_1);
     auto grad_Vs_2 = torch::zeros_like(Vs_2);
 
+    // --- Precompute Attention Tensors ---
+    torch::Tensor P, Aq, Ar, As;
+    std::tie(P, Aq, Ar, As) = compute_attention_tensors(Q, R, S);
+
+    // --- Compute Gradient w.r.t. P ---
+    // This gradient is needed for dQ, dR, dS
+    auto grad_P = compute_grad_P(
+        grad_output, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
+        P, Aq, Ar, As
+    );
+
+    // --- Compute Gradients for Value Tensors (V) ---
+    // These don't depend on grad_P
     compute_grad_Vq_1(grad_Vq_1, grad_output, Q, R, S, Vr_1, Vs_1, dropout_rate);
     compute_grad_Vr_1(grad_Vr_1, grad_output, Q, R, S, Vq_1, Vs_1, dropout_rate);
     compute_grad_Vs_1(grad_Vs_1, grad_output, Q, R, S, Vq_1, Vr_1, dropout_rate);
-    
+
     compute_grad_Vq_2(grad_Vq_2, grad_output, Q, R, S, Vr_2, Vs_2, dropout_rate);
     compute_grad_Vr_2(grad_Vr_2, grad_output, Q, R, S, Vq_2, Vs_2, dropout_rate);
     compute_grad_Vs_2(grad_Vs_2, grad_output, Q, R, S, Vq_2, Vr_2, dropout_rate);
-    
+
+    // --- Compute Gradients for Query/Key/Sensor Tensors (Q, R, S) ---
+    // Pass the precomputed grad_P to these functions
+    compute_grad_Q(grad_Q, grad_P, R, S, scale);
+    compute_grad_R(grad_R, grad_P, Q, S, scale);
+    compute_grad_S(grad_S, grad_P, Q, R, scale);
+
+
     return std::make_tuple(
         grad_Q, grad_R, grad_S,
         grad_Vq_1, grad_Vq_2,
         grad_Vr_1, grad_Vr_2,
         grad_Vs_1, grad_Vs_2
     );
-}  
-    
+}
+
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &forward_pass,
@@ -1213,7 +1564,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def("backward", &backward_pass,
           "Hypergraph Attention backward (returns dQ, dR, dS, dVq_1, dVq_2, dVr_1, dVr_2, dVs_1, dVs_2)",
-          py::arg("gradients"),
+          py::arg("grad_output"), // Corrected name
           py::arg("Q"),
           py::arg("R"),
           py::arg("S"),
