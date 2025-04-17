@@ -952,8 +952,8 @@ void compute_grad_Vq_2(
 
                      if (dy_s == 0.0f) continue; // Optimization
 
-                     for (int i = 0; i < I; ++i) { // Loop over target gradient index (Vq_2)
-                         for (int j = 0; j < J; ++j) { // Summation index
+                     for (int j = 0; j < J; ++j) { // Loop over target gradient index (Vq_2)
+                         for (int i = 0; i < I; ++i) { // Summation index
                              // Recompute necessary attention scores on the fly
                              float attn_aq = compute_single_softmax_attn(Q_acc, R_acc, S_acc, b, h, i, j, k, I, J, K, D, scale, 0); // Softmax over j,k
                              float attn_ar = compute_single_softmax_attn(Q_acc, R_acc, S_acc, b, h, i, j, k, I, J, K, D, scale, 1); // Softmax over i,k
@@ -971,269 +971,185 @@ void compute_grad_Vq_2(
 }
 
 void compute_grad_Vr_2(
-    torch::Tensor& grad_Vr_2,
-    const torch::Tensor& grad_output,
-    const torch::Tensor& Q,
-    const torch::Tensor& R,
-    const torch::Tensor& S,
-    const torch::Tensor& Vq_2,
-    const torch::Tensor& Vs_2,
-    double dropout_rate = 0.0)
+    torch::Tensor& grad_Vr_2,        // Output: Gradient w.r.t. Vr_2 [B, H, J, D]
+    const torch::Tensor& grad_output, // Input: Gradient w.r.t. final output Y [B, H, max(I,J,K), D]
+    const torch::Tensor& Q,           // Input: Q tensor [B, H, I, D]
+    const torch::Tensor& R,           // Input: R tensor [B, H, J, D]
+    const torch::Tensor& S,           // Input: S tensor [B, H, K, D]
+    const torch::Tensor& Vq_2,        // Input: Vq_2 tensor [B, H, I, D]
+    const torch::Tensor& Vs_2,        // Input: Vs_2 tensor [B, H, K, D]
+    double dropout_rate = 0.0)        // Note: Dropout not handled in this specific grad computation
 {
+    // Get tensor accessors
+    auto grad_Vr_2_acc = grad_Vr_2.accessor<float, 4>();
+    auto grad_output_acc = grad_output.accessor<float, 4>();
     auto Q_acc = Q.accessor<float, 4>();
     auto R_acc = R.accessor<float, 4>();
     auto S_acc = S.accessor<float, 4>();
     auto Vq_2_acc = Vq_2.accessor<float, 4>();
     auto Vs_2_acc = Vs_2.accessor<float, 4>();
-    auto grad_output_acc = grad_output.accessor<float, 4>();
-    auto grad_Vr_2_acc = grad_Vr_2.accessor<float, 4>();
 
-    int B = Q.size(0);
-    int H = Q.size(1);
-    int I = Q.size(2);
-    int J = R.size(2);
-    int K = S.size(2);
-    int D = Q.size(3);
-    float scale = 1.0f / std::sqrt(static_cast<float>(D));
+    // Get dimensions
+    const int B = Q.size(0);
+    const int H = Q.size(1);
+    const int I = Q.size(2);
+    const int J = R.size(2);
+    const int K = S.size(2);
+    const int D = Q.size(3);
+    const float scale = 1.0f / std::sqrt(static_cast<float>(D));
 
-    for (int b = 0; b < B; b++) {
-        for (int h = 0; h < H; h++) {
-            // For Y_q_ contribution (using Ar)
-            for (int i = 0; i < I; i++) {
-                float dy_q = 0.0f;
-                
-                for (int j = 0; j < J; j++) {
-                    for (int d = 0; d < D; d++) {
-                        dy_q = grad_output_acc[b][h][i][d];
-                        
-                        for (int k = 0; k < K; k++) {
-                            float max_val = -std::numeric_limits<float>::infinity();
-                            for (int i2 = 0; i2 < I; i2++) {
-                                for (int k2 = 0; k2 < K; k2++) {
-                                    float dot_product = 0.0f;
-                                    for (int d_idx = 0; d_idx < D; d_idx++) {
-                                        dot_product += Q_acc[b][h][i2][d_idx] * R_acc[b][h][j][d_idx] * S_acc[b][h][k2][d_idx];
-                                    }
-                                    dot_product *= scale;
-                                    
-                                    if (dot_product > max_val) {
-                                        max_val = dot_product;
-                                    }
-                                }
-                            }
-                            
-                            float sum_exp = 0.0f;
-                            for (int i2 = 0; i2 < I; i2++) {
-                                for (int k2 = 0; k2 < K; k2++) {
-                                    float dot_product = 0.0f;
-                                    for (int d_idx = 0; d_idx < D; d_idx++) {
-                                        dot_product += Q_acc[b][h][i2][d_idx] * R_acc[b][h][j][d_idx] * S_acc[b][h][k2][d_idx];
-                                    }
-                                    dot_product *= scale;
-                                    
-                                    sum_exp += std::exp(dot_product - max_val);
-                                }
-                            }
-                            
-                            float dot_product_ijk = 0.0f;
-                            for (int d_idx = 0; d_idx < D; d_idx++) {
-                                dot_product_ijk += Q_acc[b][h][i][d_idx] * R_acc[b][h][j][d_idx] * S_acc[b][h][k][d_idx];
-                            }
-                            dot_product_ijk *= scale;
-                            
-                            float attn_ar = std::exp(dot_product_ijk - max_val) / sum_exp;
-                            
-                            grad_Vr_2_acc[b][h][j][d] += dy_q * attn_ar * Vs_2_acc[b][h][k][d];
+    // grad_Vr_2 should be zero-initialized before calling this function
+
+    // Iterate over batch and head
+    for (int b = 0; b < B; ++b) {
+        for (int h = 0; h < H; ++h) {
+
+            // --- Contribution from Y_q_ Path ---
+            // dL/dVr_2[j] += sum_{i} (dL/dY_q_[i] * dY_q_[i]/dVr_2[j])
+            // dY_q_[i]/dVr_2[j] = sum_{k} (Ar[i,j,k] * As[i,j,k] * Vs_2[k])
+            for (int i = 0; i < I; ++i) { // Loop over source gradient index (Y_q_)
+                for (int d = 0; d < D; ++d) {
+                    // Gradient coming from Y_q_ at index i, dimension d
+                    // Ensure grad_output access is within bounds if I < max_seq_len
+                    if (i >= grad_output.size(2)) continue;
+                    const float dy_q = grad_output_acc[b][h][i][d];
+
+                    if (dy_q == 0.0f) continue; // Optimization: skip if gradient is zero
+
+                    for (int j = 0; j < J; ++j) { // Loop over target gradient index (Vr_2)
+                        for (int k = 0; k < K; ++k) { // Summation index
+                            // Recompute necessary attention scores on the fly
+                            float attn_ar = compute_single_softmax_attn(Q_acc, R_acc, S_acc, b, h, i, j, k, I, J, K, D, scale, 1); // Softmax over i,k
+                            float attn_as = compute_single_softmax_attn(Q_acc, R_acc, S_acc, b, h, i, j, k, I, J, K, D, scale, 2); // Softmax over i,j
+
+                            float vs2_val = Vs_2_acc[b][h][k][d];
+
+                            // Accumulate gradient: dL/dY_q * Ar * As * Vs_2
+                            grad_Vr_2_acc[b][h][j][d] += dy_q * attn_ar * attn_as * vs2_val;
                         }
                     }
                 }
             }
-            
-            // For Y_s_ contribution (using Aq)
-            for (int k = 0; k < K; k++) {
-                float dy_s = 0.0f;
-                
-                for (int j = 0; j < J; j++) {
-                    for (int d = 0; d < D; d++) {
-                        dy_s = grad_output_acc[b][h][k][d];
-                        
-                        for (int i = 0; i < I; i++) {
-                            float max_val = -std::numeric_limits<float>::infinity();
-                            for (int j2 = 0; j2 < J; j2++) {
-                                for (int k2 = 0; k2 < K; k2++) {
-                                    float dot_product = 0.0f;
-                                    for (int d_idx = 0; d_idx < D; d_idx++) {
-                                        dot_product += Q_acc[b][h][i][d_idx] * R_acc[b][h][j2][d_idx] * S_acc[b][h][k2][d_idx];
-                                    }
-                                    dot_product *= scale;
-                                    
-                                    if (dot_product > max_val) {
-                                        max_val = dot_product;
-                                    }
-                                }
-                            }
-                            
-                            float sum_exp = 0.0f;
-                            for (int j2 = 0; j2 < J; j2++) {
-                                for (int k2 = 0; k2 < K; k2++) {
-                                    float dot_product = 0.0f;
-                                    for (int d_idx = 0; d_idx < D; d_idx++) {
-                                        dot_product += Q_acc[b][h][i][d_idx] * R_acc[b][h][j2][d_idx] * S_acc[b][h][k2][d_idx];
-                                    }
-                                    dot_product *= scale;
-                                    
-                                    sum_exp += std::exp(dot_product - max_val);
-                                }
-                            }
-                            
-                            float dot_product_ijk = 0.0f;
-                            for (int d_idx = 0; d_idx < D; d_idx++) {
-                                dot_product_ijk += Q_acc[b][h][i][d_idx] * R_acc[b][h][j][d_idx] * S_acc[b][h][k][d_idx];
-                            }
-                            dot_product_ijk *= scale;
-                            
-                            float attn_aq = std::exp(dot_product_ijk - max_val) / sum_exp;
-                            
-                            grad_Vr_2_acc[b][h][j][d] += dy_s * attn_aq * Vq_2_acc[b][h][i][d];
+
+            // --- Contribution from Y_s_ Path ---
+            // dL/dVr_2[j] += sum_{k} (dL/dY_s_[k] * dY_s_[k]/dVr_2[j])
+            // dY_s_[k]/dVr_2[j] = sum_{i} (Aq[i,j,k] * Ar[i,j,k] * Vq_2[i])
+            for (int k = 0; k < K; ++k) { // Loop over source gradient index (Y_s_)
+                for (int d = 0; d < D; ++d) {
+                    // Gradient coming from Y_s_ at index k, dimension d
+                    // Ensure grad_output access is within bounds if K < max_seq_len
+                    if (k >= grad_output.size(2)) continue;
+                    const float dy_s = grad_output_acc[b][h][k][d];
+
+                    if (dy_s == 0.0f) continue; // Optimization
+
+                    for (int j = 0; j < J; ++j) { // Loop over target gradient index (Vr_2)
+                        for (int i = 0; i < I; ++i) { // Summation index
+                            // Recompute necessary attention scores on the fly
+                            float attn_aq = compute_single_softmax_attn(Q_acc, R_acc, S_acc, b, h, i, j, k, I, J, K, D, scale, 0); // Softmax over j,k
+                            float attn_ar = compute_single_softmax_attn(Q_acc, R_acc, S_acc, b, h, i, j, k, I, J, K, D, scale, 1); // Softmax over i,k
+
+                            float vq2_val = Vq_2_acc[b][h][i][d];
+
+                            // Accumulate gradient: dL/dY_s * Aq * Ar * Vq_2
+                            grad_Vr_2_acc[b][h][j][d] += dy_s * attn_aq * attn_ar * vq2_val;
                         }
                     }
                 }
             }
-        }
-    }
+        } // end head loop
+    } // end batch loop
 }
 
 void compute_grad_Vs_2(
-    torch::Tensor& grad_Vs_2,
-    const torch::Tensor& grad_output,
-    const torch::Tensor& Q,
-    const torch::Tensor& R,
-    const torch::Tensor& S,
-    const torch::Tensor& Vq_2,
-    const torch::Tensor& Vr_2,
-    double dropout_rate = 0.0)
+    torch::Tensor& grad_Vs_2,        // Output: Gradient w.r.t. Vs_2 [B, H, K, D]
+    const torch::Tensor& grad_output, // Input: Gradient w.r.t. final output Y [B, H, max(I,J,K), D]
+    const torch::Tensor& Q,           // Input: Q tensor [B, H, I, D]
+    const torch::Tensor& R,           // Input: R tensor [B, H, J, D]
+    const torch::Tensor& S,           // Input: S tensor [B, H, K, D]
+    const torch::Tensor& Vq_2,        // Input: Vq_2 tensor [B, H, I, D]
+    const torch::Tensor& Vr_2,        // Input: Vr_2 tensor [B, H, J, D]
+    double dropout_rate = 0.0)        // Note: Dropout not handled in this specific grad computation
 {
+    // Get tensor accessors
+    auto grad_Vs_2_acc = grad_Vs_2.accessor<float, 4>();
+    auto grad_output_acc = grad_output.accessor<float, 4>();
     auto Q_acc = Q.accessor<float, 4>();
     auto R_acc = R.accessor<float, 4>();
     auto S_acc = S.accessor<float, 4>();
     auto Vq_2_acc = Vq_2.accessor<float, 4>();
     auto Vr_2_acc = Vr_2.accessor<float, 4>();
-    auto grad_output_acc = grad_output.accessor<float, 4>();
-    auto grad_Vs_2_acc = grad_Vs_2.accessor<float, 4>();
 
-    int B = Q.size(0);
-    int H = Q.size(1);
-    int I = Q.size(2);
-    int J = R.size(2);
-    int K = S.size(2);
-    int D = Q.size(3);
-    float scale = 1.0f / std::sqrt(static_cast<float>(D));
+    // Get dimensions
+    const int B = Q.size(0);
+    const int H = Q.size(1);
+    const int I = Q.size(2);
+    const int J = R.size(2);
+    const int K = S.size(2);
+    const int D = Q.size(3);
+    const float scale = 1.0f / std::sqrt(static_cast<float>(D));
 
-    for (int b = 0; b < B; b++) {
-        for (int h = 0; h < H; h++) {
-            // For Y_q_ contribution (using Ar)
-            for (int i = 0; i < I; i++) {
-                float dy_q = 0.0f;
-                
-                for (int k = 0; k < K; k++) {
-                    for (int d = 0; d < D; d++) {
-                        dy_q = grad_output_acc[b][h][i][d];
-                        
-                        for (int j = 0; j < J; j++) {
-                            float max_val = -std::numeric_limits<float>::infinity();
-                            for (int i2 = 0; i2 < I; i2++) {
-                                for (int k2 = 0; k2 < K; k2++) {
-                                    float dot_product = 0.0f;
-                                    for (int d_idx = 0; d_idx < D; d_idx++) {
-                                        dot_product += Q_acc[b][h][i2][d_idx] * R_acc[b][h][j][d_idx] * S_acc[b][h][k2][d_idx];
-                                    }
-                                    dot_product *= scale;
-                                    
-                                    if (dot_product > max_val) {
-                                        max_val = dot_product;
-                                    }
-                                }
-                            }
-                            
-                            float sum_exp = 0.0f;
-                            for (int i2 = 0; i2 < I; i2++) {
-                                for (int k2 = 0; k2 < K; k2++) {
-                                    float dot_product = 0.0f;
-                                    for (int d_idx = 0; d_idx < D; d_idx++) {
-                                        dot_product += Q_acc[b][h][i2][d_idx] * R_acc[b][h][j][d_idx] * S_acc[b][h][k2][d_idx];
-                                    }
-                                    dot_product *= scale;
-                                    
-                                    sum_exp += std::exp(dot_product - max_val);
-                                }
-                            }
-                            
-                            float dot_product_ijk = 0.0f;
-                            for (int d_idx = 0; d_idx < D; d_idx++) {
-                                dot_product_ijk += Q_acc[b][h][i][d_idx] * R_acc[b][h][j][d_idx] * S_acc[b][h][k][d_idx];
-                            }
-                            dot_product_ijk *= scale;
-                            
-                            float attn_ar = std::exp(dot_product_ijk - max_val) / sum_exp;
-                            
-                            grad_Vs_2_acc[b][h][k][d] += dy_q * attn_ar * Vr_2_acc[b][h][j][d];
+    // grad_Vs_2 should be zero-initialized before calling this function
+
+    // Iterate over batch and head
+    for (int b = 0; b < B; ++b) {
+        for (int h = 0; h < H; ++h) {
+
+            // --- Contribution from Y_q_ Path ---
+            // dL/dVs_2[k] += sum_{i} (dL/dY_q_[i] * dY_q_[i]/dVs_2[k])
+            // dY_q_[i]/dVs_2[k] = sum_{j} (Ar[i,j,k] * As[i,j,k] * Vr_2[j])
+            for (int i = 0; i < I; ++i) { // Loop over source gradient index (Y_q_)
+                for (int d = 0; d < D; ++d) {
+                    // Gradient coming from Y_q_ at index i, dimension d
+                    // Ensure grad_output access is within bounds if I < max_seq_len
+                    if (i >= grad_output.size(2)) continue;
+                    const float dy_q = grad_output_acc[b][h][i][d];
+
+                    if (dy_q == 0.0f) continue; // Optimization: skip if gradient is zero
+
+                    for (int k = 0; k < K; ++k) { // Loop over target gradient index (Vs_2)
+                        for (int j = 0; j < J; ++j) { // Summation index
+                            // Recompute necessary attention scores on the fly
+                            float attn_ar = compute_single_softmax_attn(Q_acc, R_acc, S_acc, b, h, i, j, k, I, J, K, D, scale, 1); // Softmax over i,k
+                            float attn_as = compute_single_softmax_attn(Q_acc, R_acc, S_acc, b, h, i, j, k, I, J, K, D, scale, 2); // Softmax over i,j
+
+                            float vr2_val = Vr_2_acc[b][h][j][d];
+
+                            // Accumulate gradient: dL/dY_q * Ar * As * Vr_2
+                            grad_Vs_2_acc[b][h][k][d] += dy_q * attn_ar * attn_as * vr2_val;
                         }
                     }
                 }
             }
-            
-            // For Y_r_ contribution (using As)
-            for (int j = 0; j < J; j++) {
-                float dy_r = 0.0f;
-                
-                for (int k = 0; k < K; k++) {
-                    for (int d = 0; d < D; d++) {
-                        dy_r = grad_output_acc[b][h][j][d];
-                        
-                        for (int i = 0; i < I; i++) {
-                            float max_val = -std::numeric_limits<float>::infinity();
-                            for (int i2 = 0; i2 < I; i2++) {
-                                for (int j2 = 0; j2 < J; j2++) {
-                                    float dot_product = 0.0f;
-                                    for (int d_idx = 0; d_idx < D; d_idx++) {
-                                        dot_product += Q_acc[b][h][i2][d_idx] * R_acc[b][h][j2][d_idx] * S_acc[b][h][k][d_idx];
-                                    }
-                                    dot_product *= scale;
-                                    
-                                    if (dot_product > max_val) {
-                                        max_val = dot_product;
-                                    }
-                                }
-                            }
-                            
-                            float sum_exp = 0.0f;
-                            for (int i2 = 0; i2 < I; i2++) {
-                                for (int j2 = 0; j2 < J; j2++) {
-                                    float dot_product = 0.0f;
-                                    for (int d_idx = 0; d_idx < D; d_idx++) {
-                                        dot_product += Q_acc[b][h][i2][d_idx] * R_acc[b][h][j2][d_idx] * S_acc[b][h][k][d_idx];
-                                    }
-                                    dot_product *= scale;
-                                    
-                                    sum_exp += std::exp(dot_product - max_val);
-                                }
-                            }
-                            
-                            float dot_product_ijk = 0.0f;
-                            for (int d_idx = 0; d_idx < D; d_idx++) {
-                                dot_product_ijk += Q_acc[b][h][i][d_idx] * R_acc[b][h][j][d_idx] * S_acc[b][h][k][d_idx];
-                            }
-                            dot_product_ijk *= scale;
-                            
-                            float attn_as = std::exp(dot_product_ijk - max_val) / sum_exp;
-                            
-                            grad_Vs_2_acc[b][h][k][d] += dy_r * attn_as * Vq_2_acc[b][h][i][d];
+
+            // --- Contribution from Y_r_ Path ---
+            // dL/dVs_2[k] += sum_{j} (dL/dY_r_[j] * dY_r_[j]/dVs_2[k])
+            // dY_r_[j]/dVs_2[k] = sum_{i} (Aq[i,j,k] * As[i,j,k] * Vq_2[i])
+            for (int j = 0; j < J; ++j) { // Loop over source gradient index (Y_r_)
+                for (int d = 0; d < D; ++d) {
+                    // Gradient coming from Y_r_ at index j, dimension d
+                    // Ensure grad_output access is within bounds if J < max_seq_len
+                    if (j >= grad_output.size(2)) continue;
+                    const float dy_r = grad_output_acc[b][h][j][d];
+
+                    if (dy_r == .0f) continue; // Optimization
+
+                    for (int k = 0; k < K; ++k) { // Loop over target gradient index (Vs_2)
+                        for (int i = 0; i < I; ++i) { // Summation index
+                            // Recompute necessary attention scores on the fly
+                            float attn_aq = compute_single_softmax_attn(Q_acc, R_acc, S_acc, b, h, i, j, k, I, J, K, D, scale, 0); // Softmax over j,k
+                            float attn_as = compute_single_softmax_attn(Q_acc, R_acc, S_acc, b, h, i, j, k, I, J, K, D, scale, 2); // Softmax over i,j
+
+                            float vq2_val = Vq_2_acc[b][h][i][d];
+
+                            // Accumulate gradient: dL/dY_r * Aq * As * Vq_2
+                            grad_Vs_2_acc[b][h][k][d] += dy_r * attn_aq * attn_as * vq2_val;
                         }
                     }
                 }
             }
-        }
-    }
+        } // end head loop
+    } // end batch loop
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,  
@@ -1269,6 +1185,8 @@ backward_pass(
     compute_grad_Vs_1(grad_Vs_1, grad_output, Q, R, S, Vq_1, Vr_1, dropout_rate);
     
     compute_grad_Vq_2(grad_Vq_2, grad_output, Q, R, S, Vr_2, Vs_2, dropout_rate);
+    compute_grad_Vr_2(grad_Vr_2, grad_output, Q, R, S, Vq_2, Vs_2, dropout_rate);
+    compute_grad_Vs_2(grad_Vs_2, grad_output, Q, R, S, Vq_2, Vr_2, dropout_rate);
     
     return std::make_tuple(
         grad_Q, grad_R, grad_S,
