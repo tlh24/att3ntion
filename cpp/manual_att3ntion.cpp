@@ -829,7 +829,7 @@ void compute_grad_Vq_2(
     for (int b = 0; b < B; ++b) {
         for (int h = 0; h < H; ++h) {
 
-            // --- Contribution from Y_r_ Path ---
+            // --- Contribution from Y_q_ Path ---
             // dL/dVq_2[i] += sum_{j} (dL/dY_r_[j] * dY_r_[j]/dVq_2[i])
             // dY_r_[j]/dVq_2[i] = sum_{k} (Aq[i,j,k] * As[i,j,k] * Vs_2[k])
             for (int j = 0; j < J; ++j) { 
@@ -997,7 +997,6 @@ void compute_grad_Vs_2(
     const int D = Q.size(3);
     const float scale = 1.0f / std::sqrt(static_cast<float>(D));
 
-    for (int b = 0; b < B; ++b) {
     for (int b = 0; b < B; ++b) {
         for (int h = 0; h < H; ++h) {
 
