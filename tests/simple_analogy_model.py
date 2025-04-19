@@ -4,16 +4,24 @@ from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 import argparse
 from hyper_attn_full_pytorch import HypergraphAttention
+from hyper_attn_cpp_wrapper import HypergraphAttentionCPP
 from tests.gen_data import genData
 import pdb
 
 class SimpleAnalogyModel(nn.Module):
 	"""Simpler model with single hypergraph attention layer."""
-	def __init__(self, hidden_dim:int, num_heads:int):
+	def __init__(self, hidden_dim:int, num_heads:int, attn_impl:str='pytorch'):
 		super().__init__()
 		input_dim = 32
 		self.embedding_proj = nn.Linear(input_dim, hidden_dim)
-		self.attention = HypergraphAttention(hidden_dim, num_heads)
+		
+		# Select attention implementation
+		if attn_impl == 'pytorch':
+			self.attention = HypergraphAttention(hidden_dim, num_heads)
+		elif attn_impl == 'cpp':
+			self.attention = HypergraphAttentionCPP(hidden_dim, num_heads)
+		else:
+			raise ValueError(f"Unknown attention implementation: {attn_impl}")
 		
 		self.norm1 = nn.LayerNorm(hidden_dim)
 		self.ffn = nn.Sequential(
@@ -58,7 +66,7 @@ def prepare_data(data_tensor, device):
 			torch.LongTensor(op_targets).to(device),
 			torch.LongTensor(value_targets).to(device))
 
-def train_model(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, device='cpu', modulo=20):
+def train_model(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, device='cpu', modulo=20, attn_impl='pytorch'):
 	
 	if device == 'auto':
 		if torch.cuda.is_available():
@@ -72,12 +80,11 @@ def train_model(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, dev
 	
 	print(f"Using device: {device}")
 	
-	
 	data = genData(batch_size * 10, modulo)
 	dataset = TensorDataset(torch.tensor(data))
 	train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-	model = SimpleAnalogyModel(hidden_dim, num_heads).to(device)
+	model = SimpleAnalogyModel(hidden_dim, num_heads, attn_impl=attn_impl).to(device)
 	optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 	criterion = nn.CrossEntropyLoss()
 	
@@ -126,6 +133,9 @@ if __name__ == '__main__':
 	parser.add_argument('--epochs', type=int, default=200, help='Number of epochs')
 	parser.add_argument('--modulo', type=int, default=17, help='Modulo for arithmetic operations')
 	parser.add_argument('--hidden-dim', type=int, default=128, help='Hidden dimension size')
+	parser.add_argument('--num-heads', type=int, default=4, help='Number of attention heads')
+	parser.add_argument('--attn-impl', type=str, default='pytorch', choices=['pytorch', 'cpp'],
+						help='Attention implementation to use')
 	args = parser.parse_args()
 	
 	torch.manual_seed(42)
@@ -138,5 +148,7 @@ if __name__ == '__main__':
 		num_epochs=args.epochs,
 		device=args.device,
 		modulo=args.modulo,
-		hidden_dim=args.hidden_dim
+		hidden_dim=args.hidden_dim,
+		num_heads=args.num_heads,
+		attn_impl=args.attn_impl
 	)
