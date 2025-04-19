@@ -2,3 +2,4 @@ torch>=1.9.0
 numpy>=1.20.0 
 matplotlib>=3.4.0
 scikit-learn
+pytest
