@@ -53,10 +53,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     
     auto AqAr = Aq * Ar;
     auto Y_s_ = torch::einsum("bhijk,bhid,bhjd->bhkd", {AqAr, Vq_2, Vr_2});
-    
-    // Combine results
-    //auto y = Y_q + Y_r + Y_s; //+ Y_q_ + Y_r_ + Y_s_;
-    return std::make_tuple(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_);
+
+    return std::make_tuple(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_); // tuple better for debugging
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
