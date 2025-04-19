@@ -7,7 +7,7 @@
 
 // Forward pass
 
-//helper: compute dot product between three vectors at specific indices
+// helper: returns dot product between three vectors at specific indices
 template <typename T>
 inline float compute_dot_product(
     const T& Q_acc,
@@ -22,7 +22,7 @@ inline float compute_dot_product(
     return dot;
 }
 
-//helper: compute 3D softmax with configurable dimensions
+// helper: compute 3D softmax with configurable dimensions
 template <typename T>
 void compute_softmax_3d(
     const T& Q_acc,
@@ -78,20 +78,19 @@ void compute_softmax_3d(
 }
 
 void compute_Y_gather(
-    torch::Tensor& Y_out,      
+    torch::Tensor& Y_out,
     const torch::Tensor& Q,
-    const torch::Tensor& R, 
+    const torch::Tensor& R,
     const torch::Tensor& S,
-    const torch::Tensor& V1,   
-    const torch::Tensor& V2,   
-    int fixed_dim              //dimension to fix (0=i/q, 1=j/r, 2=k/s)
+    const torch::Tensor& V1,
+    const torch::Tensor& V2,
+    int fixed_dim
 ) {
-    std::cout << "Entering compute_Y_gather (fixed_dim=" << fixed_dim << ")" << std::endl;
-    auto Q_acc = Q.accessor<float, 4>();  
-    auto R_acc = R.accessor<float, 4>();  
-    auto S_acc = S.accessor<float, 4>();  
-    auto V1_acc = V1.accessor<float, 4>();  
-    auto V2_acc = V2.accessor<float, 4>();  
+    auto Q_acc = Q.accessor<float, 4>();
+    auto R_acc = R.accessor<float, 4>();
+    auto S_acc = S.accessor<float, 4>();
+    auto V1_acc = V1.accessor<float, 4>();
+    auto V2_acc = V2.accessor<float, 4>();
     auto Y_out_acc = Y_out.accessor<float, 4>();
 
     int B = Q.size(0);
@@ -101,81 +100,57 @@ void compute_Y_gather(
     int K = S.size(2);
     int D = Q.size(3);
     float scale = 1.0f / std::sqrt(static_cast<float>(D));
-    int sizes[3] = {I, J, K}; // dim sizes
-    
+    int sizes[3] = {I, J, K};
+
     for (int b = 0; b < B; b++) {
         for (int h = 0; h < H; h++) {
-            for (int fixed_idx = 0; fixed_idx < sizes[fixed_dim]; fixed_idx++) { 
-            
-                // Define variables for the other two dimensions based on the fixed dimension
+            for (int fixed_idx = 0; fixed_idx < sizes[fixed_dim]; fixed_idx++) {
                 int dim1, dim2;
                 int dim1_size, dim2_size;
+                if (fixed_dim == 0) { dim1 = 1; dim2 = 2; dim1_size = J; dim2_size = K; }
+                else if (fixed_dim == 1) { dim1 = 0; dim2 = 2; dim1_size = I; dim2_size = K; }
+                else { dim1 = 0; dim2 = 1; dim1_size = I; dim2_size = J; }
+
                 
-                if (fixed_dim == 0) {      // If i is fixed 
-                    dim1 = 1; dim2 = 2;    // j and k are the other dimensions
-                    dim1_size = J; dim2_size = K;
-                } else if (fixed_dim == 1) {    
-                    dim1 = 0; dim2 = 2;    
-                    dim1_size = I; dim2_size = K;
-                } else {                   
-                    dim1 = 0; dim2 = 1;    
-                    dim1_size = I; dim2_size = J;
-                }
-                
-                //compute softmax without materializing full tensor
                 for (int d = 0; d < D; d++) {
-                    // Zero out the output for this fixed position and dimension
                     Y_out_acc[b][h][fixed_idx][d] = 0.0f;
-                    
-                    // First pass: compute max for numerical stability in softmax
                     float max_val = -std::numeric_limits<float>::infinity();
+
+                    // compute max dot product used for numerical stability
                     for (int idx1 = 0; idx1 < dim1_size; idx1++) {
                         for (int idx2 = 0; idx2 < dim2_size; idx2++) {
-                            // Map idx1, idx2 to i, j, k based on which dimensions they represent
                             int i = (fixed_dim == 0) ? fixed_idx : (dim1 == 0) ? idx1 : idx2;
                             int j = (fixed_dim == 1) ? fixed_idx : (dim1 == 1) ? idx1 : idx2;
                             int k = (fixed_dim == 2) ? fixed_idx : (dim1 == 2) ? idx1 : idx2;
-                            
                             float dot_prod = compute_dot_product(Q_acc, R_acc, S_acc, b, h, i, j, k, D);
                             dot_prod *= scale;
-
                             max_val = std::max(max_val, dot_prod);
                         }
                     }
-                    
-                    // Second pass: compute sum of exp(dot_prod - max_val) for normalization
+
+                    // compute denominator for softmax
                     float sum_exp = 0.0f;
                     for (int idx1 = 0; idx1 < dim1_size; idx1++) {
                         for (int idx2 = 0; idx2 < dim2_size; idx2++) {
                             int i = (fixed_dim == 0) ? fixed_idx : (dim1 == 0) ? idx1 : idx2;
                             int j = (fixed_dim == 1) ? fixed_idx : (dim1 == 1) ? idx1 : idx2;
                             int k = (fixed_dim == 2) ? fixed_idx : (dim1 == 2) ? idx1 : idx2;
-                            
-                            // Compute dot product using the helper function
                             float dot_prod = compute_dot_product(Q_acc, R_acc, S_acc, b, h, i, j, k, D);
                             dot_prod *= scale;
-
                             sum_exp += std::exp(dot_prod - max_val);
                         }
                     }
-                    
-                    // Third pass: compute weighted sum directly
+
+                    // compute actual gather
                     for (int idx1 = 0; idx1 < dim1_size; idx1++) {
                         for (int idx2 = 0; idx2 < dim2_size; idx2++) {
                             int i = (fixed_dim == 0) ? fixed_idx : (dim1 == 0) ? idx1 : idx2;
                             int j = (fixed_dim == 1) ? fixed_idx : (dim1 == 1) ? idx1 : idx2;
                             int k = (fixed_dim == 2) ? fixed_idx : (dim1 == 2) ? idx1 : idx2;
-                            
-                            // Get indices for value tensors
                             int v1_idx = (dim1 == 0) ? i : (dim1 == 1) ? j : k;
                             int v2_idx = (dim2 == 0) ? i : (dim2 == 1) ? j : k;
-                            
-                            // Compute dot product using the helper function
                             float dot_prod = compute_dot_product(Q_acc, R_acc, S_acc, b, h, i, j, k, D);
                             dot_prod *= scale;
-                            
-                            // Compute softmax value and multiply by values
-                            // Avoid division by zero if sum_exp is zero or very close to it
                             float attn = (sum_exp > 1e-9) ? (std::exp(dot_prod - max_val) / sum_exp) : 0.0f;
                             Y_out_acc[b][h][fixed_idx][d] += attn * V1_acc[b][h][v1_idx][d] * V2_acc[b][h][v2_idx][d];
                         }
@@ -184,7 +159,6 @@ void compute_Y_gather(
             }
         }
     }
-    std::cout << "Exiting compute_Y_gather" << std::endl;
 }
 
 void compute_Y_scatter_q(
@@ -213,25 +187,22 @@ void compute_Y_scatter_q(
     for (int b = 0; b < B; b++) {
         for (int h = 0; h < H; h++) {
             for (int i = 0; i < I; i++) {
-                //Compute the effect of ArAs * Vr_2 * Vs_2
-                // For each j, compute attention to js (softmax over i,k)
+                //Compute the effect of ArAs * Vr_2 * Vs_2: For each j, softmax over i,k.
                 std::vector<std::vector<float>> Ar_values(J, std::vector<float>(K, 0.0f));
+
                 for (int j = 0; j < J; j++) {
-                    //Compute Ar values (softmax over i,k for fixed j)
-                    std::vector<float> softmax_results(I * K);
+                    std::vector<float> softmax_results(I * K); 
                     compute_softmax_3d(
                         Q_acc, R_acc, S_acc,
                         b, h,
-                        1, j,  // fixed_dim = 1 (j), fixed_idx = j
-                        I, K,  // dim1_size = I, dim2_size = K
-                        0, 2, 1,  // dim1_idx_fn = 0 (i), dim2_idx_fn = 2 (k), fixed_dim_idx_fn = 1 (j)
+                        1, j,  // fixed_dim
+                        I, K,  // variable dims
+                        0, 2, 1, 
                         scale, softmax_results.data()
                     );
                     
-                    // Extract the attention values for the current i
                     for (int k = 0; k < K; k++) {
-                        // Find the index of (i,k) in the softmax_results array
-                        int idx = i * K + k;
+                        int idx = i * K + k; // Find the index of (i,k) in the softmax_results array
                         Ar_values[j][k] = softmax_results[idx];
                     }
                 }
@@ -249,20 +220,17 @@ void compute_Y_scatter_q(
                         scale, softmax_results.data()
                     );
                     
-                    // Extract the attention values for the current i
                     for (int j = 0; j < J; j++) {
-                        // Find the index of (i,j) in the softmax_results array
                         int idx = i * J + j;
                         As_values[k][j] = softmax_results[idx];
                     }
                 }
 
-                // Now compute the actual scatter update for Y_q
+                // scatter update for Y_q
                 for (int d = 0; d < D; d++) {
                     float sum = 0.0f;
                     for (int j = 0; j < J; j++) {
                         for (int k = 0; k < K; k++) {
-                            // ArAs[i,j,k] = Ar[i,j,k] * As[i,j,k]
                             float attn = Ar_values[j][k] * As_values[k][j];
                             sum += attn * Vr_2_acc[b][h][j][d] * Vs_2_acc[b][h][k][d];
                         }
@@ -309,7 +277,7 @@ void compute_Y_scatter_r(
                         b, h,
                         0, i,  
                         J, K,  
-                        1, 2, 0,  // dim1_idx_fn = 1 (j), dim2_idx_fn = 2 (k), fixed_dim_idx_fn = 0 (i)
+                        1, 2, 0, 
                         scale, softmax_results.data()
                     );
                     
@@ -434,50 +402,35 @@ void compute_Y_scatter_s(
 }
 
 torch::Tensor forward_pass(
-    torch::Tensor Q,       
-    torch::Tensor R,       
-    torch::Tensor S,       
-    torch::Tensor Vq_1,    
-    torch::Tensor Vq_2,    
-    torch::Tensor Vr_1,    
-    torch::Tensor Vr_2,    
-    torch::Tensor Vs_1,    
-    torch::Tensor Vs_2,    
-    double dropout_rate = 0.0) 
+    torch::Tensor Q,
+    torch::Tensor R,
+    torch::Tensor S,
+    torch::Tensor Vq_1,
+    torch::Tensor Vq_2,
+    torch::Tensor Vr_1,
+    torch::Tensor Vr_2,
+    torch::Tensor Vs_1,
+    torch::Tensor Vs_2,
+    double dropout_rate = 0.0)
 {
-    std::cout << "Entering forward_pass" << std::endl;
     auto options = Q.options();
     int B = Q.size(0), H = Q.size(1), I = Q.size(2), D = Q.size(3);
     int J = R.size(2), K = S.size(2);
-
-    std::cout << "forward_pass: Dimensions - B=" << B << ", H=" << H << ", I=" << I << ", D=" << D << ", J=" << J << ", K=" << K << std::endl;
-
-    std::cout << "forward_pass: Initializing output tensors..." << std::endl;
     auto Y_q = torch::zeros({B, H, I, D}, options);
     auto Y_r = torch::zeros({B, H, J, D}, options);
     auto Y_s = torch::zeros({B, H, K, D}, options);
     auto Y_q_ = torch::zeros({B, H, I, D}, options);
     auto Y_r_ = torch::zeros({B, H, J, D}, options);
     auto Y_s_ = torch::zeros({B, H, K, D}, options);
-    std::cout << "forward_pass: Output tensors initialized." << std::endl;
 
-    std::cout << "forward_pass: Calling compute_Y_gather for Y_q..." << std::endl;
     compute_Y_gather(Y_q, Q, R, S, Vr_1, Vs_1, 0);
-    std::cout << "forward_pass: Returned from compute_Y_gather for Y_q." << std::endl;
-
-    std::cout << "forward_pass: Calling compute_Y_gather for Y_r..." << std::endl;
     compute_Y_gather(Y_r, Q, R, S, Vq_1, Vs_1, 1);
-    std::cout << "forward_pass: Returned from compute_Y_gather for Y_r." << std::endl;
-
-    std::cout << "forward_pass: Calling compute_Y_gather for Y_s..." << std::endl;
     compute_Y_gather(Y_s, Q, R, S, Vq_1, Vr_1, 2);
-    std::cout << "forward_pass: Returned from compute_Y_gather for Y_s." << std::endl;
 
     compute_Y_scatter_q(Y_q_, Q, R, S, Vr_2, Vs_2);
     compute_Y_scatter_r(Y_r_, Q, R, S, Vq_2, Vs_2);
     compute_Y_scatter_s(Y_s_, Q, R, S, Vq_2, Vr_2);
 
-    std::cout << "forward_pass: Exiting" << std::endl;
     return Y_q + Y_r + Y_s + Y_q_ + Y_r_ + Y_s_;
 }
 
@@ -510,25 +463,22 @@ void compute_grad_Vq_1(
     float scale = 1.0f / std::sqrt(static_cast<float>(D));
 
     // Vq_1 contributes to both Y_r and Y_s in the forward pass
-    // Backpropagate through both of these contributions
 
     // 1. Contribution from Y_r (gather to position j)
     // Y_r = compute_Y_gather(Q, R, S, Vq_1, Vs_1, 1)
     for (int b = 0; b < B; b++) {
         for (int h = 0; h < H; h++) {
-            // For each j (fixed dimension in Y_r)
             for (int j = 0; j < J; j++) {
                 // We need the attention weights Ar_j for fixed j
                 // (softmax over i,k dimensions for this fixed j)
                 std::vector<float> Ar_j_values(I * K); // Will store the attention weights
                 
-                // Compute softmax for this (b,h,j) using the same function as forward pass
                 compute_softmax_3d(
                     Q_acc, R_acc, S_acc,
                     b, h,
-                    1, j,  // fixed_dim = 1 (j), fixed_idx = j
-                    I, K,  // dim1_size = I, dim2_size = K
-                    0, 2, 1,  // dim1_idx_fn = 0 (i), dim2_idx_fn = 2 (k), fixed_dim_idx_fn = 1 (j)
+                    1, j,  
+                    I, K,  
+                    0, 2, 1, 
                     scale, Ar_j_values.data()
                 );
                 
@@ -546,7 +496,7 @@ void compute_grad_Vq_1(
                             // dL/dVq_1[b,h,i,d] += dL/dY_r[b,h,j,d] * Ar[b,h,i,j,k] * Vs_1[b,h,k,d]
                             float contribution = dy_r * Ar_j_values[attn_idx] * Vs_1_acc[b][h][k][d];
                             
-                            // Add to the gradient accumulator
+                            // Add to the grad accumulator
                             grad_Vq_1_acc[b][h][i][d] += contribution;
                         }
                     }
@@ -556,7 +506,6 @@ void compute_grad_Vq_1(
             // 2. Contribution from Y_s (gather to position k)
             // Y_s = compute_Y_gather(Q, R, S, Vq_1, Vr_1, 2)
             for (int k = 0; k < K; k++) {
-                // We need the attention weights As_k for fixed k
                 // (softmax over i,j dimensions for this fixed k)
                 std::vector<float> As_k_values(I * J); // Will store the attention weights
                 
@@ -564,9 +513,9 @@ void compute_grad_Vq_1(
                 compute_softmax_3d(
                     Q_acc, R_acc, S_acc,
                     b, h,
-                    2, k,  // fixed_dim = 2 (k), fixed_idx = k
-                    I, J,  // dim1_size = I, dim2_size = J
-                    0, 1, 2,  // dim1_idx_fn = 0 (i), dim2_idx_fn = 1 (j), fixed_dim_idx_fn = 2 (k)
+                    2, k,  
+                    I, J, 
+                    0, 1, 2, 
                     scale, As_k_values.data()
                 );
                 
@@ -595,8 +544,8 @@ void compute_grad_Vq_1(
 }
 
 void compute_grad_Vr_1(
-    torch::Tensor& grad_Vr_1,        // Output gradient tensor for Vr_1
-    const torch::Tensor& grad_output, // Incoming gradient from next layer
+    torch::Tensor& grad_Vr_1,        
+    const torch::Tensor& grad_output, 
     const torch::Tensor& Q,
     const torch::Tensor& R,
     const torch::Tensor& S,
@@ -621,31 +570,25 @@ void compute_grad_Vr_1(
     float scale = 1.0f / std::sqrt(static_cast<float>(D));
 
     // Vr_1 contributes to both Y_q and Y_s in the forward pass
-    // Backpropagate through both of these contributions
 
     // 1. Contribution from Y_q (gather to position i)
     // Y_q = compute_Y_gather(Q, R, S, Vr_1, Vs_1, 0)
     for (int b = 0; b < B; b++) {
         for (int h = 0; h < H; h++) {
-            // For each i (fixed dimension in Y_q)
             for (int i = 0; i < I; i++) {
-                // We need the attention weights Aq_i for fixed i
                 // (softmax over j,k dimensions for this fixed i)
                 std::vector<float> Aq_i_values(J * K);
                 
-                // Compute softmax for this (b,h,i)
                 compute_softmax_3d(
                     Q_acc, R_acc, S_acc,
                     b, h,
-                    0, i,  // fixed_dim = 0 (i), fixed_idx = i
-                    J, K,  // dim1_size = J, dim2_size = K
-                    1, 2, 0,  // dim1_idx_fn = 1 (j), dim2_idx_fn = 2 (k), fixed_dim_idx_fn = 0 (i)
+                    0, i,  
+                    J, K,  
+                    1, 2, 0, 
                     scale, Aq_i_values.data()
                 );
                 
-                // Propagate gradient for each dimension
                 for (int d = 0; d < D; d++) {
-                    // Gradient coming from Y_q at this position
                     float dy_q = grad_output_acc[b][h][i][d];
                     
                     // Propagate to Vr_1
@@ -666,23 +609,19 @@ void compute_grad_Vr_1(
             // 2. Contribution from Y_s (gather to position k)
             // Y_s = compute_Y_gather(Q, R, S, Vq_1, Vr_1, 2)
             for (int k = 0; k < K; k++) {
-                // We need the attention weights As_k for fixed k
                 // (softmax over i,j dimensions for this fixed k)
                 std::vector<float> As_k_values(I * J);
                 
-                // Compute softmax for this (b,h,k)
                 compute_softmax_3d(
                     Q_acc, R_acc, S_acc,
                     b, h,
-                    2, k,  // fixed_dim = 2 (k), fixed_idx = k
-                    I, J,  // dim1_size = I, dim2_size = J
-                    0, 1, 2,  // dim1_idx_fn = 0 (i), dim2_idx_fn = 1 (j), fixed_dim_idx_fn = 2 (k)
+                    2, k,  
+                    I, J,  
+                    0, 1, 2, 
                     scale, As_k_values.data()
                 );
                 
-                // Propagate gradient for each dimension
                 for (int d = 0; d < D; d++) {
-                    // Gradient coming from Y_s at this position
                     float dy_s = grad_output_acc[b][h][k][d];
                     
                     // Propagate to Vr_1
@@ -738,9 +677,9 @@ void compute_grad_Vs_1(
                 compute_softmax_3d(
                     Q_acc, R_acc, S_acc,
                     b, h,
-                    0, i,  // fixed_dim = 0 (i), fixed_idx = i
-                    J, K,  // dim1_size = J, dim2_size = K
-                    1, 2, 0,  // dim1_idx_fn = 1 (j), dim2_idx_fn = 2 (k), fixed_dim_idx_fn = 0 (i)
+                    0, i,  
+                    J, K,  
+                    1, 2, 0, 
                     scale, Aq_i_values.data()
                 );
                 
@@ -749,7 +688,7 @@ void compute_grad_Vs_1(
                     
                     for (int j = 0; j < J; j++) {
                         for (int k = 0; k < K; k++) {
-                            int attn_idx = j * K + k;  // Changed index calculation
+                            int attn_idx = j * K + k;
                             float attn = Aq_i_values[attn_idx];
                             grad_Vs_1_acc[b][h][k][d] += dy_q * attn * Vr_1_acc[b][h][j][d];
                         }
@@ -764,9 +703,9 @@ void compute_grad_Vs_1(
                 compute_softmax_3d(
                     Q_acc, R_acc, S_acc,
                     b, h,
-                    1, j,  // fixed_dim = 1 (j), fixed_idx = j
-                    I, K,  // dim1_size = I, dim2_size = K
-                    0, 2, 1,  // dim1_idx_fn = 0 (i), dim2_idx_fn = 2 (k), fixed_dim_idx_fn = 1 (j)
+                    1, j,  
+                    I, K,  
+                    0, 2, 1, 
                     scale, Ar_j_values.data()
                 );
                 
@@ -775,7 +714,7 @@ void compute_grad_Vs_1(
                     
                     for (int i = 0; i < I; i++) {
                         for (int k = 0; k < K; k++) {
-                            int attn_idx = i * K + k;  // Changed index calculation
+                            int attn_idx = i * K + k;
                             float attn = Ar_j_values[attn_idx];
                             grad_Vs_1_acc[b][h][k][d] += dy_r * attn * Vq_1_acc[b][h][i][d];
                         }
@@ -850,16 +789,12 @@ inline float compute_single_softmax_attn(
         }
     }
 
-    // --- Compute final softmax value for the target indices ---
     float target_dot = compute_dot_product(Q_acc, R_acc, S_acc, b, h, i_target, j_target, k_target, D);
-    if (sum_exp == 0.0f) { // Avoid division by zero
-        // This might happen if all dot products were extremely small or negative infinity
-        // Determine the number of elements in the softmax normalization
+    if (sum_exp == 0.0f) { //prevent division by zero 
         int num_elements = 0;
         if (fixed_dim == 0) num_elements = J * K;
         else if (fixed_dim == 1) num_elements = I * K;
         else num_elements = I * J;
-        // Return uniform probability if sum_exp is zero
         return 1.0f / static_cast<float>(num_elements);
     }
     return std::exp(target_dot * scale - max_val) / sum_exp;
@@ -868,14 +803,13 @@ inline float compute_single_softmax_attn(
 void compute_grad_Vq_2(
     torch::Tensor& grad_Vq_2,        // Output: Gradient w.r.t. Vq_2 [B, H, I, D]
     const torch::Tensor& grad_output, // Input: Gradient w.r.t. final output Y [B, H, max(I,J,K), D]
-    const torch::Tensor& Q,           // Input: Q tensor [B, H, I, D]
-    const torch::Tensor& R,           // Input: R tensor [B, H, J, D]
-    const torch::Tensor& S,           // Input: S tensor [B, H, K, D]
-    const torch::Tensor& Vr_2,        // Input: Vr_2 tensor [B, H, J, D]
-    const torch::Tensor& Vs_2,        // Input: Vs_2 tensor [B, H, K, D]
-    double dropout_rate = 0.0)        // Note: Dropout not handled in this specific grad computation
+    const torch::Tensor& Q,           
+    const torch::Tensor& R,           
+    const torch::Tensor& S,           
+    const torch::Tensor& Vr_2,        
+    const torch::Tensor& Vs_2,        
+    double dropout_rate = 0.0)        
 {
-    // Get tensor accessors
     auto grad_Vq_2_acc = grad_Vq_2.accessor<float, 4>();
     auto grad_output_acc = grad_output.accessor<float, 4>();
     auto Q_acc = Q.accessor<float, 4>();
@@ -884,7 +818,6 @@ void compute_grad_Vq_2(
     auto Vr_2_acc = Vr_2.accessor<float, 4>();
     auto Vs_2_acc = Vs_2.accessor<float, 4>();
 
-    // Get dimensions
     const int B = Q.size(0);
     const int H = Q.size(1);
     const int I = Q.size(2);
@@ -893,29 +826,25 @@ void compute_grad_Vq_2(
     const int D = Q.size(3);
     const float scale = 1.0f / std::sqrt(static_cast<float>(D));
 
-    // grad_Vq_2 should be zero-initialized before calling this function
-
-    // Iterate over batch and head
     for (int b = 0; b < B; ++b) {
         for (int h = 0; h < H; ++h) {
 
             // --- Contribution from Y_r_ Path ---
             // dL/dVq_2[i] += sum_{j} (dL/dY_r_[j] * dY_r_[j]/dVq_2[i])
             // dY_r_[j]/dVq_2[i] = sum_{k} (Aq[i,j,k] * As[i,j,k] * Vs_2[k])
-            for (int j = 0; j < J; ++j) { // Loop over source gradient index (Y_r_)
+            for (int j = 0; j < J; ++j) { 
                 for (int d = 0; d < D; ++d) {
                     // Gradient coming from Y_r_ at index j, dimension d
                     // Ensure grad_output access is within bounds if J < max_seq_len
                     if (j >= grad_output.size(2)) continue;
                     const float dy_r = grad_output_acc[b][h][j][d];
 
-                    if (dy_r == 0.0f) continue; // Optimization: skip if gradient is zero
+                    if (dy_r == 0.0f) continue;
 
-                    for (int i = 0; i < I; ++i) { // Loop over target gradient index (Vq_2)
-                        for (int k = 0; k < K; ++k) { // Summation index
-                            // Recompute necessary attention scores on the fly
-                            float attn_aq = compute_single_softmax_attn(Q_acc, R_acc, S_acc, b, h, i, j, k, I, J, K, D, scale, 0); // Softmax over j,k
-                            float attn_as = compute_single_softmax_attn(Q_acc, R_acc, S_acc, b, h, i, j, k, I, J, K, D, scale, 2); // Softmax over i,j
+                    for (int i = 0; i < I; ++i) { 
+                        for (int k = 0; k < K; ++k) { 
+                            float attn_aq = compute_single_softmax_attn(Q_acc, R_acc, S_acc, b, h, i, j, k, I, J, K, D, scale, 0);
+                            float attn_as = compute_single_softmax_attn(Q_acc, R_acc, S_acc, b, h, i, j, k, I, J, K, D, scale, 2);
 
                             float vs2_val = Vs_2_acc[b][h][k][d];
 
@@ -938,9 +867,8 @@ void compute_grad_Vq_2(
 
                      if (dy_s == 0.0f) continue; // Optimization
 
-                     for (int j = 0; j < J; ++j) { // Loop over target gradient index (Vq_2)
-                         for (int i = 0; i < I; ++i) { // Summation index
-                             // Recompute necessary attention scores on the fly
+                     for (int j = 0; j < J; ++j) { 
+                         for (int i = 0; i < I; ++i) { 
                              float attn_aq = compute_single_softmax_attn(Q_acc, R_acc, S_acc, b, h, i, j, k, I, J, K, D, scale, 0); // Softmax over j,k
                              float attn_ar = compute_single_softmax_attn(Q_acc, R_acc, S_acc, b, h, i, j, k, I, J, K, D, scale, 1); // Softmax over i,k
 
@@ -952,21 +880,20 @@ void compute_grad_Vq_2(
                      }
                  }
             }
-        } // end head loop
-    } // end batch loop
+        } 
+    } 
 }
 
 void compute_grad_Vr_2(
-    torch::Tensor& grad_Vr_2,        // Output: Gradient w.r.t. Vr_2 [B, H, J, D]
-    const torch::Tensor& grad_output, // Input: Gradient w.r.t. final output Y [B, H, max(I,J,K), D]
-    const torch::Tensor& Q,           // Input: Q tensor [B, H, I, D]
-    const torch::Tensor& R,           // Input: R tensor [B, H, J, D]
-    const torch::Tensor& S,           // Input: S tensor [B, H, K, D]
-    const torch::Tensor& Vq_2,        // Input: Vq_2 tensor [B, H, I, D]
-    const torch::Tensor& Vs_2,        // Input: Vs_2 tensor [B, H, K, D]
-    double dropout_rate = 0.0)        // Note: Dropout not handled in this specific grad computation
+    torch::Tensor& grad_Vr_2,        
+    const torch::Tensor& grad_output, 
+    const torch::Tensor& Q,           
+    const torch::Tensor& R,           
+    const torch::Tensor& S,           
+    const torch::Tensor& Vq_2,        
+    const torch::Tensor& Vs_2,        
+    double dropout_rate = 0.0)        
 {
-    // Get tensor accessors
     auto grad_Vr_2_acc = grad_Vr_2.accessor<float, 4>();
     auto grad_output_acc = grad_output.accessor<float, 4>();
     auto Q_acc = Q.accessor<float, 4>();
@@ -975,7 +902,6 @@ void compute_grad_Vr_2(
     auto Vq_2_acc = Vq_2.accessor<float, 4>();
     auto Vs_2_acc = Vs_2.accessor<float, 4>();
 
-    // Get dimensions
     const int B = Q.size(0);
     const int H = Q.size(1);
     const int I = Q.size(2);
@@ -984,9 +910,7 @@ void compute_grad_Vr_2(
     const int D = Q.size(3);
     const float scale = 1.0f / std::sqrt(static_cast<float>(D));
 
-    // grad_Vr_2 should be zero-initialized before calling this function
 
-    // Iterate over batch and head
     for (int b = 0; b < B; ++b) {
         for (int h = 0; h < H; ++h) {
 
@@ -1027,10 +951,10 @@ void compute_grad_Vr_2(
                     if (k >= grad_output.size(2)) continue;
                     const float dy_s = grad_output_acc[b][h][k][d];
 
-                    if (dy_s == 0.0f) continue; // Optimization
+                    if (dy_s == 0.0f) continue; 
 
                     for (int j = 0; j < J; ++j) { // Loop over target gradient index (Vr_2)
-                        for (int i = 0; i < I; ++i) { // Summation index
+                        for (int i = 0; i < I; ++i) { 
                             // Recompute necessary attention scores on the fly
                             float attn_aq = compute_single_softmax_attn(Q_acc, R_acc, S_acc, b, h, i, j, k, I, J, K, D, scale, 0); // Softmax over j,k
                             float attn_ar = compute_single_softmax_attn(Q_acc, R_acc, S_acc, b, h, i, j, k, I, J, K, D, scale, 1); // Softmax over i,k
@@ -1043,21 +967,20 @@ void compute_grad_Vr_2(
                     }
                 }
             }
-        } // end head loop
-    } // end batch loop
+        } 
+    } 
 }
 
 void compute_grad_Vs_2(
-    torch::Tensor& grad_Vs_2,        // Output: Gradient w.r.t. Vs_2 [B, H, K, D]
-    const torch::Tensor& grad_output, // Input: Gradient w.r.t. final output Y [B, H, max(I,J,K), D]
-    const torch::Tensor& Q,           // Input: Q tensor [B, H, I, D]
-    const torch::Tensor& R,           // Input: R tensor [B, H, J, D]
-    const torch::Tensor& S,           // Input: S tensor [B, H, K, D]
-    const torch::Tensor& Vq_2,        // Input: Vq_2 tensor [B, H, I, D]
-    const torch::Tensor& Vr_2,        // Input: Vr_2 tensor [B, H, J, D]
-    double dropout_rate = 0.0)        // Note: Dropout not handled in this specific grad computation
+    torch::Tensor& grad_Vs_2,        
+    const torch::Tensor& grad_output, 
+    const torch::Tensor& Q,           
+    const torch::Tensor& R,           
+    const torch::Tensor& S,           
+    const torch::Tensor& Vq_2,        
+    const torch::Tensor& Vr_2,        
+    double dropout_rate = 0.0)        
 {
-    // Get tensor accessors
     auto grad_Vs_2_acc = grad_Vs_2.accessor<float, 4>();
     auto grad_output_acc = grad_output.accessor<float, 4>();
     auto Q_acc = Q.accessor<float, 4>();
@@ -1066,7 +989,6 @@ void compute_grad_Vs_2(
     auto Vq_2_acc = Vq_2.accessor<float, 4>();
     auto Vr_2_acc = Vr_2.accessor<float, 4>();
 
-    // Get dimensions
     const int B = Q.size(0);
     const int H = Q.size(1);
     const int I = Q.size(2);
@@ -1075,9 +997,7 @@ void compute_grad_Vs_2(
     const int D = Q.size(3);
     const float scale = 1.0f / std::sqrt(static_cast<float>(D));
 
-    // grad_Vs_2 should be zero-initialized before calling this function
-
-    // Iterate over batch and head
+    for (int b = 0; b < B; ++b) {
     for (int b = 0; b < B; ++b) {
         for (int h = 0; h < H; ++h) {
 
@@ -1091,10 +1011,10 @@ void compute_grad_Vs_2(
                     if (i >= grad_output.size(2)) continue;
                     const float dy_q = grad_output_acc[b][h][i][d];
 
-                    if (dy_q == 0.0f) continue; // Optimization: skip if gradient is zero
+                    if (dy_q == 0.0f) continue; 
 
                     for (int k = 0; k < K; ++k) { // Loop over target gradient index (Vs_2)
-                        for (int j = 0; j < J; ++j) { // Summation index
+                        for (int j = 0; j < J; ++j) { 
                             // Recompute necessary attention scores on the fly
                             float attn_ar = compute_single_softmax_attn(Q_acc, R_acc, S_acc, b, h, i, j, k, I, J, K, D, scale, 1); // Softmax over i,k
                             float attn_as = compute_single_softmax_attn(Q_acc, R_acc, S_acc, b, h, i, j, k, I, J, K, D, scale, 2); // Softmax over i,j
@@ -1118,10 +1038,10 @@ void compute_grad_Vs_2(
                     if (j >= grad_output.size(2)) continue;
                     const float dy_r = grad_output_acc[b][h][j][d];
 
-                    if (dy_r == .0f) continue; // Optimization
+                    if (dy_r == 0.0f) continue; 
 
                     for (int k = 0; k < K; ++k) { // Loop over target gradient index (Vs_2)
-                        for (int i = 0; i < I; ++i) { // Summation index
+                        for (int i = 0; i < I; ++i) {
                             // Recompute necessary attention scores on the fly
                             float attn_aq = compute_single_softmax_attn(Q_acc, R_acc, S_acc, b, h, i, j, k, I, J, K, D, scale, 0); // Softmax over j,k
                             float attn_as = compute_single_softmax_attn(Q_acc, R_acc, S_acc, b, h, i, j, k, I, J, K, D, scale, 2); // Softmax over i,j
@@ -1134,8 +1054,8 @@ void compute_grad_Vs_2(
                     }
                 }
             }
-        } // end head loop
-    } // end batch loop
+        } 
+    } 
 }
 
 
@@ -1160,7 +1080,6 @@ compute_attention_tensors_single(
     auto R_acc = R_slice.accessor<float, 2>();
     auto S_acc = S_slice.accessor<float, 2>();
 
-    // Simplified dot product for single head/batch
     auto compute_dot_single = [&](int i, int j, int k) {
         float dot = 0.0f;
         for (int d = 0; d < D; ++d) {
@@ -1193,6 +1112,7 @@ compute_attention_tensors_single(
     // Return A_slice (raw scores) along with normalized scores
     return std::make_tuple(A_slice, Aq_slice, Ar_slice, As_slice); 
 }
+
 
 // Computes grad_A for a single batch item and head (formerly grad_P)
 torch::Tensor compute_grad_A_single( 
