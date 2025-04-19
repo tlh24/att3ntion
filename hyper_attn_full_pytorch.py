@@ -111,10 +111,8 @@ class HypergraphAttention(nn.Module):
 		return y 
 
 	def backward(self, x, dL_dy):
-		# Will compute and return all gradients
 		batch_size, ntok, d_model = x.shape
 		
-		# Will store all gradients here
 		grads = {}
 
 		# Step 1: Recompute forward pass values (no need to save activations)
@@ -167,24 +165,17 @@ class HypergraphAttention(nn.Module):
 		
 		# Step 2: Backprop through each layer
 
-		## Output layer Wo 
 		dy_gelu = dL_dy @ self.Wo.weight
 		dWo = y_gelu.reshape(-1, d_model).t() @ dL_dy.reshape(-1, d_model)
 		grads['dWo'] = dWo
 
 		## GELU - gelu(x) = x * sigmoid(1.702*x)
-		# Derivative: gelu'(x) = sigmoid(1.702*x) + x * sigmoid(1.702*x) * (1 - sigmoid(1.702*x)) * 1.702
-		# sigmoid_val = torch.sigmoid(1.702 * y)
-		# gelu_grad = sigmoid_val + y * sigmoid_val * (1 - sigmoid_val) * 1.702
-		# dy = dy_gelu * gelu_grad
 		sigmoid_val = torch.sigmoid(1.702 * y)
 		gelu_deriv = sigmoid_val + y * 1.702 * sigmoid_val * (1 - sigmoid_val)
 		dy = dy_gelu * gelu_deriv
 
-		# Reshape dy to match y for backprop
 		dy = dy.unsqueeze(2).expand(-1, -1, self.n_heads, -1).permute(0, 2, 1, 3)
 		
-		# Backprop through sum and various components
 		dY_q = dy
 		dY_r = dy
 		dY_s = dy
@@ -227,7 +218,6 @@ class HypergraphAttention(nn.Module):
 		dAr_from_Ys_ = torch.einsum('bhijk,bhid,bhkd,bhjd->bhijk', Aq, Vq_, dY_s_, Vr_)
 		dVr__from_Ys_ = torch.einsum('bhijk,bhid,bhijk,bhkd->bhjd', Aq, Vq_, Ar, dY_s_)
 
-		# Sum gradients from all sources
 		dAq = dAq_from_Yq + dAq_from_Yr_ + dAq_from_Ys_
 		dAr = dAr_from_Yr + dAr_from_Yq_ + dAr_from_Ys_
 		dAs = dAs_from_Ys + dAs_from_Yq_ + dAs_from_Yr_
@@ -253,45 +243,37 @@ class HypergraphAttention(nn.Module):
 		dDot_product_q = dDot_product_q_flat.reshape(dot_product.shape)
 		
 		# For Ar - softmax over i,k dimensions (with permutation)
-		# First permute to shape where softmax was applied
 		dAr_perm = dAr.permute(0, 1, 3, 2, 4)  # [b, h, i, j, k] -> [b, h, j, i, k]
 		Ar_perm = Ar.permute(0, 1, 3, 2, 4)
 		dAr_flat = dAr_perm.flatten(3, 4)
 		Ar_flat = Ar_perm.flatten(3, 4)
 		dDot_product_r_flat = Ar_flat * (dAr_flat - (Ar_flat * dAr_flat).sum(dim=-1, keepdim=True))
 		dDot_product_r_perm = dDot_product_r_flat.reshape(dAr_perm.shape)
-		# Permute back to original shape
-		dDot_product_r = dDot_product_r_perm.permute(0, 1, 3, 2, 4)  # Back to [b, h, i, j, k]
+		dDot_product_r = dDot_product_r_perm.permute(0, 1, 3, 2, 4) 
 		
 		# For As - softmax over i,j dimensions (with different permutation)
-		# First permute to shape where softmax was applied
 		dAs_perm = dAs.permute(0, 1, 4, 2, 3)  # [b, h, i, j, k] -> [b, h, k, i, j]
 		As_perm = As.permute(0, 1, 4, 2, 3)
 		dAs_flat = dAs_perm.flatten(3, 4)
 		As_flat = As_perm.flatten(3, 4)
+		
 		dDot_product_s_flat = As_flat * (dAs_flat - (As_flat * dAs_flat).sum(dim=-1, keepdim=True))
 		dDot_product_s_perm = dDot_product_s_flat.reshape(dAs_perm.shape)
-		# Permute back to original shape
 		dDot_product_s = dDot_product_s_perm.permute(0, 1, 3, 4, 2)  # Back to [b, h, i, j, k]
 		
-		# Combine gradients for dot_product
 		dDot_product = dDot_product_q + dDot_product_r + dDot_product_s
 		
-		# Backprop through scaling
 		scale = math.sqrt(self.head_dim)
 		dDot_product_scaled = dDot_product / scale
 		
-		# Backprop through einsum for dot_product = torch.einsum('bhid,bhjd,bhkd->bhijk', Q, R, S)
 		dQ = torch.einsum('bhijk,bhjd,bhkd->bhid', dDot_product_scaled, R, S)
 		dR = torch.einsum('bhijk,bhid,bhkd->bhjd', dDot_product_scaled, Q, S)
 		dS = torch.einsum('bhijk,bhid,bhjd->bhkd', dDot_product_scaled, Q, R)
 
-		# Combine and reshape gradients for values
 		dVq_combined = torch.cat([dVq, dVq_], dim=-1)
 		dVr_combined = torch.cat([dVr, dVr_], dim=-1)
 		dVs_combined = torch.cat([dVs, dVs_], dim=-1)
 		
-		# Reshape to match input tensors
 		dQ = dQ.permute(0, 2, 1, 3).reshape(batch_size, ntok, self.n_heads * self.head_dim)
 		dR = dR.permute(0, 2, 1, 3).reshape(batch_size, ntok, self.n_heads * self.head_dim)
 		dS = dS.permute(0, 2, 1, 3).reshape(batch_size, ntok, self.n_heads * self.head_dim)
@@ -300,7 +282,6 @@ class HypergraphAttention(nn.Module):
 		dVr_combined = dVr_combined.permute(0, 2, 1, 3).reshape(batch_size, ntok, self.n_heads * self.head_dim * 2)
 		dVs_combined = dVs_combined.permute(0, 2, 1, 3).reshape(batch_size, ntok, self.n_heads * self.head_dim * 2)
 		
-		# Compute weight gradients
 		dWq = x.reshape(-1, d_model).T @ dQ.reshape(-1, self.n_heads * self.head_dim)
 		dWr = x.reshape(-1, d_model).T @ dR.reshape(-1, self.n_heads * self.head_dim)
 		dWs = x.reshape(-1, d_model).T @ dS.reshape(-1, self.n_heads * self.head_dim)
@@ -309,7 +290,6 @@ class HypergraphAttention(nn.Module):
 		dWv_r = x.reshape(-1, d_model).T @ dVr_combined.reshape(-1, self.n_heads * self.head_dim * 2)
 		dWv_s = x.reshape(-1, d_model).T @ dVs_combined.reshape(-1, self.n_heads * self.head_dim * 2)
 		
-		# Backprop to input x
 		dx_q = dQ @ self.Wq.weight
 		dx_r = dR @ self.Wr.weight
 		dx_s = dS @ self.Ws.weight
@@ -317,10 +297,8 @@ class HypergraphAttention(nn.Module):
 		dx_vr = dVr_combined @ self.Wv_r.weight
 		dx_vs = dVs_combined @ self.Wv_s.weight
 		
-		# Combine all input gradients
 		dx = dx_q + dx_r + dx_s + dx_vq + dx_vr + dx_vs
 		
-		# Add bias gradients if present
 		if self.Wv_q.bias is not None:
 			dWv_q_bias = dVq_combined.reshape(-1, dVq_combined.size(-1)).sum(dim=0)
 			grads['dWv_q_bias'] = dWv_q_bias
@@ -333,10 +311,8 @@ class HypergraphAttention(nn.Module):
 			
 			dWo_bias = dL_dy.reshape(-1, dL_dy.size(-1)).sum(dim=0)
 			grads['dWo_bias'] = dWo_bias
-		# (Repeat for other biases)
 
-		# Step 3: Return gradients
-		# Store all gradients
+
 		grads.update({
 			'dWq': dWq,
 			'dWr': dWr,

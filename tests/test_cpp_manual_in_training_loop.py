@@ -5,6 +5,7 @@ import sys
 import os
 import pytest
 
+# run this test with: python -m pytest tests/test_cpp_backward_training.py -v -s
 #forcing cpu for now
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))

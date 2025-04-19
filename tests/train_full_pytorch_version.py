@@ -3,8 +3,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 import argparse
-from hyper_attn_pytorch import HypergraphAttention
-from test import genData
+from hyper_attn_full_pytorch import HypergraphAttention
+from tests.gen_data import genData
 import pdb
 
 class SimpleAnalogyModel(nn.Module):
