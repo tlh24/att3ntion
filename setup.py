@@ -6,11 +6,11 @@ setup(
     ext_modules=[
         CppExtension(
             name='hyper_attn_cpp_reference',
-            sources=['cpp/hyper_attn_cpp_reference.cpp']
+            sources=['cpp/torch_att3ntion.cpp']
         ),
         CppExtension(
             name='hyper_attn_cpp_manual',
-            sources=['cpp/hyper_attn_cpp_manual.cpp']
+            sources=['cpp/manual_att3ntion.cpp']
         ),
     ],
     cmdclass={
