@@ -71,8 +71,8 @@ def train_model(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, dev
 	if device == 'auto':
 		if torch.cuda.is_available():
 			device = torch.device('cuda')
-		elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-			device = torch.device('mps')
+		# elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+		# 	device = torch.device('mps')
 		else:
 			device = torch.device('cpu')
 	else:
@@ -88,7 +88,7 @@ def train_model(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, dev
 	optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 	criterion = nn.CrossEntropyLoss()
 	
-	print("\nTraining started...")
+	# print("\nTraining started...")
 	for epoch in range(num_epochs):
 		model.train()
 		total_loss = 0
@@ -128,12 +128,12 @@ def train_model(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, dev
 
 if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='Train analogy model')
-	parser.add_argument('--device', type=str, default='auto', choices=['cpu', 'mps', 'cuda', 'auto'],
-						help='Device to use (cpu, mps, cuda, auto)')
-	parser.add_argument('--epochs', type=int, default=200, help='Number of epochs')
+	parser.add_argument('--device', type=str, default='auto', choices=['cpu', 'cuda', 'auto'],
+						help='Device to use (cpu, cuda, auto)')
+	parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
 	parser.add_argument('--modulo', type=int, default=17, help='Modulo for arithmetic operations')
-	parser.add_argument('--hidden-dim', type=int, default=128, help='Hidden dimension size')
-	parser.add_argument('--num-heads', type=int, default=4, help='Number of attention heads')
+	parser.add_argument('--hidden-dim', type=int, default=16, help='Hidden dimension size')
+	parser.add_argument('--num-heads', type=int, default=2, help='Number of attention heads')
 	parser.add_argument('--attn-impl', type=str, default='pytorch', choices=['pytorch', 'cpp'],
 						help='Attention implementation to use')
 	args = parser.parse_args()
@@ -141,8 +141,8 @@ if __name__ == '__main__':
 	torch.manual_seed(42)
 	np.random.seed(42)
 	
-	print("Example data points:")
-	print(genData(3, args.modulo, do_print=True))
+	# print("Example data points:")
+	# print(genData(3, args.modulo, do_print=True))
 	
 	model = train_model(
 		num_epochs=args.epochs,
