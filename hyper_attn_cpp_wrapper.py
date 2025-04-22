@@ -30,38 +30,38 @@ class HyperAttentionAutograd(Function):
         Vs_1 = Vs_1.contiguous()
         Vs_2 = Vs_2.contiguous()
 
-        print("--- Preparing to call C++ forward ---", flush=True)
-        print(f"Q: {Q.shape}, {Q.dtype}, {Q.device}", flush=True)
-        print(f"R: {R.shape}, {R.dtype}, {R.device}", flush=True)
-        print(f"S: {S.shape}, {S.dtype}, {S.device}", flush=True)
-        print(f"Vq_1: {Vq_1.shape}, {Vq_1.dtype}, {Vq_1.device}", flush=True)
-        print(f"Vq_2: {Vq_2.shape}, {Vq_2.dtype}, {Vq_2.device}", flush=True)
-        print(f"Vr_1: {Vr_1.shape}, {Vr_1.dtype}, {Vr_1.device}", flush=True)
-        print(f"Vr_2: {Vr_2.shape}, {Vr_2.dtype}, {Vr_2.device}", flush=True)
-        print(f"Vs_1: {Vs_1.shape}, {Vs_1.dtype}, {Vs_1.device}", flush=True)
-        print(f"Vs_2: {Vs_2.shape}, {Vs_2.dtype}, {Vs_2.device}", flush=True)
-        print(f"dropout_rate: {dropout_rate}", flush=True)
-        print("--------------------------------------", flush=True)
+        # print("--- Preparing to call C++ forward ---", flush=True)
+        # print(f"Q: {Q.shape}, {Q.dtype}, {Q.device}", flush=True)
+        # print(f"R: {R.shape}, {R.dtype}, {R.device}", flush=True)
+        # print(f"S: {S.shape}, {S.dtype}, {S.device}", flush=True)
+        # print(f"Vq_1: {Vq_1.shape}, {Vq_1.dtype}, {Vq_1.device}", flush=True)
+        # print(f"Vq_2: {Vq_2.shape}, {Vq_2.dtype}, {Vq_2.device}", flush=True)
+        # print(f"Vr_1: {Vr_1.shape}, {Vr_1.dtype}, {Vr_1.device}", flush=True)
+        # print(f"Vr_2: {Vr_2.shape}, {Vr_2.dtype}, {Vr_2.device}", flush=True)
+        # print(f"Vs_1: {Vs_1.shape}, {Vs_1.dtype}, {Vs_1.device}", flush=True)
+        # print(f"Vs_2: {Vs_2.shape}, {Vs_2.dtype}, {Vs_2.device}", flush=True)
+        # print(f"dropout_rate: {dropout_rate}", flush=True)
+        # print("--------------------------------------", flush=True)
 
         output = hyper_attn_cpp_manual.forward(
             Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
         )
 
-        print(f"--- C++ forward returned. Checking output... ---", flush=True)
-        try:
-            print(f"Output shape: {output.shape}", flush=True)
-            print(f"Output dtype: {output.dtype}", flush=True)
-            print(f"Output device: {output.device}", flush=True)
-            print("--- Output check seems OK --- ", flush=True)
-        except Exception as e:
-            print(f"!!! Error accessing C++ output tensor: {e}", flush=True)
-            # Force exit or raise to ensure crash info is related to this point
-            import sys
-            sys.exit(1) 
+        # print(f"--- C++ forward returned. Checking output... ---", flush=True)
+        # try:
+        #     # print(f"Output shape: {output.shape}", flush=True)
+        #     # print(f"Output dtype: {output.dtype}", flush=True)
+        #     # print(f"Output device: {output.device}", flush=True)
+        #     print("--- Output check seems OK --- ", flush=True)
+        # except Exception as e:
+        #     print(f"!!! Error accessing C++ output tensor: {e}", flush=True)
+        #     # Force exit or raise to ensure crash info is related to this point
+        #     import sys
+        #     sys.exit(1) 
 
-        print("--- Preparing to save for backward --- ", flush=True)
+        # print("--- Preparing to save for backward --- ", flush=True)
         ctx.save_for_backward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2)
-        print("--- Saved for backward --- ", flush=True)
+        # print("--- Saved for backward --- ", flush=True)
 
         return output
 
