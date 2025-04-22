@@ -88,7 +88,7 @@ def train_model(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, dev
 	optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 	criterion = nn.CrossEntropyLoss()
 	
-	# print("\nTraining started...")
+	print("\nTraining started...")
 	for epoch in range(num_epochs):
 		model.train()
 		total_loss = 0
@@ -130,10 +130,11 @@ if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='Train analogy model')
 	parser.add_argument('--device', type=str, default='auto', choices=['cpu', 'cuda', 'auto'],
 						help='Device to use (cpu, cuda, auto)')
-	parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
+	parser.add_argument('--epochs', type=int, default=200, help='Number of epochs')
+	parser.add_argument('--batch-size', type=int, default=128, help='Batch size for training')
 	parser.add_argument('--modulo', type=int, default=17, help='Modulo for arithmetic operations')
-	parser.add_argument('--hidden-dim', type=int, default=16, help='Hidden dimension size')
-	parser.add_argument('--num-heads', type=int, default=2, help='Number of attention heads')
+	parser.add_argument('--hidden-dim', type=int, default=128, help='Hidden dimension size')
+	parser.add_argument('--num-heads', type=int, default=4, help='Number of attention heads')
 	parser.add_argument('--attn-impl', type=str, default='pytorch', choices=['pytorch', 'cpp'],
 						help='Attention implementation to use')
 	args = parser.parse_args()
@@ -150,5 +151,6 @@ if __name__ == '__main__':
 		modulo=args.modulo,
 		hidden_dim=args.hidden_dim,
 		num_heads=args.num_heads,
-		attn_impl=args.attn_impl
+		attn_impl=args.attn_impl,
+		batch_size=args.batch_size
 	)
