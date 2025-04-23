@@ -5,8 +5,11 @@
 #include <vector> 
 #include <tuple>  
 
-// Forward declarations for CUDA functions
-torch::Tensor forward_cuda(
+// Forward declarations for CUDA functions tuple
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
+          torch::Tensor, torch::Tensor,
+          torch::Tensor>
+forward_cuda(
     torch::Tensor Q, torch::Tensor R, torch::Tensor S,
     torch::Tensor Vq_1, torch::Tensor Vq_2,
     torch::Tensor Vr_1, torch::Tensor Vr_2,
@@ -421,7 +424,7 @@ void compute_Y_scatter_s(
     }
 }
 
-torch::Tensor forward_cpu(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> forward_cpu(
     torch::Tensor Q,
     torch::Tensor R,
     torch::Tensor S,
@@ -451,10 +454,11 @@ torch::Tensor forward_cpu(
     compute_Y_scatter_r(Y_r_, Q, R, S, Vq_2, Vs_2);
     compute_Y_scatter_s(Y_s_, Q, R, S, Vq_2, Vr_2);
 
-    return Y_q + Y_r + Y_s + Y_q_ + Y_r_ + Y_s_;
+    // return Y_q + Y_r + Y_s + Y_q_ + Y_r_ + Y_s_;
+    return std::make_tuple(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_);
 }
 
-torch::Tensor forward(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> forward(
     torch::Tensor Q, torch::Tensor R, torch::Tensor S,
     torch::Tensor Vq_1, torch::Tensor Vq_2,
     torch::Tensor Vr_1, torch::Tensor Vr_2,
