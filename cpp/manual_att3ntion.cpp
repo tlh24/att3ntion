@@ -5,6 +5,26 @@
 #include <vector> 
 #include <tuple>  
 
+// Forward declarations for CUDA functions
+torch::Tensor forward_cuda(
+    torch::Tensor Q, torch::Tensor R, torch::Tensor S,
+    torch::Tensor Vq_1, torch::Tensor Vq_2,
+    torch::Tensor Vr_1, torch::Tensor Vr_2,
+    torch::Tensor Vs_1, torch::Tensor Vs_2,
+    double dropout_rate = 0.0);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
+          torch::Tensor, torch::Tensor,
+          torch::Tensor, torch::Tensor,
+          torch::Tensor, torch::Tensor>
+backward_cuda(
+    torch::Tensor grad_output,
+    torch::Tensor Q, torch::Tensor R, torch::Tensor S,
+    torch::Tensor Vq_1, torch::Tensor Vq_2,
+    torch::Tensor Vr_1, torch::Tensor Vr_2,
+    torch::Tensor Vs_1, torch::Tensor Vs_2,
+    double dropout_rate = 0.0);
+
 // Forward pass
 
 // helper: returns dot product between three vectors at specific indices
@@ -401,7 +421,7 @@ void compute_Y_scatter_s(
     }
 }
 
-torch::Tensor forward_pass(
+torch::Tensor forward_cpu(
     torch::Tensor Q,
     torch::Tensor R,
     torch::Tensor S,
@@ -432,6 +452,20 @@ torch::Tensor forward_pass(
     compute_Y_scatter_s(Y_s_, Q, R, S, Vq_2, Vr_2);
 
     return Y_q + Y_r + Y_s + Y_q_ + Y_r_ + Y_s_;
+}
+
+torch::Tensor forward(
+    torch::Tensor Q, torch::Tensor R, torch::Tensor S,
+    torch::Tensor Vq_1, torch::Tensor Vq_2,
+    torch::Tensor Vr_1, torch::Tensor Vr_2,
+    torch::Tensor Vs_1, torch::Tensor Vs_2,
+    double dropout_rate)
+{
+  if (Q.is_cuda()) {
+    return forward_cuda(Q,R,S, Vq_1,Vq_2, Vr_1,Vr_2, Vs_1,Vs_2, dropout_rate);
+  } else {
+    return forward_cpu(Q,R,S, Vq_1,Vq_2, Vr_1,Vr_2, Vs_1,Vs_2, dropout_rate);
+  }
 }
 
 // Backward pass
@@ -1363,7 +1397,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
           torch::Tensor, torch::Tensor,
           torch::Tensor, torch::Tensor,
           torch::Tensor, torch::Tensor>
-backward_pass(
+backward_cpu(
     torch::Tensor grad_output,
     torch::Tensor Q,
     torch::Tensor R,
@@ -1446,9 +1480,24 @@ backward_pass(
     );
 }
 
+auto backward(
+    torch::Tensor grad_output,
+    torch::Tensor Q, torch::Tensor R, torch::Tensor S,
+    torch::Tensor Vq_1, torch::Tensor Vq_2,
+    torch::Tensor Vr_1, torch::Tensor Vr_2,
+    torch::Tensor Vs_1, torch::Tensor Vs_2,
+    double dropout_rate)
+{
+  if (grad_output.is_cuda()) {
+    return backward_cuda(grad_output, Q,R,S, Vq_1,Vq_2, Vr_1,Vr_2, Vs_1,Vs_2, dropout_rate);
+  } else {
+    return backward_cpu(grad_output, Q,R,S, Vq_1,Vq_2, Vr_1,Vr_2, Vs_1,Vs_2, dropout_rate);
+  }
+}
+
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward", &forward_pass,
+    m.def("forward", &forward,
           "Hypergraph Attention forward (returns sum of all Y tensors)",
           py::arg("Q"),
           py::arg("R"),
@@ -1461,9 +1510,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("Vs_2"),
           py::arg("dropout_rate") = 0.0);
 
-    m.def("backward", &backward_pass,
+    m.def("backward", &backward,
           "Hypergraph Attention backward (returns dQ, dR, dS, dVq_1, dVq_2, dVr_1, dVr_2, dVs_1, dVs_2)",
-          py::arg("grad_output"), // Corrected name
+          py::arg("grad_output"),
           py::arg("Q"),
           py::arg("R"),
           py::arg("S"),
