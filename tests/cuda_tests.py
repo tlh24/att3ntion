@@ -58,7 +58,7 @@ def run_test():
     
     try:
         Y_tuple_cpu = manual_att3ntion.forward(Q_cpu, R_cpu, S_cpu, Vq_1_cpu, Vq_2_cpu, Vr_1_cpu, Vr_2_cpu, Vs_1_cpu, Vs_2_cpu, dr_cpu)
-        Y_q_cpu, Y_r_cpu, Y_s_cpu, _, _, _ = Y_tuple_cpu # Extract gather outputs
+        Y_q_cpu, Y_r_cpu, Y_s_cpu, Y_q_cpu_, Y_r_cpu_, Y_s_cpu_ = Y_tuple_cpu # Extract all outputs
         print("CPU forward pass completed.")
     except Exception as e:
         print(f"Error during CPU forward pass: {e}")
@@ -90,7 +90,7 @@ def run_test():
     print("Running forward pass on CUDA...")
     try:
         Y_tuple_cuda = manual_att3ntion.forward(Q_cuda, R_cuda, S_cuda, Vq_1_cuda, Vq_2_cuda, Vr_1_cuda, Vr_2_cuda, Vs_1_cuda, Vs_2_cuda, dr_cuda)
-        Y_q_cuda, Y_r_cuda, Y_s_cuda, _, _, _ = Y_tuple_cuda # Extract gather outputs
+        Y_q_cuda, Y_r_cuda, Y_s_cuda, Y_q_cuda_, Y_r_cuda_, Y_s_cuda_ = Y_tuple_cuda # Extract all outputs
         print("CUDA forward pass completed.")
     except Exception as e:
         print(f"Error during CUDA forward pass: {e}")
@@ -101,6 +101,9 @@ def run_test():
     Y_q_cuda_cpu = Y_q_cuda.cpu()
     Y_r_cuda_cpu = Y_r_cuda.cpu()
     Y_s_cuda_cpu = Y_s_cuda.cpu()
+    Y_q_cuda_cpu_ = Y_q_cuda_.cpu() # Move Y_q_cuda to CPU
+    Y_r_cuda_cpu_ = Y_r_cuda_.cpu() # Move Y_r_cuda to CPU
+    Y_s_cuda_cpu_ = Y_s_cuda_.cpu() # Move Y_s_cuda to CPU
 
     # Check shapes
     shape_match = True
@@ -113,6 +116,15 @@ def run_test():
     if Y_s_cpu.shape != Y_s_cuda_cpu.shape:
         print(f"ERROR: Y_s shape mismatch! CPU: {Y_s_cpu.shape}, CUDA: {Y_s_cuda_cpu.shape}")
         shape_match = False
+    if Y_q_cpu_.shape != Y_q_cuda_cpu_.shape: # Add shape check for Y_q_
+        print(f"ERROR: Y_q_ shape mismatch! CPU: {Y_q_cpu_.shape}, CUDA: {Y_q_cuda_cpu_.shape}")
+        shape_match = False
+    if Y_r_cpu_.shape != Y_r_cuda_cpu_.shape: # Add shape check for Y_r_
+        print(f"ERROR: Y_r_ shape mismatch! CPU: {Y_r_cpu_.shape}, CUDA: {Y_r_cuda_cpu_.shape}")
+        shape_match = False
+    if Y_s_cpu_.shape != Y_s_cuda_cpu_.shape: # Add shape check for Y_s_
+        print(f"ERROR: Y_s_ shape mismatch! CPU: {Y_s_cpu_.shape}, CUDA: {Y_s_cuda_cpu_.shape}")
+        shape_match = False
         
     if not shape_match:
         print("Exiting due to shape mismatches.")
@@ -124,6 +136,9 @@ def run_test():
     yq_close = torch.allclose(Y_q_cpu, Y_q_cuda_cpu, rtol=rtol, atol=atol)
     yr_close = torch.allclose(Y_r_cpu, Y_r_cuda_cpu, rtol=rtol, atol=atol)
     ys_close = torch.allclose(Y_s_cpu, Y_s_cuda_cpu, rtol=rtol, atol=atol)
+    yq_prime_close = torch.allclose(Y_q_cpu_, Y_q_cuda_cpu_, rtol=rtol, atol=atol) # Add comparison for Y_q_
+    yr_prime_close = torch.allclose(Y_r_cpu_, Y_r_cuda_cpu_, rtol=rtol, atol=atol) # Add comparison for Y_r_
+    ys_prime_close = torch.allclose(Y_s_cpu_, Y_s_cuda_cpu_, rtol=rtol, atol=atol) # Add comparison for Y_s_
 
     print(f"Comparing Y_q: {'PASS' if yq_close else 'FAIL'}")
     if not yq_close:
@@ -137,10 +152,24 @@ def run_test():
     if not ys_close:
         print(f"  Max difference (Y_s): {(Y_s_cpu - Y_s_cuda_cpu).abs().max()}")
 
-    if yq_close and yr_close and ys_close:
+    print(f"Comparing Y_q': {'PASS' if yq_prime_close else 'FAIL'}") # Add print for Y_q_
+    if not yq_prime_close:
+        print(f"  Max difference (Y_q'): {(Y_q_cpu_ - Y_q_cuda_cpu_).abs().max()}")
+
+    print(f"Comparing Y_r': {'PASS' if yr_prime_close else 'FAIL'}") # Add print for Y_r_
+    if not yr_prime_close:
+        print(f"  Max difference (Y_r'): {(Y_r_cpu_ - Y_r_cuda_cpu_).abs().max()}")
+        
+    print(f"Comparing Y_s': {'PASS' if ys_prime_close else 'FAIL'}") # Add print for Y_s_
+    if not ys_prime_close:
+        print(f"  Max difference (Y_s'): {(Y_s_cpu_ - Y_s_cuda_cpu_).abs().max()}")
+
+    if yq_close and yr_close and ys_close and yq_prime_close and yr_prime_close and ys_prime_close: # Update overall check
         print("\n*** Gather Equivalence Test Passed! ***")
+        print("\n*** Gather & Scatter Equivalence Test Passed! ***")
     else:
         print("\n*** Gather Equivalence Test Failed! ***")
+        print("\n*** Scatter Equivalence Test Failed! ***")
         sys.exit(1)
 
 # --- Run the test --- 

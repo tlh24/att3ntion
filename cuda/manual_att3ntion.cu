@@ -34,6 +34,37 @@ __global__ void gather_dim2_kernel(
     int B, int H, int I, int J, int K, int D,
     float scale);
 
+// Forward declarations for scatter kernels
+__global__ void scatter_dim0_kernel(
+    const float* __restrict__ Q,
+    const float* __restrict__ R,
+    const float* __restrict__ S,
+    const float* __restrict__ Vr_2, 
+    const float* __restrict__ Vs_2, 
+    float*       __restrict__ Y_q_, 
+    int B, int H, int I, int J, int K, int D,
+    float scale);
+
+__global__ void scatter_dim1_kernel(
+    const float* __restrict__ Q,
+    const float* __restrict__ R,
+    const float* __restrict__ S,
+    const float* __restrict__ Vq_2, 
+    const float* __restrict__ Vs_2, 
+    float*       __restrict__ Y_r_, 
+    int B, int H, int I, int J, int K, int D,
+    float scale);
+
+__global__ void scatter_dim2_kernel(
+    const float* __restrict__ Q,
+    const float* __restrict__ R,
+    const float* __restrict__ S,
+    const float* __restrict__ Vq_2, 
+    const float* __restrict__ Vr_2, 
+    float*       __restrict__ Y_s_, 
+    int B, int H, int I, int J, int K, int D,
+    float scale);
+
 // Minimal backward function that returns zero gradients[placeholder]
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
           torch::Tensor, torch::Tensor,
@@ -303,6 +334,269 @@ __global__ void gather_dim2_kernel(
     Y[idx] = y_val;
 }
 
+// --- Helper functions for Scatter Kernels ---
+
+// Device helper: Compute dot product Q[i]*R[j]*S[k] for specific indices
+__device__ inline float compute_dot_product_cuda(
+    const float* __restrict__ Q, 
+    const float* __restrict__ R, 
+    const float* __restrict__ S,
+    int b, int h, int i, int j, int k, 
+    int B, int H, int I, int J, int K, int D)
+{
+    // Calculate base pointers using passed dimensions
+    const float* q_vec = Q + (((int64_t)b * H + h) * I + i) * D;
+    const float* r_vec = R + (((int64_t)b * H + h) * J + j) * D;
+    const float* s_vec = S + (((int64_t)b * H + h) * K + k) * D;
+
+    float dot = 0.0f;
+    #pragma unroll 4
+    for (int d = 0; d < D; ++d) {
+        dot += q_vec[d] * r_vec[d] * s_vec[d];
+    }
+    return dot;
+}
+
+// Device helper: Compute single softmax attention value Ar[i,j,k] (fixed_dim=1) or As[i,j,k] (fixed_dim=2)
+__device__ inline float compute_single_softmax_attn_cuda(
+    const float* __restrict__ Q, 
+    const float* __restrict__ R, 
+    const float* __restrict__ S,
+    int b, int h, int i_target, int j_target, int k_target,
+    int B, int H, int I, int J, int K, int D,
+    float scale,
+    int fixed_dim // 1 for Ar (softmax over i, k for fixed j), 2 for As (softmax over i, j for fixed k)
+)
+{
+    float max_val = -1.0e30f;
+    float sum_exp = 0.0f;
+
+    // --- First Pass: Find Max --- 
+    if (fixed_dim == 0) { // Aq: Softmax over j, k for fixed i_target
+        for (int j = 0; j < J; ++j) {
+            for (int k = 0; k < K; ++k) {
+                float dot = compute_dot_product_cuda(Q, R, S, b, h, i_target, j, k, B, H, I, J, K, D);
+                max_val = fmaxf(max_val, dot * scale);
+            }
+        }
+    }
+    else if (fixed_dim == 1) { // Ar: Softmax over i, k for fixed j_target
+        for (int i = 0; i < I; ++i) {
+            for (int k = 0; k < K; ++k) {
+                // Pass B, H, I, J, K, D to the dot product function
+                float dot = compute_dot_product_cuda(Q, R, S, b, h, i, j_target, k, B, H, I, J, K, D);
+                max_val = fmaxf(max_val, dot * scale);
+            }
+        }
+    } else { // fixed_dim == 2: As: Softmax over i, j for fixed k_target
+        for (int i = 0; i < I; ++i) {
+            for (int j = 0; j < J; ++j) {
+                // Pass B, H, I, J, K, D to the dot product function
+                float dot = compute_dot_product_cuda(Q, R, S, b, h, i, j, k_target, B, H, I, J, K, D);
+                max_val = fmaxf(max_val, dot * scale);
+            }
+        }
+    }
+
+    // --- Second Pass: Compute Sum Exp ---
+    if (fixed_dim == 0) { // Aq
+        for (int j = 0; j < J; ++j) {
+            for (int k = 0; k < K; ++k) {
+                float dot = compute_dot_product_cuda(Q, R, S, b, h, i_target, j, k, B, H, I, J, K, D);
+                sum_exp += expf(dot * scale - max_val);
+            }
+        }
+    }
+    else if (fixed_dim == 1) { // Ar
+        for (int i = 0; i < I; ++i) {
+            for (int k = 0; k < K; ++k) {
+                // Pass B, H, I, J, K, D to the dot product function
+                float dot = compute_dot_product_cuda(Q, R, S, b, h, i, j_target, k, B, H, I, J, K, D);
+                sum_exp += expf(dot * scale - max_val);
+            }
+        }
+    } else { // As
+        for (int i = 0; i < I; ++i) {
+            for (int j = 0; j < J; ++j) {
+                // Pass B, H, I, J, K, D to the dot product function
+                float dot = compute_dot_product_cuda(Q, R, S, b, h, i, j, k_target, B, H, I, J, K, D);
+                sum_exp += expf(dot * scale - max_val);
+            }
+        }
+    }
+
+    // --- Compute final value for the target indices ---
+    // Pass B, H, I, J, K, D to the dot product function
+    float target_dot = compute_dot_product_cuda(Q, R, S, b, h, i_target, j_target, k_target, B, H, I, J, K, D);
+    
+    // Handle potential division by zero if sum_exp is very small
+    if (sum_exp <= 1e-20f) { 
+        int num_elements;
+        if (fixed_dim == 0) num_elements = J * K;
+        else if (fixed_dim == 1) num_elements = I * K;
+        else /* fixed_dim == 2 */ num_elements = I * J;
+        // If the target dot was also the max (or close), return uniform prob, else 0.
+        // This is a simple heuristic; more robust handling might be needed.
+        return (fabsf(target_dot * scale - max_val) < 1e-5f) ? (1.0f / (float)num_elements) : 0.0f;
+    }
+    
+    return expf(target_dot * scale - max_val) / sum_exp;
+}
+
+// Scatter for fixed_dim = 0 (Output Y_q_)
+// Corresponds to compute_Y_scatter_q in C++
+__global__ void scatter_dim0_kernel(
+    const float* __restrict__ Q,
+    const float* __restrict__ R,
+    const float* __restrict__ S,
+    const float* __restrict__ Vr_2, // Input Value Tensor 1
+    const float* __restrict__ Vs_2, // Input Value Tensor 2
+    float*       __restrict__ Y_q_, // Output Tensor
+    int B, int H, int I, int J, int K, int D,
+    float scale)
+{
+    // global thread index [0 .. B*H*I*D)
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (int64_t)B*H*I*D) return;
+
+    // decode (b,h,i,d) from idx - this thread computes Y_q_[b,h,i,d]
+    int d = idx % D;
+    int tmp = idx / D;
+    int i = tmp % I;
+    tmp = tmp / I;
+    int h = tmp % H;
+    int b = tmp / H;
+
+    float accum_val = 0.0f;
+
+    // Iterate over the dimensions we sum over (j and k)
+    for (int j = 0; j < J; ++j) {
+        const float* vr2_vec = Vr_2 + (((int64_t)b * H + h) * J + j) * D;
+        for (int k = 0; k < K; ++k) {
+            const float* vs2_vec = Vs_2 + (((int64_t)b * H + h) * K + k) * D;
+
+            // Compute Ar[b,h,i,j,k] (softmax over i',k' for fixed j)
+            float attn_ar = compute_single_softmax_attn_cuda(Q, R, S, b, h, i, j, k, B, H, I, J, K, D, scale, 1);
+            
+            // Compute As[b,h,i,j,k] (softmax over i',j' for fixed k)
+            float attn_as = compute_single_softmax_attn_cuda(Q, R, S, b, h, i, j, k, B, H, I, J, K, D, scale, 2);
+
+            // Get value components for the specific d
+            float vr2_val = vr2_vec[d];
+            float vs2_val = vs2_vec[d];
+
+            // Accumulate: Ar * As * Vr_2 * Vs_2
+            accum_val += attn_ar * attn_as * vr2_val * vs2_val;
+        }
+    }
+
+    // Write the final accumulated value to the output tensor Y_q_
+    // Note: This is an assignment, not addition. Assumes Y_q_ is initialized to zero.
+    Y_q_[idx] = accum_val;
+}
+
+// Scatter for fixed_dim = 1 (Output Y_r_)
+// Corresponds to compute_Y_scatter_r in C++
+__global__ void scatter_dim1_kernel(
+    const float* __restrict__ Q,
+    const float* __restrict__ R,
+    const float* __restrict__ S,
+    const float* __restrict__ Vq_2, // Input Value Tensor 1
+    const float* __restrict__ Vs_2, // Input Value Tensor 2
+    float*       __restrict__ Y_r_, // Output Tensor
+    int B, int H, int I, int J, int K, int D,
+    float scale)
+{
+    // global thread index [0 .. B*H*J*D) 
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (int64_t)B*H*J*D) return;
+
+    // decode (b,h,j,d) from idx - this thread computes Y_r_[b,h,j,d]
+    int d = idx % D;
+    int tmp = idx / D;
+    int j = tmp % J; // Fixed index for this output element
+    tmp = tmp / J;
+    int h = tmp % H;
+    int b = tmp / H;
+
+    float accum_val = 0.0f;
+
+    // Iterate over the dimensions we sum over (i and k)
+    for (int i = 0; i < I; ++i) {
+        const float* vq2_vec = Vq_2 + (((int64_t)b * H + h) * I + i) * D;
+        for (int k = 0; k < K; ++k) {
+            const float* vs2_vec = Vs_2 + (((int64_t)b * H + h) * K + k) * D;
+
+            // Compute Aq[b,h,i,j,k] (softmax over j',k' for fixed i)
+            float attn_aq = compute_single_softmax_attn_cuda(Q, R, S, b, h, i, j, k, B, H, I, J, K, D, scale, 0); 
+            
+            // Compute As[b,h,i,j,k] (softmax over i',j' for fixed k)
+            float attn_as = compute_single_softmax_attn_cuda(Q, R, S, b, h, i, j, k, B, H, I, J, K, D, scale, 2);
+
+            // Get value components for the specific d
+            float vq2_val = vq2_vec[d];
+            float vs2_val = vs2_vec[d];
+
+            // Accumulate: Aq * As * Vq_2 * Vs_2
+            accum_val += attn_aq * attn_as * vq2_val * vs2_val;
+        }
+    }
+
+    // Write the final accumulated value to the output tensor Y_r_
+    Y_r_[idx] = accum_val;
+}
+
+// Scatter for fixed_dim = 2 (Output Y_s_)
+// Corresponds to compute_Y_scatter_s in C++
+__global__ void scatter_dim2_kernel(
+    const float* __restrict__ Q,
+    const float* __restrict__ R,
+    const float* __restrict__ S,
+    const float* __restrict__ Vq_2, // Input Value Tensor 1
+    const float* __restrict__ Vr_2, // Input Value Tensor 2
+    float*       __restrict__ Y_s_, // Output Tensor
+    int B, int H, int I, int J, int K, int D,
+    float scale)
+{
+    // global thread index [0 .. B*H*K*D)
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (int64_t)B*H*K*D) return;
+
+    // decode (b,h,k,d) from idx - this thread computes Y_s_[b,h,k,d]
+    int d = idx % D;
+    int tmp = idx / D;
+    int k = tmp % K; // Fixed index for this output element
+    tmp = tmp / K;
+    int h = tmp % H;
+    int b = tmp / H;
+
+    float accum_val = 0.0f;
+
+    // Iterate over the dimensions we sum over (i and j)
+    for (int i = 0; i < I; ++i) {
+        const float* vq2_vec = Vq_2 + (((int64_t)b * H + h) * I + i) * D;
+        for (int j = 0; j < J; ++j) {
+            const float* vr2_vec = Vr_2 + (((int64_t)b * H + h) * J + j) * D;
+
+            // Compute Aq[b,h,i,j,k] (softmax over j',k' for fixed i)
+            float attn_aq = compute_single_softmax_attn_cuda(Q, R, S, b, h, i, j, k, B, H, I, J, K, D, scale, 0); 
+            
+            // Compute Ar[b,h,i,j,k] (softmax over i',k' for fixed j)
+            float attn_ar = compute_single_softmax_attn_cuda(Q, R, S, b, h, i, j, k, B, H, I, J, K, D, scale, 1);
+
+            // Get value components for the specific d
+            float vq2_val = vq2_vec[d];
+            float vr2_val = vr2_vec[d];
+
+            // Accumulate: Aq * Ar * Vq_2 * Vr_2
+            accum_val += attn_aq * attn_ar * vq2_val * vr2_val;
+        }
+    }
+
+    // Write the final accumulated value to the output tensor Y_s_
+    Y_s_[idx] = accum_val;
+}
+
 // the CUDA entry‐point for forward pass
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> forward_cuda(
     at::Tensor Q, at::Tensor R, at::Tensor S,
@@ -330,60 +624,82 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
 
     const float scale = 1.0f / std::sqrt((float)D);
 
-    // 3. allocate outputs on GPU
+    // allocate outputs on GPU
     auto opts = Q.options();
     auto Y_q  = torch::zeros({B,H,I,D}, opts);
     auto Y_r  = torch::zeros({B,H,J,D}, opts);
     auto Y_s  = torch::zeros({B,H,K,D}, opts);
-    auto Y_q_ = torch::zeros({B,H,I,D}, opts);
+    auto Y_q_ = torch::zeros({B,H,I,D}, opts); // Allocate output for scatter
     auto Y_r_ = torch::zeros({B,H,J,D}, opts);
     auto Y_s_ = torch::zeros({B,H,K,D}, opts);
 
     const int threads = 256;
 
-    // GATHER Calls
-    // dim=0: Output Y_q[B,H,I,D], iterate j,k. Inputs: Q,R,S, Vr_1, Vs_1
+    // --- GATHER Calls --- 
+    // dim=0
     {
         const int64_t N = (int64_t)B*H*I*D;
         const dim3 blocks((N + threads - 1) / threads);
         gather_dim0_kernel<<<blocks, threads>>>(
             Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
-            Vr_1.data_ptr<float>(), Vs_1.data_ptr<float>(),
-            Y_q.data_ptr<float>(),
+            Vr_1.data_ptr<float>(), Vs_1.data_ptr<float>(), // Values Vr_1, Vs_1
+            Y_q.data_ptr<float>(), // Output Y_q
             B, H, I, J, K, D, scale);
     }
-
-    // dim=1: Output Y_r[B,H,J,D], iterate i,k. Inputs: R,Q,S, Vq_1, Vs_1
+    // dim=1
     {
         const int64_t N = (int64_t)B*H*J*D;
         const dim3 blocks((N + threads - 1) / threads);
         gather_dim1_kernel<<<blocks, threads>>>(
-            R.data_ptr<float>(), Q.data_ptr<float>(), S.data_ptr<float>(),
-            Vq_1.data_ptr<float>(), Vs_1.data_ptr<float>(),
-            Y_r.data_ptr<float>(),
+            R.data_ptr<float>(), Q.data_ptr<float>(), S.data_ptr<float>(), // Query R
+            Vq_1.data_ptr<float>(), Vs_1.data_ptr<float>(), // Values Vq_1, Vs_1
+            Y_r.data_ptr<float>(), // Output Y_r
             B, H, I, J, K, D, scale);
     }
-
-    // dim=2: Output Y_s[B,H,K,D], iterate i,j. Inputs: S,Q,R, Vq_1, Vr_1
+    // dim=2
     {
         const int64_t N = (int64_t)B*H*K*D;
         const dim3 blocks((N + threads - 1) / threads);
         gather_dim2_kernel<<<blocks, threads>>>(
-            S.data_ptr<float>(), Q.data_ptr<float>(), R.data_ptr<float>(),
-            Vq_1.data_ptr<float>(), Vr_1.data_ptr<float>(),
-            Y_s.data_ptr<float>(),
+            S.data_ptr<float>(), Q.data_ptr<float>(), R.data_ptr<float>(), // Query S
+            Vq_1.data_ptr<float>(), Vr_1.data_ptr<float>(), // Values Vq_1, Vr_1
+            Y_s.data_ptr<float>(), // Output Y_s
             B, H, I, J, K, D, scale);
     }
 
+    // --- SCATTER Calls --- 
+    // dim=0: Output Y_q_[B,H,I,D]. Inputs: Q,R,S, Vr_2, Vs_2
+    {
+        const int64_t N = (int64_t)B*H*I*D;
+        const dim3 blocks((N + threads - 1) / threads);
+        scatter_dim0_kernel<<<blocks, threads>>>(
+            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
+            Vr_2.data_ptr<float>(), Vs_2.data_ptr<float>(), // Values Vr_2, Vs_2
+            Y_q_.data_ptr<float>(), // Output Y_q_
+            B, H, I, J, K, D, scale);
+    }
+    // dim=1: Output Y_r_[B,H,J,D]. Inputs: Q,R,S, Vq_2, Vs_2
+    {
+        const int64_t N = (int64_t)B*H*J*D;
+        const dim3 blocks((N + threads - 1) / threads);
+        scatter_dim1_kernel<<<blocks, threads>>>(
+            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
+            Vq_2.data_ptr<float>(), Vs_2.data_ptr<float>(), // Values Vq_2, Vs_2
+            Y_r_.data_ptr<float>(), // Output Y_r_
+            B, H, I, J, K, D, scale);
+    }
+    // dim=2: Output Y_s_[B,H,K,D]. Inputs: Q,R,S, Vq_2, Vr_2
+    {
+        const int64_t N = (int64_t)B*H*K*D;
+        const dim3 blocks((N + threads - 1) / threads);
+        scatter_dim2_kernel<<<blocks, threads>>>(
+            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
+            Vq_2.data_ptr<float>(), Vr_2.data_ptr<float>(), // Values Vq_2, Vr_2
+            Y_s_.data_ptr<float>(), // Output Y_s_
+            B, H, I, J, K, D, scale);
+    }
 
-    cudaDeviceSynchronize(); // Wait for all gather kernels to complete
-
-
-    // TODO: Implement SCATTER kernels (Y_q_, Y_r_, Y_s_)
-
-    // TODO: Combine outputs (Placeholder - needs scatter results)
-    // Remove the erroneous return statement
-    // return Y_q; 
+    cudaDeviceSynchronize(); // Wait for all kernels to complete
     
     // Return the tuple of all intermediate tensors
     return std::make_tuple(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_);
