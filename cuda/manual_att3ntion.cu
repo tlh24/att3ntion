@@ -77,6 +77,30 @@ __global__ void gather_grad_Vq1_kernel(
     int B, int H, int I, int J, int K, int D, int N_grad, // Added N_grad for gradY indexing
     float scale);
 
+// Forward declaration for backward Vr1 kernel
+__global__ void gather_grad_Vr1_kernel(
+    const float* __restrict__ gradY,
+    const float* __restrict__ Q,
+    const float* __restrict__ R,
+    const float* __restrict__ S,
+    const float* __restrict__ Vq_1, // Needed for Y_s path
+    const float* __restrict__ Vs_1, // Needed for Y_q path
+    float*       __restrict__ gradVr1,
+    int B, int H, int I, int J, int K, int D, int N_grad,
+    float scale);
+
+// Forward declaration for backward Vs1 kernel
+__global__ void gather_grad_Vs1_kernel(
+    const float* __restrict__ gradY,
+    const float* __restrict__ Q,
+    const float* __restrict__ R,
+    const float* __restrict__ S,
+    const float* __restrict__ Vq_1, // Needed for Y_r path
+    const float* __restrict__ Vr_1, // Needed for Y_q path
+    float*       __restrict__ gradVs1,
+    int B, int H, int I, int J, int K, int D, int N_grad,
+    float scale);
+
 // Minimal backward function that returns zero gradients[placeholder]
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
           torch::Tensor, torch::Tensor,
@@ -144,11 +168,41 @@ backward_cuda(
         B, H, I, J, K, D, N_grad, scale); // Pass dimensions and scale
   }
 
-  // TODO: Implement and launch kernels for other gradients (grad_R, grad_S, etc.)
+  // Launch kernel for grad_Vr_1 [B, H, J, D]
+  {
+    const int64_t N_kernel = (int64_t)B * H * J * D; 
+    const dim3 blocks((N_kernel + threads - 1) / threads);
+    gather_grad_Vr1_kernel<<<blocks, threads>>>(
+        grad_output.data_ptr<float>(), 
+        Q.data_ptr<float>(),
+        R.data_ptr<float>(),
+        S.data_ptr<float>(),
+        Vq_1.data_ptr<float>(),        // Needed for Y_s path
+        Vs_1.data_ptr<float>(),        // Needed for Y_q path
+        grad_Vr_1.data_ptr<float>(),   // Output gradient
+        B, H, I, J, K, D, N_grad, scale); 
+  }
+
+  // Launch kernel for grad_Vs_1 [B, H, K, D]
+  {
+      const int64_t N_kernel = (int64_t)B * H * K * D;
+      const dim3 blocks((N_kernel + threads - 1) / threads);
+      gather_grad_Vs1_kernel<<<blocks, threads>>>(
+          grad_output.data_ptr<float>(),
+          Q.data_ptr<float>(),
+          R.data_ptr<float>(),
+          S.data_ptr<float>(),
+          Vq_1.data_ptr<float>(),        // Needed for Y_r path
+          Vr_1.data_ptr<float>(),        // Needed for Y_q path
+          grad_Vs_1.data_ptr<float>(),   // Output gradient
+          B, H, I, J, K, D, N_grad, scale);
+  }
+
+  // TODO: Implement and launch kernels for other gradients (grad_Vq_2, grad_Vr_2, grad_Vs_2, grad_Q, grad_R, grad_S)
   
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
-    fprintf(stderr, "CUDA error in backward_cuda after grad_Vq1 kernel: %s\\n", cudaGetErrorString(err));
+    fprintf(stderr, "CUDA error after backward kernel launch: %s\n", cudaGetErrorString(err));
     // Optionally throw an exception or handle the error
   }
   
@@ -748,110 +802,155 @@ __global__ void gather_grad_Vq1_kernel(
     gradVq1[idx] = grad_accum;
 }
 
-// the CUDA entry‐point for forward pass
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> forward_cuda(
-    at::Tensor Q, at::Tensor R, at::Tensor S,
-    at::Tensor Vq_1, at::Tensor Vq_2,
-    at::Tensor Vr_1, at::Tensor Vr_2,
-    at::Tensor Vs_1, at::Tensor Vs_2,
-    double dropout_rate) 
+// Kernel to compute gradient for Vr_1
+// Mirrors the logic of compute_grad_Vr_1 in the C++ version
+__global__ void gather_grad_Vr1_kernel(
+    const float* __restrict__ gradY, // Combined gradient [B, H, N_grad, D]
+    const float* __restrict__ Q,     // [B,H,I,D]
+    const float* __restrict__ R,     // [B,H,J,D]
+    const float* __restrict__ S,     // [B,H,K,D]
+    const float* __restrict__ Vq_1,  // [B,H,I,D]
+    // Vr_1 is what we are calculating the grad for
+    const float* __restrict__ Vs_1,  // [B,H,K,D]
+    float*       __restrict__ gradVr1, // [B,H,J,D] Output
+    int B, int H, int I, int J, int K, int D, int N_grad,
+    float scale)
 {
-    Q = Q.contiguous();  
-    R = R.contiguous();  
-    S = S.contiguous();
-    Vq_1 = Vq_1.contiguous();
-    Vq_2 = Vq_2.contiguous();
-    Vr_1 = Vr_1.contiguous();
-    Vr_2 = Vr_2.contiguous();
-    Vs_1 = Vs_1.contiguous();
-    Vs_2 = Vs_2.contiguous();
+    // global thread index maps to [B,H,J,D]
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (int64_t)B*H*J*D) return;
 
-    const auto B = Q.size(0);
-    const auto H = Q.size(1);
-    const auto I = Q.size(2);
-    const auto J = R.size(2);
-    const auto K = S.size(2);
-    const auto D = Q.size(3);
+    // decode (b,h,j,d) - This thread calculates gradVr1[b,h,j,d]
+    int d = idx % D;
+    int tmp = idx / D;
+    int j_target = tmp % J; // This is the target 'j' for the gradient
+    tmp = tmp / J;
+    int h = tmp % H;
+    int b = tmp / H;
 
-    const float scale = 1.0f / std::sqrt((float)D);
+    float grad_accum = 0.0f;
 
-    // allocate outputs on GPU
-    auto opts = Q.options();
-    auto Y_q  = torch::zeros({B,H,I,D}, opts);
-    auto Y_r  = torch::zeros({B,H,J,D}, opts);
-    auto Y_s  = torch::zeros({B,H,K,D}, opts);
-    auto Y_q_ = torch::zeros({B,H,I,D}, opts); // Allocate output for scatter
-    auto Y_r_ = torch::zeros({B,H,J,D}, opts);
-    auto Y_s_ = torch::zeros({B,H,K,D}, opts);
+    // Base offset for gradY for the current (b, h)
+    int64_t gradY_offset_bh = ((int64_t)b * H + h) * N_grad * D;
 
-    const int threads = 256;
+    // --- 1. Contribution from Y_q path (dL/dY_q) ---
+    // dL/dVr_1[j] += sum_{i} [ dL/dY_q[i] * sum_{k} ( Aq[i,j,k] * Vs_1[k] ) ]
+    for (int i = 0; i < I; ++i) { // Loop over the source gradient index 'i' from Y_q
+        if (i >= N_grad) continue;
+        float dy_q = gradY[gradY_offset_bh + (int64_t)i * D + d];
 
-    // --- GATHER Calls --- 
-    // dim=0
-    {
-        const int64_t N = (int64_t)B*H*I*D;
-        const dim3 blocks((N + threads - 1) / threads);
-        gather_dim0_kernel<<<blocks, threads>>>(
-            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
-            Vr_1.data_ptr<float>(), Vs_1.data_ptr<float>(), // Values Vr_1, Vs_1
-            Y_q.data_ptr<float>(), // Output Y_q
-            B, H, I, J, K, D, scale);
-    }
-    // dim=1
-    {
-        const int64_t N = (int64_t)B*H*J*D;
-        const dim3 blocks((N + threads - 1) / threads);
-        gather_dim1_kernel<<<blocks, threads>>>(
-            R.data_ptr<float>(), Q.data_ptr<float>(), S.data_ptr<float>(), // Query R
-            Vq_1.data_ptr<float>(), Vs_1.data_ptr<float>(), // Values Vq_1, Vs_1
-            Y_r.data_ptr<float>(), // Output Y_r
-            B, H, I, J, K, D, scale);
-    }
-    // dim=2
-    {
-        const int64_t N = (int64_t)B*H*K*D;
-        const dim3 blocks((N + threads - 1) / threads);
-        gather_dim2_kernel<<<blocks, threads>>>(
-            S.data_ptr<float>(), Q.data_ptr<float>(), R.data_ptr<float>(), // Query S
-            Vq_1.data_ptr<float>(), Vr_1.data_ptr<float>(), // Values Vq_1, Vr_1
-            Y_s.data_ptr<float>(), // Output Y_s
-            B, H, I, J, K, D, scale);
+        if (dy_q != 0.0f) {
+            float term1_sum_k = 0.0f;
+            for (int k = 0; k < K; ++k) {
+                // Calculate Aq[b,h,i,j_target,k] (softmax over j', k' for fixed i)
+                float attn_aq = compute_single_softmax_attn_cuda(Q, R, S, b, h, i, j_target, k, B, H, I, J, K, D, scale, 0);
+                // Get Vs_1[b,h,k,d]
+                const float* vs1_vec = Vs_1 + (((int64_t)b * H + h) * K + k) * D;
+                float vs1_val = vs1_vec[d];
+                term1_sum_k += attn_aq * vs1_val;
+            }
+            grad_accum += dy_q * term1_sum_k;
+        }
     }
 
-    // --- SCATTER Calls --- 
-    // dim=0: Output Y_q_[B,H,I,D]. Inputs: Q,R,S, Vr_2, Vs_2
-    {
-        const int64_t N = (int64_t)B*H*I*D;
-        const dim3 blocks((N + threads - 1) / threads);
-        scatter_dim0_kernel<<<blocks, threads>>>(
-            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
-            Vr_2.data_ptr<float>(), Vs_2.data_ptr<float>(), // Values Vr_2, Vs_2
-            Y_q_.data_ptr<float>(), // Output Y_q_
-            B, H, I, J, K, D, scale);
-    }
-    // dim=1: Output Y_r_[B,H,J,D]. Inputs: Q,R,S, Vq_2, Vs_2
-    {
-        const int64_t N = (int64_t)B*H*J*D;
-        const dim3 blocks((N + threads - 1) / threads);
-        scatter_dim1_kernel<<<blocks, threads>>>(
-            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
-            Vq_2.data_ptr<float>(), Vs_2.data_ptr<float>(), // Values Vq_2, Vs_2
-            Y_r_.data_ptr<float>(), // Output Y_r_
-            B, H, I, J, K, D, scale);
-    }
-    // dim=2: Output Y_s_[B,H,K,D]. Inputs: Q,R,S, Vq_2, Vr_2
-    {
-        const int64_t N = (int64_t)B*H*K*D;
-        const dim3 blocks((N + threads - 1) / threads);
-        scatter_dim2_kernel<<<blocks, threads>>>(
-            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
-            Vq_2.data_ptr<float>(), Vr_2.data_ptr<float>(), // Values Vq_2, Vr_2
-            Y_s_.data_ptr<float>(), // Output Y_s_
-            B, H, I, J, K, D, scale);
+    // --- 2. Contribution from Y_s path (dL/dY_s) ---
+    // dL/dVr_1[j] += sum_{k} [ dL/dY_s[k] * sum_{i} ( As[i,j,k] * Vq_1[i] ) ]
+    for (int k = 0; k < K; ++k) { // Loop over the source gradient index 'k' from Y_s
+        if (k >= N_grad) continue;
+        float dy_s = gradY[gradY_offset_bh + (int64_t)k * D + d];
+
+        if (dy_s != 0.0f) {
+            float term2_sum_i = 0.0f;
+            for (int i = 0; i < I; ++i) {
+                // Calculate As[b,h,i,j_target,k] (softmax over i', j' for fixed k)
+                float attn_as = compute_single_softmax_attn_cuda(Q, R, S, b, h, i, j_target, k, B, H, I, J, K, D, scale, 2);
+                // Get Vq_1[b,h,i,d]
+                const float* vq1_vec = Vq_1 + (((int64_t)b * H + h) * I + i) * D;
+                float vq1_val = vq1_vec[d];
+                term2_sum_i += attn_as * vq1_val;
+            }
+            grad_accum += dy_s * term2_sum_i;
+        }
     }
 
-    cudaDeviceSynchronize(); // Wait for all kernels to complete
-    
-    // Return the tuple of all intermediate tensors
-    return std::make_tuple(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_);
+    gradVr1[idx] = grad_accum;
 }
+
+// Kernel to compute gradient for Vs_1
+// Mirrors the logic of compute_grad_Vs_1 in the C++ version
+__global__ void gather_grad_Vs1_kernel(
+    const float* __restrict__ gradY, // Combined gradient [B, H, N_grad, D]
+    const float* __restrict__ Q,     // [B,H,I,D]
+    const float* __restrict__ R,     // [B,H,J,D]
+    const float* __restrict__ S,     // [B,H,K,D]
+    const float* __restrict__ Vq_1,  // [B,H,I,D]
+    const float* __restrict__ Vr_1,  // [B,H,J,D]
+    // Vs_1 is what we are calculating the grad for
+    float*       __restrict__ gradVs1, // [B,H,K,D] Output
+    int B, int H, int I, int J, int K, int D, int N_grad,
+    float scale)
+{
+    // global thread index maps to [B,H,K,D]
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (int64_t)B*H*K*D) return;
+
+    // decode (b,h,k,d) - This thread calculates gradVs1[b,h,k,d]
+    int d = idx % D;
+    int tmp = idx / D;
+    int k_target = tmp % K; // This is the target 'k' for the gradient
+    tmp = tmp / K;
+    int h = tmp % H;
+    int b = tmp / H;
+
+    float grad_accum = 0.0f;
+
+    // Base offset for gradY for the current (b, h)
+    int64_t gradY_offset_bh = ((int64_t)b * H + h) * N_grad * D;
+
+    // --- 1. Contribution from Y_q path (dL/dY_q) ---
+    // dL/dVs_1[k] += sum_{i} [ dL/dY_q[i] * sum_{j} ( Aq[i,j,k] * Vr_1[j] ) ]
+    for (int i = 0; i < I; ++i) { // Loop over the source gradient index 'i' from Y_q
+        if (i >= N_grad) continue;
+        float dy_q = gradY[gradY_offset_bh + (int64_t)i * D + d];
+
+        if (dy_q != 0.0f) {
+            float term1_sum_j = 0.0f;
+            for (int j = 0; j < J; ++j) {
+                // Calculate Aq[b,h,i,j,k_target] (softmax over j', k' for fixed i)
+                float attn_aq = compute_single_softmax_attn_cuda(Q, R, S, b, h, i, j, k_target, B, H, I, J, K, D, scale, 0);
+                // Get Vr_1[b,h,j,d]
+                const float* vr1_vec = Vr_1 + (((int64_t)b * H + h) * J + j) * D;
+                float vr1_val = vr1_vec[d];
+                term1_sum_j += attn_aq * vr1_val;
+            }
+            grad_accum += dy_q * term1_sum_j;
+        }
+    }
+
+    // --- 2. Contribution from Y_r path (dL/dY_r) ---
+    // dL/dVs_1[k] += sum_{j} [ dL/dY_r[j] * sum_{i} ( Ar[i,j,k] * Vq_1[i] ) ]
+    for (int j = 0; j < J; ++j) { // Loop over the source gradient index 'j' from Y_r
+        if (j >= N_grad) continue;
+        float dy_r = gradY[gradY_offset_bh + (int64_t)j * D + d];
+
+        if (dy_r != 0.0f) {
+            float term2_sum_i = 0.0f;
+            for (int i = 0; i < I; ++i) {
+                // Calculate Ar[b,h,i,j,k_target] (softmax over i', k' for fixed j)
+                float attn_ar = compute_single_softmax_attn_cuda(Q, R, S, b, h, i, j, k_target, B, H, I, J, K, D, scale, 1);
+                // Get Vq_1[b,h,i,d]
+                const float* vq1_vec = Vq_1 + (((int64_t)b * H + h) * I + i) * D;
+                float vq1_val = vq1_vec[d];
+                term2_sum_i += attn_ar * vq1_val;
+            }
+            grad_accum += dy_r * term2_sum_i;
+        }
+    }
+
+    gradVs1[idx] = grad_accum;
+}
+
+
+// Scatter for fixed_dim = 0 (Output Y_q_)
+// Corresponds to compute_Y_scatter_q in C++
+__global__ void scatter_dim0_kernel(

@@ -144,25 +144,29 @@ def benchmark_comparison(configs, num_runs=5, device_cpu='cpu', device_cuda='cud
 
                 # Compare Backward Pass (Manual CPU vs Manual CUDA)
                 if manual_cuda_grads is not None:
-                    print("Comparing Manual CPU vs Manual CUDA Backward (grad_Vq_1 only)...")
-                    # Temporarily only compare grad_Vq_1 (index 3)
-                    cpu_grad = manual_cpu_grads[3]
-                    cuda_grad = manual_cuda_grads[3]
+                    print("Comparing Manual CPU vs Manual CUDA Backward (Implemented Kernels Only)...")
+                    # Indices of gradients with implemented CUDA kernels
+                    implemented_indices = [3, 5, 7] # Vq_1, Vr_1, Vs_1
                     
-                    if cpu_grad is None and cuda_grad is None:
-                        print("  Both grad_Vq_1 are None? Skipping comparison.") 
-                        # cuda_bwd_match remains True
-                    elif cpu_grad is None or cuda_grad is None:
-                        cuda_bwd_match = False
-                        print("  Mismatch: grad_Vq_1 is None in one implementation but not the other.")
-                    else:
+                    for i in implemented_indices:
+                        cpu_grad = manual_cpu_grads[i]
+                        cuda_grad = manual_cuda_grads[i]
+
+                        if cpu_grad is None or cuda_grad is None:
+                            # This case should ideally not happen if allocation is correct
+                            cuda_bwd_match = False
+                            print(f"  Mismatch: Grad {i} is None in one implementation.")
+                            break # Stop comparison if one is None
+                        
                         cuda_grad_cpu = cuda_grad.cpu()
                         if not torch.allclose(cpu_grad, cuda_grad_cpu, rtol=1e-4, atol=1e-4):
                             cuda_bwd_match = False
-                            max_diff_bwd = torch.max(torch.abs(cpu_grad - cuda_grad_cpu)).item()
-                            print(f"  Mismatch found in grad_Vq_1 (index 3)")
-                    
-                    # Original loop commented out:
+                            this_diff = torch.max(torch.abs(cpu_grad - cuda_grad_cpu)).item()
+                            max_diff_bwd = max(max_diff_bwd, this_diff)
+                            print(f"  Mismatch found in implemented backward gradient tensor {i}")
+                            # No need to break here, we might want to see all implemented mismatches
+
+                    # Original full comparison loop commented out:
                     # for i, (cpu_grad, cuda_grad) in enumerate(zip(manual_cpu_grads, manual_cuda_grads)):
                     #     if cpu_grad is None and cuda_grad is None: continue
                     #     if cpu_grad is None or cuda_grad is None:
@@ -176,7 +180,7 @@ def benchmark_comparison(configs, num_runs=5, device_cpu='cpu', device_cuda='cud
                     #         this_diff = torch.max(torch.abs(cpu_grad - cuda_grad_cpu)).item()
                     #         max_diff_bwd = max(max_diff_bwd, this_diff)
                     #         print(f"  Mismatch found in backward gradient tensor {i}")
-                    print(f"Manual CPU vs CUDA Backward (grad_Vq_1 only): {'MATCH' if cuda_bwd_match else f'DIFFER (max diff: {max_diff_bwd:.6f})'}")
+                    print(f"Manual CPU vs CUDA Backward (Implemented Kernels Only): {'MATCH' if cuda_bwd_match else f'DIFFER (max diff: {max_diff_bwd:.6f})'}")
 
 
         # Record results
