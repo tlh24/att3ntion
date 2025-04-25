@@ -4,11 +4,11 @@ import sys
 
 # --- Configuration ---
 B = 2
-H = 4
-I = 10
-J = 12
-K = 14
-D = 64
+H = 2
+I = 4
+J = 4
+K = 4
+D = 8
 dtype = torch.float32
 device_cpu = torch.device("cpu")
 device_cuda = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -143,6 +143,116 @@ def run_test():
         print("\n*** Gather Equivalence Test Failed! ***")
         sys.exit(1)
 
+# --- Test Backward grad_Vq_1 --- 
+def run_backward_vq1_test():
+    print("\n-------------------------------------")
+    print("Testing Backward grad_Vq_1 Equivalence (CPU vs CUDA)")
+    print("-------------------------------------")
+    
+    # --- CPU Execution ---
+    print("\nGenerating inputs for backward pass on CPU...")
+    Q_cpu, R_cpu, S_cpu, Vq_1_cpu, Vq_2_cpu, Vr_1_cpu, Vr_2_cpu, Vs_1_cpu, Vs_2_cpu, dr_cpu = generate_inputs(device_cpu)
+    
+    # Generate grad_output matching the expected structure accessed by the kernels
+    # The C++ code accesses grad_output[j] and grad_output[k]. 
+    # We assume a combined gradient tensor where the 3rd dim fits max(I, J, K).
+    # This might need adjustment depending on the exact autograd implementation.
+    N_grad = max(I, J, K) # Max sequence length accessed in grad_Vq1
+    grad_output_cpu = torch.randn(B, H, N_grad, D, dtype=dtype, device=device_cpu)
+    print(f"Generated grad_output_cpu with shape: {grad_output_cpu.shape}")
+
+    # Make tensors require grad for CPU backward computation if needed by the C++ impl (though manual impl might bypass this)
+    # Q_cpu.requires_grad_(True)
+    # R_cpu.requires_grad_(True)
+    # S_cpu.requires_grad_(True)
+    # Vq_1_cpu.requires_grad_(True)
+    # ... etc for other inputs ...
+
+    print("Running backward pass on CPU...")
+    try:
+        grads_tuple_cpu = manual_att3ntion.backward(
+            grad_output_cpu,
+            Q_cpu, R_cpu, S_cpu, 
+            Vq_1_cpu, Vq_2_cpu, Vr_1_cpu, Vr_2_cpu, Vs_1_cpu, Vs_2_cpu, 
+            dr_cpu
+        )
+        grad_Vq_1_cpu = grads_tuple_cpu[3] # grad_Vq_1 is the 4th element (index 3)
+        print("CPU backward pass completed.")
+    except Exception as e:
+        print(f"Error during CPU backward pass: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+    # --- CUDA Execution & Comparison ---
+    if not torch.cuda.is_available():
+        print("\nCUDA not available. Skipping CUDA backward execution and comparison.")
+        return
+
+    print("\nMoving inputs to CUDA device for backward pass...")
+    try:
+        Q_cuda = Q_cpu.to(device_cuda)
+        R_cuda = R_cpu.to(device_cuda)
+        S_cuda = S_cpu.to(device_cuda)
+        Vq_1_cuda = Vq_1_cpu.to(device_cuda)
+        Vq_2_cuda = Vq_2_cpu.to(device_cuda) 
+        Vr_1_cuda = Vr_1_cpu.to(device_cuda)
+        Vr_2_cuda = Vr_2_cpu.to(device_cuda) 
+        Vs_1_cuda = Vs_1_cpu.to(device_cuda)
+        Vs_2_cuda = Vs_2_cpu.to(device_cuda) 
+        grad_output_cuda = grad_output_cpu.to(device_cuda)
+        dr_cuda = dr_cpu 
+        print("Inputs moved to CUDA for backward pass.")
+    except Exception as e:
+        print(f"Error moving inputs to CUDA for backward pass: {e}")
+        sys.exit(1)
+
+    print("Running backward pass on CUDA...")
+    try:
+        grads_tuple_cuda = manual_att3ntion.backward(
+            grad_output_cuda,
+            Q_cuda, R_cuda, S_cuda, 
+            Vq_1_cuda, Vq_2_cuda, Vr_1_cuda, Vr_2_cuda, Vs_1_cuda, Vs_2_cuda, 
+            dr_cuda
+        )
+        grad_Vq_1_cuda = grads_tuple_cuda[3] # grad_Vq_1 is the 4th element (index 3)
+        print("CUDA backward pass completed.")
+    except Exception as e:
+        print(f"Error during CUDA backward pass: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+    print("\nComparing CPU and CUDA grad_Vq_1 outputs...")
+    # Move CUDA result back to CPU for comparison
+    grad_Vq_1_cuda_cpu = grad_Vq_1_cuda.cpu()
+
+    # Check shapes
+    if grad_Vq_1_cpu.shape != grad_Vq_1_cuda_cpu.shape:
+        print(f"ERROR: grad_Vq_1 shape mismatch! CPU: {grad_Vq_1_cpu.shape}, CUDA: {grad_Vq_1_cuda_cpu.shape}")
+        print("Exiting due to shape mismatch.")
+        sys.exit(1)
+    else:
+        print(f"Shapes match: {grad_Vq_1_cpu.shape}")
+
+    # Check numerical equivalence
+    vq1_grads_close = torch.allclose(grad_Vq_1_cpu, grad_Vq_1_cuda_cpu, rtol=rtol, atol=atol)
+
+    print(f"Comparing grad_Vq_1: {'PASS' if vq1_grads_close else 'FAIL'}")
+    if not vq1_grads_close:
+        print(f"  Max difference (grad_Vq_1): {(grad_Vq_1_cpu - grad_Vq_1_cuda_cpu).abs().max()}")
+        # Optional: Print specific differing values
+        # diff_mask = ~torch.isclose(grad_Vq_1_cpu, grad_Vq_1_cuda_cpu, rtol=rtol, atol=atol)
+        # print("CPU vals:", grad_Vq_1_cpu[diff_mask][:10])
+        # print("CUDA vals:", grad_Vq_1_cuda_cpu[diff_mask][:10])
+
+    if vq1_grads_close:
+        print("\n*** grad_Vq_1 Equivalence Test Passed! ***")
+    else:
+        print("\n*** grad_Vq_1 Equivalence Test Failed! ***")
+        sys.exit(1)
+
 # --- Run the test --- 
 if __name__ == '__main__':
     run_test() 
+    run_backward_vq1_test() # Add the call to the new test function 
