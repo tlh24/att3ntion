@@ -579,12 +579,12 @@ __device__ inline float compute_dot_product_cuda(
     const float* r_vec = R + (((int64_t)b * H + h) * J + j) * D;
     const float* s_vec = S + (((int64_t)b * H + h) * K + k) * D;
 
-    float dot = 0.0f;
+    double dot = 0.0;
     #pragma unroll 4
     for (int d = 0; d < D; ++d) {
-        dot += q_vec[d] * r_vec[d] * s_vec[d];
+        dot += (double)q_vec[d] * (double)r_vec[d] * (double)s_vec[d];
     }
-    return dot;
+    return (float)dot;
 }
 
 // Device helper: Compute single softmax attention value Ar[i,j,k] (fixed_dim=1) or As[i,j,k] (fixed_dim=2)
@@ -598,15 +598,15 @@ __device__ inline float compute_single_softmax_attn_cuda(
     int fixed_dim // 1 for Ar (softmax over i, k for fixed j), 2 for As (softmax over i, j for fixed k)
 )
 {
-    float max_val = -1.0e30f;
-    float sum_exp = 0.0f;
+    double max_val = -1.0e30;
+    double sum_exp = 0.0;
 
     // --- First Pass: Find Max --- 
     if (fixed_dim == 0) { // Aq: Softmax over j, k for fixed i_target
         for (int j = 0; j < J; ++j) {
             for (int k = 0; k < K; ++k) {
-                float dot = compute_dot_product_cuda(Q, R, S, b, h, i_target, j, k, B, H, I, J, K, D);
-                max_val = fmaxf(max_val, dot * scale);
+                double dot = (double)compute_dot_product_cuda(Q, R, S, b, h, i_target, j, k, B, H, I, J, K, D);
+                max_val = fmax(max_val, dot * (double)scale);
             }
         }
     }
@@ -614,16 +614,16 @@ __device__ inline float compute_single_softmax_attn_cuda(
         for (int i = 0; i < I; ++i) {
             for (int k = 0; k < K; ++k) {
                 // Pass B, H, I, J, K, D to the dot product function
-                float dot = compute_dot_product_cuda(Q, R, S, b, h, i, j_target, k, B, H, I, J, K, D);
-                max_val = fmaxf(max_val, dot * scale);
+                double dot = (double)compute_dot_product_cuda(Q, R, S, b, h, i, j_target, k, B, H, I, J, K, D);
+                max_val = fmax(max_val, dot * (double)scale);
             }
         }
     } else { // fixed_dim == 2: As: Softmax over i, j for fixed k_target
         for (int i = 0; i < I; ++i) {
             for (int j = 0; j < J; ++j) {
                 // Pass B, H, I, J, K, D to the dot product function
-                float dot = compute_dot_product_cuda(Q, R, S, b, h, i, j, k_target, B, H, I, J, K, D);
-                max_val = fmaxf(max_val, dot * scale);
+                double dot = (double)compute_dot_product_cuda(Q, R, S, b, h, i, j, k_target, B, H, I, J, K, D);
+                max_val = fmax(max_val, dot * (double)scale);
             }
         }
     }
@@ -632,8 +632,8 @@ __device__ inline float compute_single_softmax_attn_cuda(
     if (fixed_dim == 0) { // Aq
         for (int j = 0; j < J; ++j) {
             for (int k = 0; k < K; ++k) {
-                float dot = compute_dot_product_cuda(Q, R, S, b, h, i_target, j, k, B, H, I, J, K, D);
-                sum_exp += expf(dot * scale - max_val);
+                double dot = (double)compute_dot_product_cuda(Q, R, S, b, h, i_target, j, k, B, H, I, J, K, D);
+                sum_exp += exp(dot * (double)scale - max_val);
             }
         }
     }
@@ -641,36 +641,35 @@ __device__ inline float compute_single_softmax_attn_cuda(
         for (int i = 0; i < I; ++i) {
             for (int k = 0; k < K; ++k) {
                 // Pass B, H, I, J, K, D to the dot product function
-                float dot = compute_dot_product_cuda(Q, R, S, b, h, i, j_target, k, B, H, I, J, K, D);
-                sum_exp += expf(dot * scale - max_val);
+                double dot = (double)compute_dot_product_cuda(Q, R, S, b, h, i, j_target, k, B, H, I, J, K, D);
+                sum_exp += exp(dot * (double)scale - max_val);
             }
         }
     } else { // As
         for (int i = 0; i < I; ++i) {
             for (int j = 0; j < J; ++j) {
                 // Pass B, H, I, J, K, D to the dot product function
-                float dot = compute_dot_product_cuda(Q, R, S, b, h, i, j, k_target, B, H, I, J, K, D);
-                sum_exp += expf(dot * scale - max_val);
+                double dot = (double)compute_dot_product_cuda(Q, R, S, b, h, i, j, k_target, B, H, I, J, K, D);
+                sum_exp += exp(dot * (double)scale - max_val);
             }
         }
     }
 
     // --- Compute final value for the target indices ---
     // Pass B, H, I, J, K, D to the dot product function
-    float target_dot = compute_dot_product_cuda(Q, R, S, b, h, i_target, j_target, k_target, B, H, I, J, K, D);
+    double target_dot = (double)compute_dot_product_cuda(Q, R, S, b, h, i_target, j_target, k_target, B, H, I, J, K, D);
     
     // Handle potential division by zero if sum_exp is very small
-    if (sum_exp <= 1e-20f) { 
+    if (sum_exp <= 1e-20) { 
         int num_elements;
         if (fixed_dim == 0) num_elements = J * K;
         else if (fixed_dim == 1) num_elements = I * K;
         else /* fixed_dim == 2 */ num_elements = I * J;
         // If the target dot was also the max (or close), return uniform prob, else 0.
-        // This is a simple heuristic; more robust handling might be needed.
-        return (fabsf(target_dot * scale - max_val) < 1e-5f) ? (1.0f / (float)num_elements) : 0.0f;
+        return (fabs(target_dot * (double)scale - max_val) < 1e-5) ? (1.0f / (float)num_elements) : 0.0f;
     }
     
-    return expf(target_dot * scale - max_val) / sum_exp;
+    return (float)(exp(target_dot * (double)scale - max_val) / sum_exp);
 }
 
 // Scatter for fixed_dim = 0 (Output Y_q_)
