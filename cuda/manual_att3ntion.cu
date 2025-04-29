@@ -137,7 +137,9 @@ __global__ void scatter_grad_Vs2_kernel(
 
 // Forward declaration for grad_Q kernel
 __global__ void grad_Q_kernel(
-    const float* __restrict__ gradY,
+    const float* __restrict__ gradY_q,
+    const float* __restrict__ gradY_r,
+    const float* __restrict__ gradY_s,
     const float* __restrict__ Q,
     const float* __restrict__ R,
     const float* __restrict__ S,
@@ -148,8 +150,7 @@ __global__ void grad_Q_kernel(
     const float* __restrict__ Vs_1,
     const float* __restrict__ Vs_2,
     float*       __restrict__ gradQ,
-    int  B,int H,int I,int J,int K,int D,
-    int  N_grad,
+    int B, int H, int I, int J, int K, int D,
     float scale);
 
 // Minimal backward function that returns zero gradients[placeholder]
@@ -300,12 +301,14 @@ backward_cuda(
       const dim3 blocks((N_kernel + threads - 1) / threads);
       grad_Q_kernel<<<blocks, threads>>>(
           grad_output.data_ptr<float>(),
+          grad_output.data_ptr<float>(),
+          grad_output.data_ptr<float>(),
           Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
           Vq_1.data_ptr<float>(), Vq_2.data_ptr<float>(),
           Vr_1.data_ptr<float>(), Vr_2.data_ptr<float>(),
           Vs_1.data_ptr<float>(), Vs_2.data_ptr<float>(),
           grad_Q.data_ptr<float>(),   // Output gradient tensor
-          B, H, I, J, K, D, N_grad, scale); // Pass dimensions and scale
+          B, H, I, J, K, D, scale); // Pass dimensions and scale (removed N_grad)
   }
 
   // TODO: Implement and launch kernels for grad_R, grad_S
@@ -1287,7 +1290,9 @@ __global__ void scatter_grad_Vs2_kernel(
 
 // Kernel to compute gradient for Q (Re-implemented with full softmax derivative)
 __global__ void grad_Q_kernel(
-    const float* __restrict__ gradY,
+    const float* __restrict__ gradY_q,
+    const float* __restrict__ gradY_r,
+    const float* __restrict__ gradY_s,
     const float* __restrict__ Q,
     const float* __restrict__ R,
     const float* __restrict__ S,
@@ -1297,147 +1302,208 @@ __global__ void grad_Q_kernel(
     const float* __restrict__ Vr_2,
     const float* __restrict__ Vs_1,
     const float* __restrict__ Vs_2,
-    float*       __restrict__ gradQ,    // Output [B,H,I,D]
-    int  B,int H,int I,int J,int K,int D,
-    int  N_grad,
+    float*       __restrict__ gradQ,
+    int B, int H, int I, int J, int K, int D,
     float scale)
 {
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (int64_t)B*H*I*D) return;
+    int64_t total = (int64_t)B * H * I * D;
+    if (idx >= total) return;
 
-    // Decode indices
+    // Decode thread index -> (b,h,i_target,d_target)
     int d_target = idx % D;
-    int tmp = idx / D;
-    int i_target = tmp % I;
-    tmp /= I;
-    int h = tmp % H;
-    int b = tmp / H;
+    int t   = idx / D;
+    int i_target = t % I;
+    t /= I;
+    int h = t % H;
+    int b = t / H;
 
-    // Precompute base offsets
-    const int64_t bh_off_gradY = ((int64_t)b * H + h) * N_grad * D;
-    const int64_t bh_off_I = ((int64_t)b * H + h) * I * D;
-    const int64_t bh_off_J = ((int64_t)b * H + h) * J * D;
-    const int64_t bh_off_K = ((int64_t)b * H + h) * K * D;
+    // DEBUG: Only print for our target indices
+    bool debug = (b == 0 && h == 0 && i_target == 1 && d_target == 3);
+    
+    // Base offsets for each tensor slice
+    int64_t bh = (int64_t)b * H + h;
+    int64_t offQ = bh * I * D + (int64_t)i_target * D;
+    int64_t offVq1 = bh * I * D + (int64_t)i_target * D;
+    int64_t offVq2 = bh * I * D + (int64_t)i_target * D;
+    int64_t off_qY = bh * I * D + (int64_t)i_target * D;
+    int64_t off_rY = bh * J * D;
+    int64_t off_sY = bh * K * D;
+    int64_t offR = bh * J * D;
+    int64_t offVr1 = bh * J * D;
+    int64_t offVr2 = bh * J * D;
+    int64_t offS = bh * K * D;
+    int64_t offVs1 = bh * K * D;
+    int64_t offVs2 = bh * K * D;
 
-    // Pointers for Vq of current i
-    const float* vq1_vec_i = Vq_1 + bh_off_I + (int64_t)i_target * D;
-    const float* vq2_vec_i = Vq_2 + bh_off_I + (int64_t)i_target * D;
+    // Load Vq vectors for this i
+    const float* vq1_vec = Vq_1 + offVq1;
+    const float* vq2_vec = Vq_2 + offVq2;
 
-    // Small fixed-size arrays for sums over j and k (J,K <= 64 in our tests)
-    float sum_r[64]; // sum over i,k for each j
-    float sum_s[64]; // sum over i,j for each k
-    #pragma unroll 64
-    for (int t=0;t<64;++t){ if (t< J) sum_r[t]=0.0f; if(t<K) sum_s[t]=0.0f; }
-    float sum_q = 0.0f; // sum over j,k for fixed i
+    // Accumulators for softmax-derivative sums - use double for higher precision
+    double sum_q = 0.0;
+    double sum_r[64];
+    double sum_s[64];
+    #pragma unroll
+    for (int j=0; j<64; ++j) {
+        sum_r[j] = (j < J) ? 0.0 : 0.0;
+        sum_s[j] = (j < K) ? 0.0 : 0.0;
+    }
 
-    // ---------- FIRST PASS : accumulate grad_Aq/r/s and the required sums ----------
-    for (int j=0;j<J;++j){
-        const float* vr1_vec_j = Vr_1 + bh_off_J + (int64_t)j * D;
-        const float* vr2_vec_j = Vr_2 + bh_off_J + (int64_t)j * D;
-        for (int k=0;k<K;++k){
-            const float* vs1_vec_k = Vs_1 + bh_off_K + (int64_t)k * D;
-            const float* vs2_vec_k = Vs_2 + bh_off_K + (int64_t)k * D;
+    // First pass: compute grad_A terms and accumulate sums
+    for (int j=0; j<J; ++j) {
+        const float* vr1_vec = Vr_1 + offVr1 + (int64_t)j * D;
+        const float* vr2_vec = Vr_2 + offVr2 + (int64_t)j * D;
+        for (int k=0; k<K; ++k) {
+            const float* vs1_vec = Vs_1 + offVs1 + (int64_t)k * D;
+            const float* vs2_vec = Vs_2 + offVs2 + (int64_t)k * D;
 
-            // Softmax terms
-            float Aq = compute_single_softmax_attn_cuda(Q,R,S,b,h,i_target,j,k,B,H,I,J,K,D,scale,0);
-            float Ar = compute_single_softmax_attn_cuda(Q,R,S,b,h,i_target,j,k,B,H,I,J,K,D,scale,1);
-            float As = compute_single_softmax_attn_cuda(Q,R,S,b,h,i_target,j,k,B,H,I,J,K,D,scale,2);
+            // Compute attention weights
+            double Aq = (double)compute_single_softmax_attn_cuda(Q, R, S,
+                                                       b, h, i_target, j, k,
+                                                       B, H, I, J, K, D, scale, 0);
+            double Ar = (double)compute_single_softmax_attn_cuda(Q, R, S,
+                                                       b, h, i_target, j, k,
+                                                       B, H, I, J, K, D, scale, 1);
+            double As = (double)compute_single_softmax_attn_cuda(Q, R, S,
+                                                       b, h, i_target, j, k,
+                                                       B, H, I, J, K, D, scale, 2);
 
-            float grad_Aq_ijk = 0.0f;
-            float grad_Ar_ijk = 0.0f;
-            float grad_As_ijk = 0.0f;
-
-            // Sum over d1
-            for(int d1=0; d1<D; ++d1){
-                // Upstream grads
-                float dYq = (i_target < N_grad) ? gradY[bh_off_gradY + (int64_t)i_target*D + d1] : 0.0f;
-                float dYr = (j < N_grad)        ? gradY[bh_off_gradY + (int64_t)j*D         + d1] : 0.0f;
-                float dYs = (k < N_grad)        ? gradY[bh_off_gradY + (int64_t)k*D         + d1] : 0.0f;
-                float dYq_ = dYq;
-                float dYr_ = dYr;
-                float dYs_ = dYs;
-
-                // V values
-                float vq1 = vq1_vec_i[d1];
-                float vq2 = vq2_vec_i[d1];
-                float vr1 = vr1_vec_j[d1];
-                float vr2 = vr2_vec_j[d1];
-                float vs1 = vs1_vec_k[d1];
-                float vs2 = vs2_vec_k[d1];
-
-                // Accumulate per rules
-                grad_Aq_ijk += dYq   * (vr1*vs1)               +
-                               dYr_  * (vq2*vs2) * As          +
-                               dYs_  * (vq2*vr2) * Ar;
-
-                grad_Ar_ijk += dYr   * (vq1*vs1)               +
-                               dYq_  * (vr2*vs2) * As          +
-                               dYs_  * (vq2*vr2) * Aq;
-
-                grad_As_ijk += dYs   * (vq1*vr1)               +
-                               dYq_  * (vr2*vs2) * Ar          +
-                               dYr_  * (vq2*vs2) * Aq;
+            // DEBUG - print our target indices values
+            if (debug && j == 2 && k == 1) {
+                printf("CUDA DEBUG [PASS 1] b=%d,h=%d,i=%d,j=%d,k=%d,d=%d\n", b, h, i_target, j, k, d_target);
+                printf("CUDA DEBUG Aq=%.10f, Ar=%.10f, As=%.10f\n", Aq, Ar, As);
             }
 
-            // accumulate sums for softmax derivative
-            sum_q      += grad_Aq_ijk * Aq;     // fixed i, sum over j,k
-            sum_r[j]   += grad_Ar_ijk * Ar;     // fixed j
-            sum_s[k]   += grad_As_ijk * As;     // fixed k
+            // Compute grad_Aq, grad_Ar, grad_As in double precision
+            double grad_Aq = 0.0;
+            double grad_Ar = 0.0;
+            double grad_As = 0.0;
+            for (int d1=0; d1<D; ++d1) {
+                // Upstream gradients, now indexed correctly
+                double dYq = (double)gradY_q[off_qY + d1];
+                double dYr = (double)gradY_r[off_rY + (int64_t)j * D + d1];
+                double dYs = (double)gradY_s[off_sY + (int64_t)k * D + d1];
+
+                // Feature values
+                double vq1 = (double)vq1_vec[d1];
+                double vq2 = (double)vq2_vec[d1];
+                double vr1 = (double)vr1_vec[d1];
+                double vr2 = (double)vr2_vec[d1];
+                double vs1 = (double)vs1_vec[d1];
+                double vs2 = (double)vs2_vec[d1];
+
+                // Accumulate per-axis contributions
+                grad_Aq += dYq * (vr1*vs1)
+                         + dYr * (vq2*vs2) * As
+                         + dYs * (vq2*vr2) * Ar;
+                grad_Ar += dYr * (vq1*vs1)
+                         + dYq * (vr2*vs2) * As
+                         + dYs * (vq2*vr2) * Aq;
+                grad_As += dYs * (vq1*vr1)
+                         + dYq * (vr2*vs2) * Ar
+                         + dYr * (vq2*vs2) * Aq;
+                
+                // DEBUG - for our target index, print the first few gradY values and V values
+                if (debug && j == 2 && k == 1 && d1 < 4) {
+                    printf("CUDA DEBUG [d1=%d] dYq=%.10f, dYr=%.10f, dYs=%.10f\n", d1, dYq, dYr, dYs);
+                    printf("CUDA DEBUG [d1=%d] vq1=%.10f, vq2=%.10f, vr1=%.10f, vr2=%.10f, vs1=%.10f, vs2=%.10f\n", 
+                           d1, vq1, vq2, vr1, vr2, vs1, vs2);
+                }
+            }
+
+            // DEBUG - print the accumulated gradients for our target index
+            if (debug && j == 2 && k == 1) {
+                printf("CUDA DEBUG grad_Aq=%.10f, grad_Ar=%.10f, grad_As=%.10f\n", grad_Aq, grad_Ar, grad_As);
+            }
+
+            // Accumulate for softmax‐derivative correction
+            sum_q    += grad_Aq * Aq;
+            sum_r[j] += grad_Ar * Ar;
+            sum_s[k] += grad_As * As;
         }
     }
 
-    // ---------- SECOND PASS : compute final grad_A and accumulate into grad_Q ----------
-    float acc = 0.0f;
-    for (int j=0;j<J;++j){
-        const float* r_vec = R + bh_off_J + (int64_t)j * D;
-        const float* vr1_vec_j = Vr_1 + bh_off_J + (int64_t)j * D;
-        const float* vr2_vec_j = Vr_2 + bh_off_J + (int64_t)j * D;
-        float r_d = r_vec[d_target];
-        for(int k=0;k<K;++k){
-            const float* s_vec = S + bh_off_K + (int64_t)k * D;
-            const float* vs1_vec_k = Vs_1 + bh_off_K + (int64_t)k * D;
-            const float* vs2_vec_k = Vs_2 + bh_off_K + (int64_t)k * D;
-            float s_d = s_vec[d_target];
+    // DEBUG - print sum values for our target
+    if (debug) {
+        printf("CUDA DEBUG [END PASS 1] sum_q=%.10f, sum_r[2]=%.10f, sum_s[1]=%.10f\n", sum_q, sum_r[2], sum_s[1]);
+    }
 
-            // Softmax values
-            float Aq = compute_single_softmax_attn_cuda(Q,R,S,b,h,i_target,j,k,B,H,I,J,K,D,scale,0);
-            float Ar = compute_single_softmax_attn_cuda(Q,R,S,b,h,i_target,j,k,B,H,I,J,K,D,scale,1);
-            float As = compute_single_softmax_attn_cuda(Q,R,S,b,h,i_target,j,k,B,H,I,J,K,D,scale,2);
+    // Second pass: finalize grad_A and accumulate into gradQ
+    double acc = 0.0;
+    for (int j=0; j<J; ++j) {
+        const float* r_vec   = R + offR + (int64_t)j * D;
+        const float* vr1_vec = Vr_1 + offVr1 + (int64_t)j * D;
+        const float* vr2_vec = Vr_2 + offVr2 + (int64_t)j * D;
+        double r_d = (double)r_vec[d_target];
+        
+        for (int k=0; k<K; ++k) {
+            const float* s_vec   = S + offS + (int64_t)k * D;
+            const float* vs1_vec = Vs_1 + offVs1 + (int64_t)k * D;
+            const float* vs2_vec = Vs_2 + offVs2 + (int64_t)k * D;
+            double s_d = (double)s_vec[d_target];
 
-            float grad_Aq_ijk=0.0f, grad_Ar_ijk=0.0f, grad_As_ijk=0.0f;
-            for(int d1=0; d1<D; ++d1){
-                float dYq = (i_target < N_grad) ? gradY[bh_off_gradY + (int64_t)i_target*D + d1] : 0.0f;
-                float dYr = (j < N_grad)        ? gradY[bh_off_gradY + (int64_t)j*D + d1] : 0.0f;
-                float dYs = (k < N_grad)        ? gradY[bh_off_gradY + (int64_t)k*D + d1] : 0.0f;
-                float dYq_ = dYq;
-                float dYr_ = dYr;
-                float dYs_ = dYs;
+            // Recompute attention (or cache if desired)
+            double Aq = (double)compute_single_softmax_attn_cuda(Q, R, S,
+                                                       b, h, i_target, j, k,
+                                                       B, H, I, J, K, D, scale, 0);
+            double Ar = (double)compute_single_softmax_attn_cuda(Q, R, S,
+                                                       b, h, i_target, j, k,
+                                                       B, H, I, J, K, D, scale, 1);
+            double As = (double)compute_single_softmax_attn_cuda(Q, R, S,
+                                                       b, h, i_target, j, k,
+                                                       B, H, I, J, K, D, scale, 2);
 
-                float vq1 = vq1_vec_i[d1];
-                float vq2 = vq2_vec_i[d1];
-                float vr1 = vr1_vec_j[d1];
-                float vr2 = vr2_vec_j[d1];
-                float vs1 = vs1_vec_k[d1];
-                float vs2 = vs2_vec_k[d1];
+            // Recompute grad_Aq, grad_Ar, grad_As in double precision
+            double grad_Aq = 0.0;
+            double grad_Ar = 0.0;
+            double grad_As = 0.0;
+            for (int d1=0; d1<D; ++d1) {
+                double dYq = (double)gradY_q[off_qY + d1];
+                double dYr = (double)gradY_r[off_rY + (int64_t)j * D + d1];
+                double dYs = (double)gradY_s[off_sY + (int64_t)k * D + d1];
+                double vq1 = (double)vq1_vec[d1];
+                double vq2 = (double)vq2_vec[d1];
+                double vr1 = (double)vr1_vec[d1];
+                double vr2 = (double)vr2_vec[d1];
+                double vs1 = (double)vs1_vec[d1];
+                double vs2 = (double)vs2_vec[d1];
 
-                grad_Aq_ijk += dYq   * (vr1*vs1)               +
-                               dYr_  * (vq2*vs2) * As          +
-                               dYs_  * (vq2*vr2) * Ar;
-                grad_Ar_ijk += dYr   * (vq1*vs1)               +
-                               dYq_  * (vr2*vs2) * As          +
-                               dYs_  * (vq2*vr2) * Aq;
-                grad_As_ijk += dYs   * (vq1*vr1)               +
-                               dYq_  * (vr2*vs2) * Ar          +
-                               dYr_  * (vq2*vs2) * Aq;
+                grad_Aq += dYq * (vr1*vs1)
+                         + dYr * (vq2*vs2) * As
+                         + dYs * (vq2*vr2) * Ar;
+                grad_Ar += dYr * (vq1*vs1)
+                         + dYq * (vr2*vs2) * As
+                         + dYs * (vq2*vr2) * Aq;
+                grad_As += dYs * (vq1*vr1)
+                         + dYq * (vr2*vs2) * Ar
+                         + dYr * (vq2*vs2) * Aq;
             }
-            float grad_A_ijk = (grad_Aq_ijk - sum_q) * Aq +
-                                (grad_Ar_ijk - sum_r[j]) * Ar +
-                                (grad_As_ijk - sum_s[k]) * As;
-            acc += grad_A_ijk * r_d * s_d;
+
+            // Softmax‐derivative correction and final grad_Q accumulation
+            double grad_A = (grad_Aq - sum_q) * Aq
+                          + (grad_Ar - sum_r[j]) * Ar
+                          + (grad_As - sum_s[k]) * As;
+
+            // DEBUG - print the final values for our target index
+            if (debug && j == 2 && k == 1) {
+                printf("CUDA DEBUG [PASS 2] grad_Aq=%.10f, grad_Ar=%.10f, grad_As=%.10f\n", grad_Aq, grad_Ar, grad_As);
+                printf("CUDA DEBUG r_d=%.10f, s_d=%.10f\n", r_d, s_d);
+                printf("CUDA DEBUG grad_A=%.10f, contribution=%.10f\n", grad_A, grad_A * r_d * s_d);
+            }
+            
+            acc += grad_A * r_d * s_d;
         }
     }
 
-    gradQ[idx] = acc * scale;
+    // Write result, converting back to float
+    float final_grad = (float)(acc * (double)scale);
+    if (debug) {
+        printf("CUDA DEBUG [FINAL] acc=%.10f, scale=%.10f, gradQ[%d,%d,%d,%d]=%.10f\n", 
+               acc, scale, b, h, i_target, d_target, final_grad);
+    }
+    
+    gradQ[idx] = final_grad;
 }
 
 // the CUDA entry‐point for forward pass

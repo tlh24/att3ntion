@@ -4,6 +4,8 @@
 #include <limits>
 #include <vector> 
 #include <tuple>  
+#include <iomanip> // Added for std::fixed and std::setprecision
+#include <cstdio>  // Added for printf
 
 // Forward declarations for CUDA functions tuple
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
@@ -1166,7 +1168,8 @@ torch::Tensor compute_grad_A_single(
     const torch::Tensor& A_slice,           // [I, J, K] 
     const torch::Tensor& Aq_slice,          // [I, J, K]
     const torch::Tensor& Ar_slice,          // [I, J, K]
-    const torch::Tensor& As_slice           // [I, J, K]
+    const torch::Tensor& As_slice,           // [I, J, K]
+    int b, int h // Added b and h parameters
 ) {
     const int I = Q_slice.size(0);
     const int J = R_slice.size(0);
@@ -1174,6 +1177,10 @@ torch::Tensor compute_grad_A_single(
     const int D = Q_slice.size(1);
     const int N = grad_output_slice.size(0); // Assuming N is the first dim of grad_output_slice
     auto options = Q_slice.options();
+
+    const int i_target_debug = 1;
+    const int j_target_debug = 2;
+    const int k_target_debug = 1;
 
     // Accessors for slice inputs
     auto grad_output_acc = grad_output_slice.accessor<float, 2>();
@@ -1274,6 +1281,9 @@ torch::Tensor compute_grad_A_single(
     for (int i = 0; i < I; ++i) {
         float sum_q = 0.0f;
         for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) { sum_q += grad_Aq_acc[i][j][k] * Aq_acc[i][j][k]; }}
+         if (b == 0 && h == 0 && i == i_target_debug) { // i_target_debug should be defined earlier if not already
+                printf("CPU DEBUG SUM_Q[%d]=%.10f\n", i, sum_q);
+            }
         for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) { grad_A_acc[i][j][k] += (grad_Aq_acc[i][j][k] - sum_q) * Aq_acc[i][j][k]; }}
     }
 
@@ -1281,6 +1291,9 @@ torch::Tensor compute_grad_A_single(
     for (int j = 0; j < J; ++j) {
         float sum_r = 0.0f;
         for (int i = 0; i < I; ++i) { for (int k = 0; k < K; ++k) { sum_r += grad_Ar_acc[i][j][k] * Ar_acc[i][j][k]; }}
+        if (b == 0 && h == 0 && j == j_target_debug) { // j_target_debug should be defined earlier if not already
+                 printf("CPU DEBUG SUM_R[%d]=%.10f\n", j, sum_r);
+             }
         for (int i = 0; i < I; ++i) { for (int k = 0; k < K; ++k) { grad_A_acc[i][j][k] += (grad_Ar_acc[i][j][k] - sum_r) * Ar_acc[i][j][k]; }}
     }
 
@@ -1288,6 +1301,9 @@ torch::Tensor compute_grad_A_single(
     for (int k = 0; k < K; ++k) {
         float sum_s = 0.0f;
         for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { sum_s += grad_As_acc[i][j][k] * As_acc[i][j][k]; }}
+        if (b == 0 && h == 0 && k == k_target_debug) { // k_target_debug should be defined earlier if not already
+                 printf("CPU DEBUG SUM_S[%d]=%.10f\n", k, sum_s);
+            }
         for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { grad_A_acc[i][j][k] += (grad_As_acc[i][j][k] - sum_s) * As_acc[i][j][k]; }}
     }
 
@@ -1416,6 +1432,10 @@ backward_cpu(
 {
     const int B = Q.size(0);
     const int H = Q.size(1);
+    // Make sure I, J, K are derived correctly if grad_output might be smaller
+    const int I = Q.size(2);
+    const int J = R.size(2);
+    const int K = S.size(2);
     const int D = Q.size(3);
     const float scale = 1.0f / std::sqrt(static_cast<float>(D));
 
@@ -1450,31 +1470,141 @@ backward_cpu(
             auto Vr_2_slice = Vr_2.select(0, b).select(0, h);
             auto Vs_1_slice = Vs_1.select(0, b).select(0, h);
             auto Vs_2_slice = Vs_2.select(0, b).select(0, h);
+            // Ensure grad_output_slice is correctly handled if its size differs
             auto grad_output_slice = grad_output.select(0, b).select(0, h);
+            const int N = grad_output_slice.size(0); // Max sequence length from grad_output
 
             // 1. Compute intermediate attention tensors for the slice
             torch::Tensor A_slice, Aq_slice, Ar_slice, As_slice;
             std::tie(A_slice, Aq_slice, Ar_slice, As_slice) =
                 compute_attention_tensors_single(Q_slice, R_slice, S_slice, scale);
 
-            // 2. Compute grad_A for the slice
+            // 2. Compute grad_A for the slice (includes softmax derivative)
             auto grad_A_slice = compute_grad_A_single(
                 grad_output_slice, Q_slice, R_slice, S_slice,
                 Vq_1_slice, Vq_2_slice, Vr_1_slice, Vr_2_slice, Vs_1_slice, Vs_2_slice,
-                A_slice, Aq_slice, Ar_slice, As_slice
+                A_slice, Aq_slice, Ar_slice, As_slice,
+                b, h
             );
 
-            // 3. Compute grad_Q/R/S for the slice
+            // 3. Compute grad_Q/R/S for the slice using the final grad_A
             auto grad_Q_slice = compute_grad_Q_single(grad_A_slice, R_slice, S_slice, scale);
             auto grad_R_slice = compute_grad_R_single(grad_A_slice, Q_slice, S_slice, scale);
             auto grad_S_slice = compute_grad_S_single(grad_A_slice, Q_slice, R_slice, scale);
+
+            // <<< START DEBUG LOGGING BLOCK >>>
+            if (b == 0 && h == 0) {
+                int i_target_debug = 1;
+                int d_target_debug = 3;
+                int j_target_debug = 2;
+                int k_target_debug = 1;
+
+                // Ensure target indices are within bounds
+                if (i_target_debug < I && j_target_debug < J && k_target_debug < K && d_target_debug < D) {
+                    // Need accessors for slices
+                    auto Q_acc_slice = Q_slice.accessor<float, 2>();
+                    auto R_acc_slice = R_slice.accessor<float, 2>();
+                    auto S_acc_slice = S_slice.accessor<float, 2>();
+                    auto Vq_1_acc_slice = Vq_1_slice.accessor<float, 2>();
+                    auto Vq_2_acc_slice = Vq_2_slice.accessor<float, 2>();
+                    auto Vr_1_acc_slice = Vr_1_slice.accessor<float, 2>();
+                    auto Vr_2_acc_slice = Vr_2_slice.accessor<float, 2>();
+                    auto Vs_1_acc_slice = Vs_1_slice.accessor<float, 2>();
+                    auto Vs_2_acc_slice = Vs_2_slice.accessor<float, 2>();
+                    auto grad_output_acc_slice = grad_output_slice.accessor<float, 2>();
+                    auto Aq_acc_slice = Aq_slice.accessor<float, 3>();
+                    auto Ar_acc_slice = Ar_slice.accessor<float, 3>();
+                    auto As_acc_slice = As_slice.accessor<float, 3>();
+                    auto grad_A_acc_slice = grad_A_slice.accessor<float, 3>(); // Final grad_A
+
+                    int i = i_target_debug;
+                    int j = j_target_debug;
+                    int k = k_target_debug;
+                    int d_target = d_target_debug;
+
+                    // --- Pass 1 Logging ---
+                    double aq_val = (double)Aq_acc_slice[i][j][k];
+                    double ar_val = (double)Ar_acc_slice[i][j][k];
+                    double as_val = (double)As_acc_slice[i][j][k];
+                    printf("CPU DEBUG [PASS 1] b=%d,h=%d,i=%d,j=%d,k=%d,d=%d\n", b, h, i, j, k, d_target);
+                    printf("CPU DEBUG Aq=%.10f, Ar=%.10f, As=%.10f\n", aq_val, ar_val, as_val);
+
+                    // Recompute intermediate grad_Aq/Ar/As for logging
+                    double grad_Aq_recomp = 0.0, grad_Ar_recomp = 0.0, grad_As_recomp = 0.0;
+                    for (int d1 = 0; d1 < D; ++d1) {
+                        // Get grad_output values safely
+                        double dYq = (i < N) ? (double)grad_output_acc_slice[i][d1] : 0.0;
+                        double dYr = (j < N) ? (double)grad_output_acc_slice[j][d1] : 0.0;
+                        double dYs = (k < N) ? (double)grad_output_acc_slice[k][d1] : 0.0;
+
+                        // Get V values
+                        double vq1 = (double)Vq_1_acc_slice[i][d1];
+                        double vq2 = (double)Vq_2_acc_slice[i][d1];
+                        double vr1 = (double)Vr_1_acc_slice[j][d1];
+                        double vr2 = (double)Vr_2_acc_slice[j][d1];
+                        double vs1 = (double)Vs_1_acc_slice[k][d1];
+                        double vs2 = (double)Vs_2_acc_slice[k][d1];
+
+                        if (d1 < 4) { // Only print first few dimensions
+                            printf("CPU DEBUG [d1=%d] dYq=%.10f, dYr=%.10f, dYs=%.10f\n", d1, dYq, dYr, dYs);
+                            printf("CPU DEBUG [d1=%d] vq1=%.10f, vq2=%.10f, vr1=%.10f, vr2=%.10f, vs1=%.10f, vs2=%.10f\n",
+                                   d1, vq1, vq2, vr1, vr2, vs1, vs2);
+                        }
+
+                        // Recompute grad_Aq/Ar/As contributions (matches compute_grad_A_single phase 1 logic)
+                        grad_Aq_recomp += dYq * (vr1*vs1)
+                                        + dYr * (vq2*vs2) * as_val
+                                        + dYs * (vq2*vr2) * ar_val;
+                        grad_Ar_recomp += dYr * (vq1*vs1)
+                                        + dYq * (vr2*vs2) * as_val
+                                        + dYs * (vq2*vr2) * aq_val;
+                        grad_As_recomp += dYs * (vq1*vr1)
+                                        + dYq * (vr2*vs2) * ar_val
+                                        + dYr * (vq2*vs2) * aq_val;
+                    }
+                     printf("CPU DEBUG grad_Aq=%.10f, grad_Ar=%.10f, grad_As=%.10f\n", grad_Aq_recomp, grad_Ar_recomp, grad_As_recomp);
+                     printf("CPU DEBUG [END PASS 1] sum_q=SKIPPED, sum_r[2]=SKIPPED, sum_s[1]=SKIPPED\n"); // Sum calculation skipped for brevity
+
+                    // --- Pass 2 Logging ---
+                     printf("CPU DEBUG [PASS 2] grad_Aq=%.10f, grad_Ar=%.10f, grad_As=%.10f\n", grad_Aq_recomp, grad_Ar_recomp, grad_As_recomp); // Reuse recomputed values for log
+
+                    double r_d_val = (double)R_acc_slice[j][d_target];
+                    double s_d_val = (double)S_acc_slice[k][d_target];
+                     printf("CPU DEBUG r_d=%.10f, s_d=%.10f\n", r_d_val, s_d_val);
+
+                    // Get the final grad_A value computed by compute_grad_A_single
+                    double grad_A_final = (double)grad_A_acc_slice[i][j][k];
+                     printf("CPU DEBUG grad_A=%.10f, contribution=%.10f\n", grad_A_final, grad_A_final * r_d_val * s_d_val);
+
+                    // --- Recompute final sum for logging (Mimic CUDA FINAL) ---
+                    double final_sum_recomp = 0.0;
+                    for (int jj = 0; jj < J; ++jj) {
+                        for (int kk = 0; kk < K; ++kk) {
+                            final_sum_recomp += (double)grad_A_acc_slice[i][jj][kk] * (double)R_acc_slice[jj][d_target] * (double)S_acc_slice[kk][d_target];
+                        }
+                    }
+                    float final_grad_cpu = (float)(final_sum_recomp * (double)scale);
+                     printf("CPU DEBUG [FINAL] acc=%.10f, scale=%.10f, gradQ[%d,%d,%d,%d]=%.10f\n",
+                           final_sum_recomp, scale, b, h, i, d_target, final_grad_cpu);
+
+                    // Print the value that compute_grad_Q_single calculated for comparison
+                    // Note: grad_Q_slice holds the result *before* accumulation via add_
+                     printf("CPU DEBUG NOTE: computed grad_Q_slice[%d,%d]=%.10f (before add_)\n",
+                            i, d_target, (float)grad_Q_slice.accessor<float, 2>()[i][d_target]);
+
+                } else {
+                     printf("CPU DEBUG skipped for b=%d, h=%d: target indices out of bounds (I=%d, J=%d, K=%d, D=%d)\n", b, h, I, J, K, D);
+                }
+            }
+            // <<< END DEBUG LOGGING BLOCK >>>
+
 
             // 4. Accumulate the gradients for this slice into the main grad tensors
             grad_Q.select(0, b).select(0, h).add_(grad_Q_slice);
             grad_R.select(0, b).select(0, h).add_(grad_R_slice);
             grad_S.select(0, b).select(0, h).add_(grad_S_slice);
-        } 
-    } 
+        }
+    }
 
     return std::make_tuple(
         grad_Q, grad_R, grad_S,

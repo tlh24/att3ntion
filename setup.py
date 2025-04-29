@@ -13,7 +13,11 @@ setup(
             sources=[
                 'cpp/manual_att3ntion.cpp',
                 'cuda/manual_att3ntion.cu'
-            ]
+            ],
+            extra_compile_args={
+                'cxx': ['-g'],
+                'nvcc': ['-G', '-g', '-O0']
+            }
         ),
     ],
     cmdclass={
