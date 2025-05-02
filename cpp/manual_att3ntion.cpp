@@ -6,6 +6,7 @@
 #include <tuple>  
 #include <iomanip> // Added for std::fixed and std::setprecision
 #include <cstdio>  // Added for printf
+#include <cuda_runtime.h> // Ensure CUDA runtime is included
 
 // Forward declarations for CUDA functions tuple
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
@@ -1135,20 +1136,91 @@ compute_attention_tensors_single(
         }
     }
 
-    // TODO: Switch out for manual softmax computation - add a variation of existing function
-
-    // 2. Compute Aq_slice (softmax over j, k) [I, J, K]
-    auto Aq_slice = torch::softmax(A_slice.reshape({I, J * K}), /*dim=*/1).reshape({I, J, K}); 
-
-    // 3. Compute Ar_slice (softmax over i, k) [I, J, K]
-    auto A_r_permuted = A_slice.permute({1, 0, 2}).contiguous(); // ijk -> jik 
-    auto Ar_permuted = torch::softmax(A_r_permuted.reshape({J, I * K}), /*dim=*/1).reshape({J, I, K});
-    auto Ar_slice = Ar_permuted.permute({1, 0, 2}); // jik -> ijk
-
-    // 4. Compute As_slice (softmax over i, j) [I, J, K]
-    auto A_s_permuted = A_slice.permute({2, 0, 1}).contiguous(); // ijk -> kij 
-    auto As_permuted = torch::softmax(A_s_permuted.reshape({K, I * J}), /*dim=*/1).reshape({K, I, J});
-    auto As_slice = As_permuted.permute({1, 2, 0}); // kij -> ijk
+    // 2. Create tensors for normalized attention scores
+    auto Aq_slice = torch::zeros({I, J, K}, options);
+    auto Ar_slice = torch::zeros({I, J, K}, options);
+    auto As_slice = torch::zeros({I, J, K}, options);
+    
+        // Simplified adapter for the compute_softmax_3d function
+    auto apply_softmax_3d = [&](torch::Tensor& output_tensor, int fixed_dim) {
+        auto output_acc = output_tensor.accessor<float, 3>();
+        
+        // Configure dimension parameters based on fixed_dim
+        int dim1_size, dim2_size;
+        int dim1_idx_fn, dim2_idx_fn;
+        
+        if (fixed_dim == 0) {
+            dim1_size = J; dim2_size = K;
+            dim1_idx_fn = 1; dim2_idx_fn = 2;
+        } else if (fixed_dim == 1) {
+            dim1_size = I; dim2_size = K;
+            dim1_idx_fn = 0; dim2_idx_fn = 2;
+        } else { // fixed_dim == 2
+            dim1_size = I; dim2_size = J;
+            dim1_idx_fn = 0; dim2_idx_fn = 1;
+        }
+        
+        // Apply softmax for each fixed dimension index
+        int fixed_dim_size = fixed_dim == 0 ? I : (fixed_dim == 1 ? J : K);
+        
+        for (int fixed_idx = 0; fixed_idx < fixed_dim_size; ++fixed_idx) {
+            // Create temporary buffer for softmax results
+            std::vector<float> softmax_buffer(dim1_size * dim2_size);
+            
+            // Simplify compute_dot_product to use our existing compute_dot_single
+            auto compute_dot_wrapper = [&](int i, int j, int k) {
+                return A_acc[i][j][k];  // Use precomputed A_slice values
+            };
+            
+            // Find max for numerical stability
+            float max_val = -std::numeric_limits<float>::infinity();
+            for (int idx1 = 0; idx1 < dim1_size; idx1++) {
+                for (int idx2 = 0; idx2 < dim2_size; idx2++) {
+                    int i = fixed_dim == 0 ? fixed_idx : (dim1_idx_fn == 0 ? idx1 : idx2);
+                    int j = fixed_dim == 1 ? fixed_idx : (dim1_idx_fn == 1 ? idx1 : idx2);
+                    int k = fixed_dim == 2 ? fixed_idx : (dim1_idx_fn == 2 ? idx1 : idx2);
+                    
+                    float val = compute_dot_wrapper(i, j, k);
+                    if (val > max_val) max_val = val;
+                }
+            }
+            
+            // Compute sum of exponentials
+            float sum_exp = 0.0f;
+            for (int idx1 = 0; idx1 < dim1_size; idx1++) {
+                for (int idx2 = 0; idx2 < dim2_size; idx2++) {
+                    int i = fixed_dim == 0 ? fixed_idx : (dim1_idx_fn == 0 ? idx1 : idx2);
+                    int j = fixed_dim == 1 ? fixed_idx : (dim1_idx_fn == 1 ? idx1 : idx2);
+                    int k = fixed_dim == 2 ? fixed_idx : (dim1_idx_fn == 2 ? idx1 : idx2);
+                    
+                    float val = compute_dot_wrapper(i, j, k);
+                    sum_exp += std::exp(val - max_val);
+                }
+            }
+            
+            // Compute softmax values
+            int idx = 0;
+            for (int idx1 = 0; idx1 < dim1_size; idx1++) {
+                for (int idx2 = 0; idx2 < dim2_size; idx2++) {
+                    int i = fixed_dim == 0 ? fixed_idx : (dim1_idx_fn == 0 ? idx1 : idx2);
+                    int j = fixed_dim == 1 ? fixed_idx : (dim1_idx_fn == 1 ? idx1 : idx2);
+                    int k = fixed_dim == 2 ? fixed_idx : (dim1_idx_fn == 2 ? idx1 : idx2);
+                    
+                    float val = compute_dot_wrapper(i, j, k);
+                    float softmax_val = std::exp(val - max_val) / sum_exp;
+                    
+                    // Store in output tensor
+                    output_acc[i][j][k] = softmax_val;
+                    idx++;
+                }
+            }
+        }
+    };
+    
+    // Apply softmax to each dimension
+    apply_softmax_3d(Aq_slice, 0);  // Fix i (dim 0), softmax over j,k
+    apply_softmax_3d(Ar_slice, 1);  // Fix j (dim 1), softmax over i,k
+    apply_softmax_3d(As_slice, 2);  // Fix k (dim 2), softmax over i,j
 
     // Return A_slice (raw scores) along with normalized scores
     return std::make_tuple(A_slice, Aq_slice, Ar_slice, As_slice); 
@@ -1177,9 +1249,8 @@ torch::Tensor compute_grad_A_single(
     const int J = R_slice.size(0);
     const int K = S_slice.size(0);
     const int D = Q_slice.size(1);
-    const int N = grad_output_slice.size(0); // Assuming N is the first dim of grad_output_slice
-    auto options = Q_slice.options();
-
+    const int N = grad_output_slice.size(0); 
+    auto options = Q_slice.options(); 
     const int i_target_debug = 1;
     const int j_target_debug = 2;
     const int k_target_debug = 1;
@@ -1206,13 +1277,13 @@ torch::Tensor compute_grad_A_single(
     auto grad_As_acc = grad_As_slice.accessor<float, 3>();
 
     // ... (rest of phase 1 calculations remain the same) ...
-    // 1.a) grad_Aq from Yq
+    // 1.a) grad_Aq from Yq (gather)
     if (I <= N) {
         for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) { for (int d = 0; d < D; ++d) {
             grad_Aq_acc[i][j][k] += grad_output_acc[i][d] * Vr_1_acc[j][d] * Vs_1_acc[k][d];
         }}}}
     }
-    // 1.b) grad_Aq from Yr'
+    // 1.b) grad_Aq from Yr' (scatter)
     if (J <= N) {
         for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) {
             float grad_x_vals = 0.0f;
@@ -1220,7 +1291,7 @@ torch::Tensor compute_grad_A_single(
             grad_Aq_acc[i][j][k] += grad_x_vals * As_acc[i][j][k];
         }}}
     }
-    // 1.c) grad_Aq from Ys'
+    // 1.c) grad_Aq from Ys' (scatter)
     if (K <= N) {
         for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) {
             float grad_x_vals = 0.0f;
@@ -1415,11 +1486,7 @@ torch::Tensor compute_grad_S_single(
 }
 
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
-          torch::Tensor, torch::Tensor,
-          torch::Tensor, torch::Tensor,
-          torch::Tensor, torch::Tensor>
-backward_cpu(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> backward_cpu(
     torch::Tensor grad_output,
     torch::Tensor Q,
     torch::Tensor R,
