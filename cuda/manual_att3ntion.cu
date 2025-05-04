@@ -150,183 +150,6 @@ __global__ void grad_Q_kernel(
     int B, int H, int I, int J, int K, int D, int N_grad, 
     float scale);
 
-// Minimal backward function that returns zero gradients[placeholder]
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
-          torch::Tensor, torch::Tensor,
-          torch::Tensor, torch::Tensor,
-          torch::Tensor, torch::Tensor>
-backward_cuda(
-    torch::Tensor grad_output,
-    torch::Tensor Q, torch::Tensor R, torch::Tensor S,
-    torch::Tensor Vq_1, torch::Tensor Vq_2,
-    torch::Tensor Vr_1, torch::Tensor Vr_2,
-    torch::Tensor Vs_1, torch::Tensor Vs_2,
-    double dropout_rate)
-{
-  // Make sure inputs are contiguous (good practice, though PyTorch often handles this)
-  grad_output = grad_output.contiguous();
-  Q = Q.contiguous();  
-  R = R.contiguous();  
-  S = S.contiguous();
-  Vq_1 = Vq_1.contiguous();
-  Vq_2 = Vq_2.contiguous(); // Ensure Vq_2 is contiguous
-  Vr_1 = Vr_1.contiguous();
-  Vr_2 = Vr_2.contiguous(); // Ensure Vr_2 is contiguous
-  Vs_1 = Vs_1.contiguous();
-  Vs_2 = Vs_2.contiguous(); // Ensure Vs_2 is contiguous
-
-  // 1) allocate outputs
-  auto grad_Q   = torch::zeros_like(Q);
-  auto grad_R   = torch::zeros_like(R);
-  auto grad_S   = torch::zeros_like(S);
-  auto grad_Vq_1 = torch::zeros_like(Vq_1);
-  auto grad_Vq_2 = torch::zeros_like(Vq_2); // Allocate the target gradient tensor
-  auto grad_Vr_1 = torch::zeros_like(Vr_1);
-  auto grad_Vr_2 = torch::zeros_like(Vr_2);
-  auto grad_Vs_1 = torch::zeros_like(Vs_1);
-  auto grad_Vs_2 = torch::zeros_like(Vs_2);
-
-  // 2) extract dims + scale
-  const int B = Q.size(0);
-  const int H = Q.size(1);
-  const int I = Q.size(2);
-  const int J = R.size(2);
-  const int K = S.size(2);
-  const int D = Q.size(3);
-  const int N_grad = grad_output.size(2); // Use the provided grad_output size
-
-  const float scale = 1.0f / std::sqrt((float)D);
-  const int threads = 256; // Standard block size
-
-  // 3) Launch the kernel for grad_Vq_1
-  // The kernel computes grad_Vq_1 which has shape [B, H, I, D]
-  {
-    const int64_t N_kernel = (int64_t)B * H * I * D; // Total number of elements in grad_Vq_1
-    const dim3 blocks((N_kernel + threads - 1) / threads); // Calculate number of blocks needed
-
-    gather_grad_Vq1_kernel<<<blocks, threads>>>(
-        grad_output.data_ptr<float>(), // Combined gradient input
-        Q.data_ptr<float>(),
-        R.data_ptr<float>(),
-        S.data_ptr<float>(),
-        Vr_1.data_ptr<float>(),        // Value tensor needed for Y_s path
-        Vs_1.data_ptr<float>(),        // Value tensor needed for Y_r path
-        grad_Vq_1.data_ptr<float>(),   // Output gradient tensor
-        B, H, I, J, K, D, N_grad, scale); // Pass dimensions and scale
-  }
-
-  // Launch kernel for grad_Vr_1 (Gather)
-  {
-      const int64_t N_kernel = (int64_t)B * H * J * D;
-      const dim3 blocks((N_kernel + threads - 1) / threads);
-      // Assuming gather_grad_Vr1_kernel exists and is implemented
-      gather_grad_Vr1_kernel<<<blocks, threads>>>( 
-          grad_output.data_ptr<float>(), 
-          Q.data_ptr<float>(), 
-          R.data_ptr<float>(), 
-          S.data_ptr<float>(), 
-          Vq_1.data_ptr<float>(), // Vq_1 is needed
-          Vs_1.data_ptr<float>(), // Vs_1 is needed
-          grad_Vr_1.data_ptr<float>(), // Output 
-          B, H, I, J, K, D, N_grad, scale); 
-  }
-
-  // Launch kernel for grad_Vs_1 (Gather)
-  {
-      const int64_t N_kernel = (int64_t)B * H * K * D;
-      const dim3 blocks((N_kernel + threads - 1) / threads);
-      // Assuming gather_grad_Vs1_kernel exists and is implemented
-      gather_grad_Vs1_kernel<<<blocks, threads>>>( 
-          grad_output.data_ptr<float>(), 
-          Q.data_ptr<float>(), 
-          R.data_ptr<float>(), 
-          S.data_ptr<float>(), 
-          Vq_1.data_ptr<float>(), // Vq_1 is needed
-          Vr_1.data_ptr<float>(), // Vr_1 is needed
-          grad_Vs_1.data_ptr<float>(), // Output 
-          B, H, I, J, K, D, N_grad, scale); 
-  }
-
-  // Launch kernel for grad_Vq_2 (Scatter)
-  {
-      const int64_t N_kernel = (int64_t)B * H * I * D; 
-      const dim3 blocks((N_kernel + threads - 1) / threads);
-      scatter_grad_Vq2_kernel<<<blocks, threads>>>( 
-          grad_output.data_ptr<float>(), // Upstream grads dL/dY_r_, dL/dY_s_ 
-          Q.data_ptr<float>(), 
-          R.data_ptr<float>(), 
-          S.data_ptr<float>(), 
-          Vr_2.data_ptr<float>(),        // Value tensor needed for Y_s_ path
-          Vs_2.data_ptr<float>(),        // Value tensor needed for Y_r_ path
-          grad_Vq_2.data_ptr<float>(),   // Output gradient tensor
-          B, H, I, J, K, D, N_grad, scale); // Pass dimensions and scale
-  }
-  
-  // Launch kernel for grad_Vr_2 (Scatter)
-  {
-      const int64_t N_kernel = (int64_t)B * H * J * D; 
-      const dim3 blocks((N_kernel + threads - 1) / threads);
-      scatter_grad_Vr2_kernel<<<blocks, threads>>>( 
-          grad_output.data_ptr<float>(), 
-          Q.data_ptr<float>(), 
-          R.data_ptr<float>(), 
-          S.data_ptr<float>(), 
-          Vq_2.data_ptr<float>(),        // Value tensor needed for Y_s_ path
-          Vs_2.data_ptr<float>(),        // Value tensor needed for Y_q_ path
-          grad_Vr_2.data_ptr<float>(),   // Output gradient tensor
-          B, H, I, J, K, D, N_grad, scale); // Pass dimensions and scale
-  }
-
-  // Launch kernel for grad_Vs_2 (Scatter)
-  {
-      const int64_t N_kernel = (int64_t)B * H * K * D; 
-      const dim3 blocks((N_kernel + threads - 1) / threads);
-      scatter_grad_Vs2_kernel<<<blocks, threads>>>( 
-          grad_output.data_ptr<float>(), 
-          Q.data_ptr<float>(), 
-          R.data_ptr<float>(), 
-          S.data_ptr<float>(), 
-          Vq_2.data_ptr<float>(),        // Value tensor needed for Y_r_ path
-          Vr_2.data_ptr<float>(),        // Value tensor needed for Y_q_ path
-          grad_Vs_2.data_ptr<float>(),   // Output gradient tensor
-          B, H, I, J, K, D, N_grad, scale); // Pass dimensions and scale
-  }
-
-  // --- Launch kernel for grad_Q ---
- { 
-      const int64_t N_kernel = (int64_t)B * H * I * D;
-      const dim3 blocks((N_kernel + threads - 1) / threads);
-      grad_Q_kernel<<<blocks, threads>>>( 
-          grad_output.data_ptr<float>(), // gradY
-          Q.data_ptr<float>(),           // Q
-          R.data_ptr<float>(),           // R
-          S.data_ptr<float>(),           // S
-          Vq_1.data_ptr<float>(),        // Vq_1
-          Vq_2.data_ptr<float>(),        // Vq_2
-          Vr_1.data_ptr<float>(),        // Vr_1
-          Vr_2.data_ptr<float>(),        // Vr_2
-          Vs_1.data_ptr<float>(),        // Vs_1
-          Vs_2.data_ptr<float>(),        // Vs_2
-          grad_Q.data_ptr<float>(),      // gradQ (output)
-          B, H, I, J, K, D, N_grad, scale); // Dimensions, N_grad, scale
-  }
-
-  // TODO: Implement and launch kernels for grad_R, grad_S
-
-  cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    fprintf(stderr, "CUDA error in backward_cuda: %s\\n", cudaGetErrorString(err));
-  }
-  
-  cudaDeviceSynchronize(); // Wait for kernel completion
-
-  return std::make_tuple(
-      grad_Q, grad_R, grad_S,
-      grad_Vq_1, grad_Vq_2, 
-      grad_Vr_1, grad_Vr_2,
-      grad_Vs_1, grad_Vs_2 // Return all computed gradients
-  );
-}
 
 // Gather for fixed_dim = 0  (i.e. output shape [B,H,I,D]) i.e. Y_q
 __global__ void gather_dim0_kernel(
@@ -826,6 +649,114 @@ __global__ void scatter_dim2_kernel(
     Y_s_[idx] = accum_val;
 }
 
+// the CUDA entry‐point for forward pass
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> forward_cuda(
+    at::Tensor Q, at::Tensor R, at::Tensor S,
+    at::Tensor Vq_1, at::Tensor Vq_2,
+    at::Tensor Vr_1, at::Tensor Vr_2,
+    at::Tensor Vs_1, at::Tensor Vs_2,
+    double dropout_rate) 
+{
+    Q = Q.contiguous();  
+    R = R.contiguous();  
+    S = S.contiguous();
+    Vq_1 = Vq_1.contiguous();
+    Vq_2 = Vq_2.contiguous();
+    Vr_1 = Vr_1.contiguous();
+    Vr_2 = Vr_2.contiguous();
+    Vs_1 = Vs_1.contiguous();
+    Vs_2 = Vs_2.contiguous();
+
+    const auto B = Q.size(0);
+    const auto H = Q.size(1);
+    const auto I = Q.size(2);
+    const auto J = R.size(2);
+    const auto K = S.size(2);
+    const auto D = Q.size(3);
+
+    const float scale = 1.0f / std::sqrt((float)D);
+
+    // allocate outputs on GPU
+    auto opts = Q.options();
+    auto Y_q  = torch::zeros({B,H,I,D}, opts);
+    auto Y_r  = torch::zeros({B,H,J,D}, opts);
+    auto Y_s  = torch::zeros({B,H,K,D}, opts);
+    auto Y_q_ = torch::zeros({B,H,I,D}, opts); // Allocate output for scatter
+    auto Y_r_ = torch::zeros({B,H,J,D}, opts);
+    auto Y_s_ = torch::zeros({B,H,K,D}, opts);
+
+    const int threads = 256;
+
+    // --- GATHER Calls --- 
+    // dim=0
+    {
+        const int64_t N = (int64_t)B*H*I*D;
+        const dim3 blocks((N + threads - 1) / threads);
+        gather_dim0_kernel<<<blocks, threads>>>(
+            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
+            Vr_1.data_ptr<float>(), Vs_1.data_ptr<float>(), // Values Vr_1, Vs_1
+            Y_q.data_ptr<float>(), // Output Y_q
+            B, H, I, J, K, D, scale);
+    }
+    // dim=1
+    {
+        const int64_t N = (int64_t)B*H*J*D;
+        const dim3 blocks((N + threads - 1) / threads);
+        gather_dim1_kernel<<<blocks, threads>>>(
+            R.data_ptr<float>(), Q.data_ptr<float>(), S.data_ptr<float>(), // Query R
+            Vq_1.data_ptr<float>(), Vs_1.data_ptr<float>(), // Values Vq_1, Vs_1
+            Y_r.data_ptr<float>(), // Output Y_r
+            B, H, I, J, K, D, scale);
+    }
+    // dim=2
+    {
+        const int64_t N = (int64_t)B*H*K*D;
+        const dim3 blocks((N + threads - 1) / threads);
+        gather_dim2_kernel<<<blocks, threads>>>(
+            S.data_ptr<float>(), Q.data_ptr<float>(), R.data_ptr<float>(), // Query S
+            Vq_1.data_ptr<float>(), Vr_1.data_ptr<float>(), // Values Vq_1, Vr_1
+            Y_s.data_ptr<float>(), // Output Y_s
+            B, H, I, J, K, D, scale);
+    }
+
+    // --- SCATTER Calls --- 
+    // dim=0: Output Y_q_[B,H,I,D]. Inputs: Q,R,S, Vr_2, Vs_2
+    {
+        const int64_t N = (int64_t)B*H*I*D;
+        const dim3 blocks((N + threads - 1) / threads);
+        scatter_dim0_kernel<<<blocks, threads>>>(
+            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
+            Vr_2.data_ptr<float>(), Vs_2.data_ptr<float>(), // Values Vr_2, Vs_2
+            Y_q_.data_ptr<float>(), // Output Y_q_
+            B, H, I, J, K, D, scale);
+    }
+    // dim=1: Output Y_r_[B,H,J,D]. Inputs: Q,R,S, Vq_2, Vs_2
+    {
+        const int64_t N = (int64_t)B*H*J*D;
+        const dim3 blocks((N + threads - 1) / threads);
+        scatter_dim1_kernel<<<blocks, threads>>>(
+            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
+            Vq_2.data_ptr<float>(), Vs_2.data_ptr<float>(), // Values Vq_2, Vs_2
+            Y_r_.data_ptr<float>(), // Output Y_r_
+            B, H, I, J, K, D, scale);
+    }
+    // dim=2: Output Y_s_[B,H,K,D]. Inputs: Q,R,S, Vq_2, Vr_2
+    {
+        const int64_t N = (int64_t)B*H*K*D;
+        const dim3 blocks((N + threads - 1) / threads);
+        scatter_dim2_kernel<<<blocks, threads>>>(
+            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
+            Vq_2.data_ptr<float>(), Vr_2.data_ptr<float>(), // Values Vq_2, Vr_2
+            Y_s_.data_ptr<float>(), // Output Y_s_
+            B, H, I, J, K, D, scale);
+    }
+
+    cudaDeviceSynchronize(); // Wait for all kernels to complete
+    
+    // Return the tuple of all intermediate tensors
+    return std::make_tuple(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_);
+}
+
 // --- Backward Kernels ---
 
 // Kernel to compute gradient for Vq_1
@@ -1310,110 +1241,181 @@ __global__ void grad_Q_kernel(
     gradQ[idx] = 0.0f;
 }
 
-// the CUDA entry‐point for forward pass
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> forward_cuda(
-    at::Tensor Q, at::Tensor R, at::Tensor S,
-    at::Tensor Vq_1, at::Tensor Vq_2,
-    at::Tensor Vr_1, at::Tensor Vr_2,
-    at::Tensor Vs_1, at::Tensor Vs_2,
-    double dropout_rate) 
+
+// Minimal backward function that returns zero gradients[placeholder]
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
+          torch::Tensor, torch::Tensor,
+          torch::Tensor, torch::Tensor,
+          torch::Tensor, torch::Tensor>
+backward_cuda(
+    torch::Tensor grad_output,
+    torch::Tensor Q, torch::Tensor R, torch::Tensor S,
+    torch::Tensor Vq_1, torch::Tensor Vq_2,
+    torch::Tensor Vr_1, torch::Tensor Vr_2,
+    torch::Tensor Vs_1, torch::Tensor Vs_2,
+    double dropout_rate)
 {
-    Q = Q.contiguous();  
-    R = R.contiguous();  
-    S = S.contiguous();
-    Vq_1 = Vq_1.contiguous();
-    Vq_2 = Vq_2.contiguous();
-    Vr_1 = Vr_1.contiguous();
-    Vr_2 = Vr_2.contiguous();
-    Vs_1 = Vs_1.contiguous();
-    Vs_2 = Vs_2.contiguous();
+  // Make sure inputs are contiguous (good practice, though PyTorch often handles this)
+  grad_output = grad_output.contiguous();
+  Q = Q.contiguous();  
+  R = R.contiguous();  
+  S = S.contiguous();
+  Vq_1 = Vq_1.contiguous();
+  Vq_2 = Vq_2.contiguous(); // Ensure Vq_2 is contiguous
+  Vr_1 = Vr_1.contiguous();
+  Vr_2 = Vr_2.contiguous(); // Ensure Vr_2 is contiguous
+  Vs_1 = Vs_1.contiguous();
+  Vs_2 = Vs_2.contiguous(); // Ensure Vs_2 is contiguous
 
-    const auto B = Q.size(0);
-    const auto H = Q.size(1);
-    const auto I = Q.size(2);
-    const auto J = R.size(2);
-    const auto K = S.size(2);
-    const auto D = Q.size(3);
+  // 1) allocate outputs
+  auto grad_Q   = torch::zeros_like(Q);
+  auto grad_R   = torch::zeros_like(R);
+  auto grad_S   = torch::zeros_like(S);
+  auto grad_Vq_1 = torch::zeros_like(Vq_1);
+  auto grad_Vq_2 = torch::zeros_like(Vq_2); // Allocate the target gradient tensor
+  auto grad_Vr_1 = torch::zeros_like(Vr_1);
+  auto grad_Vr_2 = torch::zeros_like(Vr_2);
+  auto grad_Vs_1 = torch::zeros_like(Vs_1);
+  auto grad_Vs_2 = torch::zeros_like(Vs_2);
 
-    const float scale = 1.0f / std::sqrt((float)D);
+  // 2) extract dims + scale
+  const int B = Q.size(0);
+  const int H = Q.size(1);
+  const int I = Q.size(2);
+  const int J = R.size(2);
+  const int K = S.size(2);
+  const int D = Q.size(3);
+  const int N_grad = grad_output.size(2); // Use the provided grad_output size
 
-    // allocate outputs on GPU
-    auto opts = Q.options();
-    auto Y_q  = torch::zeros({B,H,I,D}, opts);
-    auto Y_r  = torch::zeros({B,H,J,D}, opts);
-    auto Y_s  = torch::zeros({B,H,K,D}, opts);
-    auto Y_q_ = torch::zeros({B,H,I,D}, opts); // Allocate output for scatter
-    auto Y_r_ = torch::zeros({B,H,J,D}, opts);
-    auto Y_s_ = torch::zeros({B,H,K,D}, opts);
+  const float scale = 1.0f / std::sqrt((float)D);
+  const int threads = 256; // Standard block size
 
-    const int threads = 256;
+  // 3) Launch the kernel for grad_Vq_1
+  // The kernel computes grad_Vq_1 which has shape [B, H, I, D]
+  {
+    const int64_t N_kernel = (int64_t)B * H * I * D; // Total number of elements in grad_Vq_1
+    const dim3 blocks((N_kernel + threads - 1) / threads); // Calculate number of blocks needed
 
-    // --- GATHER Calls --- 
-    // dim=0
-    {
-        const int64_t N = (int64_t)B*H*I*D;
-        const dim3 blocks((N + threads - 1) / threads);
-        gather_dim0_kernel<<<blocks, threads>>>(
-            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
-            Vr_1.data_ptr<float>(), Vs_1.data_ptr<float>(), // Values Vr_1, Vs_1
-            Y_q.data_ptr<float>(), // Output Y_q
-            B, H, I, J, K, D, scale);
-    }
-    // dim=1
-    {
-        const int64_t N = (int64_t)B*H*J*D;
-        const dim3 blocks((N + threads - 1) / threads);
-        gather_dim1_kernel<<<blocks, threads>>>(
-            R.data_ptr<float>(), Q.data_ptr<float>(), S.data_ptr<float>(), // Query R
-            Vq_1.data_ptr<float>(), Vs_1.data_ptr<float>(), // Values Vq_1, Vs_1
-            Y_r.data_ptr<float>(), // Output Y_r
-            B, H, I, J, K, D, scale);
-    }
-    // dim=2
-    {
-        const int64_t N = (int64_t)B*H*K*D;
-        const dim3 blocks((N + threads - 1) / threads);
-        gather_dim2_kernel<<<blocks, threads>>>(
-            S.data_ptr<float>(), Q.data_ptr<float>(), R.data_ptr<float>(), // Query S
-            Vq_1.data_ptr<float>(), Vr_1.data_ptr<float>(), // Values Vq_1, Vr_1
-            Y_s.data_ptr<float>(), // Output Y_s
-            B, H, I, J, K, D, scale);
-    }
+    gather_grad_Vq1_kernel<<<blocks, threads>>>(
+        grad_output.data_ptr<float>(), // Combined gradient input
+        Q.data_ptr<float>(),
+        R.data_ptr<float>(),
+        S.data_ptr<float>(),
+        Vr_1.data_ptr<float>(),        // Value tensor needed for Y_s path
+        Vs_1.data_ptr<float>(),        // Value tensor needed for Y_r path
+        grad_Vq_1.data_ptr<float>(),   // Output gradient tensor
+        B, H, I, J, K, D, N_grad, scale); // Pass dimensions and scale
+  }
 
-    // --- SCATTER Calls --- 
-    // dim=0: Output Y_q_[B,H,I,D]. Inputs: Q,R,S, Vr_2, Vs_2
-    {
-        const int64_t N = (int64_t)B*H*I*D;
-        const dim3 blocks((N + threads - 1) / threads);
-        scatter_dim0_kernel<<<blocks, threads>>>(
-            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
-            Vr_2.data_ptr<float>(), Vs_2.data_ptr<float>(), // Values Vr_2, Vs_2
-            Y_q_.data_ptr<float>(), // Output Y_q_
-            B, H, I, J, K, D, scale);
-    }
-    // dim=1: Output Y_r_[B,H,J,D]. Inputs: Q,R,S, Vq_2, Vs_2
-    {
-        const int64_t N = (int64_t)B*H*J*D;
-        const dim3 blocks((N + threads - 1) / threads);
-        scatter_dim1_kernel<<<blocks, threads>>>(
-            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
-            Vq_2.data_ptr<float>(), Vs_2.data_ptr<float>(), // Values Vq_2, Vs_2
-            Y_r_.data_ptr<float>(), // Output Y_r_
-            B, H, I, J, K, D, scale);
-    }
-    // dim=2: Output Y_s_[B,H,K,D]. Inputs: Q,R,S, Vq_2, Vr_2
-    {
-        const int64_t N = (int64_t)B*H*K*D;
-        const dim3 blocks((N + threads - 1) / threads);
-        scatter_dim2_kernel<<<blocks, threads>>>(
-            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
-            Vq_2.data_ptr<float>(), Vr_2.data_ptr<float>(), // Values Vq_2, Vr_2
-            Y_s_.data_ptr<float>(), // Output Y_s_
-            B, H, I, J, K, D, scale);
-    }
+  // Launch kernel for grad_Vr_1 (Gather)
+  {
+      const int64_t N_kernel = (int64_t)B * H * J * D;
+      const dim3 blocks((N_kernel + threads - 1) / threads);
+      // Assuming gather_grad_Vr1_kernel exists and is implemented
+      gather_grad_Vr1_kernel<<<blocks, threads>>>( 
+          grad_output.data_ptr<float>(), 
+          Q.data_ptr<float>(), 
+          R.data_ptr<float>(), 
+          S.data_ptr<float>(), 
+          Vq_1.data_ptr<float>(), // Vq_1 is needed
+          Vs_1.data_ptr<float>(), // Vs_1 is needed
+          grad_Vr_1.data_ptr<float>(), // Output 
+          B, H, I, J, K, D, N_grad, scale); 
+  }
 
-    cudaDeviceSynchronize(); // Wait for all kernels to complete
-    
-    // Return the tuple of all intermediate tensors
-    return std::make_tuple(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_);
+  // Launch kernel for grad_Vs_1 (Gather)
+  {
+      const int64_t N_kernel = (int64_t)B * H * K * D;
+      const dim3 blocks((N_kernel + threads - 1) / threads);
+      // Assuming gather_grad_Vs1_kernel exists and is implemented
+      gather_grad_Vs1_kernel<<<blocks, threads>>>( 
+          grad_output.data_ptr<float>(), 
+          Q.data_ptr<float>(), 
+          R.data_ptr<float>(), 
+          S.data_ptr<float>(), 
+          Vq_1.data_ptr<float>(), // Vq_1 is needed
+          Vr_1.data_ptr<float>(), // Vr_1 is needed
+          grad_Vs_1.data_ptr<float>(), // Output 
+          B, H, I, J, K, D, N_grad, scale); 
+  }
+
+  // Launch kernel for grad_Vq_2 (Scatter)
+  {
+      const int64_t N_kernel = (int64_t)B * H * I * D; 
+      const dim3 blocks((N_kernel + threads - 1) / threads);
+      scatter_grad_Vq2_kernel<<<blocks, threads>>>( 
+          grad_output.data_ptr<float>(), // Upstream grads dL/dY_r_, dL/dY_s_ 
+          Q.data_ptr<float>(), 
+          R.data_ptr<float>(), 
+          S.data_ptr<float>(), 
+          Vr_2.data_ptr<float>(),        // Value tensor needed for Y_s_ path
+          Vs_2.data_ptr<float>(),        // Value tensor needed for Y_r_ path
+          grad_Vq_2.data_ptr<float>(),   // Output gradient tensor
+          B, H, I, J, K, D, N_grad, scale); // Pass dimensions and scale
+  }
+  
+  // Launch kernel for grad_Vr_2 (Scatter)
+  {
+      const int64_t N_kernel = (int64_t)B * H * J * D; 
+      const dim3 blocks((N_kernel + threads - 1) / threads);
+      scatter_grad_Vr2_kernel<<<blocks, threads>>>( 
+          grad_output.data_ptr<float>(), 
+          Q.data_ptr<float>(), 
+          R.data_ptr<float>(), 
+          S.data_ptr<float>(), 
+          Vq_2.data_ptr<float>(),        // Value tensor needed for Y_s_ path
+          Vs_2.data_ptr<float>(),        // Value tensor needed for Y_q_ path
+          grad_Vr_2.data_ptr<float>(),   // Output gradient tensor
+          B, H, I, J, K, D, N_grad, scale); // Pass dimensions and scale
+  }
+
+  // Launch kernel for grad_Vs_2 (Scatter)
+  {
+      const int64_t N_kernel = (int64_t)B * H * K * D; 
+      const dim3 blocks((N_kernel + threads - 1) / threads);
+      scatter_grad_Vs2_kernel<<<blocks, threads>>>( 
+          grad_output.data_ptr<float>(), 
+          Q.data_ptr<float>(), 
+          R.data_ptr<float>(), 
+          S.data_ptr<float>(), 
+          Vq_2.data_ptr<float>(),        // Value tensor needed for Y_r_ path
+          Vr_2.data_ptr<float>(),        // Value tensor needed for Y_q_ path
+          grad_Vs_2.data_ptr<float>(),   // Output gradient tensor
+          B, H, I, J, K, D, N_grad, scale); // Pass dimensions and scale
+  }
+
+  // --- Launch kernel for grad_Q ---
+ { 
+      const int64_t N_kernel = (int64_t)B * H * I * D;
+      const dim3 blocks((N_kernel + threads - 1) / threads);
+      grad_Q_kernel<<<blocks, threads>>>( 
+          grad_output.data_ptr<float>(), // gradY
+          Q.data_ptr<float>(),           // Q
+          R.data_ptr<float>(),           // R
+          S.data_ptr<float>(),           // S
+          Vq_1.data_ptr<float>(),        // Vq_1
+          Vq_2.data_ptr<float>(),        // Vq_2
+          Vr_1.data_ptr<float>(),        // Vr_1
+          Vr_2.data_ptr<float>(),        // Vr_2
+          Vs_1.data_ptr<float>(),        // Vs_1
+          Vs_2.data_ptr<float>(),        // Vs_2
+          grad_Q.data_ptr<float>(),      // gradQ (output)
+          B, H, I, J, K, D, N_grad, scale); // Dimensions, N_grad, scale
+  }
+
+  // TODO: Implement and launch kernels for grad_R, grad_S
+
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    fprintf(stderr, "CUDA error in backward_cuda: %s\\n", cudaGetErrorString(err));
+  }
+  
+  cudaDeviceSynchronize(); // Wait for kernel completion
+
+  return std::make_tuple(
+      grad_Q, grad_R, grad_S,
+      grad_Vq_1, grad_Vq_2, 
+      grad_Vr_1, grad_Vr_2,
+      grad_Vs_1, grad_Vs_2 // Return all computed gradients
+  );
 }
