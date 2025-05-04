@@ -69,7 +69,7 @@ def run_test():
     
     try:
         Y_tuple_cpu = manual_att3ntion.forward(Q_cpu, R_cpu, S_cpu, Vq_1_cpu, Vq_2_cpu, Vr_1_cpu, Vr_2_cpu, Vs_1_cpu, Vs_2_cpu, dr_cpu)
-        Y_q_cpu, Y_r_cpu, Y_s_cpu, _, _, _ = Y_tuple_cpu
+        Y_q_cpu, Y_r_cpu, Y_s_cpu, Y_q__cpu, Y_r__cpu, Y_s__cpu = Y_tuple_cpu
         print("CPU forward pass completed.")
     except Exception as e:
         print(f"Error during CPU forward pass: {e}")
@@ -100,16 +100,19 @@ def run_test():
     print("Running forward pass on CUDA...")
     try:
         Y_tuple_cuda = manual_att3ntion.forward(Q_cuda, R_cuda, S_cuda, Vq_1_cuda, Vq_2_cuda, Vr_1_cuda, Vr_2_cuda, Vs_1_cuda, Vs_2_cuda, dr_cuda)
-        Y_q_cuda, Y_r_cuda, Y_s_cuda, _, _, _ = Y_tuple_cuda
+        Y_q_cuda, Y_r_cuda, Y_s_cuda, Y_q__cuda, Y_r__cuda, Y_s__cuda = Y_tuple_cuda
         print("CUDA forward pass completed.")
     except Exception as e:
         print(f"Error during CUDA forward pass: {e}")
         sys.exit(1)
 
-    print("\nComparing CPU and CUDA gather outputs...")
+    print("\nComparing CPU and CUDA outputs...")
     Y_q_cuda_cpu = Y_q_cuda.cpu()
     Y_r_cuda_cpu = Y_r_cuda.cpu()
     Y_s_cuda_cpu = Y_s_cuda.cpu()
+    Y_q__cuda_cpu = Y_q__cuda.cpu()
+    Y_r__cuda_cpu = Y_r__cuda.cpu()
+    Y_s__cuda_cpu = Y_s__cuda.cpu()
 
     shape_match = True
     if Y_q_cpu.shape != Y_q_cuda_cpu.shape:
@@ -121,6 +124,15 @@ def run_test():
     if Y_s_cpu.shape != Y_s_cuda_cpu.shape:
         print(f"ERROR: Y_s shape mismatch! CPU: {Y_s_cpu.shape}, CUDA: {Y_s_cuda_cpu.shape}")
         shape_match = False
+    if Y_q__cpu.shape != Y_q__cuda_cpu.shape:
+        print(f"ERROR: Y_q_ shape mismatch! CPU: {Y_q__cpu.shape}, CUDA: {Y_q__cuda_cpu.shape}")
+        shape_match = False
+    if Y_r__cpu.shape != Y_r__cuda_cpu.shape:
+        print(f"ERROR: Y_r_ shape mismatch! CPU: {Y_r__cpu.shape}, CUDA: {Y_r__cuda_cpu.shape}")
+        shape_match = False
+    if Y_s__cpu.shape != Y_s__cuda_cpu.shape:
+        print(f"ERROR: Y_s_ shape mismatch! CPU: {Y_s__cpu.shape}, CUDA: {Y_s__cuda_cpu.shape}")
+        shape_match = False
         
     if not shape_match:
         print("Exiting due to shape mismatches.")
@@ -128,20 +140,31 @@ def run_test():
     else:
         print("Shapes match.")
 
+    # Check numerical equivalence for gather outputs
     yq_close = torch.allclose(Y_q_cpu, Y_q_cuda_cpu, rtol=rtol, atol=atol)
     yr_close = torch.allclose(Y_r_cpu, Y_r_cuda_cpu, rtol=rtol, atol=atol)
     ys_close = torch.allclose(Y_s_cpu, Y_s_cuda_cpu, rtol=rtol, atol=atol)
+    
+    # Check numerical equivalence for scatter outputs
+    yq__close = torch.allclose(Y_q__cpu, Y_q__cuda_cpu, rtol=rtol, atol=atol)
+    yr__close = torch.allclose(Y_r__cpu, Y_r__cuda_cpu, rtol=rtol, atol=atol)
+    ys__close = torch.allclose(Y_s__cpu, Y_s__cuda_cpu, rtol=rtol, atol=atol)
 
     forward_results = [
         ["Y_q", "PASS" if yq_close else "FAIL", (Y_q_cpu - Y_q_cuda_cpu).abs().max().item() if not yq_close else 0],
         ["Y_r", "PASS" if yr_close else "FAIL", (Y_r_cpu - Y_r_cuda_cpu).abs().max().item() if not yr_close else 0],
-        ["Y_s", "PASS" if ys_close else "FAIL", (Y_s_cpu - Y_s_cuda_cpu).abs().max().item() if not ys_close else 0]
+        ["Y_s", "PASS" if ys_close else "FAIL", (Y_s_cpu - Y_s_cuda_cpu).abs().max().item() if not ys_close else 0],
+        ["Y_q_", "PASS" if yq__close else "FAIL", (Y_q__cpu - Y_q__cuda_cpu).abs().max().item() if not yq__close else 0],
+        ["Y_r_", "PASS" if yr__close else "FAIL", (Y_r__cpu - Y_r__cuda_cpu).abs().max().item() if not yr__close else 0],
+        ["Y_s_", "PASS" if ys__close else "FAIL", (Y_s__cpu - Y_s__cuda_cpu).abs().max().item() if not ys__close else 0]
     ]
     
     print("\nForward Pass Results:")
     print_table(["Output", "Status", "Max Diff"], forward_results)
 
-    if yq_close and yr_close and ys_close:
+    all_passed = yq_close and yr_close and ys_close and yq__close and yr__close and ys__close
+    
+    if all_passed:
         print("\n*** Forward Pass Equivalence Test Passed! ***")
     else:
         print("\n*** Forward Pass Equivalence Test Failed! ***")
