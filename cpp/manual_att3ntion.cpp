@@ -4,9 +4,8 @@
 #include <limits>
 #include <vector> 
 #include <tuple>  
-#include <iomanip> // Added for std::fixed and std::setprecision
-#include <cstdio>  // Added for printf
-#include <cuda_runtime.h> // Ensure CUDA runtime is included
+#include <iomanip> 
+#include <cuda_runtime.h> 
 
 // Forward declarations for CUDA functions tuple
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
@@ -1354,9 +1353,6 @@ torch::Tensor compute_grad_A_single(
     for (int i = 0; i < I; ++i) {
         float sum_q = 0.0f;
         for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) { sum_q += grad_Aq_acc[i][j][k] * Aq_acc[i][j][k]; }}
-         if (b == 0 && h == 0 && i == i_target_debug) { // i_target_debug should be defined earlier if not already
-                printf("CPU DEBUG SUM_Q[%d]=%.10f\n", i, sum_q);
-            }
         for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) { grad_A_acc[i][j][k] += (grad_Aq_acc[i][j][k] - sum_q) * Aq_acc[i][j][k]; }}
     }
 
@@ -1364,9 +1360,6 @@ torch::Tensor compute_grad_A_single(
     for (int j = 0; j < J; ++j) {
         float sum_r = 0.0f;
         for (int i = 0; i < I; ++i) { for (int k = 0; k < K; ++k) { sum_r += grad_Ar_acc[i][j][k] * Ar_acc[i][j][k]; }}
-        if (b == 0 && h == 0 && j == j_target_debug) { // j_target_debug should be defined earlier if not already
-                 printf("CPU DEBUG SUM_R[%d]=%.10f\n", j, sum_r);
-             }
         for (int i = 0; i < I; ++i) { for (int k = 0; k < K; ++k) { grad_A_acc[i][j][k] += (grad_Ar_acc[i][j][k] - sum_r) * Ar_acc[i][j][k]; }}
     }
 
@@ -1374,9 +1367,6 @@ torch::Tensor compute_grad_A_single(
     for (int k = 0; k < K; ++k) {
         float sum_s = 0.0f;
         for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { sum_s += grad_As_acc[i][j][k] * As_acc[i][j][k]; }}
-        if (b == 0 && h == 0 && k == k_target_debug) { // k_target_debug should be defined earlier if not already
-                 printf("CPU DEBUG SUM_S[%d]=%.10f\n", k, sum_s);
-            }
         for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { grad_A_acc[i][j][k] += (grad_As_acc[i][j][k] - sum_s) * As_acc[i][j][k]; }}
     }
 
