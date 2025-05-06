@@ -398,12 +398,13 @@ __device__ inline float compute_dot_product_cuda(
     const float* r_vec = R + (((int64_t)b * H + h) * J + j) * D;
     const float* s_vec = S + (((int64_t)b * H + h) * K + k) * D;
 
-    double dot = 0.0;
+    float dot = 0.0f;
     #pragma unroll 4
     for (int d = 0; d < D; ++d) {
-        dot += (double)q_vec[d] * (double)r_vec[d] * (double)s_vec[d];
+        // Accumulate directly as float
+        dot += q_vec[d] * r_vec[d] * s_vec[d];
     }
-    return (float)dot;
+    return dot;
 }
 
 // Device helper: Compute single softmax attention value Ar[i,j,k] (fixed_dim=1) or As[i,j,k] (fixed_dim=2)
@@ -417,78 +418,73 @@ __device__ inline float compute_single_softmax_attn_cuda(
     int fixed_dim // 1 for Ar (softmax over i, k for fixed j), 2 for As (softmax over i, j for fixed k)
 )
 {
-    double max_val = -1.0e30;
-    double sum_exp = 0.0;
+    float max_val = -1.0e30f;
+    float sum_exp = 0.0f;
 
     // --- First Pass: Find Max --- 
     if (fixed_dim == 0) { // Aq: Softmax over j, k for fixed i_target
-        for (int j = 0; j < J; ++j) {
-            for (int k = 0; k < K; ++k) {
-                double dot = (double)compute_dot_product_cuda(Q, R, S, b, h, i_target, j, k, B, H, I, J, K, D);
-                max_val = fmax(max_val, dot * (double)scale);
+        for (int j_idx = 0; j_idx < J; ++j_idx) {
+            for (int k_idx = 0; k_idx < K; ++k_idx) {
+                float dot = compute_dot_product_cuda(Q, R, S, b, h, i_target, j_idx, k_idx, B, H, I, J, K, D);
+                max_val = fmaxf(max_val, dot * scale);
             }
         }
     }
     else if (fixed_dim == 1) { // Ar: Softmax over i, k for fixed j_target
-        for (int i = 0; i < I; ++i) {
-            for (int k = 0; k < K; ++k) {
-                // Pass B, H, I, J, K, D to the dot product function
-                double dot = (double)compute_dot_product_cuda(Q, R, S, b, h, i, j_target, k, B, H, I, J, K, D);
-                max_val = fmax(max_val, dot * (double)scale);
+        for (int i_idx = 0; i_idx < I; ++i_idx) {
+            for (int k_idx = 0; k_idx < K; ++k_idx) {
+                float dot = compute_dot_product_cuda(Q, R, S, b, h, i_idx, j_target, k_idx, B, H, I, J, K, D);
+                max_val = fmaxf(max_val, dot * scale);
             }
         }
     } else { // fixed_dim == 2: As: Softmax over i, j for fixed k_target
-        for (int i = 0; i < I; ++i) {
-            for (int j = 0; j < J; ++j) {
-                // Pass B, H, I, J, K, D to the dot product function
-                double dot = (double)compute_dot_product_cuda(Q, R, S, b, h, i, j, k_target, B, H, I, J, K, D);
-                max_val = fmax(max_val, dot * (double)scale);
+        for (int i_idx = 0; i_idx < I; ++i_idx) {
+            for (int j_idx = 0; j_idx < J; ++j_idx) {
+                float dot = compute_dot_product_cuda(Q, R, S, b, h, i_idx, j_idx, k_target, B, H, I, J, K, D);
+                max_val = fmaxf(max_val, dot * scale);
             }
         }
     }
 
     // --- Second Pass: Compute Sum Exp ---
     if (fixed_dim == 0) { // Aq
-        for (int j = 0; j < J; ++j) {
-            for (int k = 0; k < K; ++k) {
-                double dot = (double)compute_dot_product_cuda(Q, R, S, b, h, i_target, j, k, B, H, I, J, K, D);
-                sum_exp += exp(dot * (double)scale - max_val);
+        for (int j_idx = 0; j_idx < J; ++j_idx) {
+            for (int k_idx = 0; k_idx < K; ++k_idx) {
+                float dot = compute_dot_product_cuda(Q, R, S, b, h, i_target, j_idx, k_idx, B, H, I, J, K, D);
+                sum_exp += expf(dot * scale - max_val);
             }
         }
     }
     else if (fixed_dim == 1) { // Ar
-        for (int i = 0; i < I; ++i) {
-            for (int k = 0; k < K; ++k) {
-                // Pass B, H, I, J, K, D to the dot product function
-                double dot = (double)compute_dot_product_cuda(Q, R, S, b, h, i, j_target, k, B, H, I, J, K, D);
-                sum_exp += exp(dot * (double)scale - max_val);
+        for (int i_idx = 0; i_idx < I; ++i_idx) {
+            for (int k_idx = 0; k_idx < K; ++k_idx) {
+                float dot = compute_dot_product_cuda(Q, R, S, b, h, i_idx, j_target, k_idx, B, H, I, J, K, D);
+                sum_exp += expf(dot * scale - max_val);
             }
         }
     } else { // As
-        for (int i = 0; i < I; ++i) {
-            for (int j = 0; j < J; ++j) {
-                // Pass B, H, I, J, K, D to the dot product function
-                double dot = (double)compute_dot_product_cuda(Q, R, S, b, h, i, j, k_target, B, H, I, J, K, D);
-                sum_exp += exp(dot * (double)scale - max_val);
+        for (int i_idx = 0; i_idx < I; ++i_idx) {
+            for (int j_idx = 0; j_idx < J; ++j_idx) {
+                float dot = compute_dot_product_cuda(Q, R, S, b, h, i_idx, j_idx, k_target, B, H, I, J, K, D);
+                sum_exp += expf(dot * scale - max_val);
             }
         }
     }
 
     // --- Compute final value for the target indices ---
-    // Pass B, H, I, J, K, D to the dot product function
-    double target_dot = (double)compute_dot_product_cuda(Q, R, S, b, h, i_target, j_target, k_target, B, H, I, J, K, D);
+    float target_dot = compute_dot_product_cuda(Q, R, S, b, h, i_target, j_target, k_target, B, H, I, J, K, D);
     
     // Handle potential division by zero if sum_exp is very small
-    if (sum_exp <= 1e-20) { 
+    if (sum_exp <= 1e-20f) {
         int num_elements;
         if (fixed_dim == 0) num_elements = J * K;
         else if (fixed_dim == 1) num_elements = I * K;
         else /* fixed_dim == 2 */ num_elements = I * J;
         // If the target dot was also the max (or close), return uniform prob, else 0.
-        return (fabs(target_dot * (double)scale - max_val) < 1e-5) ? (1.0f / (float)num_elements) : 0.0f;
+        return (fabsf(target_dot * scale - max_val) < 1e-5f) ? (1.0f / (float)num_elements) : 0.0f;
     }
     
-    return (float)(exp(target_dot * (double)scale - max_val) / sum_exp);
+    return expf(target_dot * scale - max_val) / sum_exp;
 }
 
 // Scatter for fixed_dim = 0 (Output Y_q_)
@@ -670,7 +666,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     const auto K = S.size(2);
     const auto D = Q.size(3);
 
-    const float scale = 1.0f / std::sqrt((float)D);
+    const float scale = 1.0f / sqrtf((float)D); // Use sqrtf for float
 
     // allocate outputs on GPU
     auto opts = Q.options();
@@ -1271,23 +1267,24 @@ __global__ void grad_Q_kernel(
 
     // --- Compute sum for grad_Q[b, h, i, d] ---
     // grad_Q[i,d] = scale * sum_{j,k} ( grad_A[i,j,k] * R[j,d] * S[k,d] )
-    double sum_for_grad_q = 0.0; // Use double for accumulation precision
-    for (int j = 0; j < J; ++j) {
-        for (int k = 0; k < K; ++k) {
+    float sum_for_grad_q = 0.0f;
+    for (int j_idx = 0; j_idx < J; ++j_idx) {
+        for (int k_idx = 0; k_idx < K; ++k_idx) {
             // Calculate linear indices relative to slice base pointers (b,h)
             // grad_A[i, j, k] within the (b,h) slice
-            int64_t idx_A = (int64_t)i * stride_A_I + (int64_t)j * stride_A_J + (int64_t)k * stride_A_K;
+            int64_t idx_A = (int64_t)i * stride_A_I + (int64_t)j_idx * stride_A_J + (int64_t)k_idx * stride_A_K;
             // R[j, d] within the (b,h) slice
-            int64_t idx_R = (int64_t)j * stride_R_J + (int64_t)d * stride_R_D;
+            int64_t idx_R = (int64_t)j_idx * stride_R_J + (int64_t)d * stride_R_D;
             // S[k, d] within the (b,h) slice
-            int64_t idx_S = (int64_t)k * stride_S_K + (int64_t)d * stride_S_D;
+            int64_t idx_S = (int64_t)k_idx * stride_S_K + (int64_t)d * stride_S_D;
 
-            sum_for_grad_q += (double)grad_A_base[idx_A] * (double)R_base[idx_R] * (double)S_base[idx_S];
+            // Accumulate directly as float
+            sum_for_grad_q += grad_A_base[idx_A] * R_base[idx_R] * S_base[idx_S];
         }
     }
 
     // --- Write output ---
-    grad_Q[idx] = scale * (float)sum_for_grad_q;
+    grad_Q[idx] = scale * sum_for_grad_q;
 }
 
 
@@ -1400,7 +1397,7 @@ backward_cuda(
   const int D = Q.size(3);
   const int N_grad = grad_output.size(2); // Use the provided grad_output size
 
-  const float scale = 1.0f / std::sqrt((float)D);
+  const float scale = 1.0f / sqrtf((float)D); // Use sqrtf for float
   const int threads = 256; // Standard block size
 
   // 3) Launch the kernel for grad_Vq_1

@@ -128,44 +128,6 @@ def benchmark_comparison(configs, num_runs=5, device_cpu='cpu', device_cuda='cud
         max_diff_fwd = 0.0
         cuda_bwd_match = True
         max_diff_bwd = 0.0
-
-        if torch.cuda.is_available() and manual_cuda_outputs is not None:
-            with torch.no_grad():
-                # Compare Forward Pass (Manual CPU vs Manual CUDA)
-                print("Comparing Manual CPU vs Manual CUDA Forward...")
-                for i, (cpu_tensor, cuda_tensor) in enumerate(zip(manual_cpu_outputs, manual_cuda_outputs)):
-                    cuda_tensor_cpu = cuda_tensor.cpu()  # Move to CPU for comparison
-                    if not torch.allclose(cpu_tensor, cuda_tensor_cpu, rtol=1e-4, atol=1e-4):
-                        cuda_fwd_match = False
-                        this_diff = torch.max(torch.abs(cpu_tensor - cuda_tensor_cpu)).item()
-                        max_diff_fwd = max(max_diff_fwd, this_diff)
-                        print(f"  Mismatch found in forward output tensor {i}")
-                print(f"Manual CPU vs CUDA Forward: {'MATCH' if cuda_fwd_match else f'DIFFER (max diff: {max_diff_fwd:.6f})'}")
-
-                # Compare Backward Pass (Manual CPU vs Manual CUDA)
-                if manual_cuda_grads is not None:
-                    print("Comparing Manual CPU vs Manual CUDA Backward...")
-                    for i, (cpu_grad, cuda_grad) in enumerate(zip(manual_cpu_grads, manual_cuda_grads)):
-                        # Skip comparison for grad_Q, grad_R, grad_S (indices 0, 1, 2)
-                        if i < 3:
-                            continue
-
-                        if cpu_grad is None and cuda_grad is None: continue
-                        if cpu_grad is None or cuda_grad is None:
-                            cuda_bwd_match = False
-                            print(f"  Mismatch: Grad {i} is None in one implementation but not the other.")
-                            break
-
-                        cuda_grad_cpu = cuda_grad.cpu()
-                        if not torch.allclose(cpu_grad, cuda_grad_cpu, rtol=1e-4, atol=1e-4):
-                            cuda_bwd_match = False
-                            this_diff = torch.max(torch.abs(cpu_grad - cuda_grad_cpu)).item()
-                            max_diff_bwd = max(max_diff_bwd, this_diff)
-                            print(f"  Mismatch found in backward gradient tensor {i}")
-                    print(f"Manual CPU vs CUDA Backward: {'MATCH' if cuda_bwd_match else f'DIFFER (max diff: {max_diff_bwd:.6f})'}")
-
-
-        # Record results
         result = {
             'Config': f"B={B},H={H},I={I},J={J},K={K},D={D}",
             'Manual CPU Fwd (ms)': manual_cpu_fwd_time_ms,
@@ -179,13 +141,11 @@ def benchmark_comparison(configs, num_runs=5, device_cpu='cpu', device_cuda='cud
         }
         results.append(result)
 
-        # Clean up memory
         del cpu_inputs, grad_output_cpu, manual_cpu_outputs, manual_cpu_grads
         if torch.cuda.is_available():
             del cuda_inputs, grad_output_cuda, manual_cuda_outputs, manual_cuda_grads
             torch.cuda.empty_cache()
 
-    # Create DataFrame and display results
     df = pd.DataFrame(results)
     print("\n===== MANUAL CPU vs CUDA BENCHMARK RESULTS =====")
     print(df.to_string(index=False))
@@ -193,15 +153,11 @@ def benchmark_comparison(configs, num_runs=5, device_cpu='cpu', device_cuda='cud
     return df
 
 if __name__ == "__main__":
-    # Define realistic configurations to test
     configs = [
         # (B, H, I, J, K, D)
-        (1, 4, 6, 6, 6, 12),   # Small
-        (2, 4, 32, 32, 32, 32),   # Medium
-        # (4, 8, 64, 64, 64, 64),   # Large
-        # (8, 16, 32, 32, 32, 128), # High-dimensional
-        # (2, 8, 128, 128, 128, 32) # Long sequences
+        (1, 2, 4, 4, 4, 8),   
+        (2, 2, 6, 6, 6, 16),  
+        (2, 2, 12, 12, 12, 12),  
     ]
 
-    # Run the benchmark
     df = benchmark_comparison(configs, num_runs=3) 

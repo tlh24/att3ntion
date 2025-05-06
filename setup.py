@@ -15,8 +15,11 @@ setup(
                 'cuda/manual_att3ntion.cu'
             ],
             extra_compile_args={
-                'cxx': ['-g'],
-                'nvcc': ['-G', '-g', '-O0']
+                'cxx': ['-O3'],
+                'nvcc': [
+                    '-O3',
+                    '-gencode=arch=compute_86,code=sm_86',
+                ]
             }
         ),
     ],

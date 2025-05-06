@@ -1250,9 +1250,6 @@ torch::Tensor compute_grad_A_single(
     const int D = Q_slice.size(1);
     const int N = grad_output_slice.size(0); 
     auto options = Q_slice.options(); 
-    const int i_target_debug = 1;
-    const int j_target_debug = 2;
-    const int k_target_debug = 1;
 
     // Accessors for slice inputs
     auto grad_output_acc = grad_output_slice.accessor<float, 2>();
