@@ -145,6 +145,14 @@ __global__ void compute_grad_Q_kernel_from_gradA(
     const int B, const int H, const int I, const int J, const int K, const int D,
     const float scale
 );
+__global__ void compute_A_slice_kernel(
+    const float* __restrict__ Q_slice_global, 
+    const float* __restrict__ R_slice_global, 
+    const float* __restrict__ S_slice_global, 
+    float*       __restrict__ A_out_global,  
+    int I, int J, int K, int D,
+    float scale
+);
 
 
 // Gather for fixed_dim = 0  (i.e. output shape [B,H,I,D]) i.e. Y_q
@@ -1288,68 +1296,213 @@ __global__ void grad_Q_kernel(
 }
 
 
-torch::Tensor compute_grad_A_cpu_and_copy(
-    torch::Tensor grad_output, // GPU
-    torch::Tensor Q,           // GPU
-    torch::Tensor R,           // GPU
-    torch::Tensor S,           // GPU
-    torch::Tensor Vq_1,        // GPU
-    torch::Tensor Vq_2,        // GPU
-    torch::Tensor Vr_1,        // GPU
-    torch::Tensor Vr_2,        // GPU
-    torch::Tensor Vs_1,        // GPU
-    torch::Tensor Vs_2,        // GPU
+__global__ void compute_A_slice_kernel(
+    const float* __restrict__ Q_slice_global, // Input Q_slice [I,D] on GPU
+    const float* __restrict__ R_slice_global, // Input R_slice [J,D] on GPU
+    const float* __restrict__ S_slice_global, // Input S_slice [K,D] on GPU
+    float*       __restrict__ A_out_global,   // Output A_slice [I,J,K] on GPU
+    int I, int J, int K, int D,
     float scale
 ) {
-        const int B = Q.size(0);
-        const int H = Q.size(1);
-        const int I = Q.size(2);
-        const int J = R.size(2);
-        const int K = S.size(2);
+    // Map 3D block and thread indices to I, J, K
+    // This kernel is intended to be launched with a 3D grid/block structure
+    // that covers all elements of A_slice [I,J,K].
+    // E.g., GridDim could be ( (I+BlockDim.x-1)/BlockDim.x, (J+BlockDim.y-1)/BlockDim.y, (K+BlockDim.z-1)/BlockDim.z )
+    // BlockDim could be (DIM_I_THREADS, DIM_J_THREADS, DIM_K_THREADS)
+    
+    int i_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int j_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int k_idx = blockIdx.z * blockDim.z + threadIdx.z;
 
-        // Create CPU tensor for grad_A result
-        torch::Tensor grad_A_cpu = torch::zeros({B, H, I, J, K}, Q.options().device(torch::kCPU));
+    // Boundary check
+    if (i_idx >= I || j_idx >= J || k_idx >= K) {
+        return;
+    }
 
-        // Copy necessary inputs to CPU
-        auto grad_output_cpu = grad_output.cpu();
-        auto Q_cpu = Q.cpu(); auto R_cpu = R.cpu(); auto S_cpu = S.cpu();
-        auto Vq_1_cpu = Vq_1.cpu(); auto Vq_2_cpu = Vq_2.cpu();
-        auto Vr_1_cpu = Vr_1.cpu(); auto Vr_2_cpu = Vr_2.cpu();
-        auto Vs_1_cpu = Vs_1.cpu(); auto Vs_2_cpu = Vs_2.cpu();
+    // Compute dot product Q_slice[i_idx,:] * R_slice[j_idx,:] * S_slice[k_idx,:]
+    float dot_product = 0.0f;
+    for (int d_loop = 0; d_loop < D; ++d_loop) {
+        // Q_slice_global is [I, D], so access Q_slice_global[i_idx * D + d_loop]
+        // R_slice_global is [J, D], so access R_slice_global[j_idx * D + d_loop]
+        // S_slice_global is [K, D], so access S_slice_global[k_idx * D + d_loop]
+        dot_product += Q_slice_global[i_idx * D + d_loop] * \
+                       R_slice_global[j_idx * D + d_loop] * \
+                       S_slice_global[k_idx * D + d_loop];
+    }
 
-        // Compute grad_A slice by slice on CPU
+    // Apply scale and store in A_out_global
+    // A_out_global is [I,J,K]. Index is i_idx * (J*K) + j_idx * K + k_idx
+    A_out_global[i_idx * J * K + j_idx * K + k_idx] = dot_product * scale;
+}
+
+
+// C++ Wrapper for compute_A_slice_kernel
+torch::Tensor compute_A_slice_cuda_wrapper(
+    const torch::Tensor& Q_slice_gpu, // Assumed to be on GPU, shape [I,D]
+    const torch::Tensor& R_slice_gpu, // Assumed to be on GPU, shape [J,D]
+    const torch::Tensor& S_slice_gpu, // Assumed to be on GPU, shape [K,D]
+    float scale
+) {
+    TORCH_CHECK(Q_slice_gpu.is_cuda(), "Q_slice_gpu must be a CUDA tensor");
+    TORCH_CHECK(R_slice_gpu.is_cuda(), "R_slice_gpu must be a CUDA tensor");
+    TORCH_CHECK(S_slice_gpu.is_cuda(), "S_slice_gpu must be a CUDA tensor");
+
+    TORCH_CHECK(Q_slice_gpu.dim() == 2, "Q_slice_gpu must be 2D");
+    TORCH_CHECK(R_slice_gpu.dim() == 2, "R_slice_gpu must be 2D");
+    TORCH_CHECK(S_slice_gpu.dim() == 2, "S_slice_gpu must be 2D");
+
+    const int I = Q_slice_gpu.size(0);
+    const int D_q = Q_slice_gpu.size(1);
+    const int J = R_slice_gpu.size(0);
+    const int D_r = R_slice_gpu.size(1);
+    const int K = S_slice_gpu.size(0);
+    const int D_s = S_slice_gpu.size(1);
+
+    TORCH_CHECK(D_q == D_r && D_r == D_s, "Dimension D must match for Q, R, S slices");
+    const int D = D_q;
+
+    // Allocate output tensor A_slice_out_gpu [I,J,K] on GPU
+    auto options = Q_slice_gpu.options(); // Inherit dtype and device
+    torch::Tensor A_slice_out_gpu = torch::zeros({I, J, K}, options);
+
+    // Define block dimensions (e.g., 8x8x8 = 512 threads, adjust as needed)
+    // These are example values, can be tuned.
+    // Max threads per block is 1024.
+    // Block dimensions should ideally be multiples of warp size (32 for NVIDIA GPUs) for one dim.
+    constexpr int BLOCK_DIM_I = 8;
+    constexpr int BLOCK_DIM_J = 8;
+    constexpr int BLOCK_DIM_K = 8; 
+    
+    dim3 blockDim(BLOCK_DIM_I, BLOCK_DIM_J, BLOCK_DIM_K);
+
+    // Calculate grid dimensions
+    dim3 gridDim(
+        (I + BLOCK_DIM_I - 1) / BLOCK_DIM_I,
+        (J + BLOCK_DIM_J - 1) / BLOCK_DIM_J,
+        (K + BLOCK_DIM_K - 1) / BLOCK_DIM_K
+    );
+    
+    // Ensure inputs are contiguous (important for direct pointer access in kernel)
+    auto Q_cont = Q_slice_gpu.contiguous();
+    auto R_cont = R_slice_gpu.contiguous();
+    auto S_cont = S_slice_gpu.contiguous();
+
+    // Launch Kernel
+    compute_A_slice_kernel<<<gridDim, blockDim>>>(
+        Q_cont.data_ptr<float>(),
+        R_cont.data_ptr<float>(),
+        S_cont.data_ptr<float>(),
+        A_slice_out_gpu.data_ptr<float>(),
+        I, J, K, D,
+        scale
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA error in compute_A_slice_cuda_wrapper: %s\n", cudaGetErrorString(err));
+        // Optionally throw an exception
+        // throw std::runtime_error(std::string("CUDA kernel launch failed in compute_A_slice_cuda_wrapper: ") + cudaGetErrorString(err));
+    }
+    // cudaDeviceSynchronize(); // For debugging, to ensure kernel finishes before wrapper returns
+
+    return A_slice_out_gpu;
+}
+
+torch::Tensor compute_grad_A_cpu_and_copy(
+    torch::Tensor grad_output_gpu, // GPU tensor
+    torch::Tensor Q_gpu,           // GPU tensor
+    torch::Tensor R_gpu,           // GPU tensor
+    torch::Tensor S_gpu,           // GPU tensor
+    torch::Tensor Vq_1_gpu,        // GPU tensor
+    torch::Tensor Vq_2_gpu,        // GPU tensor
+    torch::Tensor Vr_1_gpu,        // GPU tensor
+    torch::Tensor Vr_2_gpu,        // GPU tensor
+    torch::Tensor Vs_1_gpu,        // GPU tensor
+    torch::Tensor Vs_2_gpu,        // GPU tensor
+    float scale
+) {
+        const int B = Q_gpu.size(0);
+        const int H = Q_gpu.size(1);
+        // I, J, K are slice dimensions, not full tensor
+        // These will be determined when we select slices for (b,h)
+
+        torch::Tensor grad_A_final_cpu_result = torch::zeros({B, H, Q_gpu.size(2), R_gpu.size(2), S_gpu.size(2)}, 
+                                                             Q_gpu.options().device(torch::kCPU));
+
+        auto grad_output_cpu_full = grad_output_gpu.cpu();
+        auto Q_cpu_full = Q_gpu.cpu();
+        auto R_cpu_full = R_gpu.cpu();
+        auto S_cpu_full = S_gpu.cpu();
+        auto Vq_1_cpu_full = Vq_1_gpu.cpu();
+        auto Vq_2_cpu_full = Vq_2_gpu.cpu();
+        auto Vr_1_cpu_full = Vr_1_gpu.cpu();
+        auto Vr_2_cpu_full = Vr_2_gpu.cpu();
+        auto Vs_1_cpu_full = Vs_1_gpu.cpu();
+        auto Vs_2_cpu_full = Vs_2_gpu.cpu();
+
         for (int b = 0; b < B; ++b) {
             for (int h = 0; h < H; ++h) {
-                // Get CPU slices for this (b,h)
-                auto Q_slice_cpu = Q_cpu.select(0, b).select(0, h);
-                auto R_slice_cpu = R_cpu.select(0, b).select(0, h);
-                auto S_slice_cpu = S_cpu.select(0, b).select(0, h);
-                auto Vq_1_slice_cpu = Vq_1_cpu.select(0, b).select(0, h);
-                auto Vq_2_slice_cpu = Vq_2_cpu.select(0, b).select(0, h);
-                auto Vr_1_slice_cpu = Vr_1_cpu.select(0, b).select(0, h);
-                auto Vr_2_slice_cpu = Vr_2_cpu.select(0, b).select(0, h);
-                auto Vs_1_slice_cpu = Vs_1_cpu.select(0, b).select(0, h);
-                auto Vs_2_slice_cpu = Vs_2_cpu.select(0, b).select(0, h);
-                auto grad_output_slice_cpu = grad_output_cpu.select(0, b).select(0, h);
+                // GPU Slices for Q,R,S for A_slice computation
+                auto Q_slice_gpu_current = Q_gpu.select(0, b).select(0, h);
+                auto R_slice_gpu_current = R_gpu.select(0, b).select(0, h);
+                auto S_slice_gpu_current = S_gpu.select(0, b).select(0, h);
 
-                // Compute intermediate A*, Aq*, Ar*, As* for the slice
-                torch::Tensor A_slice_cpu, Aq_slice_cpu, Ar_slice_cpu, As_slice_cpu;
-                std::tie(A_slice_cpu, Aq_slice_cpu, Ar_slice_cpu, As_slice_cpu) =
-                    compute_attention_tensors_single(Q_slice_cpu, R_slice_cpu, S_slice_cpu, scale);
+                // CPU Slices for reference computation and remaining parts of grad_A_single
+                auto Q_slice_cpu_ref = Q_cpu_full.select(0, b).select(0, h);
+                auto R_slice_cpu_ref = R_cpu_full.select(0, b).select(0, h);
+                auto S_slice_cpu_ref = S_cpu_full.select(0, b).select(0, h);
+                auto grad_output_slice_cpu = grad_output_cpu_full.select(0, b).select(0, h);
+                auto Vq_1_slice_cpu = Vq_1_cpu_full.select(0, b).select(0, h);
+                auto Vq_2_slice_cpu = Vq_2_cpu_full.select(0, b).select(0, h);
+                auto Vr_1_slice_cpu = Vr_1_cpu_full.select(0, b).select(0, h);
+                auto Vr_2_slice_cpu = Vr_2_cpu_full.select(0, b).select(0, h);
+                auto Vs_1_slice_cpu = Vs_1_cpu_full.select(0, b).select(0, h);
+                auto Vs_2_slice_cpu = Vs_2_cpu_full.select(0, b).select(0, h);
 
-                // Compute grad_A_slice on CPU
-                auto grad_A_slice_cpu = compute_grad_A_single(
-                    grad_output_slice_cpu, Q_slice_cpu, R_slice_cpu, S_slice_cpu,
+                // Step 1: Compute A_slice on GPU
+                torch::Tensor A_slice_from_gpu = compute_A_slice_cuda_wrapper(
+                    Q_slice_gpu_current, R_slice_gpu_current, S_slice_gpu_current, scale
+                );
+                torch::Tensor A_slice_cpu_variant = A_slice_from_gpu.cpu();
+
+                // Step 2: Compute Aq_slice on GPU using A_slice_from_gpu
+                // torch::Tensor Aq_slice_from_gpu = compute_Aq_slice_cuda_wrapper(A_slice_from_gpu);
+                // torch::Tensor Aq_slice_cpu_variant = Aq_slice_from_gpu.cpu();
+
+                // Compute reference A_slice, Aq_slice, Ar_slice, As_slice on CPU for comparison and remaining inputs
+                torch::Tensor A_slice_ref_cpu, Aq_slice_ref_cpu, Ar_slice_ref_cpu, As_slice_ref_cpu;
+                std::tie(A_slice_ref_cpu, Aq_slice_ref_cpu, Ar_slice_ref_cpu, As_slice_ref_cpu) =
+                    compute_attention_tensors_single(Q_slice_cpu_ref, R_slice_cpu_ref, S_slice_cpu_ref, scale);
+
+                // ----> Verification Points <----
+                if (!torch::allclose(A_slice_cpu_variant, A_slice_ref_cpu, 1e-4, 1e-5)) { // Adjusted tolerance
+                           fprintf(stderr, "CUDA DEBUG: Mismatch in A_slice for b=%d, h=%d. Max diff: %e\n", 
+                                   b, h, (A_slice_cpu_variant - A_slice_ref_cpu).abs().max().item<float>());
+                       }
+
+                // Print a success message if they match for a specific b,h for easier debugging
+                // else if (b==0 && h==0) {
+                //      fprintf(stdout, "CUDA DEBUG: A_slice and Aq_slice MATCH for b=0, h=0!\n");
+                // }
+
+
+                // Call compute_grad_A_single using GPU-computed A_slice and Aq_slice,
+                // but CPU-computed Ar_slice and As_slice for this incremental test.
+                auto grad_A_slice_for_final_result = compute_grad_A_single(
+                    grad_output_slice_cpu, 
+                    Q_slice_cpu_ref, R_slice_cpu_ref, S_slice_cpu_ref,
                     Vq_1_slice_cpu, Vq_2_slice_cpu, Vr_1_slice_cpu, Vr_2_slice_cpu, Vs_1_slice_cpu, Vs_2_slice_cpu,
-                    A_slice_cpu, Aq_slice_cpu, Ar_slice_cpu, As_slice_cpu,
+                    A_slice_cpu_variant,    // <<< GPU-computed A_slice (via CPU)
+                    Aq_slice_ref_cpu,   //
+                    Ar_slice_ref_cpu,       // CPU-computed Ar_slice
+                    As_slice_ref_cpu,       // CPU-computed As_slice
                     b, h
                 );
-                // Copy the computed slice into the full CPU tensor
-               grad_A_cpu.select(0, b).select(0, h).copy_(grad_A_slice_cpu);
+                
+               grad_A_final_cpu_result.select(0, b).select(0, h).copy_(grad_A_slice_for_final_result);
             }
         }
-       // Copy the full grad_A tensor from CPU to GPU
-       return grad_A_cpu.to(torch::kCUDA);
+       return grad_A_final_cpu_result.to(torch::kCUDA);
 }
 
 // Minimal backward function that returns zero gradients[placeholder]
