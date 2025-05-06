@@ -153,6 +153,14 @@ __global__ void compute_A_slice_kernel(
     int I, int J, int K, int D,
     float scale
 );
+// Add this forward declaration with the others at the top of cuda/manual_att3ntion.cu
+__global__ void compute_Aq_slice_kernel(
+    const float* __restrict__ A_slice_global, // Input A_slice [I,J,K] on GPU
+    float*       __restrict__ Aq_out_global,  // Output Aq_slice [I,J,K] on GPU
+    int I, int J, int K
+);
+
+// ... (other kernel forward declarations and implementations)
 
 
 // Gather for fixed_dim = 0  (i.e. output shape [B,H,I,D]) i.e. Y_q
@@ -1408,6 +1416,159 @@ torch::Tensor compute_A_slice_cuda_wrapper(
     return A_slice_out_gpu;
 }
 
+// Add this kernel implementation, for example, after compute_A_slice_kernel
+
+// Kernel to compute Aq_slice (softmax over j, k for each fixed i)
+// Each block processes one 'i' plane.
+__global__ void compute_Aq_slice_kernel(
+    const float* __restrict__ A_slice_global, // Input A_slice [I,J,K] (global mem)
+    float*       __restrict__ Aq_out_global,  // Output Aq_slice [I,J,K] (global mem)
+    int I_dim, int J_dim, int K_dim // Use _dim to avoid conflict with loop vars
+) {
+    // Shared memory for the current JxK plane of A_slice and for reduction
+    // Requires J_dim * K_dim floats for the plane, and 
+    // THREADS_PER_BLOCK floats for the reduction scratchpad if THREADS_PER_BLOCK > warpSize
+    extern __shared__ float s_data[]; 
+    
+    // Current 'i' index this block is responsible for
+    int i_current = blockIdx.x;
+
+    // Ensure this block is within the valid range of 'i'
+    if (i_current >= I_dim) {
+        return;
+    }
+
+    // Base pointer to the current A_slice[i_current, :, :] in global memory
+    const float* current_A_plane_global = A_slice_global + (int64_t)i_current * J_dim * K_dim;
+    // Base pointer for output Aq_out[i_current, :, :]
+    float* current_Aq_plane_global = Aq_out_global + (int64_t)i_current * J_dim * K_dim;
+
+    // --- Load A_slice[i_current, :, :] into shared memory s_A_plane ---
+    // s_A_plane will be the first J_dim * K_dim elements of s_data
+    float* s_A_plane = s_data; 
+    int plane_size = J_dim * K_dim;
+    int tid_in_block = threadIdx.y * blockDim.x + threadIdx.x; // Linear thread ID within the block
+    int threads_in_block = blockDim.x * blockDim.y;
+
+    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
+        s_A_plane[idx] = current_A_plane_global[idx];
+    }
+    __syncthreads(); // Ensure all data is loaded into s_A_plane
+
+    // --- Find max_val in s_A_plane for numerical stability (Parallel Reduction) ---
+    // s_reduction_pad will be after s_A_plane in s_data
+    float* s_reduction_pad = s_data + plane_size; 
+                                                
+    float thread_max_val = -FLT_MAX; // Initialize with a very small number
+    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
+        if (s_A_plane[idx] > thread_max_val) {
+            thread_max_val = s_A_plane[idx];
+        }
+    }
+    s_reduction_pad[tid_in_block] = thread_max_val;
+    __syncthreads();
+
+    // Perform reduction in shared memory (assumes threads_in_block is power of 2 for simplicity here)
+    // A more robust reduction handles non-power-of-2 block sizes.
+    for (int offset = threads_in_block / 2; offset > 0; offset >>= 1) {
+        if (tid_in_block < offset) {
+            if (s_reduction_pad[tid_in_block + offset] > s_reduction_pad[tid_in_block]) {
+                 s_reduction_pad[tid_in_block] = s_reduction_pad[tid_in_block + offset];
+            }
+        }
+        __syncthreads();
+    }
+    float plane_max_val = s_reduction_pad[0]; // Max value for the current plane
+    __syncthreads(); // Ensure all threads see the correct plane_max_val
+
+
+    // --- Compute sum_exp for the plane (Parallel Reduction) ---
+    float thread_sum_exp = 0.0f;
+    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
+        thread_sum_exp += expf(s_A_plane[idx] - plane_max_val);
+    }
+    s_reduction_pad[tid_in_block] = thread_sum_exp;
+    __syncthreads();
+
+    for (int offset = threads_in_block / 2; offset > 0; offset >>= 1) {
+        if (tid_in_block < offset) {
+            s_reduction_pad[tid_in_block] += s_reduction_pad[tid_in_block + offset];
+        }
+        __syncthreads();
+    }
+    float plane_sum_exp = s_reduction_pad[0];
+    __syncthreads();
+
+    // --- Compute softmax values and write to global memory ---
+    if (plane_sum_exp == 0.0f) plane_sum_exp = 1e-20f; // Avoid division by zero
+
+    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
+        float softmax_val = expf(s_A_plane[idx] - plane_max_val) / plane_sum_exp;
+        current_Aq_plane_global[idx] = softmax_val;
+    }
+}
+
+// Add this C++ wrapper function, for example, after compute_A_slice_cuda_wrapper
+
+torch::Tensor compute_Aq_slice_cuda_wrapper(
+    const torch::Tensor& A_slice_gpu // Assumed to be on GPU, shape [I,J,K]
+) {
+    TORCH_CHECK(A_slice_gpu.is_cuda(), "A_slice_gpu must be a CUDA tensor");
+    TORCH_CHECK(A_slice_gpu.dim() == 3, "A_slice_gpu must be 3D [I,J,K]");
+
+    const int I = A_slice_gpu.size(0);
+    const int J = A_slice_gpu.size(1);
+    const int K = A_slice_gpu.size(2);
+
+    // Allocate output tensor Aq_slice_out_gpu [I,J,K] on GPU
+    auto options = A_slice_gpu.options(); // Inherit dtype and device
+    torch::Tensor Aq_slice_out_gpu = torch::zeros({I, J, K}, options);
+
+    // Kernel launch configuration for compute_Aq_slice_kernel
+    // Each block handles one 'i'-plane (JxK elements)
+    dim3 gridDim(I); // I blocks in total, one for each i-plane
+
+    // Threads per block: Try to cover J*K elements.
+    // Max threads per block is 1024.
+    // Using a 1D block for simplicity, can be optimized to 2D.
+    int threads_per_block = std::min(1024, J * K);
+    // Ensure threads_per_block is a power of 2 for simpler reduction, or use a more general reduction.
+    // For this example, let's pick a common size like 256 or 512 if J*K is large enough.
+    // Or, make it precisely J*K if small enough.
+    // For robust reduction, block size should be a power of two if using the simple reduction logic.
+    // Let's choose a common block size, e.g., 256. The kernel loops if plane_size > threads_per_block.
+    threads_per_block = 256; // Example
+    if (J * K < threads_per_block && J*K > 0) { // If plane is smaller, use its size (power of 2 padding might be better for reduction)
+        // A more robust way is to ensure threads_per_block is a power of 2 for the reduction used.
+        // For now, we'll use a fixed size and the kernel loop handles it.
+    }
+
+
+    dim3 blockDim(threads_per_block); // 1D block of threads
+
+    // Calculate shared memory size:
+    // J*K floats for s_A_plane + threads_per_block floats for s_reduction_pad
+    size_t shared_mem_size = (J * K + threads_per_block) * sizeof(float);
+    
+    auto A_cont = A_slice_gpu.contiguous();
+
+    // Launch Kernel
+    compute_Aq_slice_kernel<<<gridDim, blockDim, shared_mem_size>>>(
+        A_cont.data_ptr<float>(),
+        Aq_slice_out_gpu.data_ptr<float>(),
+        I, J, K
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA error in compute_Aq_slice_cuda_wrapper: %s\n", cudaGetErrorString(err));
+        // throw std::runtime_error(std::string("CUDA kernel launch failed in compute_Aq_slice_cuda_wrapper: ") + cudaGetErrorString(err));
+    }
+    // cudaDeviceSynchronize(); // For debugging
+
+    return Aq_slice_out_gpu;
+}
+
 torch::Tensor compute_grad_A_cpu_and_copy(
     torch::Tensor grad_output_gpu, // GPU tensor
     torch::Tensor Q_gpu,           // GPU tensor
@@ -1423,8 +1584,8 @@ torch::Tensor compute_grad_A_cpu_and_copy(
 ) {
         const int B = Q_gpu.size(0);
         const int H = Q_gpu.size(1);
-        // I, J, K are slice dimensions, not full tensor
-        // These will be determined when we select slices for (b,h)
+        // Slice dimensions I_s, J_s, K_s will be Q_gpu.size(2), R_gpu.size(2), S_gpu.size(2)
+        // when we select slices.
 
         torch::Tensor grad_A_final_cpu_result = torch::zeros({B, H, Q_gpu.size(2), R_gpu.size(2), S_gpu.size(2)}, 
                                                              Q_gpu.options().device(torch::kCPU));
@@ -1442,12 +1603,10 @@ torch::Tensor compute_grad_A_cpu_and_copy(
 
         for (int b = 0; b < B; ++b) {
             for (int h = 0; h < H; ++h) {
-                // GPU Slices for Q,R,S for A_slice computation
                 auto Q_slice_gpu_current = Q_gpu.select(0, b).select(0, h);
                 auto R_slice_gpu_current = R_gpu.select(0, b).select(0, h);
                 auto S_slice_gpu_current = S_gpu.select(0, b).select(0, h);
 
-                // CPU Slices for reference computation and remaining parts of grad_A_single
                 auto Q_slice_cpu_ref = Q_cpu_full.select(0, b).select(0, h);
                 auto R_slice_cpu_ref = R_cpu_full.select(0, b).select(0, h);
                 auto S_slice_cpu_ref = S_cpu_full.select(0, b).select(0, h);
@@ -1459,43 +1618,45 @@ torch::Tensor compute_grad_A_cpu_and_copy(
                 auto Vs_1_slice_cpu = Vs_1_cpu_full.select(0, b).select(0, h);
                 auto Vs_2_slice_cpu = Vs_2_cpu_full.select(0, b).select(0, h);
 
-                // Step 1: Compute A_slice on GPU
+                // Step 1: Compute A_slice on GPU (verified in previous step)
                 torch::Tensor A_slice_from_gpu = compute_A_slice_cuda_wrapper(
                     Q_slice_gpu_current, R_slice_gpu_current, S_slice_gpu_current, scale
                 );
                 torch::Tensor A_slice_cpu_variant = A_slice_from_gpu.cpu();
 
-                // Step 2: Compute Aq_slice on GPU using A_slice_from_gpu
-                // torch::Tensor Aq_slice_from_gpu = compute_Aq_slice_cuda_wrapper(A_slice_from_gpu);
-                // torch::Tensor Aq_slice_cpu_variant = Aq_slice_from_gpu.cpu();
+                // ***** TEST STEP 2.A.2: Compute Aq_slice using the new CUDA kernel *****
+                torch::Tensor Aq_slice_from_gpu = compute_Aq_slice_cuda_wrapper(A_slice_from_gpu);
+                torch::Tensor Aq_slice_cpu_variant = Aq_slice_from_gpu.cpu();
+                // ***********************************************************************
 
-                // Compute reference A_slice, Aq_slice, Ar_slice, As_slice on CPU for comparison and remaining inputs
+                // Compute reference A_slice, Aq_slice, Ar_slice, As_slice on CPU
                 torch::Tensor A_slice_ref_cpu, Aq_slice_ref_cpu, Ar_slice_ref_cpu, As_slice_ref_cpu;
                 std::tie(A_slice_ref_cpu, Aq_slice_ref_cpu, Ar_slice_ref_cpu, As_slice_ref_cpu) =
                     compute_attention_tensors_single(Q_slice_cpu_ref, R_slice_cpu_ref, S_slice_cpu_ref, scale);
 
                 // ----> Verification Points <----
-                if (!torch::allclose(A_slice_cpu_variant, A_slice_ref_cpu, 1e-4, 1e-5)) { // Adjusted tolerance
+                // Verify A_slice (already done, but good to keep if debugging)
+                 if (!torch::allclose(A_slice_cpu_variant, A_slice_ref_cpu, 1e-4, 1e-5)) {
                            fprintf(stderr, "CUDA DEBUG: Mismatch in A_slice for b=%d, h=%d. Max diff: %e\n", 
                                    b, h, (A_slice_cpu_variant - A_slice_ref_cpu).abs().max().item<float>());
-                       }
-
-                // Print a success message if they match for a specific b,h for easier debugging
-                // else if (b==0 && h==0) {
+                 }
+                // Verify Aq_slice
+                if (!torch::allclose(Aq_slice_cpu_variant, Aq_slice_ref_cpu, 1e-4, 1e-5)) {
+                           fprintf(stderr, "CUDA DEBUG: Mismatch in Aq_slice for b=%d, h=%d. Max diff: %e\n", 
+                                   b, h, (Aq_slice_cpu_variant - Aq_slice_ref_cpu).abs().max().item<float>());
+                }
+                // else if (b==0 && h==0 && torch::allclose(A_slice_cpu_variant, A_slice_ref_cpu, 1e-4, 1e-5) && torch::allclose(Aq_slice_cpu_variant, Aq_slice_ref_cpu, 1e-4, 1e-5)) {
                 //      fprintf(stdout, "CUDA DEBUG: A_slice and Aq_slice MATCH for b=0, h=0!\n");
                 // }
 
-
-                // Call compute_grad_A_single using GPU-computed A_slice and Aq_slice,
-                // but CPU-computed Ar_slice and As_slice for this incremental test.
                 auto grad_A_slice_for_final_result = compute_grad_A_single(
                     grad_output_slice_cpu, 
                     Q_slice_cpu_ref, R_slice_cpu_ref, S_slice_cpu_ref,
                     Vq_1_slice_cpu, Vq_2_slice_cpu, Vr_1_slice_cpu, Vr_2_slice_cpu, Vs_1_slice_cpu, Vs_2_slice_cpu,
-                    A_slice_cpu_variant,    // <<< GPU-computed A_slice (via CPU)
-                    Aq_slice_ref_cpu,   //
-                    Ar_slice_ref_cpu,       // CPU-computed Ar_slice
-                    As_slice_ref_cpu,       // CPU-computed As_slice
+                    A_slice_cpu_variant,      // GPU-computed A_slice (via CPU)
+                    Aq_slice_cpu_variant,     // <<< GPU-computed Aq_slice (via CPU)
+                    Ar_slice_ref_cpu,         // CPU-computed Ar_slice (for now)
+                    As_slice_ref_cpu,         // CPU-computed As_slice (for now)
                     b, h
                 );
                 
