@@ -20,6 +20,9 @@ print(f"Parameters: B={B}, H={H}, I={I}, J={J}, K={K}, D={D}")
 print(f"CPU Device: {device_cpu}")
 print(f"CUDA Device: {device_cuda}")
 
+# ---> Verify LD_LIBRARY_PATH before import <---
+print(f"LD_LIBRARY_PATH before import: {os.environ.get('LD_LIBRARY_PATH')}")
+
 # Import Extension
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, parent_dir)

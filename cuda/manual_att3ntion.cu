@@ -1,9 +1,11 @@
 #include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>       // optional
+#include <ATen/cuda/CUDAContext.h>      
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include "../cpp/manual_att3ntion.h"
 
-// Forward declarations for kernels (optional but good practice)
+
+// Forward declarations
 __global__ void gather_dim0_kernel(
     const float* __restrict__ Q, 
     const float* __restrict__ R, 
@@ -34,7 +36,6 @@ __global__ void gather_dim2_kernel(
     int B, int H, int I, int J, int K, int D,
     float scale);
 
-// Forward declarations for scatter kernels
 __global__ void scatter_dim0_kernel(
     const float* Q,
     const float* R,
@@ -135,20 +136,15 @@ __global__ void scatter_grad_Vs2_kernel(
     int B, int H, int I, int J, int K, int D, int N_grad,
     float scale);
 
-// Forward declaration for grad_Q kernel
-__global__ void grad_Q_kernel(
-    const float* __restrict__ gradY,    const float* __restrict__ Q,
-    const float* __restrict__ R,
-    const float* __restrict__ S,
-    const float* __restrict__ Vq_1,
-    const float* __restrict__ Vq_2,
-    const float* __restrict__ Vr_1,
-    const float* __restrict__ Vr_2,
-    const float* __restrict__ Vs_1,
-    const float* __restrict__ Vs_2,
-    float*       __restrict__ gradQ,
-    int B, int H, int I, int J, int K, int D, int N_grad, 
-    float scale);
+// Forward declaration for NEW grad_Q kernel (accepts grad_A)
+__global__ void compute_grad_Q_kernel_from_gradA(
+    const float* __restrict__ grad_A, // Shape [B, H, I, J, K]
+    const float* __restrict__ R,      // Shape [B, H, J, D]
+    const float* __restrict__ S,      // Shape [B, H, K, D]
+    float*       __restrict__ grad_Q, // Shape [B, H, I, D] - Output
+    const int B, const int H, const int I, const int J, const int K, const int D,
+    const float scale
+);
 
 
 // Gather for fixed_dim = 0  (i.e. output shape [B,H,I,D]) i.e. Y_q
@@ -1218,29 +1214,146 @@ __global__ void scatter_grad_Vs2_kernel(
     gradVs2[idx] = grad_accum;
 }
 
-// Kernel to compute gradient for Q (Re-implemented with full softmax derivative)
+// Kernel to compute gradient for Q, assuming grad_A is pre-computed
 __global__ void grad_Q_kernel(
-    const float* __restrict__ gradY, 
-    const float* __restrict__ Q,
-    const float* __restrict__ R,
-    const float* __restrict__ S,
-    const float* __restrict__ Vq_1,
-    const float* __restrict__ Vq_2,
-    const float* __restrict__ Vr_1,
-    const float* __restrict__ Vr_2,
-    const float* __restrict__ Vs_1,
-    const float* __restrict__ Vs_2,
-    float*       __restrict__ gradQ,
-    int B, int H, int I, int J, int K, int D, int N_grad, 
-    float scale)
-{
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const float* __restrict__ grad_A, // Shape [B, H, I, J, K]
+    const float* __restrict__ R,      // Shape [B, H, J, D]
+    const float* __restrict__ S,      // Shape [B, H, K, D]
+    float*       __restrict__ grad_Q, // Shape [B, H, I, D] - Output
+    const int B, const int H, const int I, const int J, const int K, const int D,
+    const float scale
+) {
+    // --- Calculate indices for this thread ---
+    // Map threads to output elements (b, h, i, d)
+    // Using 1D grid/block for simplicity, can be optimized later
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     int64_t total_elements = (int64_t)B * H * I * D;
-    if (idx >= total_elements) return;
+    if (idx >= total_elements) {
+        return;
+    }
 
-    gradQ[idx] = 0.0f;
+    // Decode indices (b, h, i, d) from linear index idx
+    const int d = idx % D;
+    const int64_t temp_idx_d = idx / D;
+    const int i = temp_idx_d % I;
+    const int64_t temp_idx_i = temp_idx_d / I;
+    const int h = temp_idx_i % H;
+    const int b = temp_idx_i / H;
+
+
+    // --- Calculate strides ---
+    const int64_t stride_A_B = (int64_t)H * I * J * K;
+    const int64_t stride_A_H = (int64_t)I * J * K;
+    const int64_t stride_A_I = (int64_t)J * K;
+    const int64_t stride_A_J = (int64_t)K;
+    const int64_t stride_A_K = 1;
+
+    const int64_t stride_R_B = (int64_t)H * J * D;
+    const int64_t stride_R_H = (int64_t)J * D;
+    const int64_t stride_R_J = (int64_t)D;
+    const int64_t stride_R_D = 1;
+
+    const int64_t stride_S_B = (int64_t)H * K * D;
+    const int64_t stride_S_H = (int64_t)K * D;
+    const int64_t stride_S_K = (int64_t)D;
+    const int64_t stride_S_D = 1;
+
+    // Output stride calculation not needed as we write to grad_Q[idx]
+
+
+    // --- Calculate base pointers for this slice (b, h) ---
+    // Note: We need the base for the entire tensors here, not just slices,
+    // because the loops below access elements across different j and k.
+    const float* grad_A_base = grad_A + b * stride_A_B + h * stride_A_H;
+    const float* R_base = R + b * stride_R_B + h * stride_R_H;
+    const float* S_base = S + b * stride_S_B + h * stride_S_H;
+
+
+    // --- Compute sum for grad_Q[b, h, i, d] ---
+    // grad_Q[i,d] = scale * sum_{j,k} ( grad_A[i,j,k] * R[j,d] * S[k,d] )
+    double sum_for_grad_q = 0.0; // Use double for accumulation precision
+    for (int j = 0; j < J; ++j) {
+        for (int k = 0; k < K; ++k) {
+            // Calculate linear indices relative to slice base pointers (b,h)
+            // grad_A[i, j, k] within the (b,h) slice
+            int64_t idx_A = (int64_t)i * stride_A_I + (int64_t)j * stride_A_J + (int64_t)k * stride_A_K;
+            // R[j, d] within the (b,h) slice
+            int64_t idx_R = (int64_t)j * stride_R_J + (int64_t)d * stride_R_D;
+            // S[k, d] within the (b,h) slice
+            int64_t idx_S = (int64_t)k * stride_S_K + (int64_t)d * stride_S_D;
+
+            sum_for_grad_q += (double)grad_A_base[idx_A] * (double)R_base[idx_R] * (double)S_base[idx_S];
+        }
+    }
+
+    // --- Write output ---
+    grad_Q[idx] = scale * (float)sum_for_grad_q;
 }
 
+
+torch::Tensor compute_grad_A_cpu_and_copy(
+    torch::Tensor grad_output, // GPU
+    torch::Tensor Q,           // GPU
+    torch::Tensor R,           // GPU
+    torch::Tensor S,           // GPU
+    torch::Tensor Vq_1,        // GPU
+    torch::Tensor Vq_2,        // GPU
+    torch::Tensor Vr_1,        // GPU
+    torch::Tensor Vr_2,        // GPU
+    torch::Tensor Vs_1,        // GPU
+    torch::Tensor Vs_2,        // GPU
+    float scale
+) {
+        const int B = Q.size(0);
+        const int H = Q.size(1);
+        const int I = Q.size(2);
+        const int J = R.size(2);
+        const int K = S.size(2);
+
+        // Create CPU tensor for grad_A result
+        torch::Tensor grad_A_cpu = torch::zeros({B, H, I, J, K}, Q.options().device(torch::kCPU));
+
+        // Copy necessary inputs to CPU
+        auto grad_output_cpu = grad_output.cpu();
+        auto Q_cpu = Q.cpu(); auto R_cpu = R.cpu(); auto S_cpu = S.cpu();
+        auto Vq_1_cpu = Vq_1.cpu(); auto Vq_2_cpu = Vq_2.cpu();
+        auto Vr_1_cpu = Vr_1.cpu(); auto Vr_2_cpu = Vr_2.cpu();
+        auto Vs_1_cpu = Vs_1.cpu(); auto Vs_2_cpu = Vs_2.cpu();
+
+        // Compute grad_A slice by slice on CPU
+        for (int b = 0; b < B; ++b) {
+            for (int h = 0; h < H; ++h) {
+                // Get CPU slices for this (b,h)
+                auto Q_slice_cpu = Q_cpu.select(0, b).select(0, h);
+                auto R_slice_cpu = R_cpu.select(0, b).select(0, h);
+                auto S_slice_cpu = S_cpu.select(0, b).select(0, h);
+                auto Vq_1_slice_cpu = Vq_1_cpu.select(0, b).select(0, h);
+                auto Vq_2_slice_cpu = Vq_2_cpu.select(0, b).select(0, h);
+                auto Vr_1_slice_cpu = Vr_1_cpu.select(0, b).select(0, h);
+                auto Vr_2_slice_cpu = Vr_2_cpu.select(0, b).select(0, h);
+                auto Vs_1_slice_cpu = Vs_1_cpu.select(0, b).select(0, h);
+                auto Vs_2_slice_cpu = Vs_2_cpu.select(0, b).select(0, h);
+                auto grad_output_slice_cpu = grad_output_cpu.select(0, b).select(0, h);
+
+                // Compute intermediate A*, Aq*, Ar*, As* for the slice
+                torch::Tensor A_slice_cpu, Aq_slice_cpu, Ar_slice_cpu, As_slice_cpu;
+                std::tie(A_slice_cpu, Aq_slice_cpu, Ar_slice_cpu, As_slice_cpu) =
+                    compute_attention_tensors_single(Q_slice_cpu, R_slice_cpu, S_slice_cpu, scale);
+
+                // Compute grad_A_slice on CPU
+                auto grad_A_slice_cpu = compute_grad_A_single(
+                    grad_output_slice_cpu, Q_slice_cpu, R_slice_cpu, S_slice_cpu,
+                    Vq_1_slice_cpu, Vq_2_slice_cpu, Vr_1_slice_cpu, Vr_2_slice_cpu, Vs_1_slice_cpu, Vs_2_slice_cpu,
+                    A_slice_cpu, Aq_slice_cpu, Ar_slice_cpu, As_slice_cpu,
+                    b, h
+                );
+                // Copy the computed slice into the full CPU tensor
+               grad_A_cpu.select(0, b).select(0, h).copy_(grad_A_slice_cpu);
+            }
+        }
+       // Copy the full grad_A tensor from CPU to GPU
+       return grad_A_cpu.to(torch::kCUDA);
+}
 
 // Minimal backward function that returns zero gradients[placeholder]
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
@@ -1384,24 +1497,25 @@ backward_cuda(
           B, H, I, J, K, D, N_grad, scale); // Pass dimensions and scale
   }
 
-  // --- Launch kernel for grad_Q ---
- { 
-      const int64_t N_kernel = (int64_t)B * H * I * D;
+// --- 4. Compute grad_A (Temporarily using CPU + Copy) ---
+  // This is inefficient but allows testing the grad_Q kernel in isolation first.
+  // In the future, grad_A should be computed by a dedicated CUDA kernel.
+  torch::Tensor grad_A_gpu = compute_grad_A_cpu_and_copy(
+      grad_output, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, scale
+  );
+
+  // --- 5. Launch kernel for grad_Q using the computed grad_A ---
+ {
+      const int64_t N_kernel = (int64_t)B * H * I * D; // Output size
       const dim3 blocks((N_kernel + threads - 1) / threads);
-      grad_Q_kernel<<<blocks, threads>>>( 
-          grad_output.data_ptr<float>(), // gradY
-          Q.data_ptr<float>(),           // Q
-          R.data_ptr<float>(),           // R
-          S.data_ptr<float>(),           // S
-          Vq_1.data_ptr<float>(),        // Vq_1
-          Vq_2.data_ptr<float>(),        // Vq_2
-          Vr_1.data_ptr<float>(),        // Vr_1
-          Vr_2.data_ptr<float>(),        // Vr_2
-          Vs_1.data_ptr<float>(),        // Vs_1
-          Vs_2.data_ptr<float>(),        // Vs_2
-          grad_Q.data_ptr<float>(),      // gradQ (output)
-          B, H, I, J, K, D, N_grad, scale); // Dimensions, N_grad, scale
+      grad_Q_kernel<<<blocks, threads>>>(
+          grad_A_gpu.data_ptr<float>(),  // Input grad_A [B,H,I,J,K]
+          R.data_ptr<float>(),           // Input R [B,H,J,D]
+          S.data_ptr<float>(),           // Input S [B,H,K,D]
+          grad_Q.data_ptr<float>(),      // Output grad_Q [B,H,I,D]
+          B, H, I, J, K, D, scale);      // Dimensions and scale
   }
+
 
   // TODO: Implement and launch kernels for grad_R, grad_S
 

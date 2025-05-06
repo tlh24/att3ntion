@@ -197,7 +197,7 @@ if __name__ == "__main__":
     configs = [
         # (B, H, I, J, K, D)
         (1, 4, 6, 6, 6, 12),   # Small
-        # (2, 8, 32, 32, 32, 64),   # Medium
+        (2, 4, 32, 32, 32, 32),   # Medium
         # (4, 8, 64, 64, 64, 64),   # Large
         # (8, 16, 32, 32, 32, 128), # High-dimensional
         # (2, 8, 128, 128, 128, 32) # Long sequences
