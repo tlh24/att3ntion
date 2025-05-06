@@ -172,6 +172,20 @@ __global__ void compute_As_slice_kernel(
     float*       __restrict__ As_out_global,  // Output As_slice [I,J,K] on GPU
     int I, int J, int K
 );
+// Forward declaration for softmax backward kernel
+__global__ void apply_softmax_backward_kernel(
+    // Inputs
+    const float* __restrict__ grad_Aq_slice, // [I, J, K], from interim_grads_kernel
+    const float* __restrict__ grad_Ar_slice, // [I, J, K], from interim_grads_kernel
+    const float* __restrict__ grad_As_slice, // [I, J, K], from interim_grads_kernel
+    const float* __restrict__ Aq_slice,      // [I, J, K], from softmax kernels
+    const float* __restrict__ Ar_slice,      // [I, J, K], from softmax kernels
+    const float* __restrict__ As_slice,      // [I, J, K], from softmax kernels
+    // Output
+    float* __restrict__ grad_A_slice_out,    // [I, J, K], final grad_A for this slice
+    // Dimensions
+    int I, int J, int K
+);
 
 // ... (other kernel forward declarations and implementations)
 
@@ -1839,165 +1853,526 @@ torch::Tensor compute_As_slice_cuda_wrapper(
     return As_slice_out_gpu;
 }
 
-torch::Tensor compute_grad_A_cpu_and_copy(
-    torch::Tensor grad_output_gpu, // GPU tensor
-    torch::Tensor Q_gpu,           // GPU tensor
-    torch::Tensor R_gpu,           // GPU tensor
-    torch::Tensor S_gpu,           // GPU tensor
-    torch::Tensor Vq_1_gpu,        // GPU tensor
-    torch::Tensor Vq_2_gpu,        // GPU tensor
-    torch::Tensor Vr_1_gpu,        // GPU tensor
-    torch::Tensor Vr_2_gpu,        // GPU tensor
-    torch::Tensor Vs_1_gpu,        // GPU tensor
-    torch::Tensor Vs_2_gpu,        // GPU tensor
-    float scale
+// Kernel to compute grad_Aq_slice, grad_Ar_slice, grad_As_slice (Phase 1 of C++ compute_grad_A_single)
+__global__ void compute_interim_grads_kernel(
+    // Inputs
+    const float* __restrict__ grad_output_slice, // [N, D]
+    const float* __restrict__ Vq_1_slice,        // [I, D]
+    const float* __restrict__ Vq_2_slice,        // [I, D]
+    const float* __restrict__ Vr_1_slice,        // [J, D]
+    const float* __restrict__ Vr_2_slice,        // [J, D]
+    const float* __restrict__ Vs_1_slice,        // [K, D]
+    const float* __restrict__ Vs_2_slice,        // [K, D]
+    const float* __restrict__ Aq_slice,          // [I, J, K]
+    const float* __restrict__ Ar_slice,          // [I, J, K]
+    const float* __restrict__ As_slice,          // [I, J, K]
+    // Outputs (Temporary)
+    float* __restrict__ grad_Aq_slice_out,     // [I, J, K]
+    float* __restrict__ grad_Ar_slice_out,     // [I, J, K]
+    float* __restrict__ grad_As_slice_out,     // [I, J, K]
+    // Dimensions
+    int I_dim, int J_dim, int K_dim, int D_dim, int N_dim // Use _dim suffix
 ) {
-        const int B = Q_gpu.size(0);
-        const int H = Q_gpu.size(1);
-        
-        torch::Tensor grad_A_final_cpu_result = torch::zeros({B, H, Q_gpu.size(2), R_gpu.size(2), S_gpu.size(2)}, 
-                                                             Q_gpu.options().device(torch::kCPU));
+    // Map 3D thread indices to (i, j, k)
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    int k = blockIdx.z * blockDim.z + threadIdx.z;
 
-        // --- Get Full CPU Tensors (for reference and non-GPU'd parts) ---
-        auto grad_output_cpu_full = grad_output_gpu.cpu();
-        auto Q_cpu_full = Q_gpu.cpu();
-        auto R_cpu_full = R_gpu.cpu();
-        auto S_cpu_full = S_gpu.cpu();
-        auto Vq_1_cpu_full = Vq_1_gpu.cpu();
-        auto Vq_2_cpu_full = Vq_2_gpu.cpu();
-        auto Vr_1_cpu_full = Vr_1_gpu.cpu();
-        auto Vr_2_cpu_full = Vr_2_gpu.cpu();
-        auto Vs_1_cpu_full = Vs_1_gpu.cpu();
-        auto Vs_2_cpu_full = Vs_2_gpu.cpu();
-        // ------------------------------------------------------------------
+    // Boundary check
+    if (i >= I_dim || j >= J_dim || k >= K_dim) {
+        return;
+    }
+    
+    // Calculate linear index for output arrays [I,J,K]
+    int64_t ijk_idx = (int64_t)i * J_dim * K_dim + (int64_t)j * K_dim + k;
 
-        for (int b = 0; b < B; ++b) {
-            for (int h = 0; h < H; ++h) {
-                // --- Get GPU Slices for current (b,h) ---
-                auto Q_slice_gpu_current = Q_gpu.select(0, b).select(0, h);
-                auto R_slice_gpu_current = R_gpu.select(0, b).select(0, h);
-                auto S_slice_gpu_current = S_gpu.select(0, b).select(0, h);
-                // -----------------------------------------
+    float grad_aq_val = 0.0f;
+    float grad_ar_val = 0.0f;
+    float grad_as_val = 0.0f;
 
-                // --- Get CPU Slices for current (b,h) ---
-                auto Q_slice_cpu_ref = Q_cpu_full.select(0, b).select(0, h);
-                auto R_slice_cpu_ref = R_cpu_full.select(0, b).select(0, h);
-                auto S_slice_cpu_ref = S_cpu_full.select(0, b).select(0, h);
-                auto grad_output_slice_cpu = grad_output_cpu_full.select(0, b).select(0, h);
-                auto Vq_1_slice_cpu = Vq_1_cpu_full.select(0, b).select(0, h);
-                auto Vq_2_slice_cpu = Vq_2_cpu_full.select(0, b).select(0, h);
-                auto Vr_1_slice_cpu = Vr_1_cpu_full.select(0, b).select(0, h);
-                auto Vr_2_slice_cpu = Vr_2_cpu_full.select(0, b).select(0, h);
-                auto Vs_1_slice_cpu = Vs_1_cpu_full.select(0, b).select(0, h);
-                auto Vs_2_slice_cpu = Vs_2_cpu_full.select(0, b).select(0, h);
-                // -----------------------------------------
+    // Get pointers to relevant rows in V matrices (based on i, j, k)
+    const float* vq1_row_i = Vq_1_slice + (int64_t)i * D_dim;
+    const float* vq2_row_i = Vq_2_slice + (int64_t)i * D_dim;
+    const float* vr1_row_j = Vr_1_slice + (int64_t)j * D_dim;
+    const float* vr2_row_j = Vr_2_slice + (int64_t)j * D_dim;
+    const float* vs1_row_k = Vs_1_slice + (int64_t)k * D_dim;
+    const float* vs2_row_k = Vs_2_slice + (int64_t)k * D_dim;
+    
+    // Pre-fetch Aq, Ar, As values for this (i,j,k)
+    float aq_ijk = Aq_slice[ijk_idx];
+    float ar_ijk = Ar_slice[ijk_idx];
+    float as_ijk = As_slice[ijk_idx];
 
-                // --- Compute A*, Aq*, Ar*, As* using CUDA Kernels ---
-                // Step 1: A_slice (Verified)
-                torch::Tensor A_slice_from_gpu = compute_A_slice_cuda_wrapper(
-                    Q_slice_gpu_current, R_slice_gpu_current, S_slice_gpu_current, scale
-                );
-                torch::Tensor A_slice_cpu_variant = A_slice_from_gpu.cpu();
 
-                // Step 2: Aq_slice (Verified)
-                torch::Tensor Aq_slice_from_gpu = compute_Aq_slice_cuda_wrapper(A_slice_from_gpu);
-                torch::Tensor Aq_slice_cpu_variant = Aq_slice_from_gpu.cpu();
-                
-                // Step 3: Ar_slice (NEW)
-                torch::Tensor Ar_slice_from_gpu = compute_Ar_slice_cuda_wrapper(A_slice_from_gpu);
-                torch::Tensor Ar_slice_cpu_variant = Ar_slice_from_gpu.cpu();
-
-                // Step 4: As_slice (NEW)
-                torch::Tensor As_slice_from_gpu = compute_As_slice_cuda_wrapper(A_slice_from_gpu);
-                torch::Tensor As_slice_cpu_variant = As_slice_from_gpu.cpu();
-                // ------------------------------------------------------
-
-                // --- Compute CPU Reference Values ---
-                torch::Tensor A_slice_ref_cpu, Aq_slice_ref_cpu, Ar_slice_ref_cpu, As_slice_ref_cpu;
-                std::tie(A_slice_ref_cpu, Aq_slice_ref_cpu, Ar_slice_ref_cpu, As_slice_ref_cpu) =
-                    compute_attention_tensors_single(Q_slice_cpu_ref, R_slice_cpu_ref, S_slice_cpu_ref, scale);
-                // -----------------------------------
-
-                // ----> Verification Points <----
-                float rtol = 1e-4; // Relative tolerance
-                float atol = 1e-5; // Absolute tolerance
-                
-                // Verify A_slice 
-                 if (!torch::allclose(A_slice_cpu_variant, A_slice_ref_cpu, rtol, atol)) {
-                           fprintf(stderr, "CUDA DEBUG: Mismatch in A_slice for b=%d, h=%d. Max diff: %e\n", 
-                                   b, h, (A_slice_cpu_variant - A_slice_ref_cpu).abs().max().item<float>());
-                 }
-                // Verify Aq_slice
-                if (!torch::allclose(Aq_slice_cpu_variant, Aq_slice_ref_cpu, rtol, atol)) {
-                           fprintf(stderr, "CUDA DEBUG: Mismatch in Aq_slice for b=%d, h=%d. Max diff: %e\n", 
-                                   b, h, (Aq_slice_cpu_variant - Aq_slice_ref_cpu).abs().max().item<float>());
-                }
-                // Verify Ar_slice (NEW)
-                if (!torch::allclose(Ar_slice_cpu_variant, Ar_slice_ref_cpu, rtol, atol)) {
-                           fprintf(stderr, "CUDA DEBUG: Mismatch in Ar_slice for b=%d, h=%d. Max diff: %e\n", 
-                                   b, h, (Ar_slice_cpu_variant - Ar_slice_ref_cpu).abs().max().item<float>());
-                }
-                // Verify As_slice (NEW)
-                if (!torch::allclose(As_slice_cpu_variant, As_slice_ref_cpu, rtol, atol)) {
-                           fprintf(stderr, "CUDA DEBUG: Mismatch in As_slice for b=%d, h=%d. Max diff: %e\n", 
-                                   b, h, (As_slice_cpu_variant - As_slice_ref_cpu).abs().max().item<float>());
-                }
-                // Optional: Print success message
-                // else if (b==0 && h==0 && torch::allclose(...) && torch::allclose(...) && torch::allclose(...) && torch::allclose(...) ) {
-                //     fprintf(stdout, "CUDA DEBUG: A/Aq/Ar/As MATCH for b=0, h=0!\n");
-                // }
-                // -----------------------------
-
-                // --- Call compute_grad_A_single using ALL GPU-computed variants ---
-                auto grad_A_slice_for_final_result = compute_grad_A_single(
-                    grad_output_slice_cpu, 
-                    Q_slice_cpu_ref, R_slice_cpu_ref, S_slice_cpu_ref, // Still using CPU refs for consistency
-                    Vq_1_slice_cpu, Vq_2_slice_cpu, Vr_1_slice_cpu, Vr_2_slice_cpu, Vs_1_slice_cpu, Vs_2_slice_cpu,
-                    A_slice_cpu_variant,      // <<< GPU A_slice
-                    Aq_slice_cpu_variant,     // <<< GPU Aq_slice
-                    Ar_slice_cpu_variant,     // <<< GPU Ar_slice
-                    As_slice_cpu_variant,     // <<< GPU As_slice
-                    b, h
-                );
-                // ------------------------------------------------------------------
-                
-               grad_A_final_cpu_result.select(0, b).select(0, h).copy_(grad_A_slice_for_final_result);
-            }
+    // --- Term 1.a: grad_Aq from Yq (gather) ---
+    if (i < N_dim) {
+        const float* grad_out_row_i = grad_output_slice + (int64_t)i * D_dim;
+        for (int d = 0; d < D_dim; ++d) {
+            grad_aq_val += grad_out_row_i[d] * vr1_row_j[d] * vs1_row_k[d];
         }
-       return grad_A_final_cpu_result.to(torch::kCUDA);
+    }
+
+    // --- Term 1.b: grad_Aq from Yr' (scatter) ---
+    if (j < N_dim) {
+        float grad_x_term_j = 0.0f;
+        const float* grad_out_row_j = grad_output_slice + (int64_t)j * D_dim;
+        for (int d = 0; d < D_dim; ++d) {
+            grad_x_term_j += grad_out_row_j[d] * vq2_row_i[d] * vs2_row_k[d];
+        }
+        grad_aq_val += grad_x_term_j * as_ijk; // Multiply by As[i,j,k]
+    }
+
+    // --- Term 1.c: grad_Aq from Ys' (scatter) ---
+    if (k < N_dim) {
+        float grad_x_term_k = 0.0f;
+        const float* grad_out_row_k = grad_output_slice + (int64_t)k * D_dim;
+        for (int d = 0; d < D_dim; ++d) {
+            grad_x_term_k += grad_out_row_k[d] * vq2_row_i[d] * vr2_row_j[d];
+        }
+        grad_aq_val += grad_x_term_k * ar_ijk; // Multiply by Ar[i,j,k]
+    }
+
+    // --- Term 2.a: grad_Ar from Yr (gather) ---
+     if (j < N_dim) {
+        const float* grad_out_row_j = grad_output_slice + (int64_t)j * D_dim;
+        for (int d = 0; d < D_dim; ++d) {
+            grad_ar_val += grad_out_row_j[d] * vq1_row_i[d] * vs1_row_k[d];
+        }
+    }
+
+    // --- Term 2.b: grad_Ar from Yq' (scatter) ---
+     if (i < N_dim) {
+        float grad_x_term_i = 0.0f;
+        const float* grad_out_row_i = grad_output_slice + (int64_t)i * D_dim;
+        for (int d = 0; d < D_dim; ++d) {
+            grad_x_term_i += grad_out_row_i[d] * vr2_row_j[d] * vs2_row_k[d];
+        }
+        grad_ar_val += grad_x_term_i * as_ijk; // Multiply by As[i,j,k]
+    }
+   
+    // --- Term 2.c: grad_Ar from Ys' (scatter) ---
+    if (k < N_dim) {
+        float grad_x_term_k = 0.0f;
+        const float* grad_out_row_k = grad_output_slice + (int64_t)k * D_dim;
+         for (int d = 0; d < D_dim; ++d) {
+             grad_x_term_k += grad_out_row_k[d] * vq2_row_i[d] * vr2_row_j[d];
+         }
+        grad_ar_val += grad_x_term_k * aq_ijk; // Multiply by Aq[i,j,k]
+    }
+
+    // --- Term 3.a: grad_As from Ys (gather) ---
+     if (k < N_dim) {
+        const float* grad_out_row_k = grad_output_slice + (int64_t)k * D_dim;
+        for (int d = 0; d < D_dim; ++d) {
+            grad_as_val += grad_out_row_k[d] * vq1_row_i[d] * vr1_row_j[d];
+        }
+    }
+
+    // --- Term 3.b: grad_As from Yq' (scatter) ---
+     if (i < N_dim) {
+        float grad_x_term_i = 0.0f;
+        const float* grad_out_row_i = grad_output_slice + (int64_t)i * D_dim;
+        for (int d = 0; d < D_dim; ++d) {
+            grad_x_term_i += grad_out_row_i[d] * vr2_row_j[d] * vs2_row_k[d];
+        }
+        grad_as_val += grad_x_term_i * ar_ijk; // Multiply by Ar[i,j,k]
+    }
+    
+    // --- Term 3.c: grad_As from Yr' (scatter) ---
+    if (j < N_dim) {
+        float grad_x_term_j = 0.0f;
+        const float* grad_out_row_j = grad_output_slice + (int64_t)j * D_dim;
+        for (int d = 0; d < D_dim; ++d) {
+            grad_x_term_j += grad_out_row_j[d] * vq2_row_i[d] * vs2_row_k[d];
+        }
+        grad_as_val += grad_x_term_j * aq_ijk; // Multiply by Aq[i,j,k]
+    }
+
+    // Write results to output tensors
+    grad_Aq_slice_out[ijk_idx] = grad_aq_val;
+    grad_Ar_slice_out[ijk_idx] = grad_ar_val;
+    grad_As_slice_out[ijk_idx] = grad_as_val;
 }
 
-// Minimal backward function that returns zero gradients[placeholder]
+// C++ Wrapper for compute_interim_grads_kernel
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+compute_interim_grads_cuda_wrapper(
+    // Inputs (GPU tensors)
+    const torch::Tensor& grad_output_slice, // [N, D]
+    const torch::Tensor& Vq_1_slice,        // [I, D]
+    const torch::Tensor& Vq_2_slice,        // [I, D]
+    const torch::Tensor& Vr_1_slice,        // [J, D]
+    const torch::Tensor& Vr_2_slice,        // [J, D]
+    const torch::Tensor& Vs_1_slice,        // [K, D]
+    const torch::Tensor& Vs_2_slice,        // [K, D]
+    const torch::Tensor& Aq_slice,          // [I, J, K]
+    const torch::Tensor& Ar_slice,          // [I, J, K]
+    const torch::Tensor& As_slice           // [I, J, K]
+) {
+    // Input validation (basic checks)
+    TORCH_CHECK(grad_output_slice.is_cuda(), "Input grad_output_slice must be CUDA tensor");
+    // ... check other inputs are CUDA ...
+    TORCH_CHECK(Aq_slice.dim() == 3, "Aq_slice must be 3D");
+    // ... check other dimensions ...
+
+    const int I = Vq_1_slice.size(0);
+    const int J = Vr_1_slice.size(0);
+    const int K = Vs_1_slice.size(0);
+    const int D = Vq_1_slice.size(1);
+    const int N = grad_output_slice.size(0);
+
+    // Check dimension consistency
+    TORCH_CHECK(Vq_2_slice.sizes() == Vq_1_slice.sizes(), "Vq shapes mismatch");
+    TORCH_CHECK(Vr_2_slice.sizes() == Vr_1_slice.sizes(), "Vr shapes mismatch");
+    TORCH_CHECK(Vs_2_slice.sizes() == Vs_1_slice.sizes(), "Vs shapes mismatch");
+    TORCH_CHECK(Aq_slice.sizes() == torch::IntArrayRef({I, J, K}), "Aq shape mismatch");
+    TORCH_CHECK(Ar_slice.sizes() == torch::IntArrayRef({I, J, K}), "Ar shape mismatch");
+    TORCH_CHECK(As_slice.sizes() == torch::IntArrayRef({I, J, K}), "As shape mismatch");
+    TORCH_CHECK(grad_output_slice.size(1) == D, "grad_output D mismatch");
+    // ... add more checks as needed ...
+
+    // Allocate output tensors (temporary grads)
+    auto options = Aq_slice.options();
+    torch::Tensor grad_Aq_slice_out = torch::zeros({I, J, K}, options);
+    torch::Tensor grad_Ar_slice_out = torch::zeros({I, J, K}, options);
+    torch::Tensor grad_As_slice_out = torch::zeros({I, J, K}, options);
+
+    // Kernel launch configuration (similar to compute_A_slice_kernel)
+    constexpr int BLOCK_DIM_I = 8;
+    constexpr int BLOCK_DIM_J = 8;
+    constexpr int BLOCK_DIM_K = 8; 
+    dim3 blockDim(BLOCK_DIM_I, BLOCK_DIM_J, BLOCK_DIM_K);
+    dim3 gridDim(
+        (I + BLOCK_DIM_I - 1) / BLOCK_DIM_I,
+        (J + BLOCK_DIM_J - 1) / BLOCK_DIM_J,
+        (K + BLOCK_DIM_K - 1) / BLOCK_DIM_K
+    );
+
+    // Ensure inputs are contiguous (important for pointer access)
+    auto grad_output_cont = grad_output_slice.contiguous();
+    auto Vq_1_cont = Vq_1_slice.contiguous();
+    auto Vq_2_cont = Vq_2_slice.contiguous();
+    auto Vr_1_cont = Vr_1_slice.contiguous();
+    auto Vr_2_cont = Vr_2_slice.contiguous();
+    auto Vs_1_cont = Vs_1_slice.contiguous();
+    auto Vs_2_cont = Vs_2_slice.contiguous();
+    auto Aq_cont = Aq_slice.contiguous();
+    auto Ar_cont = Ar_slice.contiguous();
+    auto As_cont = As_slice.contiguous();
+
+    // Launch Kernel
+    compute_interim_grads_kernel<<<gridDim, blockDim>>>(
+        grad_output_cont.data_ptr<float>(),
+        Vq_1_cont.data_ptr<float>(), Vq_2_cont.data_ptr<float>(),
+        Vr_1_cont.data_ptr<float>(), Vr_2_cont.data_ptr<float>(),
+        Vs_1_cont.data_ptr<float>(), Vs_2_cont.data_ptr<float>(),
+        Aq_cont.data_ptr<float>(), Ar_cont.data_ptr<float>(), As_cont.data_ptr<float>(),
+        grad_Aq_slice_out.data_ptr<float>(),
+        grad_Ar_slice_out.data_ptr<float>(),
+        grad_As_slice_out.data_ptr<float>(),
+        I, J, K, D, N
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA error in compute_interim_grads_cuda_wrapper: %s\n", cudaGetErrorString(err));
+    }
+    // cudaDeviceSynchronize(); // For debugging
+
+    return std::make_tuple(grad_Aq_slice_out, grad_Ar_slice_out, grad_As_slice_out);
+}
+
+// Helper function to extract interim grads from C++ compute_grad_A_single
+// NOTE: You might need to modify compute_grad_A_single slightly to return these,
+// or re-implement its Phase 1 logic here for testing.
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+get_interim_grads_cpu(
+    const torch::Tensor& grad_output_slice_cpu, // [N, D]
+    const torch::Tensor& Q_slice_cpu,           // [I, D]
+    const torch::Tensor& R_slice_cpu,           // [J, D]
+    const torch::Tensor& S_slice_cpu,           // [K, D]
+    const torch::Tensor& Vq_1_slice_cpu,        // [I, D]
+    const torch::Tensor& Vq_2_slice_cpu,        // [I, D]
+    const torch::Tensor& Vr_1_slice_cpu,        // [J, D]
+    const torch::Tensor& Vr_2_slice_cpu,        // [J, D]
+    const torch::Tensor& Vs_1_slice_cpu,        // [K, D]
+    const torch::Tensor& Vs_2_slice_cpu,        // [K, D]
+    const torch::Tensor& Aq_slice_cpu,          // [I, J, K]
+    const torch::Tensor& Ar_slice_cpu,          // [I, J, K]
+    const torch::Tensor& As_slice_cpu           // [I, J, K]
+) {
+    const int I = Q_slice_cpu.size(0);
+    const int J = R_slice_cpu.size(0);
+    const int K = S_slice_cpu.size(0);
+    const int D = Q_slice_cpu.size(1);
+    const int N = grad_output_slice_cpu.size(0); 
+    auto options = Aq_slice_cpu.options(); 
+
+    auto grad_Aq_slice_ref = torch::zeros({I, J, K}, options);
+    auto grad_Ar_slice_ref = torch::zeros({I, J, K}, options);
+    auto grad_As_slice_ref = torch::zeros({I, J, K}, options);
+
+    auto grad_Aq_acc = grad_Aq_slice_ref.accessor<float, 3>();
+    auto grad_Ar_acc = grad_Ar_slice_ref.accessor<float, 3>();
+    auto grad_As_acc = grad_As_slice_ref.accessor<float, 3>();
+    
+    auto grad_output_acc = grad_output_slice_cpu.accessor<float, 2>();
+    auto Vq_1_acc = Vq_1_slice_cpu.accessor<float, 2>();
+    auto Vq_2_acc = Vq_2_slice_cpu.accessor<float, 2>();
+    auto Vr_1_acc = Vr_1_slice_cpu.accessor<float, 2>();
+    auto Vr_2_acc = Vr_2_slice_cpu.accessor<float, 2>();
+    auto Vs_1_acc = Vs_1_slice_cpu.accessor<float, 2>();
+    auto Vs_2_acc = Vs_2_slice_cpu.accessor<float, 2>();
+    auto Aq_acc = Aq_slice_cpu.accessor<float, 3>();
+    auto Ar_acc = Ar_slice_cpu.accessor<float, 3>();
+    auto As_acc = As_slice_cpu.accessor<float, 3>();
+
+    // Replicate Phase 1 logic from compute_grad_A_single here
+    // Term 1.a
+    if (I <= N) {
+        for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) { for (int d = 0; d < D; ++d) {
+            grad_Aq_acc[i][j][k] += grad_output_acc[i][d] * Vr_1_acc[j][d] * Vs_1_acc[k][d];
+        }}}}
+    }
+    // Term 1.b
+    if (J <= N) {
+        for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) {
+            float grad_x_vals = 0.0f;
+            for (int d = 0; d < D; ++d) { grad_x_vals += grad_output_acc[j][d] * Vq_2_acc[i][d] * Vs_2_acc[k][d]; }
+            grad_Aq_acc[i][j][k] += grad_x_vals * As_acc[i][j][k];
+        }}}
+    }
+    // Term 1.c
+    if (K <= N) {
+         for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) {
+             float grad_x_vals = 0.0f;
+             for (int d = 0; d < D; ++d) { grad_x_vals += grad_output_acc[k][d] * Vq_2_acc[i][d] * Vr_2_acc[j][d]; }
+             grad_Aq_acc[i][j][k] += grad_x_vals * Ar_acc[i][j][k];
+         }}}
+     }
+
+    // Term 2.a
+     if (J <= N) {
+         for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) { for (int d = 0; d < D; ++d) {
+             grad_Ar_acc[i][j][k] += grad_output_acc[j][d] * Vq_1_acc[i][d] * Vs_1_acc[k][d];
+         }}}}
+     }
+    // Term 2.b
+     if (I <= N) {
+         for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) {
+             float grad_x_vals = 0.0f;
+             for (int d = 0; d < D; ++d) { grad_x_vals += grad_output_acc[i][d] * Vr_2_acc[j][d] * Vs_2_acc[k][d]; }
+             grad_Ar_acc[i][j][k] += grad_x_vals * As_acc[i][j][k];
+         }}}
+     }
+    // Term 2.c
+     if (K <= N) {
+          for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) {
+              float grad_x_vals = 0.0f;
+              for (int d = 0; d < D; ++d) { grad_x_vals += grad_output_acc[k][d] * Vq_2_acc[i][d] * Vr_2_acc[j][d]; }
+              grad_Ar_acc[i][j][k] += grad_x_vals * Aq_acc[i][j][k];
+          }}}
+      }
+
+    // Term 3.a
+      if (K <= N) {
+          for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) { for (int d = 0; d < D; ++d) {
+              grad_As_acc[i][j][k] += grad_output_acc[k][d] * Vq_1_acc[i][d] * Vr_1_acc[j][d];
+          }}}}
+      }
+    // Term 3.b
+      if (I <= N) {
+          for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) {
+              float grad_x_vals = 0.0f;
+              for (int d = 0; d < D; ++d) { grad_x_vals += grad_output_acc[i][d] * Vr_2_acc[j][d] * Vs_2_acc[k][d]; }
+              grad_As_acc[i][j][k] += grad_x_vals * Ar_acc[i][j][k];
+          }}}
+      }
+    // Term 3.c
+      if (J <= N) {
+          for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) {
+              float grad_x_vals = 0.0f;
+              for (int d = 0; d < D; ++d) { grad_x_vals += grad_output_acc[j][d] * Vq_2_acc[i][d] * Vs_2_acc[k][d]; }
+              grad_As_acc[i][j][k] += grad_x_vals * Aq_acc[i][j][k];
+          }}}
+      }
+
+    return std::make_tuple(grad_Aq_slice_ref, grad_Ar_slice_ref, grad_As_slice_ref);
+}
+
+// Add this kernel implementation after other kernels
+
+__global__ void apply_softmax_backward_kernel(
+    // Inputs
+    const float* __restrict__ grad_Aq_slice_in, // [I, J, K]
+    const float* __restrict__ grad_Ar_slice_in, // [I, J, K]
+    const float* __restrict__ grad_As_slice_in, // [I, J, K]
+    const float* __restrict__ Aq_slice_in,      // [I, J, K]
+    const float* __restrict__ Ar_slice_in,      // [I, J, K]
+    const float* __restrict__ As_slice_in,      // [I, J, K]
+    // Output
+    float* __restrict__ grad_A_slice_out,    // [I, J, K]
+    // Dimensions
+    int I_dim, int J_dim, int K_dim
+) {
+    // Map 3D thread indices to (i, j, k) for grad_A_slice_out
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    int k = blockIdx.z * blockDim.z + threadIdx.z;
+
+    // Boundary check
+    if (i >= I_dim || j >= J_dim || k >= K_dim) {
+        return;
+    }
+
+    int64_t ijk_idx = (int64_t)i * J_dim * K_dim + (int64_t)j * K_dim + k;
+    float final_grad_A_val = 0.0f;
+
+    // --- 2.1 Contribution from Aq (Softmax over j, k for fixed i) ---
+    // sum_q = sum_{j',k'} (grad_Aq[i,j',k'] * Aq[i,j',k'])
+    // This sum is specific to each 'i'.
+    // All threads with the same 'i' (blockIdx.x * blockDim.x + threadIdx.x) participate.
+    // We need a reduction across J_dim * K_dim for each 'i'.
+
+    // For simplicity in this kernel, each thread (i,j,k) calculates its part for sum_q, sum_r, sum_s.
+    // More optimized: a dedicated reduction kernel or block-wide reduction for each sum_q[i], sum_r[j], sum_s[k].
+    // This version is less optimal for the sum_q/r/s but simpler to write initially.
+    // It recomputes sums, which is not ideal.
+
+    // --- Contribution from grad_Aq ---
+    float sum_q_for_ijk = 0.0f;
+    for (int j_prime = 0; j_prime < J_dim; ++j_prime) {
+        for (int k_prime = 0; k_prime < K_dim; ++k_prime) {
+            int64_t i_jprime_kprime_idx = (int64_t)i * J_dim * K_dim + (int64_t)j_prime * K_dim + k_prime;
+            sum_q_for_ijk += grad_Aq_slice_in[i_jprime_kprime_idx] * Aq_slice_in[i_jprime_kprime_idx];
+        }
+    }
+    final_grad_A_val += (grad_Aq_slice_in[ijk_idx] - sum_q_for_ijk) * Aq_slice_in[ijk_idx];
+
+
+    // --- Contribution from grad_Ar ---
+    float sum_r_for_ijk = 0.0f;
+    for (int i_prime = 0; i_prime < I_dim; ++i_prime) {
+        for (int k_prime = 0; k_prime < K_dim; ++k_prime) {
+            int64_t iprime_j_kprime_idx = (int64_t)i_prime * J_dim * K_dim + (int64_t)j * K_dim + k_prime;
+            sum_r_for_ijk += grad_Ar_slice_in[iprime_j_kprime_idx] * Ar_slice_in[iprime_j_kprime_idx];
+        }
+    }
+    final_grad_A_val += (grad_Ar_slice_in[ijk_idx] - sum_r_for_ijk) * Ar_slice_in[ijk_idx];
+    
+
+    // --- Contribution from grad_As ---
+    float sum_s_for_ijk = 0.0f;
+    for (int i_prime = 0; i_prime < I_dim; ++i_prime) {
+        for (int j_prime = 0; j_prime < J_dim; ++j_prime) {
+            int64_t iprime_jprime_k_idx = (int64_t)i_prime * J_dim * K_dim + (int64_t)j_prime * K_dim + k;
+            sum_s_for_ijk += grad_As_slice_in[iprime_jprime_k_idx] * As_slice_in[iprime_jprime_k_idx];
+        }
+    }
+    final_grad_A_val += (grad_As_slice_in[ijk_idx] - sum_s_for_ijk) * As_slice_in[ijk_idx];
+
+    grad_A_slice_out[ijk_idx] = final_grad_A_val;
+}
+
+// Add this C++ wrapper after other wrappers
+torch::Tensor apply_softmax_backward_cuda_wrapper(
+    // Inputs (GPU tensors)
+    const torch::Tensor& grad_Aq_slice_gpu, // [I, J, K]
+    const torch::Tensor& grad_Ar_slice_gpu, // [I, J, K]
+    const torch::Tensor& grad_As_slice_gpu, // [I, J, K]
+    const torch::Tensor& Aq_slice_gpu,      // [I, J, K]
+    const torch::Tensor& Ar_slice_gpu,      // [I, J, K]
+    const torch::Tensor& As_slice_gpu       // [I, J, K]
+) {
+    TORCH_CHECK(grad_Aq_slice_gpu.is_cuda(), "grad_Aq_slice_gpu must be CUDA");
+    // ... add checks for other inputs ...
+    TORCH_CHECK(grad_Aq_slice_gpu.dim() == 3 && Aq_slice_gpu.dim() == 3, "Inputs must be 3D");
+    
+    const int I = grad_Aq_slice_gpu.size(0);
+    const int J = grad_Aq_slice_gpu.size(1);
+    const int K = grad_Aq_slice_gpu.size(2);
+
+    TORCH_CHECK(grad_Ar_slice_gpu.sizes() == grad_Aq_slice_gpu.sizes(), "grad_Ar shape mismatch");
+    // ... add other shape consistency checks ...
+
+    auto options = grad_Aq_slice_gpu.options();
+    torch::Tensor grad_A_slice_out_gpu = torch::zeros({I, J, K}, options);
+
+    // Kernel launch configuration (maps to each element of grad_A_slice_out)
+    constexpr int BLOCK_DIM_I = 8;
+    constexpr int BLOCK_DIM_J = 8;
+    constexpr int BLOCK_DIM_K = 8; 
+    dim3 blockDim(BLOCK_DIM_I, BLOCK_DIM_J, BLOCK_DIM_K);
+    dim3 gridDim(
+        (I + BLOCK_DIM_I - 1) / BLOCK_DIM_I,
+        (J + BLOCK_DIM_J - 1) / BLOCK_DIM_J,
+        (K + BLOCK_DIM_K - 1) / BLOCK_DIM_K
+    );
+
+    // Ensure inputs are contiguous
+    auto grad_Aq_cont = grad_Aq_slice_gpu.contiguous();
+    auto grad_Ar_cont = grad_Ar_slice_gpu.contiguous();
+    auto grad_As_cont = grad_As_slice_gpu.contiguous();
+    auto Aq_cont = Aq_slice_gpu.contiguous();
+    auto Ar_cont = Ar_slice_gpu.contiguous();
+    auto As_cont = As_slice_gpu.contiguous();
+
+    apply_softmax_backward_kernel<<<gridDim, blockDim>>>(
+        grad_Aq_cont.data_ptr<float>(),
+        grad_Ar_cont.data_ptr<float>(),
+        grad_As_cont.data_ptr<float>(),
+        Aq_cont.data_ptr<float>(),
+        Ar_cont.data_ptr<float>(),
+        As_cont.data_ptr<float>(),
+        grad_A_slice_out_gpu.data_ptr<float>(),
+        I, J, K
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA error in apply_softmax_backward_cuda_wrapper: %s\n", cudaGetErrorString(err));
+    }
+    // cudaDeviceSynchronize(); // For debugging
+
+    return grad_A_slice_out_gpu;
+}
+
+// Modify the main backward_cuda function:
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
           torch::Tensor, torch::Tensor,
           torch::Tensor, torch::Tensor,
           torch::Tensor, torch::Tensor>
 backward_cuda(
-    torch::Tensor grad_output,
-    torch::Tensor Q, torch::Tensor R, torch::Tensor S,
-    torch::Tensor Vq_1, torch::Tensor Vq_2,
-    torch::Tensor Vr_1, torch::Tensor Vr_2,
-    torch::Tensor Vs_1, torch::Tensor Vs_2,
+    torch::Tensor grad_output, // GPU
+    torch::Tensor Q,           // GPU
+    torch::Tensor R,           // GPU
+    torch::Tensor S,           // GPU
+    torch::Tensor Vq_1,        // GPU
+    torch::Tensor Vq_2,        // GPU
+    torch::Tensor Vr_1,        // GPU
+    torch::Tensor Vr_2,        // GPU
+    torch::Tensor Vs_1,        // GPU
+    torch::Tensor Vs_2,        // GPU
     double dropout_rate)
 {
-  // Make sure inputs are contiguous (good practice, though PyTorch often handles this)
+  // Make sure inputs are contiguous
   grad_output = grad_output.contiguous();
   Q = Q.contiguous();  
   R = R.contiguous();  
   S = S.contiguous();
   Vq_1 = Vq_1.contiguous();
-  Vq_2 = Vq_2.contiguous(); // Ensure Vq_2 is contiguous
+  Vq_2 = Vq_2.contiguous(); 
   Vr_1 = Vr_1.contiguous();
-  Vr_2 = Vr_2.contiguous(); // Ensure Vr_2 is contiguous
+  Vr_2 = Vr_2.contiguous(); 
   Vs_1 = Vs_1.contiguous();
-  Vs_2 = Vs_2.contiguous(); // Ensure Vs_2 is contiguous
+  Vs_2 = Vs_2.contiguous(); 
 
-  // 1) allocate outputs
+  // 1) allocate final output gradient tensors
   auto grad_Q   = torch::zeros_like(Q);
-  auto grad_R   = torch::zeros_like(R);
-  auto grad_S   = torch::zeros_like(S);
+  auto grad_R   = torch::zeros_like(R); // Still a placeholder for now
+  auto grad_S   = torch::zeros_like(S); // Still a placeholder for now
   auto grad_Vq_1 = torch::zeros_like(Vq_1);
-  auto grad_Vq_2 = torch::zeros_like(Vq_2); // Allocate the target gradient tensor
+  auto grad_Vq_2 = torch::zeros_like(Vq_2); 
   auto grad_Vr_1 = torch::zeros_like(Vr_1);
   auto grad_Vr_2 = torch::zeros_like(Vr_2);
   auto grad_Vs_1 = torch::zeros_like(Vs_1);
@@ -2006,142 +2381,151 @@ backward_cuda(
   // 2) extract dims + scale
   const int B = Q.size(0);
   const int H = Q.size(1);
-  const int I = Q.size(2);
-  const int J = R.size(2);
-  const int K = S.size(2);
+  const int I = Q.size(2); // Slice dim for Q
+  const int J = R.size(2); // Slice dim for R
+  const int K = S.size(2); // Slice dim for S
   const int D = Q.size(3);
-  const int N_grad = grad_output.size(2); // Use the provided grad_output size
+  const int N_grad = grad_output.size(2); 
 
-  const float scale = 1.0f / sqrtf((float)D); // Use sqrtf for float
-  const int threads = 256; // Standard block size
+  const float scale = 1.0f / sqrtf((float)D);
+  const int threads = 256; 
 
-  // 3) Launch the kernel for grad_Vq_1
-  // The kernel computes grad_Vq_1 which has shape [B, H, I, D]
+  // 3) Launch gather/scatter kernels for grad_V* (these operate on full tensors)
   {
-    const int64_t N_kernel = (int64_t)B * H * I * D; // Total number of elements in grad_Vq_1
-    const dim3 blocks((N_kernel + threads - 1) / threads); // Calculate number of blocks needed
-
-    gather_grad_Vq1_kernel<<<blocks, threads>>>(
-        grad_output.data_ptr<float>(), // Combined gradient input
-        Q.data_ptr<float>(),
-        R.data_ptr<float>(),
-        S.data_ptr<float>(),
-        Vr_1.data_ptr<float>(),        // Value tensor needed for Y_s path
-        Vs_1.data_ptr<float>(),        // Value tensor needed for Y_r path
-        grad_Vq_1.data_ptr<float>(),   // Output gradient tensor
-        B, H, I, J, K, D, N_grad, scale); // Pass dimensions and scale
+    const int64_t N_kernel_Vq1 = (int64_t)B * H * I * D; 
+    const dim3 blocks_Vq1((N_kernel_Vq1 + threads - 1) / threads);
+    gather_grad_Vq1_kernel<<<blocks_Vq1, threads>>>(
+        grad_output.data_ptr<float>(), Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
+        Vr_1.data_ptr<float>(), Vs_1.data_ptr<float>(), grad_Vq_1.data_ptr<float>(),
+        B, H, I, J, K, D, N_grad, scale);
   }
-
-  // Launch kernel for grad_Vr_1 (Gather)
-  {
-      const int64_t N_kernel = (int64_t)B * H * J * D;
-      const dim3 blocks((N_kernel + threads - 1) / threads);
-      // Assuming gather_grad_Vr1_kernel exists and is implemented
-      gather_grad_Vr1_kernel<<<blocks, threads>>>( 
-          grad_output.data_ptr<float>(), 
-          Q.data_ptr<float>(), 
-          R.data_ptr<float>(), 
-          S.data_ptr<float>(), 
-          Vq_1.data_ptr<float>(), // Vq_1 is needed
-          Vs_1.data_ptr<float>(), // Vs_1 is needed
-          grad_Vr_1.data_ptr<float>(), // Output 
+   { 
+      const int64_t N_kernel_Vr1 = (int64_t)B * H * J * D;
+      const dim3 blocks_Vr1((N_kernel_Vr1 + threads - 1) / threads);
+      gather_grad_Vr1_kernel<<<blocks_Vr1, threads>>>( 
+          grad_output.data_ptr<float>(), Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(), 
+          Vq_1.data_ptr<float>(), Vs_1.data_ptr<float>(), grad_Vr_1.data_ptr<float>(), 
           B, H, I, J, K, D, N_grad, scale); 
   }
-
-  // Launch kernel for grad_Vs_1 (Gather)
-  {
-      const int64_t N_kernel = (int64_t)B * H * K * D;
-      const dim3 blocks((N_kernel + threads - 1) / threads);
-      // Assuming gather_grad_Vs1_kernel exists and is implemented
-      gather_grad_Vs1_kernel<<<blocks, threads>>>( 
-          grad_output.data_ptr<float>(), 
-          Q.data_ptr<float>(), 
-          R.data_ptr<float>(), 
-          S.data_ptr<float>(), 
-          Vq_1.data_ptr<float>(), // Vq_1 is needed
-          Vr_1.data_ptr<float>(), // Vr_1 is needed
-          grad_Vs_1.data_ptr<float>(), // Output 
+   { 
+      const int64_t N_kernel_Vs1 = (int64_t)B * H * K * D;
+      const dim3 blocks_Vs1((N_kernel_Vs1 + threads - 1) / threads);
+      gather_grad_Vs1_kernel<<<blocks_Vs1, threads>>>( 
+          grad_output.data_ptr<float>(), Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(), 
+          Vq_1.data_ptr<float>(), Vr_1.data_ptr<float>(), grad_Vs_1.data_ptr<float>(),
           B, H, I, J, K, D, N_grad, scale); 
   }
+  { 
+      const int64_t N_kernel_Vq2 = (int64_t)B * H * I * D; 
+      const dim3 blocks_Vq2((N_kernel_Vq2 + threads - 1) / threads);
+      scatter_grad_Vq2_kernel<<<blocks_Vq2, threads>>>( 
+          grad_output.data_ptr<float>(), Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(), 
+          Vr_2.data_ptr<float>(), Vs_2.data_ptr<float>(), grad_Vq_2.data_ptr<float>(),
+          B, H, I, J, K, D, N_grad, scale); 
+  }
+  { 
+      const int64_t N_kernel_Vr2 = (int64_t)B * H * J * D; 
+      const dim3 blocks_Vr2((N_kernel_Vr2 + threads - 1) / threads);
+      scatter_grad_Vr2_kernel<<<blocks_Vr2, threads>>>( 
+          grad_output.data_ptr<float>(), Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(), 
+          Vq_2.data_ptr<float>(), Vs_2.data_ptr<float>(), grad_Vr_2.data_ptr<float>(),
+          B, H, I, J, K, D, N_grad, scale); 
+  }
+  { 
+      const int64_t N_kernel_Vs2 = (int64_t)B * H * K * D; 
+      const dim3 blocks_Vs2((N_kernel_Vs2 + threads - 1) / threads);
+      scatter_grad_Vs2_kernel<<<blocks_Vs2, threads>>>( 
+          grad_output.data_ptr<float>(), Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(), 
+          Vq_2.data_ptr<float>(), Vr_2.data_ptr<float>(), grad_Vs_2.data_ptr<float>(),
+          B, H, I, J, K, D, N_grad, scale); 
+  }
+  // Error check after V-gradient kernels
+  cudaError_t v_err = cudaGetLastError();
+  if (v_err != cudaSuccess) {
+    fprintf(stderr, "CUDA error after V-gradient kernels in backward_cuda: %s\n", cudaGetErrorString(v_err));
+  }
 
-  // Launch kernel for grad_Vq_2 (Scatter)
+
+  // --- 4. Compute full grad_A tensor on GPU by processing slice by slice ---
+  auto grad_A_batched_gpu = torch::zeros({B, H, I, J, K}, Q.options()); // Allocate full grad_A on GPU
+
+  for (int b = 0; b < B; ++b) {
+      for (int h = 0; h < H; ++h) {
+          // Get GPU slices for current (b,h)
+          auto Q_slice_gpu = Q.select(0, b).select(0, h);
+          auto R_slice_gpu = R.select(0, b).select(0, h);
+          auto S_slice_gpu = S.select(0, b).select(0, h);
+          auto grad_output_slice_gpu = grad_output.select(0, b).select(0, h);
+          auto Vq_1_slice_gpu = Vq_1.select(0, b).select(0, h);
+          auto Vq_2_slice_gpu = Vq_2.select(0, b).select(0, h);
+          auto Vr_1_slice_gpu = Vr_1.select(0, b).select(0, h);
+          auto Vr_2_slice_gpu = Vr_2.select(0, b).select(0, h);
+          auto Vs_1_slice_gpu = Vs_1.select(0, b).select(0, h);
+          auto Vs_2_slice_gpu = Vs_2.select(0, b).select(0, h);
+
+          // --- Chain of CUDA calls to get final_grad_A_slice_gpu ---
+          torch::Tensor A_slice_gpu = compute_A_slice_cuda_wrapper(
+              Q_slice_gpu, R_slice_gpu, S_slice_gpu, scale
+          );
+          
+          torch::Tensor Aq_slice_gpu = compute_Aq_slice_cuda_wrapper(A_slice_gpu);
+          torch::Tensor Ar_slice_gpu = compute_Ar_slice_cuda_wrapper(A_slice_gpu);
+          torch::Tensor As_slice_gpu = compute_As_slice_cuda_wrapper(A_slice_gpu);
+          
+          torch::Tensor grad_Aq_slice_gpu_tmp, grad_Ar_slice_gpu_tmp, grad_As_slice_gpu_tmp;
+          std::tie(grad_Aq_slice_gpu_tmp, grad_Ar_slice_gpu_tmp, grad_As_slice_gpu_tmp) = 
+              compute_interim_grads_cuda_wrapper(
+                  grad_output_slice_gpu, 
+                  Vq_1_slice_gpu, Vq_2_slice_gpu, 
+                  Vr_1_slice_gpu, Vr_2_slice_gpu, 
+                  Vs_1_slice_gpu, Vs_2_slice_gpu, 
+                  Aq_slice_gpu, Ar_slice_gpu, As_slice_gpu);
+          
+          torch::Tensor final_grad_A_slice_gpu = apply_softmax_backward_cuda_wrapper(
+              grad_Aq_slice_gpu_tmp, grad_Ar_slice_gpu_tmp, grad_As_slice_gpu_tmp,
+              Aq_slice_gpu, Ar_slice_gpu, As_slice_gpu
+          );
+          // ----------------------------------------------------------------
+
+          // Copy the computed slice into the full batched grad_A tensor on GPU
+          grad_A_batched_gpu.select(0, b).select(0, h).copy_(final_grad_A_slice_gpu);
+      }
+  }
+  // Error check after grad_A computation loop
+  cudaError_t ga_err = cudaGetLastError();
+  if (ga_err != cudaSuccess) {
+    fprintf(stderr, "CUDA error after grad_A loop in backward_cuda: %s\n", cudaGetErrorString(ga_err));
+  }
+
+  // --- 5. Launch kernel for full grad_Q using the full grad_A_batched_gpu ---
   {
-      const int64_t N_kernel = (int64_t)B * H * I * D; 
-      const dim3 blocks((N_kernel + threads - 1) / threads);
-      scatter_grad_Vq2_kernel<<<blocks, threads>>>( 
-          grad_output.data_ptr<float>(), // Upstream grads dL/dY_r_, dL/dY_s_ 
-          Q.data_ptr<float>(), 
-          R.data_ptr<float>(), 
-          S.data_ptr<float>(), 
-          Vr_2.data_ptr<float>(),        // Value tensor needed for Y_s_ path
-          Vs_2.data_ptr<float>(),        // Value tensor needed for Y_r_ path
-          grad_Vq_2.data_ptr<float>(),   // Output gradient tensor
-          B, H, I, J, K, D, N_grad, scale); // Pass dimensions and scale
+      const int64_t N_kernel_Q = (int64_t)B * H * I * D; 
+      const dim3 blocks_Q((N_kernel_Q + threads - 1) / threads);
+      // Note: Using 'grad_Q_kernel' as it's named in your .cu file, assuming it's compute_grad_Q_kernel_from_gradA
+      grad_Q_kernel<<<blocks_Q, threads>>>( 
+          grad_A_batched_gpu.data_ptr<float>(), 
+          R.data_ptr<float>(),                  
+          S.data_ptr<float>(),                  
+          grad_Q.data_ptr<float>(),             
+          B, H, I, J, K, D, scale);      
   }
-  
-  // Launch kernel for grad_Vr_2 (Scatter)
-  {
-      const int64_t N_kernel = (int64_t)B * H * J * D; 
-      const dim3 blocks((N_kernel + threads - 1) / threads);
-      scatter_grad_Vr2_kernel<<<blocks, threads>>>( 
-          grad_output.data_ptr<float>(), 
-          Q.data_ptr<float>(), 
-          R.data_ptr<float>(), 
-          S.data_ptr<float>(), 
-          Vq_2.data_ptr<float>(),        // Value tensor needed for Y_s_ path
-          Vs_2.data_ptr<float>(),        // Value tensor needed for Y_q_ path
-          grad_Vr_2.data_ptr<float>(),   // Output gradient tensor
-          B, H, I, J, K, D, N_grad, scale); // Pass dimensions and scale
+  cudaError_t gq_err = cudaGetLastError();
+  if (gq_err != cudaSuccess) {
+    fprintf(stderr, "CUDA error after grad_Q_kernel in backward_cuda: %s\n", cudaGetErrorString(gq_err));
   }
 
-  // Launch kernel for grad_Vs_2 (Scatter)
-  {
-      const int64_t N_kernel = (int64_t)B * H * K * D; 
-      const dim3 blocks((N_kernel + threads - 1) / threads);
-      scatter_grad_Vs2_kernel<<<blocks, threads>>>( 
-          grad_output.data_ptr<float>(), 
-          Q.data_ptr<float>(), 
-          R.data_ptr<float>(), 
-          S.data_ptr<float>(), 
-          Vq_2.data_ptr<float>(),        // Value tensor needed for Y_r_ path
-          Vr_2.data_ptr<float>(),        // Value tensor needed for Y_q_ path
-          grad_Vs_2.data_ptr<float>(),   // Output gradient tensor
-          B, H, I, J, K, D, N_grad, scale); // Pass dimensions and scale
-  }
+  // TODO: Implement and launch slice-wise kernels for grad_R, grad_S using final_grad_A_slice_gpu
+  //       and accumulate into grad_R, grad_S within the b,h loop.
+  //       Or, launch full kernels for grad_R, grad_S using grad_A_batched_gpu after the loop.
 
-// --- 4. Compute grad_A (Temporarily using CPU + Copy) ---
-  // This is inefficient but allows testing the grad_Q kernel in isolation first.
-  // In the future, grad_A should be computed by a dedicated CUDA kernel.
-  torch::Tensor grad_A_gpu = compute_grad_A_cpu_and_copy(
-      grad_output, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, scale
-  );
-
-  // --- 5. Launch kernel for grad_Q using the computed grad_A ---
- {
-      const int64_t N_kernel = (int64_t)B * H * I * D; // Output size
-      const dim3 blocks((N_kernel + threads - 1) / threads);
-      grad_Q_kernel<<<blocks, threads>>>(
-          grad_A_gpu.data_ptr<float>(),  // Input grad_A [B,H,I,J,K]
-          R.data_ptr<float>(),           // Input R [B,H,J,D]
-          S.data_ptr<float>(),           // Input S [B,H,K,D]
-          grad_Q.data_ptr<float>(),      // Output grad_Q [B,H,I,D]
-          B, H, I, J, K, D, scale);      // Dimensions and scale
-  }
-
-
-  // TODO: Implement and launch kernels for grad_R, grad_S
-
-  cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    fprintf(stderr, "CUDA error in backward_cuda: %s\\n", cudaGetErrorString(err));
-  }
-  
-  cudaDeviceSynchronize(); // Wait for kernel completion
+  cudaDeviceSynchronize(); // Wait for all kernel completions
 
   return std::make_tuple(
       grad_Q, grad_R, grad_S,
       grad_Vq_1, grad_Vq_2, 
       grad_Vr_1, grad_Vr_2,
-      grad_Vs_1, grad_Vs_2 // Return all computed gradients
+      grad_Vs_1, grad_Vs_2
   );
 }
+
+
