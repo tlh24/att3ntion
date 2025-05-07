@@ -6,7 +6,7 @@
 
 
 // Forward declarations
-__global__ void gather_dim0_kernel(
+__global__ void Yq_gather_kernel(
     const float* __restrict__ Q, 
     const float* __restrict__ R, 
     const float* __restrict__ S,
@@ -16,7 +16,7 @@ __global__ void gather_dim0_kernel(
     int B, int H, int I, int J, int K, int D,
     float scale);
 
-__global__ void gather_dim1_kernel(
+__global__ void Yr_gather_kernel(
     const float* __restrict__ R_query, 
     const float* __restrict__ Q,
     const float* __restrict__ S,
@@ -26,7 +26,7 @@ __global__ void gather_dim1_kernel(
     int B, int H, int I, int J, int K, int D,
     float scale);
 
-__global__ void gather_dim2_kernel(
+__global__ void Ys_gather_kernel(
     const float* __restrict__ S_query, 
     const float* __restrict__ Q,
     const float* __restrict__ R,
@@ -36,7 +36,7 @@ __global__ void gather_dim2_kernel(
     int B, int H, int I, int J, int K, int D,
     float scale);
 
-__global__ void scatter_dim0_kernel(
+__global__ void Yq_scatter_kernel(
     const float* Q,
     const float* R,
     const float* S,
@@ -46,7 +46,7 @@ __global__ void scatter_dim0_kernel(
     int B, int H, int I, int J, int K, int D,
     float scale);
 
-__global__ void scatter_dim1_kernel(
+__global__ void Yr_scatter_kernel(
     const float* __restrict__ Q,
     const float* __restrict__ R,
     const float* __restrict__ S,
@@ -56,7 +56,17 @@ __global__ void scatter_dim1_kernel(
     int B, int H, int I, int J, int K, int D,
     float scale);
 
-__global__ void scatter_dim2_kernel(
+__global__ void Ys_scatter_kernel(
+    const float* __restrict__ Q,
+    const float* __restrict__ R,
+    const float* __restrict__ S,
+    const float* __restrict__ Vq_2, 
+    const float* __restrict__ Vr_2, 
+    float*       __restrict__ Y_s_, 
+    int B, int H, int I, int J, int K, int D,
+    float scale);
+
+
     const float* __restrict__ Q,
     const float* __restrict__ R,
     const float* __restrict__ S,
@@ -188,8 +198,7 @@ __global__ void grad_S_kernel(
     const float scale);
 
 // -- Forward Kernels --
-// Y_q Gather for fixed_dim = 0 
-__global__ void gather_dim0_kernel(
+__global__ void Yq_gather_kernel(
     const float* __restrict__ Q, 
     const float* __restrict__ R, 
     const float* __restrict__ S,
@@ -197,8 +206,7 @@ __global__ void gather_dim0_kernel(
     const float* __restrict__ V2,
     float*       __restrict__ Y,
     int B, int H, int I, int J, int K, int D,
-    float scale)
-{
+    float scale){
     // global thread index [0 .. B*H*I*D)
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (int64_t)B*H*I*D) return;
@@ -261,11 +269,8 @@ __global__ void gather_dim0_kernel(
         y_val += attn * v1_base[d] * v2_base[d];
       }
     }
-    Y[idx] = y_val;
-}
-
-// Y_r Gather for fixed_dim = 1 
-__global__ void gather_dim1_kernel(
+    Y[idx] = y_val;}
+__global__ void Yr_gather_kernel(
     const float* __restrict__ R_query, // R is the 'query' for this dimension
     const float* __restrict__ Q,
     const float* __restrict__ S,
@@ -273,8 +278,7 @@ __global__ void gather_dim1_kernel(
     const float* __restrict__ V2,      // Vs_1
     float*       __restrict__ Y,       // Y_r
     int B, int H, int I, int J, int K, int D,
-    float scale)
-{
+    float scale){
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (int64_t)B*H*J*D) return;
 
@@ -336,11 +340,8 @@ __global__ void gather_dim1_kernel(
       }
     }
 
-    Y[idx] = y_val;
-}
-
-// Y_s Gather for fixed_dim = 2 
-__global__ void gather_dim2_kernel(
+    Y[idx] = y_val;}
+__global__ void Ys_gather_kernel(
     const float* __restrict__ S_query, // S is the 'query' for this dimension
     const float* __restrict__ Q,
     const float* __restrict__ R,
@@ -348,8 +349,7 @@ __global__ void gather_dim2_kernel(
     const float* __restrict__ V2,      // Vr_1
     float*       __restrict__ Y,       // Y_s
     int B, int H, int I, int J, int K, int D,
-    float scale)
-{
+    float scale){
     // global thread index [0 .. B*H*K*D)
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (int64_t)B*H*K*D) return;
@@ -413,18 +413,14 @@ __global__ void gather_dim2_kernel(
       }
     }
 
-    Y[idx] = y_val;
-}
-
-// -- Scatter Helpers -- 
-// Computes dot product Q[i]*R[j]*S[k] for specific indices
+    Y[idx] = y_val;}
+// helper: Computes dot product Q[i]*R[j]*S[k] for specific indices
 __device__ inline float compute_dot_product_cuda(
     const float* __restrict__ Q, 
     const float* __restrict__ R, 
     const float* __restrict__ S,
     int b, int h, int i, int j, int k, 
-    int B, int H, int I, int J, int K, int D)
-{
+    int B, int H, int I, int J, int K, int D){
     // Calculate base pointers using passed dimensions
     const float* q_vec = Q + (((int64_t)b * H + h) * I + i) * D;
     const float* r_vec = R + (((int64_t)b * H + h) * J + j) * D;
@@ -435,10 +431,8 @@ __device__ inline float compute_dot_product_cuda(
     for (int d = 0; d < D; ++d) {
         dot += q_vec[d] * r_vec[d] * s_vec[d];
     }
-    return dot;
-}
-
-// Compute single softmax attention value for eg. Ar[i,j,k] (fixed_dim=1) 
+    return dot;}
+// helper: Compute single softmax attention value for eg. Ar[i,j,k] (fixed_dim=1) 
 __device__ inline float compute_single_softmax_attn_cuda(
     const float* __restrict__ Q, 
     const float* __restrict__ R, 
@@ -446,9 +440,7 @@ __device__ inline float compute_single_softmax_attn_cuda(
     int b, int h, int i_target, int j_target, int k_target,
     int B, int H, int I, int J, int K, int D,
     float scale,
-    int fixed_dim // 1 for Ar (softmax over i, k for fixed j), 2 for As (softmax over i, j for fixed k)
-)
-{
+    int fixed_dim ){
     float max_val = -1.0e30f;
     float sum_exp = 0.0f;
 
@@ -515,11 +507,8 @@ __device__ inline float compute_single_softmax_attn_cuda(
         return (fabsf(target_dot * scale - max_val) < 1e-5f) ? (1.0f / (float)num_elements) : 0.0f;
     }
     
-    return expf(target_dot * scale - max_val) / sum_exp;
-}
-
-// Y_q_ Scatter for fixed_dim = 0 
-__global__ void scatter_dim0_kernel(
+    return expf(target_dot * scale - max_val) / sum_exp;}
+__global__ void Yq_scatter_kernel(
     const float* Q,
     const float* R,
     const float* S,
@@ -527,8 +516,7 @@ __global__ void scatter_dim0_kernel(
     const float* Vs_2, 
     float*       Y_q_, 
     int B, int H, int I, int J, int K, int D,
-    float scale)
-{
+    float scale){
     // global thread index [0 .. B*H*I*D)
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (int64_t)B*H*I*D) return;
@@ -564,11 +552,8 @@ __global__ void scatter_dim0_kernel(
         }
     }
 
-    Y_q_[idx] = accum_val;
-}
-
-// Y_r_ Scatter for fixed_dim = 1 
-__global__ void scatter_dim1_kernel(
+    Y_q_[idx] = accum_val;}
+__global__ void Yr_scatter_kernel(
     const float* __restrict__ Q,
     const float* __restrict__ R,
     const float* __restrict__ S,
@@ -576,8 +561,7 @@ __global__ void scatter_dim1_kernel(
     const float* __restrict__ Vs_2, 
     float*       __restrict__ Y_r_, 
     int B, int H, int I, int J, int K, int D,
-    float scale)
-{
+    float scale) {
     // global thread index [0 .. B*H*J*D) 
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (int64_t)B*H*J*D) return;
@@ -613,11 +597,8 @@ __global__ void scatter_dim1_kernel(
         }
     }
 
-    Y_r_[idx] = accum_val;
-}
-
-// Y_s_ Scatter for fixed_dim = 2 
-__global__ void scatter_dim2_kernel(
+    Y_r_[idx] = accum_val;}
+__global__ void Ys_scatter_kernel(
     const float* __restrict__ Q,
     const float* __restrict__ R,
     const float* __restrict__ S,
@@ -625,8 +606,7 @@ __global__ void scatter_dim2_kernel(
     const float* __restrict__ Vr_2, 
     float*       __restrict__ Y_s_, 
     int B, int H, int I, int J, int K, int D,
-    float scale)
-{
+    float scale){
     // global thread index [0 .. B*H*K*D)
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (int64_t)B*H*K*D) return;
@@ -662,17 +642,14 @@ __global__ void scatter_dim2_kernel(
         }
     }
 
-    Y_s_[idx] = accum_val;
-}
-
+    Y_s_[idx] = accum_val;}
 // -- Forward pass --
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> forward_cuda(
     at::Tensor Q, at::Tensor R, at::Tensor S,
     at::Tensor Vq_1, at::Tensor Vq_2,
     at::Tensor Vr_1, at::Tensor Vr_2,
     at::Tensor Vs_1, at::Tensor Vs_2,
-    double dropout_rate) 
-{
+    double dropout_rate) {
     Q = Q.contiguous();  
     R = R.contiguous();  
     S = S.contiguous();
@@ -708,7 +685,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     {
         const int64_t N = (int64_t)B*H*I*D;
         const dim3 blocks((N + threads - 1) / threads);
-        gather_dim0_kernel<<<blocks, threads>>>(
+        Yq_gather_kernel<<<blocks, threads>>>(
             Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(), //Query Q
             Vr_1.data_ptr<float>(), Vs_1.data_ptr<float>(),
             Y_q.data_ptr<float>(), 
@@ -718,7 +695,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     {
         const int64_t N = (int64_t)B*H*J*D;
         const dim3 blocks((N + threads - 1) / threads);
-        gather_dim1_kernel<<<blocks, threads>>>(
+        Yr_gather_kernel<<<blocks, threads>>>(
             R.data_ptr<float>(), Q.data_ptr<float>(), S.data_ptr<float>(), 
             Vq_1.data_ptr<float>(), Vs_1.data_ptr<float>(), 
             Y_r.data_ptr<float>(), 
@@ -728,7 +705,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     {
         const int64_t N = (int64_t)B*H*K*D;
         const dim3 blocks((N + threads - 1) / threads);
-        gather_dim2_kernel<<<blocks, threads>>>(
+        Ys_gather_kernel<<<blocks, threads>>>(
             S.data_ptr<float>(), Q.data_ptr<float>(), R.data_ptr<float>(), //Query S
             Vq_1.data_ptr<float>(), Vr_1.data_ptr<float>(), 
             Y_s.data_ptr<float>(), 
@@ -740,7 +717,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     {
         const int64_t N = (int64_t)B*H*I*D;
         const dim3 blocks((N + threads - 1) / threads);
-        scatter_dim0_kernel<<<blocks, threads>>>(
+        Yq_scatter_kernel<<<blocks, threads>>>(
             Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
             Vr_2.data_ptr<float>(), Vs_2.data_ptr<float>(), 
             Y_q_.data_ptr<float>(), 
@@ -750,7 +727,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     {
         const int64_t N = (int64_t)B*H*J*D;
         const dim3 blocks((N + threads - 1) / threads);
-        scatter_dim1_kernel<<<blocks, threads>>>(
+        Yr_scatter_kernel<<<blocks, threads>>>(
             Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
             Vq_2.data_ptr<float>(), Vs_2.data_ptr<float>(), 
             Y_r_.data_ptr<float>(), 
@@ -760,7 +737,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     {
         const int64_t N = (int64_t)B*H*K*D;
         const dim3 blocks((N + threads - 1) / threads);
-        scatter_dim2_kernel<<<blocks, threads>>>(
+        Ys_scatter_kernel<<<blocks, threads>>>(
             Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
             Vq_2.data_ptr<float>(), Vr_2.data_ptr<float>(), 
             Y_s_.data_ptr<float>(), 
@@ -768,13 +745,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     }
 
     cudaDeviceSynchronize(); 
-    return std::make_tuple(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_);
-}
+    return std::make_tuple(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_);}
+
 
 // --- Backward Kernels ---
 
-// Kernel to compute gradient for Vq_1
-// Mirrors the logic of compute_grad_Vq_1 in the C++ version
 __global__ void gather_grad_Vq1_kernel(
     const float* gradY, 
     const float* Q,     
@@ -793,7 +768,7 @@ __global__ void gather_grad_Vq1_kernel(
     // decode (b,h,i,d) - This thread calculates gradVq1[b,h,i,d]
     int d = idx % D;
     int tmp = idx / D;
-    int i_target = tmp % I; // This is the target 'i' for the gradient
+    int i_target = tmp % I; 
     tmp = tmp / I;
     int h = tmp % H;
     int b = tmp / H;
@@ -831,7 +806,6 @@ __global__ void gather_grad_Vq1_kernel(
     // --- 2. Contribution from Y_s path (dL/dY_s) ---
     // dL/dVq_1[i] += sum_{k} [ dL/dY_s[k] * sum_{j} ( As[i,j,k] * Vr_1[j] ) ]
     for (int k = 0; k < K; ++k) { // Loop over the source gradient index 'k' from Y_s
-        // Check bounds for gradY access
         if (k >= N_grad) continue;
 
         // Get dL/dY_s[b,h,k,d] from the combined gradient tensor
@@ -853,12 +827,10 @@ __global__ void gather_grad_Vq1_kernel(
         }
     }
 
-    // Write the final accumulated gradient for Vq_1[b,h,i_target,d]
+    // final accumulated gradient for Vq_1[b,h,i_target,d]
     gradVq1[idx] = grad_accum;
 }
 
-// Kernel to compute gradient for Vr_1
-// Mirrors the logic of compute_grad_Vr_1 in the C++ version
 __global__ void gather_grad_Vr1_kernel(
     const float* gradY,
     const float* Q,
@@ -877,7 +849,7 @@ __global__ void gather_grad_Vr1_kernel(
     // decode (b,h,j,d) - This thread calculates gradVr1[b,h,j,d]
     int d = idx % D;
     int tmp = idx / D;
-    int j_target = tmp % J; // This is the target 'j' for the gradient
+    int j_target = tmp % J; 
     tmp = tmp / J;
     int h = tmp % H;
     int b = tmp / H;
@@ -930,8 +902,6 @@ __global__ void gather_grad_Vr1_kernel(
     gradVr1[idx] = grad_accum;
 }
 
-// Kernel to compute gradient for Vs_1
-// Mirrors the logic of compute_grad_Vs_1 in the C++ version
 __global__ void gather_grad_Vs1_kernel(
     const float* gradY,
     const float* Q,
@@ -941,8 +911,7 @@ __global__ void gather_grad_Vs1_kernel(
     const float* Vr_1,
     float*       gradVs1,
     int B, int H, int I, int J, int K, int D, int N_grad,
-    float scale)
-{
+    float scale){
     // global thread index maps to [B,H,K,D]
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (int64_t)B*H*K*D) return;
@@ -1000,11 +969,8 @@ __global__ void gather_grad_Vs1_kernel(
         }
     }
 
-    gradVs1[idx] = grad_accum;
-}
+    gradVs1[idx] = grad_accum;}
 
-// Kernel to compute gradient for Vq_2
-// Mirrors the logic of compute_grad_Vq_2 in the C++ version
 __global__ void scatter_grad_Vq2_kernel(
     const float* gradY, 
     const float* Q,     
@@ -1061,7 +1027,7 @@ __global__ void scatter_grad_Vq2_kernel(
         if (k >= N_grad) continue; // Check bounds for gradY access
         float dy_s = gradY[gradY_offset_bh + (int64_t)k * D + d];
 
-        if (dy_s != 0.0f) { // Optimization
+        if (dy_s != 0.0f) { 
             for (int j = 0; j < J; ++j) {
                  // Calculate Aq[b,h,i_target,j,k] (softmax over j', k' for fixed i)
                  float attn_aq = compute_single_softmax_attn_cuda(Q, R, S, b, h, i_target, j, k, B, H, I, J, K, D, scale, 0);
@@ -1076,12 +1042,10 @@ __global__ void scatter_grad_Vq2_kernel(
         }
     }
 
-    // Write the final accumulated gradient for Vq_2[b,h,i_target,d]
+    // final accumulated gradient for Vq_2[b,h,i_target,d]
     gradVq2[idx] = grad_accum;
 }
 
-// Kernel to compute gradient for Vr_2
-// Mirrors the logic of compute_grad_Vr_2 in the C++ version
 __global__ void scatter_grad_Vr2_kernel(
     const float* gradY, 
     const float* Q,     
@@ -1116,7 +1080,7 @@ __global__ void scatter_grad_Vr2_kernel(
         if (i >= N_grad) continue; // Check bounds for gradY access
         float dy_q = gradY[gradY_offset_bh + (int64_t)i * D + d];
 
-        if (dy_q != 0.0f) { // Optimization
+        if (dy_q != 0.0f) { 
             for (int k = 0; k < K; ++k) {
                 // Calculate Ar[b,h,i,j_target,k] (softmax over i', k' for fixed j)
                 float attn_ar = compute_single_softmax_attn_cuda(Q, R, S, b, h, i, j_target, k, B, H, I, J, K, D, scale, 1);
@@ -1137,7 +1101,7 @@ __global__ void scatter_grad_Vr2_kernel(
         if (k >= N_grad) continue; // Check bounds for gradY access
         float dy_s = gradY[gradY_offset_bh + (int64_t)k * D + d];
 
-        if (dy_s != 0.0f) { // Optimization
+        if (dy_s != 0.0f) { 
             for (int i = 0; i < I; ++i) {
                 // Calculate Aq[b,h,i,j_target,k] (softmax over j', k' for fixed i)
                 float attn_aq = compute_single_softmax_attn_cuda(Q, R, S, b, h, i, j_target, k, B, H, I, J, K, D, scale, 0);
@@ -1152,7 +1116,7 @@ __global__ void scatter_grad_Vr2_kernel(
         }
     }
 
-    // Write the final accumulated gradient for Vr_2[b,h,j_target,d]
+    // final accumulated gradient for Vr_2[b,h,j_target,d]
     gradVr2[idx] = grad_accum;
 }
 
@@ -1192,7 +1156,7 @@ __global__ void scatter_grad_Vs2_kernel(
         if (i >= N_grad) continue; // Check bounds for gradY access
         float dy_q = gradY[gradY_offset_bh + (int64_t)i * D + d];
 
-        if (dy_q != 0.0f) { // Optimization
+        if (dy_q != 0.0f) { 
             for (int j = 0; j < J; ++j) {
                 // Calculate Ar[b,h,i,j,k_target] (softmax over i', k' for fixed j)
                 float attn_ar = compute_single_softmax_attn_cuda(Q, R, S, b, h, i, j, k_target, B, H, I, J, K, D, scale, 1);
@@ -1213,7 +1177,7 @@ __global__ void scatter_grad_Vs2_kernel(
         if (j >= N_grad) continue; // Check bounds for gradY access
         float dy_r = gradY[gradY_offset_bh + (int64_t)j * D + d];
 
-        if (dy_r != 0.0f) { // Optimization
+        if (dy_r != 0.0f) { 
             for (int i = 0; i < I; ++i) {
                 // Calculate Aq[b,h,i,j,k_target] (softmax over j', k' for fixed i)
                 float attn_aq = compute_single_softmax_attn_cuda(Q, R, S, b, h, i, j, k_target, B, H, I, J, K, D, scale, 0);
@@ -1228,7 +1192,7 @@ __global__ void scatter_grad_Vs2_kernel(
         }
     }
 
-    // Write the final accumulated gradient for Vs_2[b,h,k_target,d]
+    // final accumulated gradient for Vs_2[b,h,k_target,d]
     gradVs2[idx] = grad_accum;
 }
 
@@ -2471,7 +2435,6 @@ backward_cuda(
     torch::Tensor Vs_2,        // GPU
     double dropout_rate)
 {
-  // Make sure inputs are contiguous
   grad_output = grad_output.contiguous();
   Q = Q.contiguous();  
   R = R.contiguous();  
@@ -2555,15 +2518,9 @@ backward_cuda(
           Vq_2.data_ptr<float>(), Vr_2.data_ptr<float>(), grad_Vs_2.data_ptr<float>(),
           B, H, I, J, K, D, N_grad, scale); 
   }
-  // Error check after V-gradient kernels
-  cudaError_t v_err = cudaGetLastError();
-  if (v_err != cudaSuccess) {
-    fprintf(stderr, "CUDA error after V-gradient kernels in backward_cuda: %s\n", cudaGetErrorString(v_err));
-  }
-
 
   // --- 4. Compute full grad_A tensor on GPU by processing slice by slice ---
-  auto grad_A_batched_gpu = torch::zeros({B, H, I, J, K}, Q.options()); // Allocate full grad_A on GPU
+  auto grad_A_batched_gpu = torch::zeros({B, H, I, J, K}, Q.options()); // Allocate full grad_A on GPU Global Memory
 
   for (int b = 0; b < B; ++b) {
       for (int h = 0; h < H; ++h) {
@@ -2613,11 +2570,10 @@ backward_cuda(
     fprintf(stderr, "CUDA error after grad_A loop in backward_cuda: %s\n", cudaGetErrorString(ga_err));
   }
 
-  // --- 5. Launch kernel for full grad_Q using the full grad_A_batched_gpu ---
+  // --- 5. Launch kernelS for full grad_Q/R/S using the full grad_A_batched_gpu ---
   {
-      const int64_t N_kernel_Q = (int64_t)B * H * I * D; 
+      const int64_t N_kernel_Q = (int64_t)B * H * I * D; //output size for grad_Q/R/S
       const dim3 blocks_Q((N_kernel_Q + threads - 1) / threads);
-      // Note: Using 'grad_Q_kernel' as it's named in your .cu file, assuming it's compute_grad_Q_kernel_from_gradA
       grad_Q_kernel<<<blocks_Q, threads>>>( 
           grad_A_batched_gpu.data_ptr<float>(), 
           R.data_ptr<float>(),                  
@@ -2625,49 +2581,29 @@ backward_cuda(
           grad_Q.data_ptr<float>(),             
           B, H, I, J, K, D, scale);      
   }  
-  
-  cudaError_t gq_err = cudaGetLastError();
-  if (gq_err != cudaSuccess) {
-    fprintf(stderr, "CUDA error after grad_Q_kernel in backward_cuda: %s\n", cudaGetErrorString(gq_err));
-  }
-
-    // --- 6. Launch kernel for full grad_R using the full grad_A_batched_gpu --- (NEW LAUNCH STYLE)
   {
-      const int64_t N_kernel_R = (int64_t)B * H * J * D; // Output size for grad_R
+      const int64_t N_kernel_R = (int64_t)B * H * J * D; 
       const dim3 blocks_R((N_kernel_R + threads - 1) / threads);
-      grad_R_kernel<<<blocks_R, threads>>>( // Direct launch of grad_R_kernel
-          grad_A_batched_gpu.data_ptr<float>(), // Full grad_A
-          Q.data_ptr<float>(),                  // Full Q
-          S.data_ptr<float>(),                  // Full S
-          grad_R.data_ptr<float>(),             // Write to pre-allocated grad_R
+      grad_R_kernel<<<blocks_R, threads>>>( 
+          grad_A_batched_gpu.data_ptr<float>(), 
+          Q.data_ptr<float>(),                 
+          S.data_ptr<float>(),                 
+          grad_R.data_ptr<float>(),            
           B, H, I, J, K, D, scale);
    }
-  cudaError_t gr_err = cudaGetLastError();
-  if (gr_err != cudaSuccess) {
-     fprintf(stderr, "CUDA error after grad_R_kernel in backward_cuda: %s\n", cudaGetErrorString(gr_err));
-  }
 
-  // --- 7. Launch kernel for full grad_S using the full grad_A_batched_gpu --- (NEW)
   {
-      const int64_t N_kernel_S = (int64_t)B * H * K * D; // Output size for grad_S
+      const int64_t N_kernel_S = (int64_t)B * H * K * D; 
       const dim3 blocks_S((N_kernel_S + threads - 1) / threads);
-      grad_S_kernel<<<blocks_S, threads>>>( // Direct launch of grad_S_kernel
-          grad_A_batched_gpu.data_ptr<float>(), // Full grad_A
-          Q.data_ptr<float>(),                  // Full Q
-          R.data_ptr<float>(),                  // Full R
-          grad_S.data_ptr<float>(),             // Write to pre-allocated grad_S
+      grad_S_kernel<<<blocks_S, threads>>>( 
+          grad_A_batched_gpu.data_ptr<float>(), 
+          Q.data_ptr<float>(),                 
+          R.data_ptr<float>(),                 
+          grad_S.data_ptr<float>(),            
           B, H, I, J, K, D, scale);
   }
-  cudaError_t gs_err = cudaGetLastError();
-  if (gs_err != cudaSuccess) {
-     fprintf(stderr, "CUDA error after grad_S_kernel in backward_cuda: %s\n", cudaGetErrorString(gs_err));
-  }
 
-  // TODO: Implement and launch slice-wise kernels for grad_R, grad_S using final_grad_A_slice_gpu
-  //       and accumulate into grad_R, grad_S within the b,h loop.
-  //       Or, launch full kernels for grad_R, grad_S using grad_A_batched_gpu after the loop.
-
-  cudaDeviceSynchronize(); // Wait for all kernel completions
+  cudaDeviceSynchronize(); 
 
   return std::make_tuple(
       grad_Q, grad_R, grad_S,
