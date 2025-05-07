@@ -2,7 +2,6 @@
 #include <ATen/cuda/CUDAContext.h>      
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include "../cpp/manual_att3ntion.h"
 
 
 // Forward declarations
@@ -57,16 +56,6 @@ __global__ void Yr_scatter_kernel(
     float scale);
 
 __global__ void Ys_scatter_kernel(
-    const float* __restrict__ Q,
-    const float* __restrict__ R,
-    const float* __restrict__ S,
-    const float* __restrict__ Vq_2, 
-    const float* __restrict__ Vr_2, 
-    float*       __restrict__ Y_s_, 
-    int B, int H, int I, int J, int K, int D,
-    float scale);
-
-
     const float* __restrict__ Q,
     const float* __restrict__ R,
     const float* __restrict__ S,
