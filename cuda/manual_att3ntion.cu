@@ -1253,82 +1253,7 @@ __global__ void scatter_grad_Vs2_kernel(
     gradVs2[idx] = grad_accum;
 }
 
-// Kernel to compute gradient for Q, assuming grad_A is pre-computed
-__global__ void grad_Q_kernel(
-    const float* __restrict__ grad_A, // Shape [B, H, I, J, K]
-    const float* __restrict__ R,      // Shape [B, H, J, D]
-    const float* __restrict__ S,      // Shape [B, H, K, D]
-    float*       __restrict__ grad_Q, // Shape [B, H, I, D] - Output
-    const int B, const int H, const int I, const int J, const int K, const int D,
-    const float scale
-) {
-    // --- Calculate indices for this thread ---
-    // Map threads to output elements (b, h, i, d)
-    // Using 1D grid/block for simplicity, can be optimized later
-    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total_elements = (int64_t)B * H * I * D;
-    if (idx >= total_elements) {
-        return;
-    }
-
-    // Decode indices (b, h, i, d) from linear index idx
-    const int d = idx % D;
-    const int64_t temp_idx_d = idx / D;
-    const int i = temp_idx_d % I;
-    const int64_t temp_idx_i = temp_idx_d / I;
-    const int h = temp_idx_i % H;
-    const int b = temp_idx_i / H;
-
-
-    // --- Calculate strides ---
-    const int64_t stride_A_B = (int64_t)H * I * J * K;
-    const int64_t stride_A_H = (int64_t)I * J * K;
-    const int64_t stride_A_I = (int64_t)J * K;
-    const int64_t stride_A_J = (int64_t)K;
-    const int64_t stride_A_K = 1;
-
-    const int64_t stride_R_B = (int64_t)H * J * D;
-    const int64_t stride_R_H = (int64_t)J * D;
-    const int64_t stride_R_J = (int64_t)D;
-    const int64_t stride_R_D = 1;
-
-    const int64_t stride_S_B = (int64_t)H * K * D;
-    const int64_t stride_S_H = (int64_t)K * D;
-    const int64_t stride_S_K = (int64_t)D;
-    const int64_t stride_S_D = 1;
-
-    // Output stride calculation not needed as we write to grad_Q[idx]
-
-
-    // --- Calculate base pointers for this slice (b, h) ---
-    // Note: We need the base for the entire tensors here, not just slices,
-    // because the loops below access elements across different j and k.
-    const float* grad_A_base = grad_A + b * stride_A_B + h * stride_A_H;
-    const float* R_base = R + b * stride_R_B + h * stride_R_H;
-    const float* S_base = S + b * stride_S_B + h * stride_S_H;
-
-
-    // --- Compute sum for grad_Q[b, h, i, d] ---
-    // grad_Q[i,d] = scale * sum_{j,k} ( grad_A[i,j,k] * R[j,d] * S[k,d] )
-    float sum_for_grad_q = 0.0f;
-    for (int j_idx = 0; j_idx < J; ++j_idx) {
-        for (int k_idx = 0; k_idx < K; ++k_idx) {
-            // Calculate linear indices relative to slice base pointers (b,h)
-            // grad_A[i, j, k] within the (b,h) slice
-            int64_t idx_A = (int64_t)i * stride_A_I + (int64_t)j_idx * stride_A_J + (int64_t)k_idx * stride_A_K;
-            // R[j, d] within the (b,h) slice
-            int64_t idx_R = (int64_t)j_idx * stride_R_J + (int64_t)d * stride_R_D;
-            // S[k, d] within the (b,h) slice
-            int64_t idx_S = (int64_t)k_idx * stride_S_K + (int64_t)d * stride_S_D;
-
-            // Accumulate directly as float
-            sum_for_grad_q += grad_A_base[idx_A] * R_base[idx_R] * S_base[idx_S];
-        }
-    }
-
-    // --- Write output ---
-    grad_Q[idx] = scale * sum_for_grad_q;
-}
+// -- grad Q: multi-kernel implementation --
 
 
 __global__ void compute_A_slice_kernel(
@@ -1994,7 +1919,6 @@ __global__ void compute_interim_grads_kernel(
     grad_As_slice_out[ijk_idx] = grad_as_val;
 }
 
-// C++ Wrapper for compute_interim_grads_kernel
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 compute_interim_grads_cuda_wrapper(
     // Inputs (GPU tensors)
@@ -2082,9 +2006,6 @@ compute_interim_grads_cuda_wrapper(
     return std::make_tuple(grad_Aq_slice_out, grad_Ar_slice_out, grad_As_slice_out);
 }
 
-// Helper function to extract interim grads from C++ compute_grad_A_single
-// NOTE: You might need to modify compute_grad_A_single slightly to return these,
-// or re-implement its Phase 1 logic here for testing.
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 get_interim_grads_cpu(
     const torch::Tensor& grad_output_slice_cpu, // [N, D]
@@ -2200,8 +2121,6 @@ get_interim_grads_cpu(
     return std::make_tuple(grad_Aq_slice_ref, grad_Ar_slice_ref, grad_As_slice_ref);
 }
 
-// Add this kernel implementation after other kernels
-
 __global__ void apply_softmax_backward_kernel(
     // Inputs
     const float* __restrict__ grad_Aq_slice_in, // [I, J, K]
@@ -2274,7 +2193,6 @@ __global__ void apply_softmax_backward_kernel(
     grad_A_slice_out[ijk_idx] = final_grad_A_val;
 }
 
-// Add this C++ wrapper after other wrappers
 torch::Tensor apply_softmax_backward_cuda_wrapper(
     // Inputs (GPU tensors)
     const torch::Tensor& grad_Aq_slice_gpu, // [I, J, K]
@@ -2336,6 +2254,84 @@ torch::Tensor apply_softmax_backward_cuda_wrapper(
 
     return grad_A_slice_out_gpu;
 }
+
+// Kernel to compute gradient for Q, assuming grad_A is pre-computed
+__global__ void grad_Q_kernel(
+    const float* __restrict__ grad_A, // Shape [B, H, I, J, K]
+    const float* __restrict__ R,      // Shape [B, H, J, D]
+    const float* __restrict__ S,      // Shape [B, H, K, D]
+    float*       __restrict__ grad_Q, // Shape [B, H, I, D] - Output
+    const int B, const int H, const int I, const int J, const int K, const int D,
+    const float scale
+) {
+    // --- Calculate indices for this thread ---
+    // Map threads to output elements (b, h, i, d)
+    // Using 1D grid/block for simplicity, can be optimized later
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total_elements = (int64_t)B * H * I * D;
+    if (idx >= total_elements) {
+        return;
+    }
+
+    // Decode indices (b, h, i, d) from linear index idx
+    const int d = idx % D;
+    const int64_t temp_idx_d = idx / D;
+    const int i = temp_idx_d % I;
+    const int64_t temp_idx_i = temp_idx_d / I;
+    const int h = temp_idx_i % H;
+    const int b = temp_idx_i / H;
+
+
+    // --- Calculate strides ---
+    const int64_t stride_A_B = (int64_t)H * I * J * K;
+    const int64_t stride_A_H = (int64_t)I * J * K;
+    const int64_t stride_A_I = (int64_t)J * K;
+    const int64_t stride_A_J = (int64_t)K;
+    const int64_t stride_A_K = 1;
+
+    const int64_t stride_R_B = (int64_t)H * J * D;
+    const int64_t stride_R_H = (int64_t)J * D;
+    const int64_t stride_R_J = (int64_t)D;
+    const int64_t stride_R_D = 1;
+
+    const int64_t stride_S_B = (int64_t)H * K * D;
+    const int64_t stride_S_H = (int64_t)K * D;
+    const int64_t stride_S_K = (int64_t)D;
+    const int64_t stride_S_D = 1;
+
+    // Output stride calculation not needed as we write to grad_Q[idx]
+
+
+    // --- Calculate base pointers for this slice (b, h) ---
+    // Note: We need the base for the entire tensors here, not just slices,
+    // because the loops below access elements across different j and k.
+    const float* grad_A_base = grad_A + b * stride_A_B + h * stride_A_H;
+    const float* R_base = R + b * stride_R_B + h * stride_R_H;
+    const float* S_base = S + b * stride_S_B + h * stride_S_H;
+
+
+    // --- Compute sum for grad_Q[b, h, i, d] ---
+    // grad_Q[i,d] = scale * sum_{j,k} ( grad_A[i,j,k] * R[j,d] * S[k,d] )
+    float sum_for_grad_q = 0.0f;
+    for (int j_idx = 0; j_idx < J; ++j_idx) {
+        for (int k_idx = 0; k_idx < K; ++k_idx) {
+            // Calculate linear indices relative to slice base pointers (b,h)
+            // grad_A[i, j, k] within the (b,h) slice
+            int64_t idx_A = (int64_t)i * stride_A_I + (int64_t)j_idx * stride_A_J + (int64_t)k_idx * stride_A_K;
+            // R[j, d] within the (b,h) slice
+            int64_t idx_R = (int64_t)j_idx * stride_R_J + (int64_t)d * stride_R_D;
+            // S[k, d] within the (b,h) slice
+            int64_t idx_S = (int64_t)k_idx * stride_S_K + (int64_t)d * stride_S_D;
+
+            // Accumulate directly as float
+            sum_for_grad_q += grad_A_base[idx_A] * R_base[idx_R] * S_base[idx_S];
+        }
+    }
+
+    // --- Write output ---
+    grad_Q[idx] = scale * sum_for_grad_q;
+}
+
 
 // Modify the main backward_cuda function:
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
