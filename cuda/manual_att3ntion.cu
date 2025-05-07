@@ -186,7 +186,15 @@ __global__ void apply_softmax_backward_kernel(
     // Dimensions
     int I, int J, int K
 );
-
+// Forward declaration for the full grad_R kernel
+__global__ void grad_R_kernel(
+    const float* __restrict__ grad_A, // Shape [B, H, I, J, K]
+    const float* __restrict__ Q,      // Shape [B, H, I, D]
+    const float* __restrict__ S,      // Shape [B, H, K, D]
+    float*       __restrict__ grad_R, // Shape [B, H, J, D] - Output
+    const int B, const int H, const int I, const int J, const int K, const int D,
+    const float scale
+);
 // ... (other kernel forward declarations and implementations)
 
 
@@ -1253,7 +1261,8 @@ __global__ void scatter_grad_Vs2_kernel(
     gradVs2[idx] = grad_accum;
 }
 
-// -- grad Q: multi-kernel implementation --
+// -- needed for grad_Q, grad_R, grad_S : multi-kernel implementation --
+// -- grad A batched gpu helpers --
 
 
 __global__ void compute_A_slice_kernel(
@@ -1368,7 +1377,6 @@ torch::Tensor compute_A_slice_cuda_wrapper(
     return A_slice_out_gpu;
 }
 
-// Add this kernel implementation, for example, after compute_A_slice_kernel
 
 // Kernel to compute Aq_slice (softmax over j, k for each fixed i)
 // Each block processes one 'i' plane.
@@ -2332,6 +2340,81 @@ __global__ void grad_Q_kernel(
     grad_Q[idx] = scale * sum_for_grad_q;
 }
 
+// Kernel to compute gradient for R, following grad_Q pattern
+__global__ void grad_R_kernel(
+    const float* __restrict__ grad_A, // Shape [B, H, I, J, K]
+    const float* __restrict__ Q,      // Shape [B, H, I, D]
+    const float* __restrict__ S,      // Shape [B, H, K, D]
+    float*       __restrict__ grad_R, // Shape [B, H, J, D] - Output
+    const int B_dim, const int H_dim, const int I_dim, const int J_dim, const int K_dim, const int D_dim,
+    const float scale
+) {
+    // --- Calculate indices for this thread ---
+    // Map threads to output elements (b, h, j, d)
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total_elements = (int64_t)B_dim * H_dim * J_dim * D_dim; // Output shape B*H*J*D
+    if (idx >= total_elements) {
+        return;
+    }
+
+    // Decode indices (b, h, j, d) from linear index idx
+    const int d = idx % D_dim;
+    const int64_t temp_idx_d = idx / D_dim;
+    const int j = temp_idx_d % J_dim;
+    const int64_t temp_idx_j = temp_idx_d / J_dim;
+    const int h = temp_idx_j % H_dim;
+    const int b = temp_idx_j / H_dim;
+
+
+    // --- Calculate strides ---
+    const int64_t stride_A_B = (int64_t)H_dim * I_dim * J_dim * K_dim;
+    const int64_t stride_A_H = (int64_t)I_dim * J_dim * K_dim;
+    const int64_t stride_A_I = (int64_t)J_dim * K_dim;
+    const int64_t stride_A_J = (int64_t)K_dim;
+    const int64_t stride_A_K = 1;
+
+    const int64_t stride_Q_B = (int64_t)H_dim * I_dim * D_dim;
+    const int64_t stride_Q_H = (int64_t)I_dim * D_dim;
+    const int64_t stride_Q_I = (int64_t)D_dim;
+    const int64_t stride_Q_D = 1;
+
+    const int64_t stride_S_B = (int64_t)H_dim * K_dim * D_dim;
+    const int64_t stride_S_H = (int64_t)K_dim * D_dim;
+    const int64_t stride_S_K = (int64_t)D_dim;
+    const int64_t stride_S_D = 1;
+
+    // Output stride calculation not needed as we write to grad_R[idx]
+
+
+    // --- Calculate base pointers for this slice (b, h) ---
+    // Note: We need the base for the entire tensors here, not just slices,
+    // because the loops below access elements across different i and k.
+    const float* grad_A_base = grad_A + b * stride_A_B + h * stride_A_H;
+    const float* Q_base = Q + b * stride_Q_B + h * stride_Q_H;
+    const float* S_base = S + b * stride_S_B + h * stride_S_H;
+
+
+    // --- Compute sum for grad_R[b, h, j, d] ---
+    // grad_R[b, h, j, d] = scale * sum_{i,k} ( grad_A[i,j,k] * Q[i,d] * S[k,d] )
+    float sum_for_grad_r = 0.0f;
+    for (int i_idx = 0; i_idx < I_dim; ++i_idx) {
+        for (int k_idx = 0; k_idx < K_dim; ++k_idx) {
+            // Calculate linear indices relative to slice base pointers (b,h)
+            // grad_A[i, j, k] within the (b,h) slice
+            int64_t idx_A = (int64_t)i_idx * stride_A_I + (int64_t)j * stride_A_J + (int64_t)k_idx * stride_A_K;
+            // Q[i, d] within the (b,h) slice
+            int64_t idx_Q = (int64_t)i_idx * stride_Q_I + (int64_t)d * stride_Q_D;
+            // S[k, d] within the (b,h) slice
+            int64_t idx_S = (int64_t)k_idx * stride_S_K + (int64_t)d * stride_S_D;
+
+            // Accumulate directly as float
+            sum_for_grad_r += grad_A_base[idx_A] * Q_base[idx_Q] * S_base[idx_S];
+        }
+    }
+
+    // --- Write output ---
+    grad_R[idx] = scale * sum_for_grad_r;
+}
 
 // Modify the main backward_cuda function:
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
@@ -2504,11 +2587,29 @@ backward_cuda(
           S.data_ptr<float>(),                  
           grad_Q.data_ptr<float>(),             
           B, H, I, J, K, D, scale);      
-  }
+  }  
+  
   cudaError_t gq_err = cudaGetLastError();
   if (gq_err != cudaSuccess) {
     fprintf(stderr, "CUDA error after grad_Q_kernel in backward_cuda: %s\n", cudaGetErrorString(gq_err));
   }
+
+    // --- 6. Launch kernel for full grad_R using the full grad_A_batched_gpu --- (NEW LAUNCH STYLE)
+  {
+      const int64_t N_kernel_R = (int64_t)B * H * J * D; // Output size for grad_R
+      const dim3 blocks_R((N_kernel_R + threads - 1) / threads);
+      grad_R_kernel<<<blocks_R, threads>>>( // Direct launch of grad_R_kernel
+          grad_A_batched_gpu.data_ptr<float>(), // Full grad_A
+          Q.data_ptr<float>(),                  // Full Q
+          S.data_ptr<float>(),                  // Full S
+          grad_R.data_ptr<float>(),             // Write to pre-allocated grad_R
+          B, H, I, J, K, D, scale);
+   }
+  cudaError_t gr_err = cudaGetLastError();
+  if (gr_err != cudaSuccess) {
+     fprintf(stderr, "CUDA error after grad_R_kernel in backward_cuda: %s\n", cudaGetErrorString(gr_err));
+  }
+
 
   // TODO: Implement and launch slice-wise kernels for grad_R, grad_S using final_grad_A_slice_gpu
   //       and accumulate into grad_R, grad_S within the b,h loop.
