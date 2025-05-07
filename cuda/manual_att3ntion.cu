@@ -196,6 +196,15 @@ __global__ void grad_R_kernel(
     const float scale
 );
 // ... (other kernel forward declarations and implementations)
+// Forward declaration for the full grad_S kernel
+__global__ void grad_S_kernel(
+    const float* __restrict__ grad_A, // Shape [B, H, I, J, K]
+    const float* __restrict__ Q,      // Shape [B, H, I, D]
+    const float* __restrict__ R,      // Shape [B, H, J, D]
+    float*       __restrict__ grad_S, // Shape [B, H, K, D] - Output
+    const int B, const int H, const int I, const int J, const int K, const int D,
+    const float scale
+);
 
 
 // Gather for fixed_dim = 0  (i.e. output shape [B,H,I,D]) i.e. Y_q
@@ -2416,6 +2425,72 @@ __global__ void grad_R_kernel(
     grad_R[idx] = scale * sum_for_grad_r;
 }
 
+// Kernel to compute gradient for S, following grad_Q/R pattern
+__global__ void grad_S_kernel(
+    const float* __restrict__ grad_A, // Shape [B, H, I, J, K]
+    const float* __restrict__ Q,      // Shape [B, H, I, D]
+    const float* __restrict__ R,      // Shape [B, H, J, D]
+    float*       __restrict__ grad_S, // Shape [B, H, K, D] - Output
+    const int B_dim, const int H_dim, const int I_dim, const int J_dim, const int K_dim, const int D_dim,
+    const float scale
+) {
+    // Map threads to output elements (b, h, k, d)
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total_elements = (int64_t)B_dim * H_dim * K_dim * D_dim; // Output shape B*H*K*D
+    if (idx >= total_elements) {
+        return;
+    }
+
+    // Decode indices (b, h, k, d) from linear index idx
+    const int d = idx % D_dim;
+    const int64_t temp_idx_d = idx / D_dim;
+    const int k = temp_idx_d % K_dim; // This thread calculates for grad_S[k,d]
+    const int64_t temp_idx_k = temp_idx_d / K_dim;
+    const int h = temp_idx_k % H_dim;
+    const int b = temp_idx_k / H_dim;
+
+    // Strides for grad_A[B, H, I, J, K]
+    const int64_t stride_A_B = (int64_t)H_dim * I_dim * J_dim * K_dim;
+    const int64_t stride_A_H = (int64_t)I_dim * J_dim * K_dim;
+    const int64_t stride_A_I = (int64_t)J_dim * K_dim;
+    const int64_t stride_A_J = (int64_t)K_dim;
+    const int64_t stride_A_K = 1;
+
+    // Strides for Q[B, H, I, D]
+    const int64_t stride_Q_B = (int64_t)H_dim * I_dim * D_dim;
+    const int64_t stride_Q_H = (int64_t)I_dim * D_dim;
+    const int64_t stride_Q_I = (int64_t)D_dim;
+    const int64_t stride_Q_D = 1;
+
+    // Strides for R[B, H, J, D]
+    const int64_t stride_R_B = (int64_t)H_dim * J_dim * D_dim;
+    const int64_t stride_R_H = (int64_t)J_dim * D_dim;
+    const int64_t stride_R_J = (int64_t)D_dim;
+    const int64_t stride_R_D = 1;
+
+    // Calculate base pointers for this batch/head (b, h)
+    const float* grad_A_base = grad_A + b * stride_A_B + h * stride_A_H;
+    const float* Q_base = Q + b * stride_Q_B + h * stride_Q_H;
+    const float* R_base = R + b * stride_R_B + h * stride_R_H;
+
+    // Compute sum for grad_S[b, h, k, d]
+    // grad_S[k,d] = scale * sum_{i,j} ( grad_A[i,j,k] * Q[i,d] * R[j,d] )
+    float sum_for_grad_s = 0.0f;
+    for (int i_loop = 0; i_loop < I_dim; ++i_loop) { // Sum over i
+        for (int j_loop = 0; j_loop < J_dim; ++j_loop) { // Sum over j
+            // Calculate linear indices relative to slice base pointers (b,h)
+            int64_t idx_A = (int64_t)i_loop * stride_A_I + (int64_t)j_loop * stride_A_J + (int64_t)k * stride_A_K;
+            int64_t idx_Q = (int64_t)i_loop * stride_Q_I + (int64_t)d * stride_Q_D;
+            int64_t idx_R = (int64_t)j_loop * stride_R_J + (int64_t)d * stride_R_D;
+
+            sum_for_grad_s += grad_A_base[idx_A] * Q_base[idx_Q] * R_base[idx_R];
+        }
+    }
+
+    // Write output
+    grad_S[idx] = scale * sum_for_grad_s;
+}
+
 // Modify the main backward_cuda function:
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
           torch::Tensor, torch::Tensor,
@@ -2610,6 +2685,21 @@ backward_cuda(
      fprintf(stderr, "CUDA error after grad_R_kernel in backward_cuda: %s\n", cudaGetErrorString(gr_err));
   }
 
+  // --- 7. Launch kernel for full grad_S using the full grad_A_batched_gpu --- (NEW)
+  {
+      const int64_t N_kernel_S = (int64_t)B * H * K * D; // Output size for grad_S
+      const dim3 blocks_S((N_kernel_S + threads - 1) / threads);
+      grad_S_kernel<<<blocks_S, threads>>>( // Direct launch of grad_S_kernel
+          grad_A_batched_gpu.data_ptr<float>(), // Full grad_A
+          Q.data_ptr<float>(),                  // Full Q
+          R.data_ptr<float>(),                  // Full R
+          grad_S.data_ptr<float>(),             // Write to pre-allocated grad_S
+          B, H, I, J, K, D, scale);
+  }
+  cudaError_t gs_err = cudaGetLastError();
+  if (gs_err != cudaSuccess) {
+     fprintf(stderr, "CUDA error after grad_S_kernel in backward_cuda: %s\n", cudaGetErrorString(gs_err));
+  }
 
   // TODO: Implement and launch slice-wise kernels for grad_R, grad_S using final_grad_A_slice_gpu
   //       and accumulate into grad_R, grad_S within the b,h loop.
