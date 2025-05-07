@@ -7,7 +7,7 @@
 #include <iomanip> 
 #include <cuda_runtime.h> 
 
-// Forward declarations for CUDA functions tuple
+// Forward declarations for CUDA 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
           torch::Tensor, torch::Tensor,
           torch::Tensor>
@@ -30,8 +30,8 @@ backward_cuda(
     torch::Tensor Vs_1, torch::Tensor Vs_2,
     double dropout_rate = 0.0);
 
-// Forward pass
 
+// Forward pass
 // helper: returns dot product between three vectors at specific indices
 template <typename T>
 inline float compute_dot_product(
@@ -46,7 +46,6 @@ inline float compute_dot_product(
     }
     return dot;
 }
-
 // helper: compute 3D softmax with configurable dimensions
 template <typename T>
 void compute_softmax_3d(
@@ -782,21 +781,21 @@ inline float compute_single_softmax_attn(
     float sum_exp = 0.0f;
 
     // --- First Pass: Find Max ---
-    if (fixed_dim == 0) { // Compute Aq[b,h,i_target,j_target,k_target] (softmax over j,k for fixed i_target)
+    if (fixed_dim == 0) { 
         for (int j = 0; j < J; ++j) {
             for (int k = 0; k < K; ++k) {
                 float dot = compute_dot_product(Q_acc, R_acc, S_acc, b, h, i_target, j, k, D);
                 max_val = std::max(max_val, dot * scale);
             }
         }
-    } else if (fixed_dim == 1) { // Compute Ar[b,h,i_target,j_target,k_target] (softmax over i,k for fixed j_target)
+    } else if (fixed_dim == 1) { 
         for (int i = 0; i < I; ++i) {
             for (int k = 0; k < K; ++k) {
                 float dot = compute_dot_product(Q_acc, R_acc, S_acc, b, h, i, j_target, k, D);
                 max_val = std::max(max_val, dot * scale);
             }
         }
-    } else { // fixed_dim == 2: Compute As[b,h,i_target,j_target,k_target] (softmax over i,j for fixed k_target)
+    } else { 
         for (int i = 0; i < I; ++i) {
             for (int j = 0; j < J; ++j) {
                 float dot = compute_dot_product(Q_acc, R_acc, S_acc, b, h, i, j, k_target, D);
@@ -1226,7 +1225,7 @@ compute_attention_tensors_single(
 }
 
 
-// Computes grad_A for a single batch item and head (formerly grad_P)
+// Computes grad_A for a single batch item and head 
 torch::Tensor compute_grad_A_single( 
     const torch::Tensor& grad_output_slice, // Shape [N, D]
     const torch::Tensor& Q_slice,           // [I, D]
@@ -1242,7 +1241,7 @@ torch::Tensor compute_grad_A_single(
     const torch::Tensor& Aq_slice,          // [I, J, K]
     const torch::Tensor& Ar_slice,          // [I, J, K]
     const torch::Tensor& As_slice,           // [I, J, K]
-    int b, int h // Added b and h parameters
+    int b, int h 
 ) {
     const int I = Q_slice.size(0);
     const int J = R_slice.size(0);
@@ -1251,7 +1250,6 @@ torch::Tensor compute_grad_A_single(
     const int N = grad_output_slice.size(0); 
     auto options = Q_slice.options(); 
 
-    // Accessors for slice inputs
     auto grad_output_acc = grad_output_slice.accessor<float, 2>();
     auto Vq_1_acc = Vq_1_slice.accessor<float, 2>();
     auto Vq_2_acc = Vq_2_slice.accessor<float, 2>();
@@ -1262,7 +1260,6 @@ torch::Tensor compute_grad_A_single(
     auto Aq_acc = Aq_slice.accessor<float, 3>();
     auto Ar_acc = Ar_slice.accessor<float, 3>();
     auto As_acc = As_slice.accessor<float, 3>();
-    // Note: A_slice accessor not needed directly in this phase
 
     // --- Phase 1: Compute grad_A* slices ---
     auto grad_Aq_slice = torch::zeros_like(Aq_slice);
@@ -1272,7 +1269,6 @@ torch::Tensor compute_grad_A_single(
     auto grad_Ar_acc = grad_Ar_slice.accessor<float, 3>();
     auto grad_As_acc = grad_As_slice.accessor<float, 3>();
 
-    // ... (rest of phase 1 calculations remain the same) ...
     // 1.a) grad_Aq from Yq (gather)
     if (I <= N) {
         for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) { for (int d = 0; d < D; ++d) {
@@ -1372,7 +1368,7 @@ torch::Tensor compute_grad_A_single(
 
 // Computes grad_Q for a single batch item and head
 torch::Tensor compute_grad_Q_single(
-    const torch::Tensor& grad_A_slice, // Input: Gradient w.r.t. A [I, J, K] (formerly grad_P_slice)
+    const torch::Tensor& grad_A_slice, // Input: Gradient w.r.t. A [I, J, K] 
     const torch::Tensor& R_slice,      // Input: R slice [J, D]
     const torch::Tensor& S_slice,      // Input: S slice [K, D]
     float scale                        // Input: Scaling factor 1/sqrt(D)
@@ -1406,7 +1402,7 @@ torch::Tensor compute_grad_Q_single(
 
 // Computes grad_R for a single batch item and head
 torch::Tensor compute_grad_R_single(
-    const torch::Tensor& grad_A_slice, // Input: Gradient w.r.t. A [I, J, K] (formerly grad_P_slice)
+    const torch::Tensor& grad_A_slice, // Input: Gradient w.r.t. A [I, J, K] 
     const torch::Tensor& Q_slice,      // Input: Q slice [I, D]
     const torch::Tensor& S_slice,      // Input: S slice [K, D]
     float scale                        // Input: Scaling factor 1/sqrt(D)
@@ -1440,7 +1436,7 @@ torch::Tensor compute_grad_R_single(
 
 // Computes grad_S for a single batch item and head
 torch::Tensor compute_grad_S_single(
-    const torch::Tensor& grad_A_slice, // Input: Gradient w.r.t. A [I, J, K] (formerly grad_P_slice)
+    const torch::Tensor& grad_A_slice, // Input: Gradient w.r.t. A [I, J, K]
     const torch::Tensor& Q_slice,      // Input: Q slice [I, D]
     const torch::Tensor& R_slice,      // Input: R slice [J, D]
     float scale                        // Input: Scaling factor 1/sqrt(D)
@@ -1489,7 +1485,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     const int B = Q.size(0);
     const int H = Q.size(1);
 
-    // Make sure I, J, K are derived correctly if grad_output might be smaller
     const int I = Q.size(2);
     const int J = R.size(2);
     const int K = S.size(2);
@@ -1528,16 +1523,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             auto Vs_1_slice = Vs_1.select(0, b).select(0, h);
             auto Vs_2_slice = Vs_2.select(0, b).select(0, h);
 
-            // Ensure grad_output_slice is correctly handled if its size differs
             auto grad_output_slice = grad_output.select(0, b).select(0, h);
-            const int N = grad_output_slice.size(0); // Max sequence length from grad_output
+            const int N = grad_output_slice.size(0);
 
-            // 1. Compute intermediate attention tensors for the slice
             torch::Tensor A_slice, Aq_slice, Ar_slice, As_slice;
             std::tie(A_slice, Aq_slice, Ar_slice, As_slice) =
                 compute_attention_tensors_single(Q_slice, R_slice, S_slice, scale);
 
-            // 2. Compute grad_A for the slice (includes softmax derivative)
             auto grad_A_slice = compute_grad_A_single(
                 grad_output_slice, Q_slice, R_slice, S_slice,
                 Vq_1_slice, Vq_2_slice, Vr_1_slice, Vr_2_slice, Vs_1_slice, Vs_2_slice,
@@ -1545,19 +1537,16 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
                 b, h
             );
 
-            // 3. Compute grad_Q/R/S for the slice using the final grad_A
             auto grad_Q_slice = compute_grad_Q_single(grad_A_slice, R_slice, S_slice, scale);
             auto grad_R_slice = compute_grad_R_single(grad_A_slice, Q_slice, S_slice, scale);
             auto grad_S_slice = compute_grad_S_single(grad_A_slice, Q_slice, R_slice, scale);
 
-            // 4. Accumulate the gradients for this slice into the main grad tensors
             grad_Q.select(0, b).select(0, h).add_(grad_Q_slice);
             grad_R.select(0, b).select(0, h).add_(grad_R_slice);
             grad_S.select(0, b).select(0, h).add_(grad_S_slice);
         }
     }
 
-    // >>> FIX: Return all 9 gradient tensors <<<
     return std::make_tuple(
         grad_Q, grad_R, grad_S,
         grad_Vq_1, grad_Vq_2,
