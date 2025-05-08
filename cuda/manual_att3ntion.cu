@@ -130,14 +130,6 @@ __global__ void scatter_grad_Vs2_kernel(
     float*       gradVs2,
     int B, int H, int I, int J, int K, int D, int N_grad,
     float scale);
-
-__global__ void compute_grad_Q_kernel_from_gradA(
-    const float* __restrict__ grad_A, // Shape [B, H, I, J, K]
-    const float* __restrict__ R,      // Shape [B, H, J, D]
-    const float* __restrict__ S,      // Shape [B, H, K, D]
-    float*       __restrict__ grad_Q, // Shape [B, H, I, D] - Output
-    const int B, const int H, const int I, const int J, const int K, const int D,
-    const float scale);
 __global__ void compute_A_slice_kernel(
     const float* __restrict__ Q_slice_global, 
     const float* __restrict__ R_slice_global, 
