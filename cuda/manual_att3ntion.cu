@@ -1904,7 +1904,6 @@ compute_interim_grads_cuda_wrapper(
         (K + BLOCK_DIM_K - 1) / BLOCK_DIM_K
     );
 
-    // Ensure inputs are contiguous (important for pointer access)
     auto grad_output_cont = grad_output_slice.contiguous();
     auto Vq_1_cont = Vq_1_slice.contiguous();
     auto Vq_2_cont = Vq_2_slice.contiguous();
@@ -1933,7 +1932,6 @@ compute_interim_grads_cuda_wrapper(
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA error in compute_interim_grads_cuda_wrapper: %s\n", cudaGetErrorString(err));
     }
-    // cudaDeviceSynchronize(); // For debugging
 
     return std::make_tuple(grad_Aq_slice_out, grad_Ar_slice_out, grad_As_slice_out);
 }
@@ -2054,16 +2052,13 @@ get_interim_grads_cpu(
 }
 
 __global__ void apply_softmax_backward_kernel(
-    // Inputs
     const float* __restrict__ grad_Aq_slice_in, // [I, J, K]
     const float* __restrict__ grad_Ar_slice_in, // [I, J, K]
     const float* __restrict__ grad_As_slice_in, // [I, J, K]
     const float* __restrict__ Aq_slice_in,      // [I, J, K]
     const float* __restrict__ Ar_slice_in,      // [I, J, K]
     const float* __restrict__ As_slice_in,      // [I, J, K]
-    // Output
     float* __restrict__ grad_A_slice_out,    // [I, J, K]
-    // Dimensions
     int I_dim, int J_dim, int K_dim
 ) {
     // Map 3D thread indices to (i, j, k) for grad_A_slice_out
@@ -2126,7 +2121,6 @@ __global__ void apply_softmax_backward_kernel(
 }
 
 torch::Tensor apply_softmax_backward_cuda_wrapper(
-    // Inputs (GPU tensors)
     const torch::Tensor& grad_Aq_slice_gpu, // [I, J, K]
     const torch::Tensor& grad_Ar_slice_gpu, // [I, J, K]
     const torch::Tensor& grad_As_slice_gpu, // [I, J, K]
@@ -2135,7 +2129,6 @@ torch::Tensor apply_softmax_backward_cuda_wrapper(
     const torch::Tensor& As_slice_gpu       // [I, J, K]
 ) {
     TORCH_CHECK(grad_Aq_slice_gpu.is_cuda(), "grad_Aq_slice_gpu must be CUDA");
-    // ... add checks for other inputs ...
     TORCH_CHECK(grad_Aq_slice_gpu.dim() == 3 && Aq_slice_gpu.dim() == 3, "Inputs must be 3D");
     
     const int I = grad_Aq_slice_gpu.size(0);
@@ -2148,7 +2141,6 @@ torch::Tensor apply_softmax_backward_cuda_wrapper(
     auto options = grad_Aq_slice_gpu.options();
     torch::Tensor grad_A_slice_out_gpu = torch::zeros({I, J, K}, options);
 
-    // Kernel launch configuration (maps to each element of grad_A_slice_out)
     constexpr int BLOCK_DIM_I = 8;
     constexpr int BLOCK_DIM_J = 8;
     constexpr int BLOCK_DIM_K = 8; 
@@ -2182,7 +2174,6 @@ torch::Tensor apply_softmax_backward_cuda_wrapper(
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA error in apply_softmax_backward_cuda_wrapper: %s\n", cudaGetErrorString(err));
     }
-    // cudaDeviceSynchronize(); // For debugging
 
     return grad_A_slice_out_gpu;
 }
@@ -2260,7 +2251,6 @@ __global__ void grad_Q_kernel(
         }
     }
 
-    // --- Write output ---
     grad_Q[idx] = scale * sum_for_grad_q;
 }
 
@@ -2336,7 +2326,6 @@ __global__ void grad_R_kernel(
         }
     }
 
-    // --- Write output ---
     grad_R[idx] = scale * sum_for_grad_r;
 }
 
@@ -2401,8 +2390,6 @@ __global__ void grad_S_kernel(
             sum_for_grad_s += grad_A_base[idx_A] * Q_base[idx_Q] * R_base[idx_R];
         }
     }
-
-    // Write output
     grad_S[idx] = scale * sum_for_grad_s;
 }
 
@@ -2508,7 +2495,7 @@ backward_cuda(
           B, H, I, J, K, D, N_grad, scale); 
   }
 
-  // --- 4. Compute full grad_A tensor on GPU by processing slice by slice ---
+  // --- 4. Compute full grad_A tensor on GPU by processing slice by slice --- 
   auto grad_A_batched_gpu = torch::zeros({B, H, I, J, K}, Q.options()); // Allocate full grad_A on GPU Global Memory
 
   for (int b = 0; b < B; ++b) {
@@ -2525,7 +2512,6 @@ backward_cuda(
           auto Vs_1_slice_gpu = Vs_1.select(0, b).select(0, h);
           auto Vs_2_slice_gpu = Vs_2.select(0, b).select(0, h);
 
-          // --- Chain of CUDA calls to get final_grad_A_slice_gpu ---
           torch::Tensor A_slice_gpu = compute_A_slice_cuda_wrapper(
               Q_slice_gpu, R_slice_gpu, S_slice_gpu, scale
           );
