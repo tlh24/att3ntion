@@ -39,14 +39,6 @@ def train_and_visualize():
         device = torch.device('cuda')
         device_name = torch.cuda.get_device_name(0)
         print(f"🚀 CUDA GPU detected: {device_name}")
-    # elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-    #     try:
-    #         _ = torch.zeros(1, device='mps')
-    #         device = torch.device('mps')
-    #         print("🍎 Using Apple MPS (Metal Performance Shaders)")
-    #     except Exception as e:
-    #         print(f"⚠️ MPS device test failed ({e}), falling back to CPU")
-    #         device = torch.device('cpu')
     else:
         device = torch.device('cpu')
         
@@ -109,7 +101,8 @@ def train_and_visualize():
         # Forward pass with timing and error handling
         try:
             forward_start = time.time()
-            output = model(x)
+            # model(x) should now return a single tensor after internal summing
+            output = model(x) 
             forward_time = time.time() - forward_start
         except Exception as e:
             print(f"❌ Forward pass failed on step {step+1}: {e}")
