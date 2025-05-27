@@ -54,7 +54,8 @@ def compare_forward_configs():
 
         start_time = time.time()
         try:
-            Y_opt_sum = hyper_attn_cpp_manual.forward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2)
+            outputs_opt_tuple = hyper_attn_cpp_manual.forward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2)
+            Y_opt_sum = sum(outputs_opt_tuple) # Sum the tensors in the tuple
         except Exception as e:
             print(f"Manual forward pass failed: {e}")
             all_passed = False

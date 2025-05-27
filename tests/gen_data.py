@@ -64,7 +64,7 @@ def genData(bs, md, do_print=False):
 					ops = '*'
 				case 3: 
 					ops = '/'
-			print(f"if {va} op {vb} = {vc} then {vd} op {ve} = f  (op = {ops}, f = {vf}")
+			print(f"if {va} op {vb} = {vc} then {vd} op {ve} = f  (op = {ops}, f = {vf})")
 	# endfor b
 	return x
 

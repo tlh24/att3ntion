@@ -18,7 +18,7 @@ class HyperAttentionAutograd(Function):
             Q, R, S, V*_*: Input tensors for the attention mechanism.
             dropout_rate: Dropout rate (passed to C++ if needed, but not differentiable).
         Returns:
-            The output tensor from the C++ forward pass.
+            The output tensor from the C++ forward pass (summed).
         """
         Q = Q.contiguous()
         R = R.contiguous()
@@ -30,40 +30,22 @@ class HyperAttentionAutograd(Function):
         Vs_1 = Vs_1.contiguous()
         Vs_2 = Vs_2.contiguous()
 
-        print("--- Preparing to call C++ forward ---", flush=True)
-        print(f"Q: {Q.shape}, {Q.dtype}, {Q.device}", flush=True)
-        print(f"R: {R.shape}, {R.dtype}, {R.device}", flush=True)
-        print(f"S: {S.shape}, {S.dtype}, {S.device}", flush=True)
-        print(f"Vq_1: {Vq_1.shape}, {Vq_1.dtype}, {Vq_1.device}", flush=True)
-        print(f"Vq_2: {Vq_2.shape}, {Vq_2.dtype}, {Vq_2.device}", flush=True)
-        print(f"Vr_1: {Vr_1.shape}, {Vr_1.dtype}, {Vr_1.device}", flush=True)
-        print(f"Vr_2: {Vr_2.shape}, {Vr_2.dtype}, {Vr_2.device}", flush=True)
-        print(f"Vs_1: {Vs_1.shape}, {Vs_1.dtype}, {Vs_1.device}", flush=True)
-        print(f"Vs_2: {Vs_2.shape}, {Vs_2.dtype}, {Vs_2.device}", flush=True)
-        print(f"dropout_rate: {dropout_rate}", flush=True)
-        print("--------------------------------------", flush=True)
-
-        output = hyper_attn_cpp_manual.forward(
+        outputs_tuple = hyper_attn_cpp_manual.forward(
             Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
         )
 
-        print(f"--- C++ forward returned. Checking output... ---", flush=True)
-        try:
-            print(f"Output shape: {output.shape}", flush=True)
-            print(f"Output dtype: {output.dtype}", flush=True)
-            print(f"Output device: {output.device}", flush=True)
-            print("--- Output check seems OK --- ", flush=True)
-        except Exception as e:
-            print(f"!!! Error accessing C++ output tensor: {e}", flush=True)
-            # Force exit or raise to ensure crash info is related to this point
-            import sys
-            sys.exit(1) 
+        # Sum the tuple of tensors from the C++ backend to return a single tensor
+        if not isinstance(outputs_tuple, torch.Tensor):
+            if isinstance(outputs_tuple, tuple) and all(isinstance(t, torch.Tensor) for t in outputs_tuple):
+                 final_output = sum(outputs_tuple)
+            else:
+                raise TypeError(f"C++ forward expected to return a tuple of Tensors or a single Tensor, but got {type(outputs_tuple)}")
+        else: # It's already a single tensor
+            final_output = outputs_tuple
 
-        print("--- Preparing to save for backward --- ", flush=True)
         ctx.save_for_backward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2)
-        print("--- Saved for backward --- ", flush=True)
-
-        return output
+        
+        return final_output
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -84,6 +66,10 @@ class HyperAttentionAutograd(Function):
             grad_output, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2 #,dropout_rate
         )
 
+        # Ensure grad_tuple from C++ has the correct number of elements (9 for the 9 tensor inputs)
+        if not (isinstance(grad_tuple, tuple) and len(grad_tuple) == 9):
+            raise ValueError(f"C++ backward expected to return a tuple of 9 gradients, got {len(grad_tuple) if isinstance(grad_tuple, tuple) else type(grad_tuple)}")
+
         grad_Q, grad_R, grad_S, grad_Vq_1, grad_Vq_2, grad_Vr_1, grad_Vr_2, grad_Vs_1, grad_Vs_2 = grad_tuple
 
         return (
@@ -96,6 +82,7 @@ class HyperAttentionAutograd(Function):
             grad_Vr_2,
             grad_Vs_1,
             grad_Vs_2,
+            None, #dropout doesn't need a gradient
         )
 
 class QuickGELU(nn.Module):
@@ -153,8 +140,10 @@ class HypergraphAttentionCPP(nn.Module):
             Vq_1, Vq_2,
             Vr_1, Vr_2,
             Vs_1, Vs_2,
-        )
+            self.dropout.p
+            )
         
+            
         y = y.permute(0, 2, 1, 3).contiguous().view(batch_size, ntok, self.n_heads * self.head_dim) 
         #The previous reshape assumed summing over heads, let's adjust to typical attention output handling
         # y = y.permute(0, 2, 1, 3).sum(dim=2).squeeze() # is this correct? doublecheck
