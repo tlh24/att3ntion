@@ -10,7 +10,7 @@ class QuickGELU(nn.Module):
 		return x * torch.sigmoid(1.702 * x)
 
 class HypergraphAttention_Naive(nn.Module):
-	def __init__(self, d_model, n_heads, dropout_rate=0):
+	def __init__(self, d_model, n_heads, dropout_rate=0, **kwargs):
 		super(HypergraphAttention_Naive, self).__init__()
 
 		torch.manual_seed(42)
@@ -22,15 +22,15 @@ class HypergraphAttention_Naive(nn.Module):
 		self.n_heads = n_heads
 		self.head_dim = d_model
 		
-		self.Wq = nn.Linear(d_model, d_model*n_heads, bias=False)
-		self.Wr = nn.Linear(d_model, d_model*n_heads, bias=False)
-		self.Ws = nn.Linear(d_model, d_model*n_heads, bias=False)
+		self.Wq = nn.Linear(d_model, d_model*n_heads, bias=False, **kwargs)
+		self.Wr = nn.Linear(d_model, d_model*n_heads, bias=False, **kwargs)
+		self.Ws = nn.Linear(d_model, d_model*n_heads, bias=False, **kwargs)
 		
-		self.Wv_q = nn.Linear(d_model, d_model*n_heads*2, bias=True)
-		self.Wv_r = nn.Linear(d_model, d_model*n_heads*2, bias=True)
-		self.Wv_s = nn.Linear(d_model, d_model*n_heads*2, bias=True)
+		self.Wv_q = nn.Linear(d_model, d_model*n_heads*2, bias=True, **kwargs)
+		self.Wv_r = nn.Linear(d_model, d_model*n_heads*2, bias=True, **kwargs)
+		self.Wv_s = nn.Linear(d_model, d_model*n_heads*2, bias=True, **kwargs)
 		
-		self.Wo = nn.Linear(d_model, d_model, bias=True)
+		self.Wo = nn.Linear(d_model, d_model, bias=True, **kwargs)
 		
 		self.dropout = nn.Dropout(dropout_rate)
 		self.gelu = QuickGELU()

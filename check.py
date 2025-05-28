@@ -13,8 +13,7 @@ device = torch.device("cpu")
 torch.manual_seed(int(time.time()))
 
 kwargs = {'dtype': torch.float64,
-          'device': device,
-          'requires_grad': True}
+          'device': device}
 
 debug = False
 
@@ -57,11 +56,11 @@ else:
 #
 # q = torch.clone(qp).requires_grad_(True)
 # k = torch.clone(kp).requires_grad_(True)
+pdb.set_trace()
+x = torch.randn((batch_size, n_ctx, width), requires_grad=True, **kwargs)
 
-x = torch.randn((batch_size, n_ctx, width), **kwargs)
-
-ha_naive = HypergraphAttention_Naive(width, n_heads)
-ha_baseline = HypergraphAttention(width, n_heads)
+ha_naive = HypergraphAttention_Naive(width, n_heads, **kwargs)
+ha_baseline = HypergraphAttention(width, n_heads, **kwargs)
 
 variables = [x]
 
@@ -100,7 +99,7 @@ print('Forward: Baseline vs Naive Ok')
 # k = torch.randn(batch_size, n_ctx, n_heads, width, **kwargs)
 # variables = [q, k]
 
-if gradcheck(ha_baseline.L1AttnFn.apply, variables, nondet_tol=1e-6):
+if gradcheck(ha_baseline, variables, nondet_tol=1e-6):
     print('Backward: Baseline grad Ok')
 
 # if gradcheck(l1attn_cpp.L1AttnFn.apply, variables, nondet_tol=1e-6):
