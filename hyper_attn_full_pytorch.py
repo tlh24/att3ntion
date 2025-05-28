@@ -12,7 +12,7 @@ class HypergraphAttention(nn.Module):
 
 		torch.manual_seed(42)
 		
-		# as with other small transformers, there are no head subg-spaces.
+		# as with other small transformers, there are no head sub-spaces.
 		# Really need to test if this is necessary! 
 		
 		self.d_model = d_model
@@ -54,8 +54,6 @@ class HypergraphAttention(nn.Module):
 		Vs, Vs_ = Vs.reshape(batch_size, ntok, self.n_heads, self.head_dim*2).permute(0, 2, 1, 3).split(self.head_dim, dim=-1)
 		# Vq,Vr,Vs also [batch_size, n_heads, ntok, head_dim]
 		
-		
-		
 		# compute 3-way attention scores of shape [b, h, i, j, k]
 		dot_product = torch.einsum('bhid,bhjd,bhkd->bhijk', Q, R, S)
 		dot_product = dot_product / (math.sqrt(self.head_dim))
@@ -78,7 +76,7 @@ class HypergraphAttention(nn.Module):
         # Aq = self.dropout(Aq)
 		# Ar = self.dropout(Ar)
 		# As = self.dropout(As)
-		# No dropout for testing backprob
+		# No dropout for testing backprop
 		self.dropout_mask_q = torch.ones_like(Aq)
 		self.dropout_mask_r = torch.ones_like(Ar)
 		self.dropout_mask_s = torch.ones_like(As)
@@ -323,3 +321,5 @@ class HypergraphAttention(nn.Module):
 			'dx': dx
 		})
 		return grads
+
+

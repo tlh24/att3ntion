@@ -4,9 +4,10 @@ def genData(bs, md, do_print=False):
 	'''
 	Problem is a 3-term analogy: 
 	if A `op B = C then D `op E = `F
-	where op and F need to be `filled in. 
+	tokens indicated by ` need to be filled in.
 	Values are integers, ops are the usual arithmetic operations. 
-	All opearations are over the finite field of integers: mod 'md'
+	values and ops are one-hot encoded in a 32-d vector.
+	All operations are over the finite field of integers: mod 'md'
 	'''
 	def randint(k): 
 		return np.random.randint(k)

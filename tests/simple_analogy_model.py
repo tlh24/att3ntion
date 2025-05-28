@@ -3,9 +3,18 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 import argparse
+
+import sys
+from pathlib import Path
+current_script_path = Path(__file__).resolve()
+parent_dir = current_script_path.parent.parent
+parent_dir_str = str(parent_dir)
+if parent_dir_str not in sys.path:
+    sys.path.insert(0, parent_dir_str)
+
 from hyper_attn_full_pytorch import HypergraphAttention
 from hyper_attn_cpp_wrapper import HypergraphAttentionCPP
-from tests.gen_data import genData
+from gen_data import genData
 import pdb
 
 class SimpleAnalogyModel(nn.Module):
