@@ -110,6 +110,7 @@ class HypergraphAttention(nn.Module):
 		return y 
 
 	def backward(self, x, dL_dy):
+		pdb.set_trace()
 		batch_size, ntok, d_model = x.shape
 		
 		grads = {}

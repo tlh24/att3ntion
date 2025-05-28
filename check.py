@@ -15,10 +15,10 @@ torch.manual_seed(int(time.time()))
 kwargs = {'dtype': torch.float64,
           'device': device}
 
-debug = False
+debug = True
 
 if debug:
-	batch_size = 1
+	batch_size = 1 # unlikely to be bugs in this
 	n_ctx = 3
 	n_heads = 2
 	width = 2
@@ -32,31 +32,7 @@ else:
 	n_heads = 8
 	width = 64
 
-# # CUDA implemetation of IEEE-754 is not *exactly* like Intel / AMD's
-# # but, if we restrict to multiples of 1/128, everything matches bit-perfectly.
-# # finer granulations results in errors on the order of 1e-16.
-# # ??perhaps there is a bug in the code??
-# denom = 128
-# q = torch.randint(0, denom, (batch_size, n_ctx, n_heads, width), **kwargs)/denom
-# k = torch.randint(0, denom, (batch_size, n_ctx, n_heads, width), **kwargs)/denom
-# q = torch.randn((batch_size, n_ctx, n_heads, width), **kwargs)
-# k = torch.randn((batch_size, n_ctx, n_heads, width), **kwargs)
 
-# q = torch.arange(0, 1536, dtype=torch.float64).reshape((batch_size, n_ctx, n_heads, width))
-# k = torch.arange(1, 1537, dtype=torch.float64).reshape((batch_size, n_ctx, n_heads, width))
-# kwargs_p = {'dtype': torch.float64,
-#           'device': device,
-#           'requires_grad': False}
-# qp = torch.zeros((batch_size, n_ctx, n_heads, width), **kwargs_p)
-# kp = torch.zeros((batch_size, n_ctx, n_heads, width), **kwargs_p)
-#
-# # qp[:,:4,:4,:] = 1
-# # qp[:,16:,16:,:] = 1
-# qp[:,16:,:,15:] = 1
-#
-# q = torch.clone(qp).requires_grad_(True)
-# k = torch.clone(kp).requires_grad_(True)
-pdb.set_trace()
 x = torch.randn((batch_size, n_ctx, width), requires_grad=True, **kwargs)
 
 ha_naive = HypergraphAttention_Naive(width, n_heads, **kwargs)
