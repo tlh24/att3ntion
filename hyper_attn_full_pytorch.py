@@ -9,12 +9,12 @@ class QuickGELU(nn.Module):
 		return x * torch.sigmoid(1.702 * x)
 
 
-class HypergraphAttention(Function):
-	@staticmethod
-	def forward(ctx, Q, R, S, Vq, Vr, Vs):
-
-	@staticmethod
-	def backward(ctx, d_Y):
+# class HypergraphAttention(Function):
+# 	@staticmethod
+# 	def forward(ctx, Q, R, S, Vq, Vr, Vs):
+#
+# 	@staticmethod
+# 	def backward(ctx, d_Y):
 
 
 class HypergraphAttention(nn.Module):

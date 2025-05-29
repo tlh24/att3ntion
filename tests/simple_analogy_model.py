@@ -12,45 +12,57 @@ parent_dir_str = str(parent_dir)
 if parent_dir_str not in sys.path:
     sys.path.insert(0, parent_dir_str)
 
-from hyper_attn_full_pytorch import HypergraphAttention
+from hyper_attn_pytorch import HypergraphAttention_Naive
 from hyper_attn_cpp_wrapper import HypergraphAttentionCPP
 from gen_data import genData
 import pdb
 
 class SimpleAnalogyModel(nn.Module):
-	"""Simpler model with single hypergraph attention layer."""
-	def __init__(self, hidden_dim:int, num_heads:int, attn_impl:str='pytorch'):
+	"""Simpler model with hypergraph attention layer."""
+	def __init__(self, hidden_dim:int, num_heads:int, n_layers:int, attn_impl:str='pytorch'):
 		super().__init__()
 		input_dim = 32
 		self.embedding_proj = nn.Linear(input_dim, hidden_dim)
 		
-		# Select attention implementation
-		if attn_impl == 'pytorch':
-			self.attention = HypergraphAttention(hidden_dim, num_heads)
-		elif attn_impl == 'cpp':
-			self.attention = HypergraphAttentionCPP(hidden_dim, num_heads)
-		else:
-			raise ValueError(f"Unknown attention implementation: {attn_impl}")
-		
-		self.norm1 = nn.LayerNorm(hidden_dim)
-		self.ffn = nn.Sequential(
-			nn.Linear(hidden_dim, 4 * hidden_dim),
-			nn.ReLU(),
-			nn.Linear(4 * hidden_dim, hidden_dim)
-		)
-		self.norm2 = nn.LayerNorm(hidden_dim)
+		self.repeated_layers = nn.ModuleList()
+		for _ in range(n_layers):
+			# Select attention implementation for this layer
+			if attn_impl == 'pytorch':
+				attention_layer = HypergraphAttention_Naive(hidden_dim, num_heads)
+			elif attn_impl == 'cpp':
+				attention_layer = HypergraphAttentionCPP(hidden_dim, num_heads)
+			else:
+				raise ValueError(f"Unknown attention implementation: {attn_impl}")
+
+			norm1_layer = nn.LayerNorm(hidden_dim)
+			ffn_layer = nn.Sequential(
+				nn.Linear(hidden_dim, 3 * hidden_dim),
+				nn.ReLU(),
+				nn.Linear(3 * hidden_dim, hidden_dim)
+			)
+			norm2_layer = nn.LayerNorm(hidden_dim)
+
+			# Store the components for this specific repeated block
+			self.repeated_layers.append(
+				nn.ModuleDict({
+						'attention': attention_layer,
+						'norm1': norm1_layer,
+						'ffn': ffn_layer,
+						'norm2': norm2_layer,
+				})
+				)
 		
 		self.op_classifier = nn.Linear(hidden_dim, 4)
 		self.value_classifier = nn.Linear(hidden_dim, 28)
 		
 	def forward(self, x):
 		x = self.embedding_proj(x)
-		
-		attn_output = self.attention(x)
-		x = self.norm1(x + attn_output)
-		
-		ffn_output = self.ffn(x)
-		x = self.norm2(x + ffn_output)
+
+		for layer_block in self.repeated_layers:
+			attn_output = layer_block['attention'](x)
+			x = layer_block['norm1'](x + attn_output)
+			ffn_output = layer_block['ffn'](x)
+			x = layer_block['norm2'](x + ffn_output)
 		
 		# Predict operators at positions 1 and 5, and value at position 7
 		op_pred1 = self.op_classifier(x[:, 1])
@@ -75,7 +87,7 @@ def prepare_data(data_tensor, device):
 			torch.LongTensor(op_targets).to(device),
 			torch.LongTensor(value_targets).to(device))
 
-def train_model(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, device='cpu', modulo=20, attn_impl='pytorch'):
+def train_model(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, device='cpu', modulo=19, attn_impl='pytorch'):
 	
 	if device == 'auto':
 		if torch.cuda.is_available():
@@ -89,11 +101,11 @@ def train_model(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, dev
 	
 	print(f"Using device: {device}")
 	
-	data = genData(batch_size * 10, modulo)
+	data = genData(batch_size * 1000, modulo)
 	dataset = TensorDataset(torch.tensor(data))
 	train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-	model = SimpleAnalogyModel(hidden_dim, num_heads, attn_impl=attn_impl).to(device)
+	model = SimpleAnalogyModel(hidden_dim, num_heads, n_layers=2, attn_impl=attn_impl).to(device)
 	optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 	criterion = nn.CrossEntropyLoss()
 	
@@ -141,7 +153,7 @@ if __name__ == '__main__':
 						help='Device to use (cpu, cuda, auto)')
 	parser.add_argument('--epochs', type=int, default=200, help='Number of epochs')
 	parser.add_argument('--batch-size', type=int, default=128, help='Batch size for training')
-	parser.add_argument('--modulo', type=int, default=17, help='Modulo for arithmetic operations')
+	parser.add_argument('--modulo', type=int, default=19, help='Modulo for arithmetic operations')
 	parser.add_argument('--hidden-dim', type=int, default=128, help='Hidden dimension size')
 	parser.add_argument('--num-heads', type=int, default=4, help='Number of attention heads')
 	parser.add_argument('--attn-impl', type=str, default='pytorch', choices=['pytorch', 'cpp'],
