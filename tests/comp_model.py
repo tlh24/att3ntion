@@ -116,7 +116,7 @@ class CompModel(nn.Module):
 			ffn_output = layer_block['ffn'](x)
 			x = layer_block['norm2'](x + ffn_output)
 
-		value_pred = self.value_classifier(x[:, -1])
+		value_pred = self.value_classifier(x[:, 5]) # FIXME replaces the op
 		return value_pred
 
 	def save_model(self, path: str):
@@ -323,7 +323,6 @@ if __name__ == '__main__':
 		attn_impl=args.attn_impl,
 		batch_size=args.batch_size
 	)
-
 	model.save_model("comp_model.pt")
 
 	model = train_model2(
