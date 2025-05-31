@@ -206,7 +206,7 @@ def train_model(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, dev
 	optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 	criterion = nn.CrossEntropyLoss()
 	
-	print("\nTraining started...")
+	print("\ntrain_model started...")
 	for epoch in range(num_epochs):
 		model.train()
 		total_loss = 0
@@ -256,12 +256,13 @@ def train_model2(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, de
 	train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
 	model = CompModel(hidden_dim, num_heads, n_layers=3, attn_impl=attn_impl)
-	model.loadSimple("comp_model.pt", device)
+	# model.loadSimple("comp_model.pt", device)
+	model.to(device)
 	trainable_params = filter(lambda p: p.requires_grad, model.parameters())
 	optimizer = torch.optim.Adam(trainable_params, lr=0.001)
 	criterion = nn.CrossEntropyLoss()
 
-	print("\nTraining started...")
+	print("\ntrain_model2 started...")
 	for epoch in range(num_epochs):
 		model.train()
 		total_loss = 0
@@ -322,7 +323,7 @@ if __name__ == '__main__':
 	# 	attn_impl=args.attn_impl,
 	# 	batch_size=args.batch_size
 	# )
-
+ #
 	# model.save_model("comp_model.pt")
 
 	model = train_model2(
