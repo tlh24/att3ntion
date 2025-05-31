@@ -59,7 +59,7 @@ class SimpleCompModel(nn.Module):
 			ffn_output = layer_block['ffn'](x)
 			x = layer_block['norm2'](x + ffn_output)
 		
-		value_pred = self.value_classifier(x[:, 3])
+		value_pred = self.value_classifier(x[:, 1]) # FIXME - replaces the op
 		return value_pred
 
 	def save_model(self, path: str):
@@ -186,7 +186,7 @@ def prepare_data(data_tensor, device):
 	return (torch.FloatTensor(inputs).to(device), 
 			torch.LongTensor(value_targets).to(device))
 
-def train_model(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, device='cpu', modulo=19, attn_impl='pytorch'):
+def train_model1(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, device='cpu', modulo=19, attn_impl='pytorch'):
 	
 	if device == 'auto':
 		if torch.cuda.is_available():
@@ -206,7 +206,7 @@ def train_model(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, dev
 	optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 	criterion = nn.CrossEntropyLoss()
 	
-	print("\ntrain_model started...")
+	print("\ntrain_model1 started...")
 	for epoch in range(num_epochs):
 		model.train()
 		total_loss = 0
@@ -314,17 +314,17 @@ if __name__ == '__main__':
 	# print("Example data points:")
 	# print(genData(3, args.modulo, do_print=True))
 	
-	# model = train_model(
-	# 	num_epochs=args.epochs,
-	# 	device=args.device,
-	# 	modulo=args.modulo,
-	# 	hidden_dim=args.hidden_dim,
-	# 	num_heads=args.num_heads,
-	# 	attn_impl=args.attn_impl,
-	# 	batch_size=args.batch_size
-	# )
- #
-	# model.save_model("comp_model.pt")
+	model = train_model1(
+		num_epochs=args.epochs,
+		device=args.device,
+		modulo=args.modulo,
+		hidden_dim=args.hidden_dim,
+		num_heads=args.num_heads,
+		attn_impl=args.attn_impl,
+		batch_size=args.batch_size
+	)
+
+	model.save_model("comp_model.pt")
 
 	model = train_model2(
 		num_epochs=args.epochs,
