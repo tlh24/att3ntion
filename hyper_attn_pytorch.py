@@ -112,4 +112,50 @@ class HypergraphAttention_Naive(nn.Module):
 		# residual path is external to this layer.
 		return y 
 
+class GraphAttention_Naive(nn.Module):
+	def __init__(self, d_model, n_heads, dropout_rate=0, **kwargs):
+		super(GraphAttention_Naive, self).__init__()
 
+		torch.manual_seed(42)
+
+		# as with other small transformers, there are no head sub-spaces.
+		# Really need to test if this is necessary!
+
+		self.d_model = d_model
+		self.n_heads = n_heads
+		self.head_dim = d_model
+
+		self.Wq = nn.Linear(d_model, d_model*n_heads, bias=False, **kwargs)
+		self.Wk = nn.Linear(d_model, d_model*n_heads, bias=False, **kwargs)
+
+		self.Wv = nn.Linear(d_model, d_model*n_heads, bias=True, **kwargs)
+
+		self.Wo = nn.Linear(d_model, d_model, bias=True, **kwargs)
+
+		self.dropout = nn.Dropout(dropout_rate)
+		self.gelu = QuickGELU()
+
+	def forward(self, x, rotary_emb):
+		batch_size, ntok, d_model = x.shape
+
+		Q = rotary_emb.rotate_queries_or_keys(self.Wq(x))
+		K = rotary_emb.rotate_queries_or_keys(self.Wk(x))
+		V = self.Wv(x)
+
+		Q = Q.reshape(batch_size, ntok, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+		K = K.reshape(batch_size, ntok, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+		# Q,K are hence [batch_size, n_heads, ntok, head_dim]
+
+		V = V.reshape(batch_size, ntok, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+		# V is [batch_size, n_heads, ntok, head_dim]
+
+		A = torch.einsum('bhid,bhjd->bhij', Q, K)
+		A = torch.softmax(A, dim=-1)
+		y = torch.einsum('bhij,bhjd->bhid', A, V)
+
+		# sum along the heads
+		y = y.permute(0, 2, 3, 1).sum(dim=3).squeeze()
+		y = self.gelu(y)
+		y = self.Wo(y)
+		# residual path is external to this layer.
+		return y

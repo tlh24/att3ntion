@@ -13,7 +13,7 @@ parent_dir_str = str(parent_dir)
 if parent_dir_str not in sys.path:
     sys.path.insert(0, parent_dir_str)
 
-from hyper_attn_pytorch import HypergraphAttention_Naive
+from hyper_attn_pytorch import HypergraphAttention_Naive, GraphAttention_Naive
 # from hyper_attn_cpp_wrapper import HypergraphAttentionCPP
 from gen_data_comp import genData1, genData2
 import pdb
@@ -28,7 +28,7 @@ class SimpleCompModel(nn.Module):
 		
 		self.repeated_layers = nn.ModuleList()
 		for _ in range(n_layers):
-			attention_layer = HypergraphAttention_Naive(hidden_dim, num_heads)
+			attention_layer = GraphAttention_Naive(hidden_dim, num_heads)
 
 			norm1_layer = nn.LayerNorm(hidden_dim)
 			ffn_layer = nn.Sequential(
