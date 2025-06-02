@@ -20,15 +20,19 @@ import pdb
 
 class SimpleCompModel(nn.Module):
 	"""Model with hypergraph attention layer."""
-	def __init__(self, hidden_dim:int, num_heads:int, n_layers:int, attn_impl:str='pytorch'):
+	def __init__(self, hidden_dim:int, num_heads:int, n_layers:int, attn_impl:str='hypergraph'):
 		super().__init__()
 		input_dim = 32
 		self.embedding_proj = nn.Linear(input_dim, hidden_dim)
 		self.rotary_emb = RotaryEmbedding(dim = hidden_dim)
+		self.attn_impl = attn_impl
 		
 		self.repeated_layers = nn.ModuleList()
 		for _ in range(n_layers):
-			attention_layer = GraphAttention_Naive(hidden_dim, num_heads)
+			if attn_impl == "hypergraph":
+				attention_layer = HypergraphAttention_Naive(hidden_dim, num_heads)
+			else:
+				attention_layer = GraphAttention_Naive(hidden_dim, num_heads)
 
 			norm1_layer = nn.LayerNorm(hidden_dim)
 			ffn_layer = nn.Sequential(
@@ -78,15 +82,19 @@ class SimpleCompModel(nn.Module):
 
 class CompModel(nn.Module):
 	"""Model with hypergraph attention layer."""
-	def __init__(self, hidden_dim:int, num_heads:int, n_layers:int, attn_impl:str='pytorch'):
+	def __init__(self, hidden_dim:int, num_heads:int, n_layers:int, attn_impl:str='hypergraph'):
 		super().__init__()
 		input_dim = 32
 		self.embedding_proj = nn.Linear(input_dim, hidden_dim)
 		self.rotary_emb = RotaryEmbedding(dim = hidden_dim)
+		self.attn_impl = attn_impl
 
 		self.repeated_layers = nn.ModuleList()
 		for _ in range(n_layers):
-			attention_layer = HypergraphAttention_Naive(hidden_dim, num_heads)
+			if attn_impl == "hypergraph":
+				attention_layer = HypergraphAttention_Naive(hidden_dim, num_heads)
+			else:
+				attention_layer = GraphAttention_Naive(hidden_dim, num_heads)
 
 			norm1_layer = nn.LayerNorm(hidden_dim)
 			ffn_layer = nn.Sequential(
@@ -126,6 +134,7 @@ class CompModel(nn.Module):
 
 	def loadSimple(self, path:str, device):
 		# init from file
+		pdb.set_trace()
 		mdata = torch.load("comp_model.pt")
 		self.load_state_dict(mdata, strict=False) # this won't fill everything
 
@@ -138,16 +147,24 @@ class CompModel(nn.Module):
 				param.requires_grad = True # Ensure other layers (like layer2 and output_layer) are trainable
 				print(f"  Trainable: {param_name}")
 
-		self.repeated_layers[2].attention.Wq.weight.copy_( mdata["repeated_layers.0.attention.Wq.weight"])
-		self.repeated_layers[2].attention.Wr.weight.copy_( mdata["repeated_layers.0.attention.Wr.weight"])
-		self.repeated_layers[2].attention.Ws.weight.copy_( mdata["repeated_layers.0.attention.Ws.weight"])
+		if self.attn_impl == "hypergraph":
+			self.repeated_layers[2].attention.Wq.weight.copy_( mdata["repeated_layers.0.attention.Wq.weight"])
+			self.repeated_layers[2].attention.Wr.weight.copy_( mdata["repeated_layers.0.attention.Wr.weight"])
+			self.repeated_layers[2].attention.Ws.weight.copy_( mdata["repeated_layers.0.attention.Ws.weight"])
 
-		self.repeated_layers[2].attention.Wv_q.weight.copy_( mdata["repeated_layers.0.attention.Wv_q.weight"])
-		self.repeated_layers[2].attention.Wv_q.bias.copy_( mdata["repeated_layers.0.attention.Wv_q.bias"])
-		self.repeated_layers[2].attention.Wv_q.weight.copy_( mdata["repeated_layers.0.attention.Wv_r.weight"])
-		self.repeated_layers[2].attention.Wv_q.bias.copy_( mdata["repeated_layers.0.attention.Wv_r.bias"])
-		self.repeated_layers[2].attention.Wv_q.weight.copy_( mdata["repeated_layers.0.attention.Wv_s.weight"])
-		self.repeated_layers[2].attention.Wv_q.bias.copy_( mdata["repeated_layers.0.attention.Wv_s.bias"])
+			self.repeated_layers[2].attention.Wv_q.weight.copy_( mdata["repeated_layers.0.attention.Wv_q.weight"])
+			self.repeated_layers[2].attention.Wv_q.bias.copy_( mdata["repeated_layers.0.attention.Wv_q.bias"])
+			self.repeated_layers[2].attention.Wv_q.weight.copy_( mdata["repeated_layers.0.attention.Wv_r.weight"])
+			self.repeated_layers[2].attention.Wv_q.bias.copy_( mdata["repeated_layers.0.attention.Wv_r.bias"])
+			self.repeated_layers[2].attention.Wv_q.weight.copy_( mdata["repeated_layers.0.attention.Wv_s.weight"])
+			self.repeated_layers[2].attention.Wv_q.bias.copy_( mdata["repeated_layers.0.attention.Wv_s.bias"])
+
+		else:
+			self.repeated_layers[2].attention.Wq.weight.copy_( mdata["repeated_layers.0.attention.Wq.weight"])
+			self.repeated_layers[2].attention.Wk.weight.copy_( mdata["repeated_layers.0.attention.Wk.weight"])
+
+			self.repeated_layers[2].attention.Wv.weight.copy_( mdata["repeated_layers.0.attention.Wv.weight"])
+			self.repeated_layers[2].attention.Wv.bias.copy_( mdata["repeated_layers.0.attention.Wv.bias"])
 
 		self.repeated_layers[2].attention.Wo.weight.copy_( mdata["repeated_layers.0.attention.Wo.weight"])
 		self.repeated_layers[2].attention.Wo.bias.copy_( mdata["repeated_layers.0.attention.Wo.bias"])
