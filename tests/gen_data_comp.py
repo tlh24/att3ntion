@@ -31,7 +31,6 @@ def genData1(bs, md, do_print=False):
 	'''
 	Task 1: learn the rules of modulo arithmetic.
 	'''
-
 	assert(md < 32-4)
 	x = np.zeros((bs, 4, 32), dtype=int)
 

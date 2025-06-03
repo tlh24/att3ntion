@@ -20,7 +20,7 @@ import pdb
 
 class SimpleCompModel(nn.Module):
 	"""Model with hypergraph attention layer."""
-	def __init__(self, hidden_dim:int, num_heads:int, n_layers:int, attn_impl:str='hypergraph'):
+	def __init__(self, hidden_dim:int, num_heads:int, n_layers:int, attn_impl:str=''):
 		super().__init__()
 		input_dim = 32
 		self.embedding_proj = nn.Linear(input_dim, hidden_dim)
@@ -80,9 +80,15 @@ class SimpleCompModel(nn.Module):
 		model.eval() # Set to evaluation mode by default
 		return model
 
+	def printParamCount(self):
+		trainable_params = sum(
+			p.numel() for p in self.parameters() if p.requires_grad
+		)
+		print(f"SimpleCompModel {self.attn_impl}: number of model parameters:{trainable_params/1e6}M")
+
 class CompModel(nn.Module):
 	"""Model with hypergraph attention layer."""
-	def __init__(self, hidden_dim:int, num_heads:int, n_layers:int, attn_impl:str='hypergraph'):
+	def __init__(self, hidden_dim:int, num_heads:int, n_layers:int, attn_impl:str=''):
 		super().__init__()
 		input_dim = 32
 		self.embedding_proj = nn.Linear(input_dim, hidden_dim)
@@ -134,20 +140,20 @@ class CompModel(nn.Module):
 
 	def loadSimple(self, path:str, device):
 		# init from file
-		pdb.set_trace()
 		mdata = torch.load("comp_model.pt")
 		self.load_state_dict(mdata, strict=False) # this won't fill everything
 
-		print("Freezing weights for layer1 and layer3")
-		for param_name, param in self.named_parameters():
-			if param_name.startswith("repeated_layers.0") or param_name.startswith("repeated_layers.2"):
-				param.requires_grad = False
-				print(f"  Froze: {param_name}")
-			else:
-				param.requires_grad = True # Ensure other layers (like layer2 and output_layer) are trainable
-				print(f"  Trainable: {param_name}")
-
 		if self.attn_impl == "hypergraph":
+
+			print("Freezing weights for layer0 and layer2")
+			for param_name, param in self.named_parameters():
+				if param_name.startswith("repeated_layers.0") or param_name.startswith("repeated_layers.2"):
+					param.requires_grad = False
+					print(f"  Froze: {param_name}")
+				else:
+					param.requires_grad = True # Ensure other layers (like layer2 and output_layer) are trainable
+					print(f"  Trainable: {param_name}")
+
 			self.repeated_layers[2].attention.Wq.weight.copy_( mdata["repeated_layers.0.attention.Wq.weight"])
 			self.repeated_layers[2].attention.Wr.weight.copy_( mdata["repeated_layers.0.attention.Wr.weight"])
 			self.repeated_layers[2].attention.Ws.weight.copy_( mdata["repeated_layers.0.attention.Ws.weight"])
@@ -159,30 +165,54 @@ class CompModel(nn.Module):
 			self.repeated_layers[2].attention.Wv_q.weight.copy_( mdata["repeated_layers.0.attention.Wv_s.weight"])
 			self.repeated_layers[2].attention.Wv_q.bias.copy_( mdata["repeated_layers.0.attention.Wv_s.bias"])
 
+			self.repeated_layers[2].attention.Wo.weight.copy_( mdata["repeated_layers.0.attention.Wo.weight"])
+			self.repeated_layers[2].attention.Wo.bias.copy_( mdata["repeated_layers.0.attention.Wo.bias"])
+
+			self.repeated_layers[2].norm1.weight.copy_( mdata["repeated_layers.0.norm1.weight"])
+			self.repeated_layers[2].norm1.bias.copy_( mdata["repeated_layers.0.norm1.bias"])
+			self.repeated_layers[2].norm2.weight.copy_( mdata["repeated_layers.0.norm1.weight"])
+			self.repeated_layers[2].norm2.bias.copy_( mdata["repeated_layers.0.norm1.bias"])
+
+			self.repeated_layers[2].ffn[0].weight.copy_( mdata["repeated_layers.0.ffn.0.weight"])
+			self.repeated_layers[2].ffn[0].bias.copy_( mdata["repeated_layers.0.ffn.0.bias"])
+			self.repeated_layers[2].ffn[2].weight.copy_( mdata["repeated_layers.0.ffn.2.weight"])
+			self.repeated_layers[2].ffn[2].bias.copy_( mdata["repeated_layers.0.ffn.2.bias"])
+
 		else:
-			self.repeated_layers[2].attention.Wq.weight.copy_( mdata["repeated_layers.0.attention.Wq.weight"])
-			self.repeated_layers[2].attention.Wk.weight.copy_( mdata["repeated_layers.0.attention.Wk.weight"])
 
-			self.repeated_layers[2].attention.Wv.weight.copy_( mdata["repeated_layers.0.attention.Wv.weight"])
-			self.repeated_layers[2].attention.Wv.bias.copy_( mdata["repeated_layers.0.attention.Wv.bias"])
+			print("Freezing weights for layers 0, 1, 4, 5")
+			for param_name, param in self.named_parameters():
+				if (param_name.startswith("repeated_layers.0") or param_name.startswith("repeated_layers.1")) or ( param_name.startswith("repeated_layers.4") or
+				param_name.startswith("repeated_layers.5")):
+					param.requires_grad = False
+					print(f"  Froze: {param_name}")
+				else:
+					param.requires_grad = True # Ensure other layers (like layer2 and output_layer) are trainable
+					print(f"  Trainable: {param_name}")
 
-		self.repeated_layers[2].attention.Wo.weight.copy_( mdata["repeated_layers.0.attention.Wo.weight"])
-		self.repeated_layers[2].attention.Wo.bias.copy_( mdata["repeated_layers.0.attention.Wo.bias"])
+			for i in range(2):
+				self.repeated_layers[4+i].attention.Wq.weight.copy_( mdata[f"repeated_layers.{i}.attention.Wq.weight"])
+				self.repeated_layers[4+i].attention.Wk.weight.copy_( mdata[f"repeated_layers.{i}.attention.Wk.weight"])
 
-		self.repeated_layers[2].norm1.weight.copy_( mdata["repeated_layers.0.norm1.weight"])
-		self.repeated_layers[2].norm1.bias.copy_( mdata["repeated_layers.0.norm1.bias"])
-		self.repeated_layers[2].norm2.weight.copy_( mdata["repeated_layers.0.norm1.weight"])
-		self.repeated_layers[2].norm2.bias.copy_( mdata["repeated_layers.0.norm1.bias"])
+				self.repeated_layers[4+i].attention.Wv.weight.copy_( mdata[f"repeated_layers.{i}.attention.Wv.weight"])
+				self.repeated_layers[4+i].attention.Wv.bias.copy_( mdata[f"repeated_layers.{i}.attention.Wv.bias"])
 
-		self.repeated_layers[2].ffn[0].weight.copy_( mdata["repeated_layers.0.ffn.0.weight"])
-		self.repeated_layers[2].ffn[0].bias.copy_( mdata["repeated_layers.0.ffn.0.bias"])
-		self.repeated_layers[2].ffn[2].weight.copy_( mdata["repeated_layers.0.ffn.2.weight"])
-		self.repeated_layers[2].ffn[2].bias.copy_( mdata["repeated_layers.0.ffn.2.bias"])
+				self.repeated_layers[4+i].attention.Wo.weight.copy_( mdata[f"repeated_layers.0.attention.Wo.weight"])
+				self.repeated_layers[4+i].attention.Wo.bias.copy_( mdata[f"repeated_layers.0.attention.Wo.bias"])
+
+				self.repeated_layers[4+i].norm1.weight.copy_( mdata[f"repeated_layers.{i}.norm1.weight"])
+				self.repeated_layers[4+i].norm1.bias.copy_( mdata[f"repeated_layers.{i}.norm1.bias"])
+				self.repeated_layers[4+i].norm2.weight.copy_( mdata[f"repeated_layers.{i}.norm1.weight"])
+				self.repeated_layers[4+i].norm2.bias.copy_( mdata[f"repeated_layers.{i}.norm1.bias"])
+
+				self.repeated_layers[4+i].ffn[0].weight.copy_( mdata[f"repeated_layers.{i}.ffn.0.weight"])
+				self.repeated_layers[4+i].ffn[0].bias.copy_( mdata[f"repeated_layers.{i}.ffn.0.bias"])
+				self.repeated_layers[4+i].ffn[2].weight.copy_( mdata[f"repeated_layers.{i}.ffn.2.weight"])
+				self.repeated_layers[4+i].ffn[2].bias.copy_( mdata[f"repeated_layers.{i}.ffn.2.bias"])
 
 		self.to(device)
 		self.eval() # Set to evaluation mode by default
 		return
-
 
 	def load_model(cls, path: str, device):
 		"""Loads a model from a file."""
@@ -191,6 +221,12 @@ class CompModel(nn.Module):
 		self.to(device)
 		self.eval() # Set to evaluation mode by default
 		return
+
+	def printParamCount(self):
+		trainable_params = sum(
+			p.numel() for p in self.parameters() if p.requires_grad
+		)
+		print(f"CompModel {self.attn_impl}: number of model parameters:{trainable_params/1e6}M")
 
 def prepare_data(data_tensor, device):
 	inputs = data_tensor.copy()
@@ -203,7 +239,7 @@ def prepare_data(data_tensor, device):
 	return (torch.FloatTensor(inputs).to(device), 
 			torch.LongTensor(value_targets).to(device))
 
-def train_model1(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, device='cpu', modulo=19, attn_impl='pytorch'):
+def train_model1(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, device='cpu', modulo=23, attn_impl=""):
 	
 	if device == 'auto':
 		if torch.cuda.is_available():
@@ -215,15 +251,24 @@ def train_model1(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, de
 	
 	print(f"Using device: {device}")
 	
-	data = genData1(batch_size * 100, modulo)
+	data = genData1(batch_size * 1000, modulo)
 	dataset = TensorDataset(torch.tensor(data))
 	train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-	model = SimpleCompModel(hidden_dim, num_heads, n_layers=1, attn_impl=attn_impl).to(device)
+	if attn_impl == "hypergraph":
+		n_layers = 1
+	else:
+		n_layers = 2
+
+	model = SimpleCompModel(hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl).to(device)
 	optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 	criterion = nn.CrossEntropyLoss()
-	
+	model.printParamCount()
+
+	fd_losslog = open(f'losslog_trainModel1_{attn_impl}.txt', 'w')
+
 	print("\ntrain_model1 started...")
+	uu = 0
 	for epoch in range(num_epochs):
 		model.train()
 		total_loss = 0
@@ -242,6 +287,11 @@ def train_model1(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, de
 			
 			loss.backward()
 			optimizer.step()
+
+			lloss = loss.detach().cpu().item()
+			fd_losslog.write(f"{uu}\t{lloss}\t0.0\n")
+			fd_losslog.flush()
+			uu += 1
 			
 			total_loss += loss.item()
 			total += inputs.size(0)
@@ -253,10 +303,11 @@ def train_model1(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, de
 			avg_loss = total_loss / len(train_loader)
 			val_accuracy = 100 * correct_vals / total
 			print(f'Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Result Acc: {val_accuracy:.2f}%')
-	
+
+	fd_losslog.close()
 	return model
 
-def train_model2(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, device='cpu', modulo=19, attn_impl='pytorch'):
+def train_model2(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, device='cpu', modulo=23, attn_impl=""):
 
 	if device == 'auto':
 		if torch.cuda.is_available():
@@ -268,18 +319,27 @@ def train_model2(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, de
 
 	print(f"Using device: {device}")
 
-	data = genData2(batch_size * 100, modulo)
+	data = genData2(batch_size * 1000, modulo)
 	dataset = TensorDataset(torch.tensor(data))
 	train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-	model = CompModel(hidden_dim, num_heads, n_layers=3, attn_impl=attn_impl)
+	if attn_impl == "hypergraph":
+		n_layers = 3
+	else:
+		n_layers = 6
+
+	model = CompModel(hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl)
 	model.loadSimple("comp_model.pt", device)
 	model.to(device)
 	trainable_params = filter(lambda p: p.requires_grad, model.parameters())
 	optimizer = torch.optim.Adam(trainable_params, lr=0.001)
 	criterion = nn.CrossEntropyLoss()
+	model.printParamCount()
+
+	fd_losslog = open(f'losslog_trainModel2_{attn_impl}.txt', 'w')
 
 	print("\ntrain_model2 started...")
+	uu = 0
 	for epoch in range(num_epochs):
 		model.train()
 		total_loss = 0
@@ -299,6 +359,11 @@ def train_model2(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, de
 			loss.backward()
 			optimizer.step()
 
+			lloss = loss.detach().cpu().item()
+			fd_losslog.write(f"{uu}\t{lloss}\t0.0\n")
+			fd_losslog.flush()
+			uu += 1
+
 			total_loss += loss.item()
 			total += inputs.size(0)
 
@@ -310,6 +375,7 @@ def train_model2(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, de
 			val_accuracy = 100 * correct_vals / total
 			print(f'Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Result Acc: {val_accuracy:.2f}%')
 
+	fd_losslog.close()
 	return model
 
 if __name__ == '__main__':
@@ -321,7 +387,7 @@ if __name__ == '__main__':
 	parser.add_argument('--modulo', type=int, default=19, help='Modulo for arithmetic operations')
 	parser.add_argument('--hidden-dim', type=int, default=128, help='Hidden dimension size')
 	parser.add_argument('--num-heads', type=int, default=4, help='Number of attention heads')
-	parser.add_argument('--attn-impl', type=str, default='pytorch', choices=['pytorch', 'cpp'],
+	parser.add_argument('--attn-impl', type=str, default='hypergraph', choices=['hypergraph', 'graph'],
 						help='Attention implementation to use')
 	args = parser.parse_args()
 	
@@ -332,7 +398,7 @@ if __name__ == '__main__':
 	# print(genData(3, args.modulo, do_print=True))
 	
 	model = train_model1(
-		num_epochs=args.epochs,
+		num_epochs=40,
 		device=args.device,
 		modulo=args.modulo,
 		hidden_dim=args.hidden_dim,
