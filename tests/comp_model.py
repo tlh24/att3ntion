@@ -13,7 +13,7 @@ parent_dir_str = str(parent_dir)
 if parent_dir_str not in sys.path:
     sys.path.insert(0, parent_dir_str)
 
-from hyper_attn_pytorch import HypergraphAttention_Naive, GraphAttention_Naive
+from hyper_attn_pytorch import HypergraphAttention_Naive, GraphAttention_Naive, QuickGELU
 # from hyper_attn_cpp_wrapper import HypergraphAttentionCPP
 from gen_data_comp import genData1, genData2
 import pdb
@@ -53,6 +53,7 @@ class SimpleCompModel(nn.Module):
 		
 		# self.op_classifier = nn.Linear(hidden_dim, 4)
 		self.value_classifier = nn.Linear(hidden_dim, 28)
+		self.gelu = QuickGELU()
 		
 	def forward(self, x):
 		x = self.embedding_proj(x)
@@ -63,7 +64,7 @@ class SimpleCompModel(nn.Module):
 			ffn_output = layer_block['ffn'](x)
 			x = layer_block['norm2'](x + ffn_output)
 		
-		value_pred = self.value_classifier(x[:, 1]) # FIXME - replaces the op
+		value_pred = (self.value_classifier(x[:, -1])) # FIXME - replaces the op
 		return value_pred
 
 	def save_model(self, path: str):
@@ -120,6 +121,7 @@ class CompModel(nn.Module):
 				)
 
 		self.value_classifier = nn.Linear(hidden_dim, 28)
+		self.gelu = QuickGELU()
 
 	def forward(self, x):
 		x = self.embedding_proj(x)
@@ -130,7 +132,7 @@ class CompModel(nn.Module):
 			ffn_output = layer_block['ffn'](x)
 			x = layer_block['norm2'](x + ffn_output)
 
-		value_pred = self.value_classifier(x[:, 5]) # FIXME replaces the op
+		value_pred = ( self.value_classifier(x[:, -1]) ) # FIXME replaces the op
 		return value_pred
 
 	def save_model(self, path: str):
@@ -140,7 +142,7 @@ class CompModel(nn.Module):
 
 	def loadSimple(self, path:str, device):
 		# init from file
-		mdata = torch.load("comp_model.pt")
+		mdata = torch.load(path)
 		self.load_state_dict(mdata, strict=False) # this won't fill everything
 
 		if self.attn_impl == "hypergraph":
@@ -153,30 +155,30 @@ class CompModel(nn.Module):
 				else:
 					param.requires_grad = True # Ensure other layers (like layer2 and output_layer) are trainable
 					print(f"  Trainable: {param_name}")
+			with torch.no_grad():
+				self.repeated_layers[2].attention.Wq.weight.copy_( mdata["repeated_layers.0.attention.Wq.weight"])
+				self.repeated_layers[2].attention.Wr.weight.copy_( mdata["repeated_layers.0.attention.Wr.weight"])
+				self.repeated_layers[2].attention.Ws.weight.copy_( mdata["repeated_layers.0.attention.Ws.weight"])
 
-			self.repeated_layers[2].attention.Wq.weight.copy_( mdata["repeated_layers.0.attention.Wq.weight"])
-			self.repeated_layers[2].attention.Wr.weight.copy_( mdata["repeated_layers.0.attention.Wr.weight"])
-			self.repeated_layers[2].attention.Ws.weight.copy_( mdata["repeated_layers.0.attention.Ws.weight"])
+				self.repeated_layers[2].attention.Wv_q.weight.copy_( mdata["repeated_layers.0.attention.Wv_q.weight"])
+				self.repeated_layers[2].attention.Wv_q.bias.copy_( mdata["repeated_layers.0.attention.Wv_q.bias"])
+				self.repeated_layers[2].attention.Wv_q.weight.copy_( mdata["repeated_layers.0.attention.Wv_r.weight"])
+				self.repeated_layers[2].attention.Wv_q.bias.copy_( mdata["repeated_layers.0.attention.Wv_r.bias"])
+				self.repeated_layers[2].attention.Wv_q.weight.copy_( mdata["repeated_layers.0.attention.Wv_s.weight"])
+				self.repeated_layers[2].attention.Wv_q.bias.copy_( mdata["repeated_layers.0.attention.Wv_s.bias"])
 
-			self.repeated_layers[2].attention.Wv_q.weight.copy_( mdata["repeated_layers.0.attention.Wv_q.weight"])
-			self.repeated_layers[2].attention.Wv_q.bias.copy_( mdata["repeated_layers.0.attention.Wv_q.bias"])
-			self.repeated_layers[2].attention.Wv_q.weight.copy_( mdata["repeated_layers.0.attention.Wv_r.weight"])
-			self.repeated_layers[2].attention.Wv_q.bias.copy_( mdata["repeated_layers.0.attention.Wv_r.bias"])
-			self.repeated_layers[2].attention.Wv_q.weight.copy_( mdata["repeated_layers.0.attention.Wv_s.weight"])
-			self.repeated_layers[2].attention.Wv_q.bias.copy_( mdata["repeated_layers.0.attention.Wv_s.bias"])
+				self.repeated_layers[2].attention.Wo.weight.copy_( mdata["repeated_layers.0.attention.Wo.weight"])
+				self.repeated_layers[2].attention.Wo.bias.copy_( mdata["repeated_layers.0.attention.Wo.bias"])
 
-			self.repeated_layers[2].attention.Wo.weight.copy_( mdata["repeated_layers.0.attention.Wo.weight"])
-			self.repeated_layers[2].attention.Wo.bias.copy_( mdata["repeated_layers.0.attention.Wo.bias"])
+				self.repeated_layers[2].norm1.weight.copy_( mdata["repeated_layers.0.norm1.weight"])
+				self.repeated_layers[2].norm1.bias.copy_( mdata["repeated_layers.0.norm1.bias"])
+				self.repeated_layers[2].norm2.weight.copy_( mdata["repeated_layers.0.norm1.weight"])
+				self.repeated_layers[2].norm2.bias.copy_( mdata["repeated_layers.0.norm1.bias"])
 
-			self.repeated_layers[2].norm1.weight.copy_( mdata["repeated_layers.0.norm1.weight"])
-			self.repeated_layers[2].norm1.bias.copy_( mdata["repeated_layers.0.norm1.bias"])
-			self.repeated_layers[2].norm2.weight.copy_( mdata["repeated_layers.0.norm1.weight"])
-			self.repeated_layers[2].norm2.bias.copy_( mdata["repeated_layers.0.norm1.bias"])
-
-			self.repeated_layers[2].ffn[0].weight.copy_( mdata["repeated_layers.0.ffn.0.weight"])
-			self.repeated_layers[2].ffn[0].bias.copy_( mdata["repeated_layers.0.ffn.0.bias"])
-			self.repeated_layers[2].ffn[2].weight.copy_( mdata["repeated_layers.0.ffn.2.weight"])
-			self.repeated_layers[2].ffn[2].bias.copy_( mdata["repeated_layers.0.ffn.2.bias"])
+				self.repeated_layers[2].ffn[0].weight.copy_( mdata["repeated_layers.0.ffn.0.weight"])
+				self.repeated_layers[2].ffn[0].bias.copy_( mdata["repeated_layers.0.ffn.0.bias"])
+				self.repeated_layers[2].ffn[2].weight.copy_( mdata["repeated_layers.0.ffn.2.weight"])
+				self.repeated_layers[2].ffn[2].bias.copy_( mdata["repeated_layers.0.ffn.2.bias"])
 
 		else:
 
@@ -190,25 +192,26 @@ class CompModel(nn.Module):
 					param.requires_grad = True # Ensure other layers (like layer2 and output_layer) are trainable
 					print(f"  Trainable: {param_name}")
 
-			for i in range(2):
-				self.repeated_layers[4+i].attention.Wq.weight.copy_( mdata[f"repeated_layers.{i}.attention.Wq.weight"])
-				self.repeated_layers[4+i].attention.Wk.weight.copy_( mdata[f"repeated_layers.{i}.attention.Wk.weight"])
+			with torch.no_grad():
+				for i in range(2):
+					self.repeated_layers[4+i].attention.Wq.weight.copy_( mdata[f"repeated_layers.{i}.attention.Wq.weight"])
+					self.repeated_layers[4+i].attention.Wk.weight.copy_( mdata[f"repeated_layers.{i}.attention.Wk.weight"])
 
-				self.repeated_layers[4+i].attention.Wv.weight.copy_( mdata[f"repeated_layers.{i}.attention.Wv.weight"])
-				self.repeated_layers[4+i].attention.Wv.bias.copy_( mdata[f"repeated_layers.{i}.attention.Wv.bias"])
+					self.repeated_layers[4+i].attention.Wv.weight.copy_( mdata[f"repeated_layers.{i}.attention.Wv.weight"])
+					self.repeated_layers[4+i].attention.Wv.bias.copy_( mdata[f"repeated_layers.{i}.attention.Wv.bias"])
 
-				self.repeated_layers[4+i].attention.Wo.weight.copy_( mdata[f"repeated_layers.0.attention.Wo.weight"])
-				self.repeated_layers[4+i].attention.Wo.bias.copy_( mdata[f"repeated_layers.0.attention.Wo.bias"])
+					self.repeated_layers[4+i].attention.Wo.weight.copy_( mdata[f"repeated_layers.0.attention.Wo.weight"])
+					self.repeated_layers[4+i].attention.Wo.bias.copy_( mdata[f"repeated_layers.0.attention.Wo.bias"])
 
-				self.repeated_layers[4+i].norm1.weight.copy_( mdata[f"repeated_layers.{i}.norm1.weight"])
-				self.repeated_layers[4+i].norm1.bias.copy_( mdata[f"repeated_layers.{i}.norm1.bias"])
-				self.repeated_layers[4+i].norm2.weight.copy_( mdata[f"repeated_layers.{i}.norm1.weight"])
-				self.repeated_layers[4+i].norm2.bias.copy_( mdata[f"repeated_layers.{i}.norm1.bias"])
+					self.repeated_layers[4+i].norm1.weight.copy_( mdata[f"repeated_layers.{i}.norm1.weight"])
+					self.repeated_layers[4+i].norm1.bias.copy_( mdata[f"repeated_layers.{i}.norm1.bias"])
+					self.repeated_layers[4+i].norm2.weight.copy_( mdata[f"repeated_layers.{i}.norm1.weight"])
+					self.repeated_layers[4+i].norm2.bias.copy_( mdata[f"repeated_layers.{i}.norm1.bias"])
 
-				self.repeated_layers[4+i].ffn[0].weight.copy_( mdata[f"repeated_layers.{i}.ffn.0.weight"])
-				self.repeated_layers[4+i].ffn[0].bias.copy_( mdata[f"repeated_layers.{i}.ffn.0.bias"])
-				self.repeated_layers[4+i].ffn[2].weight.copy_( mdata[f"repeated_layers.{i}.ffn.2.weight"])
-				self.repeated_layers[4+i].ffn[2].bias.copy_( mdata[f"repeated_layers.{i}.ffn.2.bias"])
+					self.repeated_layers[4+i].ffn[0].weight.copy_( mdata[f"repeated_layers.{i}.ffn.0.weight"])
+					self.repeated_layers[4+i].ffn[0].bias.copy_( mdata[f"repeated_layers.{i}.ffn.0.bias"])
+					self.repeated_layers[4+i].ffn[2].weight.copy_( mdata[f"repeated_layers.{i}.ffn.2.weight"])
+					self.repeated_layers[4+i].ffn[2].bias.copy_( mdata[f"repeated_layers.{i}.ffn.2.bias"])
 
 		self.to(device)
 		self.eval() # Set to evaluation mode by default
@@ -239,7 +242,7 @@ def prepare_data(data_tensor, device):
 	return (torch.FloatTensor(inputs).to(device), 
 			torch.LongTensor(value_targets).to(device))
 
-def train_model1(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, device='cpu', modulo=23, attn_impl=""):
+def train_model1(num_epochs=40, batch_size=128, hidden_dim=128, num_heads=4, device='cpu', modulo=23, attn_impl=""):
 	
 	if device == 'auto':
 		if torch.cuda.is_available():
@@ -299,10 +302,9 @@ def train_model1(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, de
 			# Calculate accuracies
 			correct_vals += (torch.argmax(value_pred, dim=1) == value_targets).sum().item()
 		
-		if (epoch + 1) % 10 == 0:
-			avg_loss = total_loss / len(train_loader)
-			val_accuracy = 100 * correct_vals / total
-			print(f'Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Result Acc: {val_accuracy:.2f}%')
+		avg_loss = total_loss / len(train_loader)
+		val_accuracy = 100 * correct_vals / total
+		print(f'Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Result Acc: {val_accuracy:.2f}%')
 
 	fd_losslog.close()
 	return model
@@ -329,7 +331,7 @@ def train_model2(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, de
 		n_layers = 6
 
 	model = CompModel(hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl)
-	model.loadSimple("comp_model.pt", device)
+	model.loadSimple(f"comp_model_{attn_impl}.pt", device)
 	model.to(device)
 	trainable_params = filter(lambda p: p.requires_grad, model.parameters())
 	optimizer = torch.optim.Adam(trainable_params, lr=0.001)
@@ -370,10 +372,9 @@ def train_model2(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, de
 			# Calculate accuracies
 			correct_vals += (torch.argmax(value_pred, dim=1) == value_targets).sum().item()
 
-		if (epoch + 1) % 10 == 0:
-			avg_loss = total_loss / len(train_loader)
-			val_accuracy = 100 * correct_vals / total
-			print(f'Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Result Acc: {val_accuracy:.2f}%')
+		avg_loss = total_loss / len(train_loader)
+		val_accuracy = 100 * correct_vals / total
+		print(f'Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Result Acc: {val_accuracy:.2f}%')
 
 	fd_losslog.close()
 	return model
@@ -382,7 +383,7 @@ if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='Train analogy model')
 	parser.add_argument('--device', type=str, default='auto', choices=['cpu', 'cuda', 'auto'],
 						help='Device to use (cpu, cuda, auto)')
-	parser.add_argument('--epochs', type=int, default=40, help='Number of epochs')
+	parser.add_argument('--epochs', type=int, default=15, help='Number of epochs')
 	parser.add_argument('--batch-size', type=int, default=128, help='Batch size for training')
 	parser.add_argument('--modulo', type=int, default=19, help='Modulo for arithmetic operations')
 	parser.add_argument('--hidden-dim', type=int, default=128, help='Hidden dimension size')
@@ -398,7 +399,7 @@ if __name__ == '__main__':
 	# print(genData(3, args.modulo, do_print=True))
 	
 	model = train_model1(
-		num_epochs=40,
+		num_epochs=4,
 		device=args.device,
 		modulo=args.modulo,
 		hidden_dim=args.hidden_dim,
@@ -406,10 +407,10 @@ if __name__ == '__main__':
 		attn_impl=args.attn_impl,
 		batch_size=args.batch_size
 	)
-	model.save_model("comp_model.pt")
+	model.save_model(f"comp_model_{args.attn_impl}.pt")
 
 	model = train_model2(
-		num_epochs=args.epochs,
+		num_epochs=10,
 		device=args.device,
 		modulo=args.modulo,
 		hidden_dim=args.hidden_dim,
