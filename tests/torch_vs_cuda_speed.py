@@ -26,7 +26,6 @@ def get_grad_output_cuda(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_):
 
 def benchmark():
     configs = [
-        # B, H, I,  J,  K,  D
         (1, 2, 4, 4, 4, 8),   
         (1, 2, 6, 6, 6, 8),  
         (1, 2, 8, 8, 8, 8),  
@@ -35,7 +34,6 @@ def benchmark():
         (1, 2, 24, 24, 24, 8),  
         (1, 2, 32, 32, 32, 8),  
         (1, 2, 48, 48, 48, 8),  
-        # Add more configurations as needed
     ]
 
     dropout_rate = 0.0 # Keep dropout off for direct comparison of core ops
