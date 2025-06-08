@@ -2,6 +2,7 @@
 #include <ATen/cuda/CUDAContext.h>      
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include "../cpp/manual_att3ntion.h"
 
 
 // Forward declarations

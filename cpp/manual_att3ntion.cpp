@@ -6,7 +6,7 @@
 #include <tuple>  
 #include <iomanip> 
 #include <cuda_runtime.h> 
-
+#include "manual_att3ntion.h"
 // Forward declarations for CUDA 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
           torch::Tensor, torch::Tensor,
