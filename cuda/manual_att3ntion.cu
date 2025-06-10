@@ -2030,82 +2030,314 @@ get_interim_grads_cpu(
     return std::make_tuple(grad_Aq_slice_ref, grad_Ar_slice_ref, grad_As_slice_ref);
 }
 
-__global__ void apply_softmax_backward_kernel(
-    const float* __restrict__ grad_Aq_slice_in, // [I, J, K]
-    const float* __restrict__ grad_Ar_slice_in, // [I, J, K]
-    const float* __restrict__ grad_As_slice_in, // [I, J, K]
-    const float* __restrict__ Aq_slice_in,      // [I, J, K]
-    const float* __restrict__ Ar_slice_in,      // [I, J, K]
-    const float* __restrict__ As_slice_in,      // [I, J, K]
-    float* __restrict__ grad_A_slice_out,    // [I, J, K]
+// __global__ void apply_softmax_backward_kernel(
+//     const float* __restrict__ grad_Aq_slice_in, // [I, J, K]
+//     const float* __restrict__ grad_Ar_slice_in, // [I, J, K]
+//     const float* __restrict__ grad_As_slice_in, // [I, J, K]
+//     const float* __restrict__ Aq_slice_in,      // [I, J, K]
+//     const float* __restrict__ Ar_slice_in,      // [I, J, K]
+//     const float* __restrict__ As_slice_in,      // [I, J, K]
+//     float* __restrict__ grad_A_slice_out,    // [I, J, K]
+//     int I_dim, int J_dim, int K_dim
+// ) {
+//     // Map 3D thread indices to (i, j, k) for grad_A_slice_out
+//     int i = blockIdx.x * blockDim.x + threadIdx.x;
+//     int j = blockIdx.y * blockDim.y + threadIdx.y;
+//     int k = blockIdx.z * blockDim.z + threadIdx.z;
+
+//     // Boundary check
+//     if (i >= I_dim || j >= J_dim || k >= K_dim) {
+//         return;
+//     }
+
+//     int64_t ijk_idx = (int64_t)i * J_dim * K_dim + (int64_t)j * K_dim + k;
+//     float final_grad_A_val = 0.0f;
+
+//     // --- 2.1 Contribution from Aq (Softmax over j, k for fixed i) ---
+//     // sum_q = sum_{j',k'} (grad_Aq[i,j',k'] * Aq[i,j',k'])
+//     // This sum is specific to each 'i'.
+//     // All threads with the same 'i' (blockIdx.x * blockDim.x + threadIdx.x) participate.
+//     // We need a reduction across J_dim * K_dim for each 'i'.
+
+//     // For simplicity in this kernel, each thread (i,j,k) calculates its part for sum_q, sum_r, sum_s.
+//     // More optimized: a dedicated reduction kernel or block-wide reduction for each sum_q[i], sum_r[j], sum_s[k].
+//     // This version is less optimal for the sum_q/r/s but simpler to write initially.
+//     // It recomputes sums, which is not ideal.
+
+//     // --- Contribution from grad_Aq ---
+//     float sum_q_for_ijk = 0.0f;
+//     for (int j_prime = 0; j_prime < J_dim; ++j_prime) {
+//         for (int k_prime = 0; k_prime < K_dim; ++k_prime) {
+//             int64_t i_jprime_kprime_idx = (int64_t)i * J_dim * K_dim + (int64_t)j_prime * K_dim + k_prime;
+//             sum_q_for_ijk += grad_Aq_slice_in[i_jprime_kprime_idx] * Aq_slice_in[i_jprime_kprime_idx];
+//         }
+//     }
+//     final_grad_A_val += (grad_Aq_slice_in[ijk_idx] - sum_q_for_ijk) * Aq_slice_in[ijk_idx];
+
+
+//     // --- Contribution from grad_Ar ---
+//     float sum_r_for_ijk = 0.0f;
+//     for (int i_prime = 0; i_prime < I_dim; ++i_prime) {
+//         for (int k_prime = 0; k_prime < K_dim; ++k_prime) {
+//             int64_t iprime_j_kprime_idx = (int64_t)i_prime * J_dim * K_dim + (int64_t)j * K_dim + k_prime;
+//             sum_r_for_ijk += grad_Ar_slice_in[iprime_j_kprime_idx] * Ar_slice_in[iprime_j_kprime_idx];
+//         }
+//     }
+//     final_grad_A_val += (grad_Ar_slice_in[ijk_idx] - sum_r_for_ijk) * Ar_slice_in[ijk_idx];
+    
+
+//     // --- Contribution from grad_As ---
+//     float sum_s_for_ijk = 0.0f;
+//     for (int i_prime = 0; i_prime < I_dim; ++i_prime) {
+//         for (int j_prime = 0; j_prime < J_dim; ++j_prime) {
+//             int64_t iprime_jprime_k_idx = (int64_t)i_prime * J_dim * K_dim + (int64_t)j_prime * K_dim + k;
+//             sum_s_for_ijk += grad_As_slice_in[iprime_jprime_k_idx] * As_slice_in[iprime_jprime_k_idx];
+//         }
+//     }
+//     final_grad_A_val += (grad_As_slice_in[ijk_idx] - sum_s_for_ijk) * As_slice_in[ijk_idx];
+
+//     grad_A_slice_out[ijk_idx] = final_grad_A_val;
+// }
+
+// torch::Tensor apply_softmax_backward_cuda_wrapper(
+//     const torch::Tensor& grad_Aq_slice_gpu, // [I, J, K]
+//     const torch::Tensor& grad_Ar_slice_gpu, // [I, J, K]
+//     const torch::Tensor& grad_As_slice_gpu, // [I, J, K]
+//     const torch::Tensor& Aq_slice_gpu,      // [I, J, K]
+//     const torch::Tensor& Ar_slice_gpu,      // [I, J, K]
+//     const torch::Tensor& As_slice_gpu       // [I, J, K]
+// ) {
+//     TORCH_CHECK(grad_Aq_slice_gpu.is_cuda(), "grad_Aq_slice_gpu must be CUDA");
+//     TORCH_CHECK(grad_Aq_slice_gpu.dim() == 3 && Aq_slice_gpu.dim() == 3, "Inputs must be 3D");
+    
+//     const int I = grad_Aq_slice_gpu.size(0);
+//     const int J = grad_Aq_slice_gpu.size(1);
+//     const int K = grad_Aq_slice_gpu.size(2);
+
+//     TORCH_CHECK(grad_Ar_slice_gpu.sizes() == grad_Aq_slice_gpu.sizes(), "grad_Ar shape mismatch");
+//     // ... add other shape consistency checks ...
+
+//     auto options = grad_Aq_slice_gpu.options();
+//     torch::Tensor grad_A_slice_out_gpu = torch::zeros({I, J, K}, options);
+
+//     constexpr int BLOCK_DIM_I = 8;
+//     constexpr int BLOCK_DIM_J = 8;
+//     constexpr int BLOCK_DIM_K = 8; 
+//     dim3 blockDim(BLOCK_DIM_I, BLOCK_DIM_J, BLOCK_DIM_K);
+//     dim3 gridDim(
+//         (I + BLOCK_DIM_I - 1) / BLOCK_DIM_I,
+//         (J + BLOCK_DIM_J - 1) / BLOCK_DIM_J,
+//         (K + BLOCK_DIM_K - 1) / BLOCK_DIM_K
+//     );
+
+//     // Ensure inputs are contiguous
+//     auto grad_Aq_cont = grad_Aq_slice_gpu.contiguous();
+//     auto grad_Ar_cont = grad_Ar_slice_gpu.contiguous();
+//     auto grad_As_cont = grad_As_slice_gpu.contiguous();
+//     auto Aq_cont = Aq_slice_gpu.contiguous();
+//     auto Ar_cont = Ar_slice_gpu.contiguous();
+//     auto As_cont = As_slice_gpu.contiguous();
+
+//     apply_softmax_backward_kernel<<<gridDim, blockDim>>>(
+//         grad_Aq_cont.data_ptr<float>(),
+//         grad_Ar_cont.data_ptr<float>(),
+//         grad_As_cont.data_ptr<float>(),
+//         Aq_cont.data_ptr<float>(),
+//         Ar_cont.data_ptr<float>(),
+//         As_cont.data_ptr<float>(),
+//         grad_A_slice_out_gpu.data_ptr<float>(),
+//         I, J, K
+//     );
+
+//     cudaError_t err = cudaGetLastError();
+//     if (err != cudaSuccess) {
+//         fprintf(stderr, "CUDA error in apply_softmax_backward_cuda_wrapper: %s\n", cudaGetErrorString(err));
+//     }
+
+//     return grad_A_slice_out_gpu;
+// }
+
+// --- Optimized Softmax Backward Implementation ---
+
+// Stage 1, Kernel 1: Compute sum_q[i] = sum_{j,k} (grad_Aq[i,j,k] * Aq[i,j,k])
+__global__ void compute_softmax_backward_sum_q_kernel(
+    const float* __restrict__ grad_Aq_slice_in,
+    const float* __restrict__ Aq_slice_in,
+    float* __restrict__ sum_q_vec_out, // [I]
+    int I_dim, int J_dim, int K_dim)
+{
+    extern __shared__ float s_data[];
+    int i_current = blockIdx.x;
+    if (i_current >= I_dim) return;
+
+    // Load grad_Aq[i,:,:] and Aq[i,:,:] plane into shared memory and compute product
+    float* s_prod_plane = s_data;
+    int plane_size = J_dim * K_dim;
+    int tid_in_block = threadIdx.x;
+    int threads_in_block = blockDim.x;
+
+    const float* grad_Aq_plane = grad_Aq_slice_in + (int64_t)i_current * plane_size;
+    const float* Aq_plane = Aq_slice_in + (int64_t)i_current * plane_size;
+
+    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
+        s_prod_plane[idx] = grad_Aq_plane[idx] * Aq_plane[idx];
+    }
+    __syncthreads();
+
+    // Parallel reduction to find the sum of s_prod_plane
+    float* s_reduction_pad = s_data; // Reuse shared memory for reduction
+    float thread_sum = 0.0f;
+    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
+        thread_sum += s_prod_plane[idx];
+    }
+    s_reduction_pad[tid_in_block] = thread_sum;
+    __syncthreads();
+
+    for (int offset = threads_in_block / 2; offset > 0; offset >>= 1) {
+        if (tid_in_block < offset) {
+            s_reduction_pad[tid_in_block] += s_reduction_pad[tid_in_block + offset];
+        }
+        __syncthreads();
+    }
+
+    if (tid_in_block == 0) {
+        sum_q_vec_out[i_current] = s_reduction_pad[0];
+    }
+}
+
+// Stage 1, Kernel 2: Compute sum_r[j] = sum_{i,k} (grad_Ar[i,j,k] * Ar[i,j,k])
+__global__ void compute_softmax_backward_sum_r_kernel(
+    const float* __restrict__ grad_Ar_slice_in,
+    const float* __restrict__ Ar_slice_in,
+    float* __restrict__ sum_r_vec_out, // [J]
+    int I_dim, int J_dim, int K_dim)
+{
+    extern __shared__ float s_data[];
+    int j_current = blockIdx.x;
+    if (j_current >= J_dim) return;
+
+    float* s_prod_plane = s_data;
+    int plane_size = I_dim * K_dim;
+    int tid_in_block = threadIdx.x;
+    int threads_in_block = blockDim.x;
+
+    // Load non-contiguous plane data and compute product
+    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
+        int i = idx / K_dim;
+        int k = idx % K_dim;
+        int64_t global_idx = (int64_t)i * J_dim * K_dim + (int64_t)j_current * K_dim + k;
+        s_prod_plane[idx] = grad_Ar_slice_in[global_idx] * Ar_slice_in[global_idx];
+    }
+    __syncthreads();
+
+    // Parallel reduction (same as sum_q_kernel)
+    float* s_reduction_pad = s_data;
+    float thread_sum = 0.0f;
+    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
+        thread_sum += s_prod_plane[idx];
+    }
+    s_reduction_pad[tid_in_block] = thread_sum;
+    __syncthreads();
+
+    for (int offset = threads_in_block / 2; offset > 0; offset >>= 1) {
+        if (tid_in_block < offset) {
+            s_reduction_pad[tid_in_block] += s_reduction_pad[tid_in_block + offset];
+        }
+        __syncthreads();
+    }
+
+    if (tid_in_block == 0) {
+        sum_r_vec_out[j_current] = s_reduction_pad[0];
+    }
+}
+
+// Stage 1, Kernel 3: Compute sum_s[k] = sum_{i,j} (grad_As[i,j,k] * As[i,j,k])
+__global__ void compute_softmax_backward_sum_s_kernel(
+    const float* __restrict__ grad_As_slice_in,
+    const float* __restrict__ As_slice_in,
+    float* __restrict__ sum_s_vec_out, // [K]
+    int I_dim, int J_dim, int K_dim)
+{
+    extern __shared__ float s_data[];
+    int k_current = blockIdx.x;
+    if (k_current >= K_dim) return;
+
+    float* s_prod_plane = s_data;
+    int plane_size = I_dim * J_dim;
+    int tid_in_block = threadIdx.x;
+    int threads_in_block = blockDim.x;
+
+    // Load non-contiguous plane data and compute product
+    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
+        int i = idx / J_dim;
+        int j = idx % J_dim;
+        int64_t global_idx = (int64_t)i * J_dim * K_dim + (int64_t)j * K_dim + k_current;
+        s_prod_plane[idx] = grad_As_slice_in[global_idx] * As_slice_in[global_idx];
+    }
+    __syncthreads();
+
+    // Parallel reduction (same as sum_q_kernel)
+    float* s_reduction_pad = s_data;
+    float thread_sum = 0.0f;
+    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
+        thread_sum += s_prod_plane[idx];
+    }
+    s_reduction_pad[tid_in_block] = thread_sum;
+    __syncthreads();
+
+    for (int offset = threads_in_block / 2; offset > 0; offset >>= 1) {
+        if (tid_in_block < offset) {
+            s_reduction_pad[tid_in_block] += s_reduction_pad[tid_in_block + offset];
+        }
+        __syncthreads();
+    }
+
+    if (tid_in_block == 0) {
+        sum_s_vec_out[k_current] = s_reduction_pad[0];
+    }
+}
+
+
+// Stage 2: Final combination kernel
+__global__ void apply_softmax_backward_optimized_kernel(
+    const float* __restrict__ grad_Aq_slice_in,
+    const float* __restrict__ grad_Ar_slice_in,
+    const float* __restrict__ grad_As_slice_in,
+    const float* __restrict__ Aq_slice_in,
+    const float* __restrict__ Ar_slice_in,
+    const float* __restrict__ As_slice_in,
+    const float* __restrict__ sum_q_vec, // [I]
+    const float* __restrict__ sum_r_vec, // [J]
+    const float* __restrict__ sum_s_vec, // [K]
+    float* __restrict__ grad_A_slice_out, // [I, J, K]
     int I_dim, int J_dim, int K_dim
 ) {
-    // Map 3D thread indices to (i, j, k) for grad_A_slice_out
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     int k = blockIdx.z * blockDim.z + threadIdx.z;
 
-    // Boundary check
     if (i >= I_dim || j >= J_dim || k >= K_dim) {
         return;
     }
 
     int64_t ijk_idx = (int64_t)i * J_dim * K_dim + (int64_t)j * K_dim + k;
-    float final_grad_A_val = 0.0f;
 
-    // --- 2.1 Contribution from Aq (Softmax over j, k for fixed i) ---
-    // sum_q = sum_{j',k'} (grad_Aq[i,j',k'] * Aq[i,j',k'])
-    // This sum is specific to each 'i'.
-    // All threads with the same 'i' (blockIdx.x * blockDim.x + threadIdx.x) participate.
-    // We need a reduction across J_dim * K_dim for each 'i'.
+    // Each component is calculated without loops using the pre-computed sums
+    float grad_A_q_comp = (grad_Aq_slice_in[ijk_idx] - sum_q_vec[i]) * Aq_slice_in[ijk_idx];
+    float grad_A_r_comp = (grad_Ar_slice_in[ijk_idx] - sum_r_vec[j]) * Ar_slice_in[ijk_idx];
+    float grad_A_s_comp = (grad_As_slice_in[ijk_idx] - sum_s_vec[k]) * As_slice_in[ijk_idx];
 
-    // For simplicity in this kernel, each thread (i,j,k) calculates its part for sum_q, sum_r, sum_s.
-    // More optimized: a dedicated reduction kernel or block-wide reduction for each sum_q[i], sum_r[j], sum_s[k].
-    // This version is less optimal for the sum_q/r/s but simpler to write initially.
-    // It recomputes sums, which is not ideal.
-
-    // --- Contribution from grad_Aq ---
-    float sum_q_for_ijk = 0.0f;
-    for (int j_prime = 0; j_prime < J_dim; ++j_prime) {
-        for (int k_prime = 0; k_prime < K_dim; ++k_prime) {
-            int64_t i_jprime_kprime_idx = (int64_t)i * J_dim * K_dim + (int64_t)j_prime * K_dim + k_prime;
-            sum_q_for_ijk += grad_Aq_slice_in[i_jprime_kprime_idx] * Aq_slice_in[i_jprime_kprime_idx];
-        }
-    }
-    final_grad_A_val += (grad_Aq_slice_in[ijk_idx] - sum_q_for_ijk) * Aq_slice_in[ijk_idx];
-
-
-    // --- Contribution from grad_Ar ---
-    float sum_r_for_ijk = 0.0f;
-    for (int i_prime = 0; i_prime < I_dim; ++i_prime) {
-        for (int k_prime = 0; k_prime < K_dim; ++k_prime) {
-            int64_t iprime_j_kprime_idx = (int64_t)i_prime * J_dim * K_dim + (int64_t)j * K_dim + k_prime;
-            sum_r_for_ijk += grad_Ar_slice_in[iprime_j_kprime_idx] * Ar_slice_in[iprime_j_kprime_idx];
-        }
-    }
-    final_grad_A_val += (grad_Ar_slice_in[ijk_idx] - sum_r_for_ijk) * Ar_slice_in[ijk_idx];
-    
-
-    // --- Contribution from grad_As ---
-    float sum_s_for_ijk = 0.0f;
-    for (int i_prime = 0; i_prime < I_dim; ++i_prime) {
-        for (int j_prime = 0; j_prime < J_dim; ++j_prime) {
-            int64_t iprime_jprime_k_idx = (int64_t)i_prime * J_dim * K_dim + (int64_t)j_prime * K_dim + k;
-            sum_s_for_ijk += grad_As_slice_in[iprime_jprime_k_idx] * As_slice_in[iprime_jprime_k_idx];
-        }
-    }
-    final_grad_A_val += (grad_As_slice_in[ijk_idx] - sum_s_for_ijk) * As_slice_in[ijk_idx];
-
-    grad_A_slice_out[ijk_idx] = final_grad_A_val;
+    grad_A_slice_out[ijk_idx] = grad_A_q_comp + grad_A_r_comp + grad_A_s_comp;
 }
 
+
 torch::Tensor apply_softmax_backward_cuda_wrapper(
-    const torch::Tensor& grad_Aq_slice_gpu, // [I, J, K]
-    const torch::Tensor& grad_Ar_slice_gpu, // [I, J, K]
-    const torch::Tensor& grad_As_slice_gpu, // [I, J, K]
-    const torch::Tensor& Aq_slice_gpu,      // [I, J, K]
-    const torch::Tensor& Ar_slice_gpu,      // [I, J, K]
-    const torch::Tensor& As_slice_gpu       // [I, J, K]
+    const torch::Tensor& grad_Aq_slice_gpu,
+    const torch::Tensor& grad_Ar_slice_gpu,
+    const torch::Tensor& grad_As_slice_gpu,
+    const torch::Tensor& Aq_slice_gpu,
+    const torch::Tensor& Ar_slice_gpu,
+    const torch::Tensor& As_slice_gpu
 ) {
     TORCH_CHECK(grad_Aq_slice_gpu.is_cuda(), "grad_Aq_slice_gpu must be CUDA");
     TORCH_CHECK(grad_Aq_slice_gpu.dim() == 3 && Aq_slice_gpu.dim() == 3, "Inputs must be 3D");
@@ -2113,22 +2345,7 @@ torch::Tensor apply_softmax_backward_cuda_wrapper(
     const int I = grad_Aq_slice_gpu.size(0);
     const int J = grad_Aq_slice_gpu.size(1);
     const int K = grad_Aq_slice_gpu.size(2);
-
-    TORCH_CHECK(grad_Ar_slice_gpu.sizes() == grad_Aq_slice_gpu.sizes(), "grad_Ar shape mismatch");
-    // ... add other shape consistency checks ...
-
     auto options = grad_Aq_slice_gpu.options();
-    torch::Tensor grad_A_slice_out_gpu = torch::zeros({I, J, K}, options);
-
-    constexpr int BLOCK_DIM_I = 8;
-    constexpr int BLOCK_DIM_J = 8;
-    constexpr int BLOCK_DIM_K = 8; 
-    dim3 blockDim(BLOCK_DIM_I, BLOCK_DIM_J, BLOCK_DIM_K);
-    dim3 gridDim(
-        (I + BLOCK_DIM_I - 1) / BLOCK_DIM_I,
-        (J + BLOCK_DIM_J - 1) / BLOCK_DIM_J,
-        (K + BLOCK_DIM_K - 1) / BLOCK_DIM_K
-    );
 
     // Ensure inputs are contiguous
     auto grad_Aq_cont = grad_Aq_slice_gpu.contiguous();
@@ -2138,20 +2355,61 @@ torch::Tensor apply_softmax_backward_cuda_wrapper(
     auto Ar_cont = Ar_slice_gpu.contiguous();
     auto As_cont = As_slice_gpu.contiguous();
 
-    apply_softmax_backward_kernel<<<gridDim, blockDim>>>(
-        grad_Aq_cont.data_ptr<float>(),
-        grad_Ar_cont.data_ptr<float>(),
-        grad_As_cont.data_ptr<float>(),
-        Aq_cont.data_ptr<float>(),
-        Ar_cont.data_ptr<float>(),
-        As_cont.data_ptr<float>(),
+    // --- Stage 1: Pre-compute sums ---
+    torch::Tensor sum_q_vec = torch::zeros({I}, options);
+    torch::Tensor sum_r_vec = torch::zeros({J}, options);
+    torch::Tensor sum_s_vec = torch::zeros({K}, options);
+    
+    int threads_per_block = 256; // Common choice for reduction kernels
+
+    // Launch sum_q kernel
+    dim3 gridDim_q(I);
+    dim3 blockDim(threads_per_block);
+    size_t shmem_q = (size_t)(J * K) * sizeof(float);
+    cudaFuncSetAttribute(compute_softmax_backward_sum_q_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_q);
+    compute_softmax_backward_sum_q_kernel<<<gridDim_q, blockDim, shmem_q>>>(
+        grad_Aq_cont.data_ptr<float>(), Aq_cont.data_ptr<float>(), sum_q_vec.data_ptr<float>(), I, J, K
+    );
+
+    // Launch sum_r kernel
+    dim3 gridDim_r(J);
+    size_t shmem_r = (size_t)(I * K) * sizeof(float);
+    cudaFuncSetAttribute(compute_softmax_backward_sum_r_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_r);
+    compute_softmax_backward_sum_r_kernel<<<gridDim_r, blockDim, shmem_r>>>(
+        grad_Ar_cont.data_ptr<float>(), Ar_cont.data_ptr<float>(), sum_r_vec.data_ptr<float>(), I, J, K
+    );
+
+    // Launch sum_s kernel
+    dim3 gridDim_s(K);
+    size_t shmem_s = (size_t)(I * J) * sizeof(float);
+    cudaFuncSetAttribute(compute_softmax_backward_sum_s_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_s);
+    compute_softmax_backward_sum_s_kernel<<<gridDim_s, blockDim, shmem_s>>>(
+        grad_As_cont.data_ptr<float>(), As_cont.data_ptr<float>(), sum_s_vec.data_ptr<float>(), I, J, K
+    );
+
+    // --- Stage 2: Final Combination ---
+    torch::Tensor grad_A_slice_out_gpu = torch::zeros({I, J, K}, options);
+    constexpr int BLOCK_DIM_I = 8;
+    constexpr int BLOCK_DIM_J = 8;
+    constexpr int BLOCK_DIM_K = 8; 
+    dim3 blockDim_final(BLOCK_DIM_I, BLOCK_DIM_J, BLOCK_DIM_K);
+    dim3 gridDim_final(
+        (I + BLOCK_DIM_I - 1) / BLOCK_DIM_I,
+        (J + BLOCK_DIM_J - 1) / BLOCK_DIM_J,
+        (K + BLOCK_DIM_K - 1) / BLOCK_DIM_K
+    );
+
+    apply_softmax_backward_optimized_kernel<<<gridDim_final, blockDim_final>>>(
+        grad_Aq_cont.data_ptr<float>(), grad_Ar_cont.data_ptr<float>(), grad_As_cont.data_ptr<float>(),
+        Aq_cont.data_ptr<float>(), Ar_cont.data_ptr<float>(), As_cont.data_ptr<float>(),
+        sum_q_vec.data_ptr<float>(), sum_r_vec.data_ptr<float>(), sum_s_vec.data_ptr<float>(),
         grad_A_slice_out_gpu.data_ptr<float>(),
         I, J, K
     );
-
+    
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "CUDA error in apply_softmax_backward_cuda_wrapper: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "CUDA error in apply_softmax_backward_cuda_wrapper (optimized): %s\n", cudaGetErrorString(err));
     }
 
     return grad_A_slice_out_gpu;
