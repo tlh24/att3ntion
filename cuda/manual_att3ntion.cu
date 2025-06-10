@@ -112,38 +112,6 @@ __global__ void gather_grad_Vs1_kernel(
     int B, int H, int I, int J, int K, int D, int N_grad,
     float scale);
 
-__global__ void scatter_grad_Vq2_kernel(
-    const float* gradY, 
-    const float* Q,     
-    const float* R,     
-    const float* S,     
-    const float* Vr_2,  
-    const float* Vs_2,  
-    float*       gradVq2, 
-    int B, int H, int I, int J, int K, int D, int N_grad,
-    float scale);
-
-__global__ void scatter_grad_Vr2_kernel(
-    const float* gradY,
-    const float* Q,
-    const float* R,
-    const float* S,
-    const float* Vq_2,
-    const float* Vs_2,
-    float*       gradVr2,
-    int B, int H, int I, int J, int K, int D, int N_grad,
-    float scale);
-
-__global__ void scatter_grad_Vs2_kernel(
-    const float* gradY,
-    const float* Q,
-    const float* R,
-    const float* S,
-    const float* Vq_2,
-    const float* Vr_2,
-    float*       gradVs2,
-    int B, int H, int I, int J, int K, int D, int N_grad,
-    float scale);
 __global__ void compute_A_slice_kernel(
     const float* __restrict__ Q_slice_global, 
     const float* __restrict__ R_slice_global, 
@@ -414,7 +382,6 @@ __global__ void Ys_gather_kernel(
 
 // -- Optimized Scatter Kernels --
 // These kernels operate on a single (b,h) slice and expect pre-computed attention scores.
-
 __global__ void Yq_scatter_kernel_optimized(
     const float* __restrict__ Ar_slice, 
     const float* __restrict__ As_slice,
@@ -522,6 +489,35 @@ __global__ void Ys_scatter_kernel_optimized(
     }
     Y_s__slice[idx] = accum_val;
 }
+__global__ void scatter_grad_Vq2_kernel_optimized(
+    const float* __restrict__ gradY_slice,
+    const float* __restrict__ Aq_slice,
+    const float* __restrict__ Ar_slice,
+    const float* __restrict__ As_slice,
+    const float* __restrict__ Vr_2_slice,
+    const float* __restrict__ Vs_2_slice,
+    float*       __restrict__ gradVq2_slice_out,
+    int I, int J, int K, int D, int N_grad);
+
+__global__ void scatter_grad_Vr2_kernel_optimized(
+    const float* __restrict__ gradY_slice,
+    const float* __restrict__ Aq_slice,
+    const float* __restrict__ Ar_slice,
+    const float* __restrict__ As_slice,
+    const float* __restrict__ Vq_2_slice,
+    const float* __restrict__ Vs_2_slice,
+    float*       __restrict__ gradVr2_slice_out,
+    int I, int J, int K, int D, int N_grad);
+
+__global__ void scatter_grad_Vs2_kernel_optimized(
+    const float* __restrict__ gradY_slice,
+    const float* __restrict__ Aq_slice,
+    const float* __restrict__ Ar_slice,
+    const float* __restrict__ As_slice,
+    const float* __restrict__ Vq_2_slice,
+    const float* __restrict__ Vr_2_slice,
+    float*       __restrict__ gradVs2_slice_out,
+    int I, int J, int K, int D, int N_grad);
 
 // helper: Computes dot product Q[i]*R[j]*S[k] for specific indices
 __device__ inline float compute_dot_product_cuda(
@@ -821,37 +817,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
             B, H, I, J, K, D, scale);
     }
 
-    // // --- SCATTER Calls --- 
-    // // Y_q_[B,H,I,D]
-    // {
-    //     const int64_t N = (int64_t)B*H*I*D;
-    //     const dim3 blocks((N + threads - 1) / threads);
-    //     Yq_scatter_kernel<<<blocks, threads>>>(
-    //         Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
-    //         Vr_2.data_ptr<float>(), Vs_2.data_ptr<float>(), 
-    //         Y_q_.data_ptr<float>(), 
-    //         B, H, I, J, K, D, scale);
-    // }
-    // // Y_r_[B,H,J,D]
-    // {
-    //     const int64_t N = (int64_t)B*H*J*D;
-    //     const dim3 blocks((N + threads - 1) / threads);
-    //     Yr_scatter_kernel<<<blocks, threads>>>(
-    //         Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
-    //         Vq_2.data_ptr<float>(), Vs_2.data_ptr<float>(), 
-    //         Y_r_.data_ptr<float>(), 
-    //         B, H, I, J, K, D, scale);
-    // }
-    // // Y_s_[B,H,K,D]
-    // {
-    //     const int64_t N = (int64_t)B*H*K*D;
-    //     const dim3 blocks((N + threads - 1) / threads);
-    //     Ys_scatter_kernel<<<blocks, threads>>>(
-    //         Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
-    //         Vq_2.data_ptr<float>(), Vr_2.data_ptr<float>(), 
-    //         Y_s_.data_ptr<float>(), 
-    //         B, H, I, J, K, D, scale);
-    // }
     // --- OPTIMIZED SCATTER Calls (Slice-wise) --- 
     for (int b = 0; b < B; ++b) {
         for (int h = 0; h < H; ++h) {
@@ -1136,229 +1101,139 @@ __global__ void gather_grad_Vs1_kernel(
 
     gradVs1[idx] = grad_accum;}
 
-__global__ void scatter_grad_Vq2_kernel(
-    const float* gradY, 
-    const float* Q,     
-    const float* R,     
-    const float* S,     
-    const float* Vr_2,  
-    const float* Vs_2,  
-    float*       gradVq2, 
-    int B, int H, int I, int J, int K, int D, int N_grad,
-    float scale)
-{
-    // global thread index maps to [B,H,I,D]
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (int64_t)B*H*I*D) return;
+__global__ void scatter_grad_Vq2_kernel_optimized(
+    const float* __restrict__ gradY_slice,
+    const float* __restrict__ Aq_slice,
+    const float* __restrict__ Ar_slice,
+    const float* __restrict__ As_slice,
+    const float* __restrict__ Vr_2_slice,
+    const float* __restrict__ Vs_2_slice,
+    float*       __restrict__ gradVq2_slice_out,
+    int I, int J, int K, int D, int N_grad) {
 
-    // decode (b,h,i,d) - This thread calculates gradVq2[b,h,i,d]
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (int64_t)I * D) return;
+
     int d = idx % D;
-    int tmp = idx / D;
-    int i_target = tmp % I; // This is the target 'i' for the gradient
-    tmp = tmp / I;
-    int h = tmp % H;
-    int b = tmp / H;
+    int i_target = idx / D;
 
     float grad_accum = 0.0f;
 
-    // Base offset for gradY for the current (b, h)
-    // gradY contains the upstream gradients dL/dY_r_ and dL/dY_s_
-    int64_t gradY_offset_bh = ((int64_t)b * H + h) * N_grad * D;
+    // Term 1: from dL/dY_r'
+    for (int j = 0; j < J; ++j) {
+        if (j >= N_grad) continue;
+        float dy_r = gradY_slice[(int64_t)j * D + d];
+        if (dy_r == 0.0f) continue;
 
-    // --- 1. Contribution from Y_r_ path (dL/dY_r_) ---
-    // dL/dVq_2[i] += sum_{j,k} [ dL/dY_r_[j] * Aq[i,j,k] * As[i,j,k] * Vs_2[k] ]
-    for (int j = 0; j < J; ++j) { // Loop over the source gradient index 'j' from Y_r_
-        if (j >= N_grad) continue; // Check bounds for gradY access
-        float dy_r = gradY[gradY_offset_bh + (int64_t)j * D + d];
-
-        if (dy_r != 0.0f) { // Optimization
-            for (int k = 0; k < K; ++k) {
-                // Calculate Aq[b,h,i_target,j,k] (softmax over j', k' for fixed i)
-                float attn_aq = compute_single_softmax_attn_cuda(Q, R, S, b, h, i_target, j, k, B, H, I, J, K, D, scale, 0);
-                // Calculate As[b,h,i_target,j,k] (softmax over i', j' for fixed k)
-                float attn_as = compute_single_softmax_attn_cuda(Q, R, S, b, h, i_target, j, k, B, H, I, J, K, D, scale, 2);
-                // Get Vs_2[b,h,k,d]
-                const float* vs2_vec = Vs_2 + (((int64_t)b * H + h) * K + k) * D;
-                float vs2_val = vs2_vec[d];
-
-                grad_accum += dy_r * attn_aq * attn_as * vs2_val;
-            }
+        for (int k = 0; k < K; ++k) {
+            int64_t ijk_idx = (int64_t)i_target * J * K + (int64_t)j * K + k;
+            grad_accum += dy_r * Aq_slice[ijk_idx] * As_slice[ijk_idx] * Vs_2_slice[(int64_t)k * D + d];
         }
     }
 
-    // --- 2. Contribution from Y_s_ path (dL/dY_s_) ---
-    // dL/dVq_2[i] += sum_{k,j} [ dL/dY_s_[k] * Aq[i,j,k] * Ar[i,j,k] * Vr_2[j] ]
-    for (int k = 0; k < K; ++k) { // Loop over the source gradient index 'k' from Y_s_
-        if (k >= N_grad) continue; // Check bounds for gradY access
-        float dy_s = gradY[gradY_offset_bh + (int64_t)k * D + d];
-
-        if (dy_s != 0.0f) { 
-            for (int j = 0; j < J; ++j) {
-                 // Calculate Aq[b,h,i_target,j,k] (softmax over j', k' for fixed i)
-                 float attn_aq = compute_single_softmax_attn_cuda(Q, R, S, b, h, i_target, j, k, B, H, I, J, K, D, scale, 0);
-                 // Calculate Ar[b,h,i_target,j,k] (softmax over i', k' for fixed j)
-                 float attn_ar = compute_single_softmax_attn_cuda(Q, R, S, b, h, i_target, j, k, B, H, I, J, K, D, scale, 1);
-                 // Get Vr_2[b,h,j,d]
-                 const float* vr2_vec = Vr_2 + (((int64_t)b * H + h) * J + j) * D;
-                 float vr2_val = vr2_vec[d];
-
-                 grad_accum += dy_s * attn_aq * attn_ar * vr2_val;
-            }
+    // Term 2: from dL/dY_s'
+    for (int k = 0; k < K; ++k) {
+        if (k >= N_grad) continue;
+        float dy_s = gradY_slice[(int64_t)k * D + d];
+        if (dy_s == 0.0f) continue;
+        
+        for (int j = 0; j < J; ++j) {
+            int64_t ijk_idx = (int64_t)i_target * J * K + (int64_t)j * K + k;
+            grad_accum += dy_s * Aq_slice[ijk_idx] * Ar_slice[ijk_idx] * Vr_2_slice[(int64_t)j * D + d];
         }
     }
 
-    // final accumulated gradient for Vq_2[b,h,i_target,d]
-    gradVq2[idx] = grad_accum;
+    gradVq2_slice_out[idx] = grad_accum;
 }
 
-__global__ void scatter_grad_Vr2_kernel(
-    const float* gradY, 
-    const float* Q,     
-    const float* R,     
-    const float* S,     
-    const float* Vq_2,  
-    const float* Vs_2,  
-    float*       gradVr2, 
-    int B, int H, int I, int J, int K, int D, int N_grad,
-    float scale)
-{
-    // global thread index maps to [B,H,J,D]
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (int64_t)B*H*J*D) return;
+__global__ void scatter_grad_Vr2_kernel_optimized(
+    const float* __restrict__ gradY_slice,
+    const float* __restrict__ Aq_slice,
+    const float* __restrict__ Ar_slice,
+    const float* __restrict__ As_slice,
+    const float* __restrict__ Vq_2_slice,
+    const float* __restrict__ Vs_2_slice,
+    float*       __restrict__ gradVr2_slice_out,
+    int I, int J, int K, int D, int N_grad) {
 
-    // decode (b,h,j,d) - This thread calculates gradVr2[b,h,j,d]
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (int64_t)J * D) return;
+
     int d = idx % D;
-    int tmp = idx / D;
-    int j_target = tmp % J; // This is the target 'j' for the gradient
-    tmp = tmp / J;
-    int h = tmp % H;
-    int b = tmp / H;
+    int j_target = idx / D;
 
     float grad_accum = 0.0f;
 
-    // Base offset for gradY for the current (b, h)
-    int64_t gradY_offset_bh = ((int64_t)b * H + h) * N_grad * D;
+    // Term 1: from dL/dY_q'
+    for (int i = 0; i < I; ++i) {
+        if (i >= N_grad) continue;
+        float dy_q = gradY_slice[(int64_t)i * D + d];
+        if (dy_q == 0.0f) continue;
 
-    // --- 1. Contribution from Y_q_ path (dL/dY_q_) ---
-    // dL/dVr_2[j] += sum_{i,k} [ dL/dY_q_[i] * Ar[i,j,k] * As[i,j,k] * Vs_2[k] ]
-    for (int i = 0; i < I; ++i) { // Loop over the source gradient index 'i' from Y_q_
-        if (i >= N_grad) continue; // Check bounds for gradY access
-        float dy_q = gradY[gradY_offset_bh + (int64_t)i * D + d];
-
-        if (dy_q != 0.0f) { 
-            for (int k = 0; k < K; ++k) {
-                // Calculate Ar[b,h,i,j_target,k] (softmax over i', k' for fixed j)
-                float attn_ar = compute_single_softmax_attn_cuda(Q, R, S, b, h, i, j_target, k, B, H, I, J, K, D, scale, 1);
-                // Calculate As[b,h,i,j_target,k] (softmax over i', j' for fixed k)
-                float attn_as = compute_single_softmax_attn_cuda(Q, R, S, b, h, i, j_target, k, B, H, I, J, K, D, scale, 2);
-                // Get Vs_2[b,h,k,d]
-                const float* vs2_vec = Vs_2 + (((int64_t)b * H + h) * K + k) * D;
-                float vs2_val = vs2_vec[d];
-
-                grad_accum += dy_q * attn_ar * attn_as * vs2_val;
-            }
+        for (int k = 0; k < K; ++k) {
+            int64_t ijk_idx = (int64_t)i * J * K + (int64_t)j_target * K + k;
+            grad_accum += dy_q * Ar_slice[ijk_idx] * As_slice[ijk_idx] * Vs_2_slice[(int64_t)k * D + d];
         }
     }
 
-    // --- 2. Contribution from Y_s_ path (dL/dY_s_) ---
-    // dL/dVr_2[j] += sum_{k,i} [ dL/dY_s_[k] * Aq[i,j,k] * Ar[i,j,k] * Vq_2[i] ]
-    for (int k = 0; k < K; ++k) { // Loop over the source gradient index 'k' from Y_s_
-        if (k >= N_grad) continue; // Check bounds for gradY access
-        float dy_s = gradY[gradY_offset_bh + (int64_t)k * D + d];
-
-        if (dy_s != 0.0f) { 
-            for (int i = 0; i < I; ++i) {
-                // Calculate Aq[b,h,i,j_target,k] (softmax over j', k' for fixed i)
-                float attn_aq = compute_single_softmax_attn_cuda(Q, R, S, b, h, i, j_target, k, B, H, I, J, K, D, scale, 0);
-                // Calculate Ar[b,h,i,j_target,k] (softmax over i', k' for fixed j)
-                float attn_ar = compute_single_softmax_attn_cuda(Q, R, S, b, h, i, j_target, k, B, H, I, J, K, D, scale, 1);
-                // Get Vq_2[b,h,i,d]
-                const float* vq2_vec = Vq_2 + (((int64_t)b * H + h) * I + i) * D;
-                float vq2_val = vq2_vec[d];
-
-                grad_accum += dy_s * attn_aq * attn_ar * vq2_val;
-            }
+    // Term 2: from dL/dY_s'
+    for (int k = 0; k < K; ++k) {
+        if (k >= N_grad) continue;
+        float dy_s = gradY_slice[(int64_t)k * D + d];
+        if (dy_s == 0.0f) continue;
+        
+        for (int i = 0; i < I; ++i) {
+            int64_t ijk_idx = (int64_t)i * J * K + (int64_t)j_target * K + k;
+            grad_accum += dy_s * Aq_slice[ijk_idx] * Ar_slice[ijk_idx] * Vq_2_slice[(int64_t)i * D + d];
         }
     }
 
-    // final accumulated gradient for Vr_2[b,h,j_target,d]
-    gradVr2[idx] = grad_accum;
+    gradVr2_slice_out[idx] = grad_accum;
 }
 
-// Kernel to compute gradient for Vs_2
-// Mirrors the logic of compute_grad_Vs_2 in the C++ version
-__global__ void scatter_grad_Vs2_kernel(
-    const float* gradY, 
-    const float* Q,     
-    const float* R,     
-    const float* S,     
-    const float* Vq_2,  
-    const float* Vr_2,  
-    float*       gradVs2, 
-    int B, int H, int I, int J, int K, int D, int N_grad,
-    float scale)
-{
-    // global thread index maps to [B,H,K,D]
+__global__ void scatter_grad_Vs2_kernel_optimized(
+    const float* __restrict__ gradY_slice,
+    const float* __restrict__ Aq_slice,
+    const float* __restrict__ Ar_slice,
+    const float* __restrict__ As_slice,
+    const float* __restrict__ Vq_2_slice,
+    const float* __restrict__ Vr_2_slice,
+    float*       __restrict__ gradVs2_slice_out,
+    int I, int J, int K, int D, int N_grad) {
+    
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (int64_t)B*H*K*D) return;
+    if (idx >= (int64_t)K * D) return;
 
-    // decode (b,h,k,d) - This thread calculates gradVs2[b,h,k,d]
     int d = idx % D;
-    int tmp = idx / D;
-    int k_target = tmp % K; // This is the target 'k' for the gradient
-    tmp = tmp / K;
-    int h = tmp % H;
-    int b = tmp / H;
+    int k_target = idx / D;
 
     float grad_accum = 0.0f;
 
-    // Base offset for gradY for the current (b, h)
-    int64_t gradY_offset_bh = ((int64_t)b * H + h) * N_grad * D;
+    // Term 1: from dL/dY_q'
+    for (int i = 0; i < I; ++i) {
+        if (i >= N_grad) continue;
+        float dy_q = gradY_slice[(int64_t)i * D + d];
+        if (dy_q == 0.0f) continue;
 
-    // --- 1. Contribution from Y_q_ path (dL/dY_q_) ---
-    // dL/dVs_2[k] += sum_{i,j} [ dL/dY_q_[i] * Ar[i,j,k] * As[i,j,k] * Vr_2[j] ]
-    for (int i = 0; i < I; ++i) { // Loop over the source gradient index 'i' from Y_q_
-        if (i >= N_grad) continue; // Check bounds for gradY access
-        float dy_q = gradY[gradY_offset_bh + (int64_t)i * D + d];
-
-        if (dy_q != 0.0f) { 
-            for (int j = 0; j < J; ++j) {
-                // Calculate Ar[b,h,i,j,k_target] (softmax over i', k' for fixed j)
-                float attn_ar = compute_single_softmax_attn_cuda(Q, R, S, b, h, i, j, k_target, B, H, I, J, K, D, scale, 1);
-                // Calculate As[b,h,i,j,k_target] (softmax over i', j' for fixed k)
-                float attn_as = compute_single_softmax_attn_cuda(Q, R, S, b, h, i, j, k_target, B, H, I, J, K, D, scale, 2);
-                // Get Vr_2[b,h,j,d]
-                const float* vr2_vec = Vr_2 + (((int64_t)b * H + h) * J + j) * D;
-                float vr2_val = vr2_vec[d];
-
-                grad_accum += dy_q * attn_ar * attn_as * vr2_val;
-            }
+        for (int j = 0; j < J; ++j) {
+            int64_t ijk_idx = (int64_t)i * J * K + (int64_t)j * K + k_target;
+            grad_accum += dy_q * Ar_slice[ijk_idx] * As_slice[ijk_idx] * Vr_2_slice[(int64_t)j * D + d];
         }
     }
 
-    // --- 2. Contribution from Y_r_ path (dL/dY_r_) ---
-    // dL/dVs_2[k] += sum_{j,i} [ dL/dY_r_[j] * Aq[i,j,k] * As[i,j,k] * Vq_2[i] ]
-    for (int j = 0; j < J; ++j) { // Loop over the source gradient index 'j' from Y_r_
-        if (j >= N_grad) continue; // Check bounds for gradY access
-        float dy_r = gradY[gradY_offset_bh + (int64_t)j * D + d];
+    // Term 2: from dL/dY_r'
+    for (int j = 0; j < J; ++j) {
+        if (j >= N_grad) continue;
+        float dy_r = gradY_slice[(int64_t)j * D + d];
+        if (dy_r == 0.0f) continue;
 
-        if (dy_r != 0.0f) { 
-            for (int i = 0; i < I; ++i) {
-                // Calculate Aq[b,h,i,j,k_target] (softmax over j', k' for fixed i)
-                float attn_aq = compute_single_softmax_attn_cuda(Q, R, S, b, h, i, j, k_target, B, H, I, J, K, D, scale, 0);
-                // Calculate As[b,h,i,j,k_target] (softmax over i', j' for fixed k)
-                float attn_as = compute_single_softmax_attn_cuda(Q, R, S, b, h, i, j, k_target, B, H, I, J, K, D, scale, 2);
-                // Get Vq_2[b,h,i,d]
-                const float* vq2_vec = Vq_2 + (((int64_t)b * H + h) * I + i) * D;
-                float vq2_val = vq2_vec[d];
-
-                grad_accum += dy_r * attn_aq * attn_as * vq2_val;
-            }
+        for (int i = 0; i < I; ++i) {
+            int64_t ijk_idx = (int64_t)i * J * K + (int64_t)j * K + k_target;
+            grad_accum += dy_r * Aq_slice[ijk_idx] * As_slice[ijk_idx] * Vq_2_slice[(int64_t)i * D + d];
         }
     }
 
-    // final accumulated gradient for Vs_2[b,h,k_target,d]
-    gradVs2[idx] = grad_accum;
+    gradVs2_slice_out[idx] = grad_accum;
 }
 
 // -- needed for grad_Q, grad_R, grad_S : multi-kernel implementation --
@@ -2646,30 +2521,6 @@ backward_cuda(
           Vq_1.data_ptr<float>(), Vr_1.data_ptr<float>(), grad_Vs_1.data_ptr<float>(),
           B, H, I, J, K, D, N_grad, scale); 
   }
-  { 
-      const int64_t N_kernel_Vq2 = (int64_t)B * H * I * D; 
-      const dim3 blocks_Vq2((N_kernel_Vq2 + threads - 1) / threads);
-      scatter_grad_Vq2_kernel<<<blocks_Vq2, threads>>>( 
-          grad_output.data_ptr<float>(), Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(), 
-          Vr_2.data_ptr<float>(), Vs_2.data_ptr<float>(), grad_Vq_2.data_ptr<float>(),
-          B, H, I, J, K, D, N_grad, scale); 
-  }
-  { 
-      const int64_t N_kernel_Vr2 = (int64_t)B * H * J * D; 
-      const dim3 blocks_Vr2((N_kernel_Vr2 + threads - 1) / threads);
-      scatter_grad_Vr2_kernel<<<blocks_Vr2, threads>>>( 
-          grad_output.data_ptr<float>(), Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(), 
-          Vq_2.data_ptr<float>(), Vs_2.data_ptr<float>(), grad_Vr_2.data_ptr<float>(),
-          B, H, I, J, K, D, N_grad, scale); 
-  }
-  { 
-      const int64_t N_kernel_Vs2 = (int64_t)B * H * K * D; 
-      const dim3 blocks_Vs2((N_kernel_Vs2 + threads - 1) / threads);
-      scatter_grad_Vs2_kernel<<<blocks_Vs2, threads>>>( 
-          grad_output.data_ptr<float>(), Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(), 
-          Vq_2.data_ptr<float>(), Vr_2.data_ptr<float>(), grad_Vs_2.data_ptr<float>(),
-          B, H, I, J, K, D, N_grad, scale); 
-  }
 
   // --- 4. Compute full grad_A tensor on GPU by processing slice by slice --- 
   auto grad_A_batched_gpu = torch::zeros({B, H, I, J, K}, Q.options()); // Allocate full grad_A on GPU Global Memory
@@ -2696,6 +2547,42 @@ backward_cuda(
           torch::Tensor Ar_slice_gpu = compute_Ar_slice_cuda_wrapper(A_slice_gpu);
           torch::Tensor As_slice_gpu = compute_As_slice_cuda_wrapper(A_slice_gpu);
           
+          {
+              auto gradVq2_slice = grad_Vq_2.select(0, b).select(0, h);
+              const int64_t N_kernel = (int64_t)I * D;
+              const dim3 blocks((N_kernel + threads - 1) / threads);
+              scatter_grad_Vq2_kernel_optimized<<<blocks, threads>>>(
+                  grad_output_slice_gpu.data_ptr<float>(),
+                  Aq_slice_gpu.data_ptr<float>(), Ar_slice_gpu.data_ptr<float>(), As_slice_gpu.data_ptr<float>(),
+                  Vr_2_slice_gpu.data_ptr<float>(), Vs_2_slice_gpu.data_ptr<float>(),
+                  gradVq2_slice.data_ptr<float>(),
+                  I, J, K, D, N_grad
+              );
+          }
+          {
+              auto gradVr2_slice = grad_Vr_2.select(0, b).select(0, h);
+              const int64_t N_kernel = (int64_t)J * D;
+              const dim3 blocks((N_kernel + threads - 1) / threads);
+              scatter_grad_Vr2_kernel_optimized<<<blocks, threads>>>(
+                  grad_output_slice_gpu.data_ptr<float>(),
+                  Aq_slice_gpu.data_ptr<float>(), Ar_slice_gpu.data_ptr<float>(), As_slice_gpu.data_ptr<float>(),
+                  Vq_2_slice_gpu.data_ptr<float>(), Vs_2_slice_gpu.data_ptr<float>(),
+                  gradVr2_slice.data_ptr<float>(),
+                  I, J, K, D, N_grad
+              );
+          }
+          {
+              auto gradVs2_slice = grad_Vs_2.select(0, b).select(0, h);
+              const int64_t N_kernel = (int64_t)K * D;
+              const dim3 blocks((N_kernel + threads - 1) / threads);
+              scatter_grad_Vs2_kernel_optimized<<<blocks, threads>>>(
+                  grad_output_slice_gpu.data_ptr<float>(),
+                  Aq_slice_gpu.data_ptr<float>(), Ar_slice_gpu.data_ptr<float>(), As_slice_gpu.data_ptr<float>(),
+                  Vq_2_slice_gpu.data_ptr<float>(), Vr_2_slice_gpu.data_ptr<float>(),
+                  gradVs2_slice.data_ptr<float>(),
+                  I, J, K, D, N_grad
+              );
+          }
           torch::Tensor grad_Aq_slice_gpu_tmp, grad_Ar_slice_gpu_tmp, grad_As_slice_gpu_tmp;
           std::tie(grad_Aq_slice_gpu_tmp, grad_Ar_slice_gpu_tmp, grad_As_slice_gpu_tmp) = 
               compute_interim_grads_cuda_wrapper(
