@@ -33,13 +33,20 @@ def benchmark():
         (1, 2, 16, 16, 16, 8),  
         (1, 2, 24, 24, 24, 8),  
         (1, 2, 32, 32, 32, 8),  
-        (1, 2, 48, 48, 48, 8),  
+        (1, 2, 48, 48, 48, 8),
+        (1, 2, 64, 64, 64, 8),
+        (1, 2, 96, 96, 96, 8),
+        (1, 2, 128, 128, 128, 8), #fails for larger inputs due to shared memory size / need to make this dynamic
+
     ]
 
     dropout_rate = 0.0 # Keep dropout off for direct comparison of core ops
 
-    print(f"{'Config (B,H,I,J,K,D)':<25} | {'Manual CUDA (ms)':<20} | {'PyTorch C++ Ref (ms)':<25}")
-    print("-" * 80)
+    header = (f"{'Config (B,H,I,J,K,D)':<25} | "
+              f"{'Manual Time (ms)':<20} | {'Manual Mem (MB)':<20} | "
+              f"{'PyTorch Time (ms)':<20} | {'PyTorch Mem (MB)':<20}")
+    print(header)
+    print("-" * len(header))
 
     for B, H, I_dim, J_dim, K_dim, D_dim in configs:
         config_str = f"({B},{H},{I_dim},{J_dim},{K_dim},{D_dim})"
@@ -63,7 +70,9 @@ def benchmark():
 
 
         # --- Manual CUDA Benchmark ---
+        torch.cuda.reset_peak_memory_stats()
         total_time_manual_cuda = 0
+        peak_mem_manual_cuda_mb = 0
         try:
             # Forward
             torch.cuda.synchronize()
@@ -95,10 +104,13 @@ def benchmark():
             torch.cuda.synchronize()
             bwd_time_manual = time.perf_counter() - start_time
             total_time_manual_cuda += bwd_time_manual
-            print(f"{total_time_manual_cuda * 1000:.4f} ms".ljust(20) + " | ", end="")
+
+            peak_mem_manual_cuda_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+            
+            print(f"{total_time_manual_cuda * 1000:<20.4f} | {peak_mem_manual_cuda_mb:<20.2f} | ", end="")
 
         except Exception as e:
-            print(f"CUDA Error: {e}".ljust(20) + " | ", end="")
+            print(f"{'CUDA Error:':<20} | {'N/A':<20} | ", end="")
             total_time_manual_cuda = float('inf') # Indicate failure
 
 
@@ -113,7 +125,9 @@ def benchmark():
         Vs_1_ref = Vs_1.clone().requires_grad_(True)
         Vs_2_ref = Vs_2.clone().requires_grad_(True)
         
+        torch.cuda.reset_peak_memory_stats()
         total_time_pytorch_ref = 0
+        peak_mem_pytorch_ref_mb = 0
         try:
             # Forward
             torch.cuda.synchronize()
@@ -139,10 +153,12 @@ def benchmark():
             torch.cuda.synchronize()
             bwd_time_ref = time.perf_counter() - start_time
             total_time_pytorch_ref += bwd_time_ref
-            print(f"{total_time_pytorch_ref * 1000:.4f} ms".ljust(25))
+
+            peak_mem_pytorch_ref_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+            print(f"{total_time_pytorch_ref * 1000:<20.4f} | {peak_mem_pytorch_ref_mb:<20.2f}")
 
         except Exception as e:
-            print(f"PyTorch Ref Error: {e}".ljust(25))
+            print(f"{'PyTorch Ref Error:':<20} | {'N/A':<20}")
             total_time_pytorch_ref = float('inf')
 
         # Clear gradients for next iteration if any tensors were reused with requires_grad=True
@@ -151,7 +167,7 @@ def benchmark():
         if R_ref.grad is not None: R_ref.grad.zero_()
         # ... and so on for all grad-requiring tensors
 
-    print("-" * 80)
+    print("-" * len(header))
 
 if __name__ == '__main__':
     # Before running, ensure the extensions are compiled:
