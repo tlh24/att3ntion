@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import random
 
 def randint(k):
 	return np.random.randint(k)
@@ -131,16 +132,81 @@ def genData3(bs, md):
 
 	return x
 
+class Expression:
+	def __init__(self, value=None, operator=None, left=None, right=None):
+		self.value = value
+		self.operator = operator
+		self.left = left
+		self.right = right
+
+	def __str__(self):
+		if self.value is not None:
+			return str(self.value)
+		return f"({self.left} {self.operator} {self.right})"
+
+class ExpressionGenerator:
+	"""Recursively generates random arithmetic expression trees."""
+	OPERATORS = ['+', '-', '*', '/']
+
+	def __init__(self, max_terms, modulo):
+		self.max_terms = max(2, max_terms) # Need at least 2 terms for an op
+		self.modulo = modulo
+
+	def generate(self):
+		"""Public method to generate a new expression tree."""
+		return self._generate_recursive(self.max_terms)
+
+	def _generate_recursive(self, terms_count):
+		"""The core recursive generation logic."""
+		# Base case: if only one term is left, it must be a number.
+		if terms_count <= 1:
+			return Expression(value=random.randrange(self.modulo))
+
+		op = random.choice(self.OPERATORS)
+
+		# Split the remaining terms between left and right children.
+		left_terms = random.randint(1, terms_count - 1)
+		right_terms = terms_count - left_terms
+
+		left_child = self._generate_recursive(left_terms)
+		right_child = self._generate_recursive(right_terms)
+
+		# Prevent division by the literal number 0.
+		if op == '/' and str(right_child) == '0':
+			while str(right_child) == '0':
+				right_child = self._generate_recursive(right_terms) # Reroll
+
+		return Expression(operator=op, left=left_child, right=right_child)
+
+def genData4(bs, md):
+	'''
+	Task 4: from random arithmetic expressions,
+	generate parse trees
+	'''
+	pos_enc = np.zeros((10,8), dtype=np.float32)
+	indx = np.linspace(0, 2*3.1415926, 10)
+	for i in range(4):
+		freq = 2**(i/3)
+		pos_enc[:, 2*i  ] = np.sin(indx * freq)
+		pos_enc[:, 2*i+1] = np.cos(indx * freq)
+
+	x = np.zeros((bs, 16, md + 5 + 8*3), dtype=np.float32)
+	exp_gen = ExpressionGenerator(5, 19)
+	for i in range(bs):
+		tree = exp_gen.generate()
+		print(tree)
 
 if __name__ == '__main__':
-	genData1(15, 19, True)
-	genData2(15, 19, True)
+	# genData1(15, 19, True)
+	# genData2(15, 19, True)
 
-	x = genData3(4, 19)
-	print(x.shape)
-	fig,axs = plt.subplots(2,2)
-	for i in range(4):
-		j = i // 2
-		k = i % 2
-		axs[j,k].imshow(np.squeeze(x[i,...]))
-	plt.show()
+	# x = genData3(4, 19)
+	# print(x.shape)
+	# fig,axs = plt.subplots(2,2)
+	# for i in range(4):
+	# 	j = i // 2
+	# 	k = i % 2
+	# 	axs[j,k].imshow(np.squeeze(x[i,...]))
+	# plt.show()
+
+	genData4(10)
