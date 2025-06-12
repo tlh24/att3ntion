@@ -15,14 +15,14 @@ if parent_dir_str not in sys.path:
 
 from hyper_attn_pytorch import HypergraphAttention_Naive, GraphAttention_Naive, QuickGELU
 # from hyper_attn_cpp_wrapper import HypergraphAttentionCPP
-from gen_data_comp import genData1, genData2
+from gen_data_comp import genData1, genData2, genData3
 import pdb
 
 class SimpleCompModel(nn.Module):
 	"""Model with hypergraph attention layer."""
 	def __init__(self, hidden_dim:int, num_heads:int, n_layers:int, attn_impl:str=''):
 		super().__init__()
-		input_dim = 32
+		input_dim = 48
 		self.embedding_proj = nn.Linear(input_dim, hidden_dim)
 		self.rotary_emb = RotaryEmbedding(dim = hidden_dim)
 		self.attn_impl = attn_impl
@@ -59,7 +59,8 @@ class SimpleCompModel(nn.Module):
 		x = self.embedding_proj(x)
 
 		for layer_block in self.repeated_layers:
-			attn_output = layer_block['attention'](x, self.rotary_emb)
+			# attn_output = layer_block['attention'](x, self.rotary_emb)
+			attn_output = layer_block['attention'](x, None)
 			x = layer_block['norm1'](x + attn_output)
 			ffn_output = layer_block['ffn'](x)
 			x = layer_block['norm2'](x + ffn_output)
@@ -231,18 +232,18 @@ class CompModel(nn.Module):
 		)
 		print(f"CompModel {self.attn_impl}: number of model parameters:{trainable_params/1e6}M")
 
-def prepare_data(data_tensor, device):
+def prepare_data(data_tensor, device, modulo):
 	inputs = data_tensor.copy()
 	# Mask the value
 	inputs[:, -1, :] = 0
 	
 	# Extract targets
-	value_targets = np.argmax(data_tensor[:, -1, 4:], axis=1)
+	value_targets = np.argmax(data_tensor[:, -1, 5:5+modulo], axis=1)
 	
 	return (torch.FloatTensor(inputs).to(device), 
 			torch.LongTensor(value_targets).to(device))
 
-def train_model1(num_epochs=40, batch_size=128, hidden_dim=128, num_heads=4, device='cpu', modulo=23, attn_impl=""):
+def train_model1(num_epochs=40, batch_size=128, hidden_dim=96, num_heads=4, device='auto', modulo=19, attn_impl=""):
 	
 	if device == 'auto':
 		if torch.cuda.is_available():
@@ -254,14 +255,14 @@ def train_model1(num_epochs=40, batch_size=128, hidden_dim=128, num_heads=4, dev
 	
 	print(f"Using device: {device}")
 	
-	data = genData1(batch_size * 1000, modulo)
+	data = genData3(batch_size * 1000, modulo) ## NOTE
 	dataset = TensorDataset(torch.tensor(data))
 	train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
 	if attn_impl == "hypergraph":
-		n_layers = 1
-	else:
 		n_layers = 2
+	else:
+		n_layers = 4
 
 	model = SimpleCompModel(hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl).to(device)
 	optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
@@ -280,7 +281,7 @@ def train_model1(num_epochs=40, batch_size=128, hidden_dim=128, num_heads=4, dev
 		total = 0
 		
 		for batch_idx, (inputs_np,) in enumerate(train_loader):
-			inputs, value_targets = prepare_data(inputs_np.numpy(), device)
+			inputs, value_targets = prepare_data(inputs_np.numpy(), device, modulo)
 			
 			optimizer.zero_grad()
 			value_pred = model(inputs)
@@ -386,7 +387,7 @@ if __name__ == '__main__':
 	parser.add_argument('--epochs', type=int, default=15, help='Number of epochs')
 	parser.add_argument('--batch-size', type=int, default=128, help='Batch size for training')
 	parser.add_argument('--modulo', type=int, default=19, help='Modulo for arithmetic operations')
-	parser.add_argument('--hidden-dim', type=int, default=128, help='Hidden dimension size')
+	parser.add_argument('--hidden-dim', type=int, default=96, help='Hidden dimension size')
 	parser.add_argument('--num-heads', type=int, default=4, help='Number of attention heads')
 	parser.add_argument('--attn-impl', type=str, default='hypergraph', choices=['hypergraph', 'graph'],
 						help='Attention implementation to use')
@@ -408,14 +409,14 @@ if __name__ == '__main__':
 		batch_size=args.batch_size
 	)
 	model.save_model(f"comp_model_{args.attn_impl}.pt")
-
-	model = train_model2(
-		num_epochs=10,
-		device=args.device,
-		modulo=args.modulo,
-		hidden_dim=args.hidden_dim,
-		num_heads=args.num_heads,
-		attn_impl=args.attn_impl,
-		batch_size=args.batch_size
-	)
+ #
+	# model = train_model2(
+	# 	num_epochs=10,
+	# 	device=args.device,
+	# 	modulo=args.modulo,
+	# 	hidden_dim=args.hidden_dim,
+	# 	num_heads=args.num_heads,
+	# 	attn_impl=args.attn_impl,
+	# 	batch_size=args.batch_size
+	# )
 

@@ -1,4 +1,5 @@
 import numpy as np
+import matplotlib.pyplot as plt
 
 def randint(k):
 	return np.random.randint(k)
@@ -97,7 +98,49 @@ def genData2(bs, md, do_print=False):
 	# endfor b
 	return x
 
+def genData3(bs, md):
+	'''
+	Task 3: from a list of 8 integers,
+	compute the op of two of them based on *pointers*
+	rather than positional arguments.
+	This ought to be easy.
+	'''
+	pos_enc = np.zeros((10,8), dtype=np.float32)
+	indx = np.linspace(0, 2*3.1415926, 10)
+	for i in range(4):
+		freq = 2**(i/3)
+		pos_enc[:, 2*i  ] = np.sin(indx * freq)
+		pos_enc[:, 2*i+1] = np.cos(indx * freq)
+
+	x = np.zeros((bs, 10, md + 5 + 8*3), dtype=np.float32)
+	for b in range(bs):
+		d = np.random.randint(1, md, size=(8,))
+		ai = randint(8)
+		bi = randint(8)
+		op = randint(4)
+		c = modOp(d[ai], d[bi], op, md)
+		for k in range(8):
+			x[b,k,d[k]+5] = 1
+		x[b,8,op] = 1
+		x[b,9,4 ] = 1 # result
+		# positional encoding
+		x[b,:,md+5:md+5+8] = pos_enc
+		x[b,8,md+5+8:md+5+16] = pos_enc[ai,:]
+		x[b,8,md+5+16:md+5+24] = pos_enc[bi,:]
+		x[b,9,md+5+8:md+5+16] = pos_enc[8,:] # point to op
+
+	return x
+
 
 if __name__ == '__main__':
 	genData1(15, 19, True)
 	genData2(15, 19, True)
+
+	x = genData3(4, 19)
+	print(x.shape)
+	fig,axs = plt.subplots(2,2)
+	for i in range(4):
+		j = i // 2
+		k = i % 2
+		axs[j,k].imshow(np.squeeze(x[i,...]))
+	plt.show()

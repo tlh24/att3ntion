@@ -38,10 +38,14 @@ class HypergraphAttention_Naive(nn.Module):
 	def forward(self, x, rotary_emb):
 		batch_size, ntok, d_model = x.shape
 		
-		Q = rotary_emb.rotate_queries_or_keys(self.Wq(x))
-		R = rotary_emb.rotate_queries_or_keys(self.Wr(x))
-		S = rotary_emb.rotate_queries_or_keys(self.Ws(x))
-
+		if rotary_emb is not None:
+			Q = rotary_emb.rotate_queries_or_keys(self.Wq(x))
+			R = rotary_emb.rotate_queries_or_keys(self.Wr(x))
+			S = rotary_emb.rotate_queries_or_keys(self.Ws(x))
+		else:
+			Q = self.Wq(x)
+			R = self.Wr(x)
+			S = self.Ws(x)
 		
 		Vq = self.Wv_q(x)
 		Vr = self.Wv_r(x)
@@ -138,8 +142,12 @@ class GraphAttention_Naive(nn.Module):
 	def forward(self, x, rotary_emb):
 		batch_size, ntok, d_model = x.shape
 
-		Q = rotary_emb.rotate_queries_or_keys(self.Wq(x))
-		K = rotary_emb.rotate_queries_or_keys(self.Wk(x))
+		if rotary_emb is not None:
+			Q = rotary_emb.rotate_queries_or_keys(self.Wq(x))
+			K = rotary_emb.rotate_queries_or_keys(self.Wk(x))
+		else:
+			Q = self.Wq(x)
+			K = self.Wk(x)
 		V = self.Wv(x)
 
 		Q = Q.reshape(batch_size, ntok, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
