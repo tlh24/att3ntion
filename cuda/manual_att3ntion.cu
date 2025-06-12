@@ -1282,71 +1282,49 @@ __global__ void compute_Aq_slice_kernel(
     float*       __restrict__ Aq_out_global,  // Output Aq_slice [I,J,K] (global mem)
     int I_dim, int J_dim, int K_dim // Use _dim to avoid conflict with loop vars
 ) {
-    // Shared memory for the current JxK plane of A_slice and for reduction
-    // Requires J_dim * K_dim floats for the plane, and 
-    // THREADS_PER_BLOCK floats for the reduction scratchpad if THREADS_PER_BLOCK > warpSize
-    extern __shared__ float s_data[]; 
+    // Shared memory is now only for reduction, not for the entire data plane.
+    extern __shared__ float s_reduction_pad[]; 
     
     // Current 'i' index this block is responsible for
     int i_current = blockIdx.x;
-
-    // Ensure this block is within the valid range of 'i'
     if (i_current >= I_dim) {
         return;
     }
 
-    // Base pointer to the current A_slice[i_current, :, :] in global memory
     const float* current_A_plane_global = A_slice_global + (int64_t)i_current * J_dim * K_dim;
-    // Base pointer for output Aq_out[i_current, :, :]
     float* current_Aq_plane_global = Aq_out_global + (int64_t)i_current * J_dim * K_dim;
 
-    // --- Load A_slice[i_current, :, :] into shared memory s_A_plane ---
-    // s_A_plane will be the first J_dim * K_dim elements of s_data
-    float* s_A_plane = s_data; 
     int plane_size = J_dim * K_dim;
-    int tid_in_block = threadIdx.y * blockDim.x + threadIdx.x; // Linear thread ID within the block
-    int threads_in_block = blockDim.x * blockDim.y;
+    int tid_in_block = threadIdx.x;
+    int threads_in_block = blockDim.x;
 
+    // --- Pass 1: Find max_val in the plane using a parallel reduction ---
+    float thread_max_val = -FLT_MAX;
     for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        s_A_plane[idx] = current_A_plane_global[idx];
-    }
-    __syncthreads(); // Ensure all data is loaded into s_A_plane
-
-    // --- Find max_val in s_A_plane for numerical stability (Parallel Reduction) ---
-    // s_reduction_pad will be after s_A_plane in s_data
-    float* s_reduction_pad = s_data + plane_size; 
-                                                
-    float thread_max_val = -FLT_MAX; // Initialize with a very small number
-    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        if (s_A_plane[idx] > thread_max_val) {
-            thread_max_val = s_A_plane[idx];
-        }
+        thread_max_val = fmaxf(thread_max_val, current_A_plane_global[idx]);
     }
     s_reduction_pad[tid_in_block] = thread_max_val;
     __syncthreads();
 
-    // Perform reduction in shared memory (assumes threads_in_block is power of 2 for simplicity here)
-    // A more robust reduction handles non-power-of-2 block sizes.
+    // Reduce to find the max value for the whole plane
     for (int offset = threads_in_block / 2; offset > 0; offset >>= 1) {
         if (tid_in_block < offset) {
-            if (s_reduction_pad[tid_in_block + offset] > s_reduction_pad[tid_in_block]) {
-                 s_reduction_pad[tid_in_block] = s_reduction_pad[tid_in_block + offset];
-            }
+            s_reduction_pad[tid_in_block] = fmaxf(s_reduction_pad[tid_in_block], s_reduction_pad[tid_in_block + offset]);
         }
         __syncthreads();
     }
-    float plane_max_val = s_reduction_pad[0]; // Max value for the current plane
-    __syncthreads(); // Ensure all threads see the correct plane_max_val
+    float plane_max_val = s_reduction_pad[0];
+    __syncthreads(); // Ensure all threads see the correct max value
 
-
-    // --- Compute sum_exp for the plane (Parallel Reduction) ---
+    // --- Pass 2: Compute sum_exp for the plane ---
     float thread_sum_exp = 0.0f;
     for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        thread_sum_exp += expf(s_A_plane[idx] - plane_max_val);
+        thread_sum_exp += expf(current_A_plane_global[idx] - plane_max_val);
     }
     s_reduction_pad[tid_in_block] = thread_sum_exp;
     __syncthreads();
 
+    // Reduce to find the sum of exponents for the whole plane
     for (int offset = threads_in_block / 2; offset > 0; offset >>= 1) {
         if (tid_in_block < offset) {
             s_reduction_pad[tid_in_block] += s_reduction_pad[tid_in_block + offset];
@@ -1356,16 +1334,13 @@ __global__ void compute_Aq_slice_kernel(
     float plane_sum_exp = s_reduction_pad[0];
     __syncthreads();
 
-    // --- Compute softmax values and write to global memory ---
+    // --- Pass 3: Compute softmax values and write to global memory ---
     if (plane_sum_exp == 0.0f) plane_sum_exp = 1e-20f; // Avoid division by zero
-
     for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        float softmax_val = expf(s_A_plane[idx] - plane_max_val) / plane_sum_exp;
-        current_Aq_plane_global[idx] = softmax_val;
+        current_Aq_plane_global[idx] = expf(current_A_plane_global[idx] - plane_max_val) / plane_sum_exp;
     }
 }
 
-// Add this C++ wrapper function, for example, after compute_A_slice_cuda_wrapper
 
 torch::Tensor compute_Aq_slice_cuda_wrapper(
     const torch::Tensor& A_slice_gpu // Assumed to be on GPU, shape [I,J,K]
@@ -1377,39 +1352,18 @@ torch::Tensor compute_Aq_slice_cuda_wrapper(
     const int J = A_slice_gpu.size(1);
     const int K = A_slice_gpu.size(2);
 
-    // Allocate output tensor Aq_slice_out_gpu [I,J,K] on GPU
-    auto options = A_slice_gpu.options(); // Inherit dtype and device
+    auto options = A_slice_gpu.options();
     torch::Tensor Aq_slice_out_gpu = torch::zeros({I, J, K}, options);
 
-    // Kernel launch configuration for compute_Aq_slice_kernel
-    // Each block handles one 'i'-plane (JxK elements)
-    dim3 gridDim(I); // I blocks in total, one for each i-plane
+    dim3 gridDim(I);
+    int threads_per_block = 256;
+    dim3 blockDim(threads_per_block);
 
-    // Threads per block: Try to cover J*K elements.
-    // Max threads per block is 1024.
-    // Using a 1D block for simplicity, can be optimized to 2D.
-    int threads_per_block = std::min(1024, J * K);
-    // Ensure threads_per_block is a power of 2 for simpler reduction, or use a more general reduction.
-    // For this example, let's pick a common size like 256 or 512 if J*K is large enough.
-    // Or, make it precisely J*K if small enough.
-    // For robust reduction, block size should be a power of two if using the simple reduction logic.
-    // Let's choose a common block size, e.g., 256. The kernel loops if plane_size > threads_per_block.
-    threads_per_block = 256; // Example
-    if (J * K < threads_per_block && J*K > 0) { // If plane is smaller, use its size (power of 2 padding might be better for reduction)
-        // A more robust way is to ensure threads_per_block is a power of 2 for the reduction used.
-        // For now, we'll use a fixed size and the kernel loop handles it.
-    }
-
-
-    dim3 blockDim(threads_per_block); // 1D block of threads
-
-    // Calculate shared memory size:
-    // J*K floats for s_A_plane + threads_per_block floats for s_reduction_pad
-    size_t shared_mem_size = (J * K + threads_per_block) * sizeof(float);
-    cudaError_t attr_err = cudaFuncSetAttribute(compute_Aq_slice_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size);
-    if (attr_err != cudaSuccess) {
-        fprintf(stderr, "Warning: Failed to set shared memory size for Aq kernel. May fail for large inputs. Error: %s\n", cudaGetErrorString(attr_err));
-    }
+    // Shared memory size is now fixed and small, proportional to block size
+    size_t shared_mem_size = threads_per_block * sizeof(float);
+    
+    // The explicit call to cudaFuncSetAttribute is no longer needed, as the requested
+    // shared memory size is small and constant. Passing it in the kernel launch is sufficient.
 
     auto A_cont = A_slice_gpu.contiguous();
 
@@ -1423,10 +1377,7 @@ torch::Tensor compute_Aq_slice_cuda_wrapper(
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA error in compute_Aq_slice_cuda_wrapper: %s\n", cudaGetErrorString(err));
-        // throw std::runtime_error(std::string("CUDA kernel launch failed in compute_Aq_slice_cuda_wrapper: ") + cudaGetErrorString(err));
     }
-    // cudaDeviceSynchronize(); // For debugging
-
     return Aq_slice_out_gpu;
 }
 
@@ -1437,79 +1388,56 @@ __global__ void compute_Ar_slice_kernel(
     float*       __restrict__ Ar_out_global,  // Output Ar_slice [I,J,K] (global mem)
     int I_dim, int J_dim, int K_dim
 ) {
-    // Shared memory: I_dim * K_dim for the plane + reduction pad
-    extern __shared__ float s_data[]; 
+    extern __shared__ float s_reduction_pad[]; 
     
-    int j_current = blockIdx.x; // Current 'j' index this block handles
-
+    int j_current = blockIdx.x;
     if (j_current >= J_dim) return;
 
-    // --- Load A_slice[:, j_current, :] into shared memory s_A_plane ---
-    // This plane is non-contiguous in global memory. Careful loading is needed.
-    float* s_A_plane = s_data; 
     int plane_size = I_dim * K_dim;
-    int tid_in_block = threadIdx.x; // Using 1D block
+    int tid_in_block = threadIdx.x;
     int threads_in_block = blockDim.x;
 
+    // --- Pass 1: Find max_val ---
+    float thread_max_val = -FLT_MAX;
     for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        // Map linear index 'idx' back to (i, k) within the plane
         int i_load = idx / K_dim;
         int k_load = idx % K_dim;
-        
-        // Calculate global memory index for A_slice[i_load, j_current, k_load]
         int64_t global_idx = (int64_t)i_load * J_dim * K_dim + (int64_t)j_current * K_dim + k_load;
-        
-        s_A_plane[idx] = A_slice_global[global_idx];
-    }
-    __syncthreads(); 
-
-    // --- Perform Reduction for max_val and sum_exp (same as Aq kernel) ---
-    float* s_reduction_pad = s_data + plane_size; 
-    float thread_max_val = -FLT_MAX; 
-    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        thread_max_val = fmaxf(thread_max_val, s_A_plane[idx]);
+        thread_max_val = fmaxf(thread_max_val, A_slice_global[global_idx]);
     }
     s_reduction_pad[tid_in_block] = thread_max_val;
     __syncthreads();
-    // Reduction for max_val
     for (int offset = threads_in_block / 2; offset > 0; offset >>= 1) {
-        if (tid_in_block < offset) {
-            s_reduction_pad[tid_in_block] = fmaxf(s_reduction_pad[tid_in_block], s_reduction_pad[tid_in_block + offset]);
-        }
+        if (tid_in_block < offset) s_reduction_pad[tid_in_block] = fmaxf(s_reduction_pad[tid_in_block], s_reduction_pad[tid_in_block + offset]);
         __syncthreads();
     }
-    float plane_max_val = s_reduction_pad[0]; 
-    __syncthreads(); 
+    float plane_max_val = s_reduction_pad[0];
+    __syncthreads();
 
+    // --- Pass 2: Compute sum_exp ---
     float thread_sum_exp = 0.0f;
     for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        thread_sum_exp += expf(s_A_plane[idx] - plane_max_val);
+        int i_load = idx / K_dim;
+        int k_load = idx % K_dim;
+        int64_t global_idx = (int64_t)i_load * J_dim * K_dim + (int64_t)j_current * K_dim + k_load;
+        thread_sum_exp += expf(A_slice_global[global_idx] - plane_max_val);
     }
     s_reduction_pad[tid_in_block] = thread_sum_exp;
     __syncthreads();
-    // Reduction for sum_exp
     for (int offset = threads_in_block / 2; offset > 0; offset >>= 1) {
-        if (tid_in_block < offset) {
-            s_reduction_pad[tid_in_block] += s_reduction_pad[tid_in_block + offset];
-        }
+        if (tid_in_block < offset) s_reduction_pad[tid_in_block] += s_reduction_pad[tid_in_block + offset];
         __syncthreads();
     }
     float plane_sum_exp = s_reduction_pad[0];
     __syncthreads();
 
-    // --- Compute softmax values and write to global memory ---
-    if (plane_sum_exp == 0.0f) plane_sum_exp = 1e-20f; 
-
+    // --- Pass 3: Compute softmax and write ---
+    if (plane_sum_exp == 0.0f) plane_sum_exp = 1e-20f;
     for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        float softmax_val = expf(s_A_plane[idx] - plane_max_val) / plane_sum_exp;
-        
-        // Map linear index 'idx' back to (i, k)
         int i_write = idx / K_dim;
         int k_write = idx % K_dim;
-        
-        // Calculate global memory index for Ar_out[i_write, j_current, k_write]
         int64_t global_idx = (int64_t)i_write * J_dim * K_dim + (int64_t)j_current * K_dim + k_write;
-        Ar_out_global[global_idx] = softmax_val;
+        Ar_out_global[global_idx] = expf(A_slice_global[global_idx] - plane_max_val) / plane_sum_exp;
     }
 }
 
@@ -1521,77 +1449,56 @@ __global__ void compute_As_slice_kernel(
     float*       __restrict__ As_out_global,  // Output As_slice [I,J,K] (global mem)
     int I_dim, int J_dim, int K_dim
 ) {
-    // Shared memory: I_dim * J_dim for the plane + reduction pad
-    extern __shared__ float s_data[]; 
-    
-    int k_current = blockIdx.x; // Current 'k' index this block handles
+    extern __shared__ float s_reduction_pad[];
 
+    int k_current = blockIdx.x;
     if (k_current >= K_dim) return;
 
-    // --- Load A_slice[:, :, k_current] into shared memory s_A_plane ---
-    // This plane is also non-contiguous.
-    float* s_A_plane = s_data; 
     int plane_size = I_dim * J_dim;
     int tid_in_block = threadIdx.x;
     int threads_in_block = blockDim.x;
 
+    // --- Pass 1: Find max_val ---
+    float thread_max_val = -FLT_MAX;
     for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        // Map linear index 'idx' back to (i, j) within the plane
         int i_load = idx / J_dim;
         int j_load = idx % J_dim;
-        
-        // Calculate global memory index for A_slice[i_load, j_load, k_current]
         int64_t global_idx = (int64_t)i_load * J_dim * K_dim + (int64_t)j_load * K_dim + k_current;
-        
-        s_A_plane[idx] = A_slice_global[global_idx];
-    }
-    __syncthreads(); 
-
-    // --- Perform Reduction for max_val and sum_exp (same as Aq/Ar kernel) ---
-    float* s_reduction_pad = s_data + plane_size; 
-    float thread_max_val = -FLT_MAX; 
-    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        thread_max_val = fmaxf(thread_max_val, s_A_plane[idx]);
+        thread_max_val = fmaxf(thread_max_val, A_slice_global[global_idx]);
     }
     s_reduction_pad[tid_in_block] = thread_max_val;
     __syncthreads();
     for (int offset = threads_in_block / 2; offset > 0; offset >>= 1) {
-        if (tid_in_block < offset) {
-            s_reduction_pad[tid_in_block] = fmaxf(s_reduction_pad[tid_in_block], s_reduction_pad[tid_in_block + offset]);
-        }
+        if (tid_in_block < offset) s_reduction_pad[tid_in_block] = fmaxf(s_reduction_pad[tid_in_block], s_reduction_pad[tid_in_block + offset]);
         __syncthreads();
     }
-    float plane_max_val = s_reduction_pad[0]; 
-    __syncthreads(); 
+    float plane_max_val = s_reduction_pad[0];
+    __syncthreads();
 
+    // --- Pass 2: Compute sum_exp ---
     float thread_sum_exp = 0.0f;
     for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        thread_sum_exp += expf(s_A_plane[idx] - plane_max_val);
+        int i_load = idx / J_dim;
+        int j_load = idx % J_dim;
+        int64_t global_idx = (int64_t)i_load * J_dim * K_dim + (int64_t)j_load * K_dim + k_current;
+        thread_sum_exp += expf(A_slice_global[global_idx] - plane_max_val);
     }
     s_reduction_pad[tid_in_block] = thread_sum_exp;
     __syncthreads();
     for (int offset = threads_in_block / 2; offset > 0; offset >>= 1) {
-        if (tid_in_block < offset) {
-            s_reduction_pad[tid_in_block] += s_reduction_pad[tid_in_block + offset];
-        }
+        if (tid_in_block < offset) s_reduction_pad[tid_in_block] += s_reduction_pad[tid_in_block + offset];
         __syncthreads();
     }
     float plane_sum_exp = s_reduction_pad[0];
     __syncthreads();
 
-    // --- Compute softmax values and write to global memory ---
-    if (plane_sum_exp == 0.0f) plane_sum_exp = 1e-20f; 
-
+    // --- Pass 3: Compute softmax and write ---
+    if (plane_sum_exp == 0.0f) plane_sum_exp = 1e-20f;
     for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        float softmax_val = expf(s_A_plane[idx] - plane_max_val) / plane_sum_exp;
-        
-        // Map linear index 'idx' back to (i, j)
         int i_write = idx / J_dim;
         int j_write = idx % J_dim;
-        
-        // Calculate global memory index for As_out[i_write, j_write, k_current]
         int64_t global_idx = (int64_t)i_write * J_dim * K_dim + (int64_t)j_write * K_dim + k_current;
-        As_out_global[global_idx] = softmax_val;
+        As_out_global[global_idx] = expf(A_slice_global[global_idx] - plane_max_val) / plane_sum_exp;
     }
 }
 
@@ -1611,19 +1518,10 @@ torch::Tensor compute_Ar_slice_cuda_wrapper(
 
     dim3 gridDim(J); // J blocks, one for each j-plane
 
-    // Threads per block: Cover I*K elements. Use similar logic as Aq
-    int plane_size = I * K;
-    int threads_per_block = 256; // Example fixed size
-    // Potentially adjust based on plane_size if needed, ensuring power of 2 for simple reduction.
-     if (plane_size < threads_per_block && plane_size > 0) { 
-          // Adapt or use fixed size; fixed 256 used here.
-     }
-
+    int threads_per_block = 256;
     dim3 blockDim(threads_per_block); 
 
-    // Shared memory: I*K floats for s_A_plane + threads_per_block floats for reduction pad
-    size_t shared_mem_size = (plane_size + threads_per_block) * sizeof(float);
-    cudaFuncSetAttribute(compute_Ar_slice_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size);
+    size_t shared_mem_size = threads_per_block * sizeof(float);
     
     auto A_cont = A_slice_gpu.contiguous();
 
@@ -1637,8 +1535,6 @@ torch::Tensor compute_Ar_slice_cuda_wrapper(
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA error in compute_Ar_slice_cuda_wrapper: %s\n", cudaGetErrorString(err));
     }
-    // cudaDeviceSynchronize(); // For debugging
-
     return Ar_slice_out_gpu;
 }
 
@@ -1659,18 +1555,10 @@ torch::Tensor compute_As_slice_cuda_wrapper(
 
     dim3 gridDim(K); // K blocks, one for each k-plane
 
-    // Threads per block: Cover I*J elements.
-    int plane_size = I * J;
-    int threads_per_block = 256; // Example fixed size
-     if (plane_size < threads_per_block && plane_size > 0) { 
-          // Adapt or use fixed size
-     }
-
+    int threads_per_block = 256;
     dim3 blockDim(threads_per_block); 
 
-    // Shared memory: I*J floats for s_A_plane + threads_per_block floats for reduction pad
-    size_t shared_mem_size = (plane_size + threads_per_block) * sizeof(float);
-    cudaFuncSetAttribute(compute_As_slice_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size);
+    size_t shared_mem_size = threads_per_block * sizeof(float);
     
     auto A_cont = A_slice_gpu.contiguous();
 
@@ -1684,8 +1572,6 @@ torch::Tensor compute_As_slice_cuda_wrapper(
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA error in compute_As_slice_cuda_wrapper: %s\n", cudaGetErrorString(err));
     }
-    // cudaDeviceSynchronize(); // For debugging
-
     return As_slice_out_gpu;
 }
 
@@ -2166,33 +2052,26 @@ __global__ void compute_softmax_backward_sum_q_kernel(
     float* __restrict__ sum_q_vec_out, // [I]
     int I_dim, int J_dim, int K_dim)
 {
-    extern __shared__ float s_data[];
+    extern __shared__ float s_reduction_pad[];
     int i_current = blockIdx.x;
     if (i_current >= I_dim) return;
 
-    // Load grad_Aq[i,:,:] and Aq[i,:,:] plane into shared memory and compute product
-    float* s_prod_plane = s_data;
+    const float* grad_Aq_plane = grad_Aq_slice_in + (int64_t)i_current * J_dim * K_dim;
+    const float* Aq_plane = Aq_slice_in + (int64_t)i_current * J_dim * K_dim;
+
     int plane_size = J_dim * K_dim;
     int tid_in_block = threadIdx.x;
     int threads_in_block = blockDim.x;
 
-    const float* grad_Aq_plane = grad_Aq_slice_in + (int64_t)i_current * plane_size;
-    const float* Aq_plane = Aq_slice_in + (int64_t)i_current * plane_size;
-
-    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        s_prod_plane[idx] = grad_Aq_plane[idx] * Aq_plane[idx];
-    }
-    __syncthreads();
-
-    // Parallel reduction to find the sum of s_prod_plane
-    float* s_reduction_pad = s_data; // Reuse shared memory for reduction
+    // --- Pass 1: Compute sum of products for the plane ---
     float thread_sum = 0.0f;
     for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        thread_sum += s_prod_plane[idx];
+        thread_sum += grad_Aq_plane[idx] * Aq_plane[idx];
     }
     s_reduction_pad[tid_in_block] = thread_sum;
     __syncthreads();
 
+    // --- Pass 2: Reduce sums in shared memory ---
     for (int offset = threads_in_block / 2; offset > 0; offset >>= 1) {
         if (tid_in_block < offset) {
             s_reduction_pad[tid_in_block] += s_reduction_pad[tid_in_block + offset];
@@ -2212,29 +2091,20 @@ __global__ void compute_softmax_backward_sum_r_kernel(
     float* __restrict__ sum_r_vec_out, // [J]
     int I_dim, int J_dim, int K_dim)
 {
-    extern __shared__ float s_data[];
+    extern __shared__ float s_reduction_pad[];
     int j_current = blockIdx.x;
     if (j_current >= J_dim) return;
 
-    float* s_prod_plane = s_data;
     int plane_size = I_dim * K_dim;
     int tid_in_block = threadIdx.x;
     int threads_in_block = blockDim.x;
 
-    // Load non-contiguous plane data and compute product
+    float thread_sum = 0.0f;
     for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
         int i = idx / K_dim;
         int k = idx % K_dim;
         int64_t global_idx = (int64_t)i * J_dim * K_dim + (int64_t)j_current * K_dim + k;
-        s_prod_plane[idx] = grad_Ar_slice_in[global_idx] * Ar_slice_in[global_idx];
-    }
-    __syncthreads();
-
-    // Parallel reduction (same as sum_q_kernel)
-    float* s_reduction_pad = s_data;
-    float thread_sum = 0.0f;
-    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        thread_sum += s_prod_plane[idx];
+        thread_sum += grad_Ar_slice_in[global_idx] * Ar_slice_in[global_idx];
     }
     s_reduction_pad[tid_in_block] = thread_sum;
     __syncthreads();
@@ -2258,29 +2128,20 @@ __global__ void compute_softmax_backward_sum_s_kernel(
     float* __restrict__ sum_s_vec_out, // [K]
     int I_dim, int J_dim, int K_dim)
 {
-    extern __shared__ float s_data[];
+    extern __shared__ float s_reduction_pad[];
     int k_current = blockIdx.x;
     if (k_current >= K_dim) return;
 
-    float* s_prod_plane = s_data;
     int plane_size = I_dim * J_dim;
     int tid_in_block = threadIdx.x;
     int threads_in_block = blockDim.x;
 
-    // Load non-contiguous plane data and compute product
+    float thread_sum = 0.0f;
     for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
         int i = idx / J_dim;
         int j = idx % J_dim;
         int64_t global_idx = (int64_t)i * J_dim * K_dim + (int64_t)j * K_dim + k_current;
-        s_prod_plane[idx] = grad_As_slice_in[global_idx] * As_slice_in[global_idx];
-    }
-    __syncthreads();
-
-    // Parallel reduction (same as sum_q_kernel)
-    float* s_reduction_pad = s_data;
-    float thread_sum = 0.0f;
-    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        thread_sum += s_prod_plane[idx];
+        thread_sum += grad_As_slice_in[global_idx] * As_slice_in[global_idx];
     }
     s_reduction_pad[tid_in_block] = thread_sum;
     __syncthreads();
@@ -2365,25 +2226,20 @@ torch::Tensor apply_softmax_backward_cuda_wrapper(
     // Launch sum_q kernel
     dim3 gridDim_q(I);
     dim3 blockDim(threads_per_block);
-    size_t shmem_q = (size_t)(J * K) * sizeof(float);
-    cudaFuncSetAttribute(compute_softmax_backward_sum_q_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_q);
-    compute_softmax_backward_sum_q_kernel<<<gridDim_q, blockDim, shmem_q>>>(
+    size_t shmem_size = threads_per_block * sizeof(float);
+    compute_softmax_backward_sum_q_kernel<<<gridDim_q, blockDim, shmem_size>>>(
         grad_Aq_cont.data_ptr<float>(), Aq_cont.data_ptr<float>(), sum_q_vec.data_ptr<float>(), I, J, K
     );
 
     // Launch sum_r kernel
     dim3 gridDim_r(J);
-    size_t shmem_r = (size_t)(I * K) * sizeof(float);
-    cudaFuncSetAttribute(compute_softmax_backward_sum_r_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_r);
-    compute_softmax_backward_sum_r_kernel<<<gridDim_r, blockDim, shmem_r>>>(
+    compute_softmax_backward_sum_r_kernel<<<gridDim_r, blockDim, shmem_size>>>(
         grad_Ar_cont.data_ptr<float>(), Ar_cont.data_ptr<float>(), sum_r_vec.data_ptr<float>(), I, J, K
     );
 
     // Launch sum_s kernel
     dim3 gridDim_s(K);
-    size_t shmem_s = (size_t)(I * J) * sizeof(float);
-    cudaFuncSetAttribute(compute_softmax_backward_sum_s_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_s);
-    compute_softmax_backward_sum_s_kernel<<<gridDim_s, blockDim, shmem_s>>>(
+    compute_softmax_backward_sum_s_kernel<<<gridDim_s, blockDim, shmem_size>>>(
         grad_As_cont.data_ptr<float>(), As_cont.data_ptr<float>(), sum_s_vec.data_ptr<float>(), I, J, K
     );
 
@@ -2630,22 +2486,21 @@ __global__ void grad_S_kernel(
     grad_S[idx] = scale * sum_for_grad_s;
 }
 
-// Modify the main backward_cuda function:
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
           torch::Tensor, torch::Tensor,
           torch::Tensor, torch::Tensor,
           torch::Tensor, torch::Tensor>
 backward_cuda(
-    torch::Tensor grad_output, // GPU
-    torch::Tensor Q,           // GPU
-    torch::Tensor R,           // GPU
-    torch::Tensor S,           // GPU
-    torch::Tensor Vq_1,        // GPU
-    torch::Tensor Vq_2,        // GPU
-    torch::Tensor Vr_1,        // GPU
-    torch::Tensor Vr_2,        // GPU
-    torch::Tensor Vs_1,        // GPU
-    torch::Tensor Vs_2,        // GPU
+    torch::Tensor grad_output, 
+    torch::Tensor Q,           
+    torch::Tensor R,           
+    torch::Tensor S,           
+    torch::Tensor Vq_1,        
+    torch::Tensor Vq_2,        
+    torch::Tensor Vr_1,        
+    torch::Tensor Vr_2,        
+    torch::Tensor Vs_1,        
+    torch::Tensor Vs_2,        
     double dropout_rate)
 {
   grad_output = grad_output.contiguous();
@@ -2661,8 +2516,8 @@ backward_cuda(
 
   // 1) allocate final output gradient tensors
   auto grad_Q   = torch::zeros_like(Q);
-  auto grad_R   = torch::zeros_like(R); // Still a placeholder for now
-  auto grad_S   = torch::zeros_like(S); // Still a placeholder for now
+  auto grad_R   = torch::zeros_like(R); 
+  auto grad_S   = torch::zeros_like(S); 
   auto grad_Vq_1 = torch::zeros_like(Vq_1);
   auto grad_Vq_2 = torch::zeros_like(Vq_2); 
   auto grad_Vr_1 = torch::zeros_like(Vr_1);
@@ -2673,19 +2528,17 @@ backward_cuda(
   // 2) extract dims + scale
   const int B = Q.size(0);
   const int H = Q.size(1);
-  const int I = Q.size(2); // Slice dim for Q
-  const int J = R.size(2); // Slice dim for R
-  const int K = S.size(2); // Slice dim for S
+  const int I = Q.size(2); 
+  const int J = R.size(2); 
+  const int K = S.size(2); 
   const int D = Q.size(3);
   const int N_grad = grad_output.size(2); 
 
   const float scale = 1.0f / sqrtf((float)D);
   const int threads = 256; 
 
-
-
-  // --- 4. Compute full grad_A tensor on GPU by processing slice by slice --- 
-  auto grad_A_batched_gpu = torch::zeros({B, H, I, J, K}, Q.options()); // Allocate full grad_A on GPU Global Memory
+  // 3) Compute grad_A tensor on GPU by processing slice by slice - materializes on GPU 
+  auto grad_A_batched_gpu = torch::zeros({B, H, I, J, K}, Q.options()); 
 
   for (int b = 0; b < B; ++b) {
       for (int h = 0; h < H; ++h) {
@@ -2700,7 +2553,7 @@ backward_cuda(
           auto Vr_2_slice_gpu = Vr_2.select(0, b).select(0, h);
           auto Vs_1_slice_gpu = Vs_1.select(0, b).select(0, h);
           auto Vs_2_slice_gpu = Vs_2.select(0, b).select(0, h);
-
+        
           torch::Tensor A_slice_gpu = compute_A_slice_cuda_wrapper(
               Q_slice_gpu, R_slice_gpu, S_slice_gpu, scale
           );
