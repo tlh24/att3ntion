@@ -258,6 +258,203 @@ __global__ void Yq_gather_kernel(
       }
     }
     Y[idx] = y_val;}
+
+// ... existing code ...
+#include <cooperative_groups.h>
+namespace cg = cooperative_groups;
+
+// Using compile-time constants for tile sizes allows the compiler to optimize memory offsets.
+// These values can be tuned for optimal performance based on the specific GPU architecture.
+#define TILE_J 16
+#define TILE_K 16
+// V2 KERNEL: We now use a healthy number of threads per block.
+// #define THREADS_PER_BLOCK 128
+// Helper for a block-wide sum reduction using shared memory.
+__device__ float block_reduce_sum(float val, float* smem_buffer) {
+    auto block = cg::this_thread_block();
+    smem_buffer[block.thread_rank()] = val;
+    cg::sync(block);
+
+    for (unsigned int stride = block.size() / 2; stride > 0; stride >>= 1) {
+        if (block.thread_rank() < stride) {
+            smem_buffer[block.thread_rank()] += smem_buffer[block.thread_rank() + stride];
+        }
+        cg::sync(block);
+    }
+    return smem_buffer[0];
+}
+
+// Helper for a block-wide max reduction using shared memory.
+__device__ float block_reduce_max(float val, float* smem_buffer) {
+    auto block = cg::this_thread_block();
+    smem_buffer[block.thread_rank()] = val;
+    cg::sync(block);
+
+    for (unsigned int stride = block.size() / 2; stride > 0; stride >>= 1) {
+        if (block.thread_rank() < stride) {
+            smem_buffer[block.thread_rank()] = fmaxf(smem_buffer[block.thread_rank()], smem_buffer[block.thread_rank() + stride]);
+        }
+        cg::sync(block);
+    }
+    return smem_buffer[0];
+}
+
+
+__global__ void Yq_gather_kernel_tiled(
+    const float* __restrict__ Q,
+    const float* __restrict__ R,
+    const float* __restrict__ S,
+    const float* __restrict__ V1,
+    const float* __restrict__ V2,
+    float*       __restrict__ Y,
+    int B, int H, int I, int J, int K, int D,
+    float scale)
+{
+    // --- 1. Grid and Shared Memory Setup ---
+    // Each block computes one Y[b,h,i,:] vector.
+    int b = blockIdx.z;
+    int h = blockIdx.y;
+    int i = blockIdx.x;
+
+    // Each thread in the block handles one feature dimension 'd'.
+    int d = threadIdx.x;
+    auto block = cg::this_thread_block();
+
+    // Dynamically allocated shared memory.
+    extern __shared__ float smem[];
+    // We partition the shared memory for different uses.
+    float* q_vec = smem;                                  // Size: D
+    float* r_tile = q_vec + D;                            // Size: TILE_J * D
+    float* s_tile = r_tile + TILE_J * D;                  // Size: TILE_K * D
+    float* v1_tile = s_tile + TILE_K * D;                 // Size: TILE_J * D
+    float* v2_tile = v1_tile + TILE_J * D;                // Size: TILE_K * D
+    float* reduce_buffer = v2_tile + TILE_K * D;          // Size: D (blockDim.x)
+    
+    // --- Load Q[b,h,i,:] into shared memory ---
+    const int64_t q_offset = (((int64_t)b * H + h) * I + i) * D;
+    q_vec[d] = Q[q_offset + d];
+    cg::sync(block);
+
+    // --- Pass 1: Find max_dot over all (j,k) using tiling ---
+    float max_dot_val = -1e30f;
+    for (int j_base = 0; j_base < J; j_base += TILE_J) {
+        for (int k_base = 0; k_base < K; k_base += TILE_K) {
+            // Collaboratively load tiles of R and S into shared memory.
+            // Each thread 'd' loads TILE_J values for r_tile and TILE_K for s_tile.
+            for (int j_tile_idx = 0; j_tile_idx < TILE_J; ++j_tile_idx) {
+                if ((j_base + j_tile_idx) < J) {
+                    const int64_t r_offset = (((int64_t)b * H + h) * J + (j_base + j_tile_idx)) * D;
+                    r_tile[j_tile_idx * D + d] = R[r_offset + d];
+                }
+            }
+             for (int k_tile_idx = 0; k_tile_idx < TILE_K; ++k_tile_idx) {
+                if ((k_base + k_tile_idx) < K) {
+                    const int64_t s_offset = (((int64_t)b * H + h) * K + (k_base + k_tile_idx)) * D;
+                    s_tile[k_tile_idx * D + d] = S[s_offset + d];
+                }
+            }
+            cg::sync(block);
+
+            // Sequentially iterate within the tile, but parallelize the dot product over 'd'.
+            for (int j_tile = 0; j_tile < TILE_J && (j_base + j_tile) < J; ++j_tile) {
+                for (int k_tile = 0; k_tile < TILE_K && (k_base + k_tile) < K; ++k_tile) {
+                    // Each thread computes its partial sum for the dot product.
+                    float psum = q_vec[d] * r_tile[j_tile * D + d] * s_tile[k_tile * D + d];
+                    float dot = block_reduce_sum(psum, reduce_buffer);
+                    if (d == 0) {
+                        max_dot_val = fmaxf(max_dot_val, dot * scale);
+                    }
+                }
+            }
+            cg::sync(block);
+        }
+    }
+    // After iterating through all tiles, thread 0 of each block holds the true max_dot.
+    // We broadcast it to all threads in the block.
+    if(d==0) reduce_buffer[0] = max_dot_val;
+    cg::sync(block);
+    max_dot_val = reduce_buffer[0];
+
+
+    // --- Pass 2: Compute denominator (sum_exp) using tiling ---
+    float sum_exp_val = 0.0f;
+     for (int j_base = 0; j_base < J; j_base += TILE_J) {
+        for (int k_base = 0; k_base < K; k_base += TILE_K) {
+            // Re-load tiles for this pass. In a fully fused kernel, this would be avoided.
+            for (int j_tile_idx = 0; j_tile_idx < TILE_J; ++j_tile_idx) {
+                if ((j_base + j_tile_idx) < J) {
+                     const int64_t r_offset = (((int64_t)b * H + h) * J + (j_base + j_tile_idx)) * D;
+                     r_tile[j_tile_idx * D + d] = R[r_offset + d];
+                }
+            }
+            for (int k_tile_idx = 0; k_tile_idx < TILE_K; ++k_tile_idx) {
+                if ((k_base + k_tile_idx) < K) {
+                    const int64_t s_offset = (((int64_t)b * H + h) * K + (k_base + k_tile_idx)) * D;
+                    s_tile[k_tile_idx * D + d] = S[s_offset + d];
+                }
+            }
+            cg::sync(block);
+
+            for (int j_tile = 0; j_tile < TILE_J && (j_base + j_tile) < J; ++j_tile) {
+                for (int k_tile = 0; k_tile < TILE_K && (k_base + k_tile) < K; ++k_tile) {
+                    float psum = q_vec[d] * r_tile[j_tile * D + d] * s_tile[k_tile * D + d];
+                    float dot = block_reduce_sum(psum, reduce_buffer);
+                    if (d == 0) {
+                        sum_exp_val += expf(dot * scale - max_dot_val);
+                    }
+                }
+            }
+            cg::sync(block);
+        }
+    }
+    if(d==0) reduce_buffer[0] = sum_exp_val;
+    cg::sync(block);
+    sum_exp_val = reduce_buffer[0];
+
+    // --- Pass 3: Accumulate final Y value using tiling ---
+    float inv_denom = 1.0f / sum_exp_val;
+    float y_val = 0.0f;
+    for (int j_base = 0; j_base < J; j_base += TILE_J) {
+        for (int k_base = 0; k_base < K; k_base += TILE_K) {
+            // Load all required tiles for this pass: R, S, V1, V2.
+             for (int j_tile_idx = 0; j_tile_idx < TILE_J; ++j_tile_idx) {
+                if ((j_base + j_tile_idx) < J) {
+                    const int64_t r_offset = (((int64_t)b * H + h) * J + (j_base + j_tile_idx)) * D;
+                    r_tile[j_tile_idx * D + d] = R[r_offset + d];
+                    v1_tile[j_tile_idx * D + d] = V1[r_offset + d];
+                }
+            }
+            for (int k_tile_idx = 0; k_tile_idx < TILE_K; ++k_tile_idx) {
+                if ((k_base + k_tile_idx) < K) {
+                    const int64_t s_offset = (((int64_t)b * H + h) * K + (k_base + k_tile_idx)) * D;
+                    s_tile[k_tile_idx * D + d] = S[s_offset + d];
+                    v2_tile[k_tile_idx * D + d] = V2[s_offset + d];
+                }
+            }
+            cg::sync(block);
+
+            for (int j_tile = 0; j_tile < TILE_J && (j_base + j_tile) < J; ++j_tile) {
+                for (int k_tile = 0; k_tile < TILE_K && (k_base + k_tile) < K; ++k_tile) {
+                    float psum = q_vec[d] * r_tile[j_tile * D + d] * s_tile[k_tile * D + d];
+                    float dot = block_reduce_sum(psum, reduce_buffer);
+                    
+                    // Broadcast dot product to all threads
+                    if (d == 0) reduce_buffer[1] = dot;
+                    cg::sync(block);
+                    dot = reduce_buffer[1];
+
+                    float attn = expf(dot * scale - max_dot_val) * inv_denom;
+                    y_val += attn * v1_tile[j_tile * D + d] * v2_tile[k_tile * D + d];
+                }
+            }
+            cg::sync(block);
+        }
+    }
+    
+    // Write final result to global memory
+    Y[q_offset + d] = y_val;
+}
+
 __global__ void Yr_gather_kernel(
     const float* __restrict__ R_query, // R is the 'query' for this dimension
     const float* __restrict__ Q,
@@ -542,10 +739,26 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
 
     // --- GATHER Calls --- 
     // Y_q Gather for fixed_dim = 0 
+    // {
+    //     const int64_t N = (int64_t)B*H*I*D;
+    //     const dim3 blocks((N + threads - 1) / threads);
+    //     Yq_gather_kernel<<<blocks, threads>>>(
+    //         Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(), //Query Q
+    //         Vr_1.data_ptr<float>(), Vs_1.data_ptr<float>(),
+    //         Y_q.data_ptr<float>(), 
+    //         B, H, I, J, K, D, scale);
+    // }
     {
-        const int64_t N = (int64_t)B*H*I*D;
-        const dim3 blocks((N + threads - 1) / threads);
-        Yq_gather_kernel<<<blocks, threads>>>(
+        // LAUNCHING THE NEW TILED KERNEL
+        // Each block handles one of the I vectors, and has D threads.
+        dim3 grid(I, H, B);
+        dim3 block(D);
+
+        // Calculate shared memory size needed.
+        // It's the sum of all our tile buffers.
+        size_t smem_size = (D + TILE_J * D + TILE_K * D + TILE_J * D + TILE_K * D + D) * sizeof(float);
+
+        Yq_gather_kernel_tiled<<<grid, block, smem_size>>>(
             Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(), //Query Q
             Vr_1.data_ptr<float>(), Vs_1.data_ptr<float>(),
             Y_q.data_ptr<float>(), 
