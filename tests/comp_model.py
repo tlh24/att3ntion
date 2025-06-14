@@ -15,7 +15,7 @@ if parent_dir_str not in sys.path:
 
 from hyper_attn_pytorch import HypergraphAttention_Naive, GraphAttention_Naive, QuickGELU
 # from hyper_attn_cpp_wrapper import HypergraphAttentionCPP
-from gen_data_comp import genData1, genData2, genData3
+from gen_data_comp import genData1, genData2, genData3, genData4
 import pdb
 
 class SimpleCompModel(nn.Module):
@@ -53,6 +53,7 @@ class SimpleCompModel(nn.Module):
 		
 		# self.op_classifier = nn.Linear(hidden_dim, 4)
 		self.value_classifier = nn.Linear(hidden_dim, 28)
+		self.posenc_proj = nn.Linear(hidden_dim, 16)
 		self.gelu = QuickGELU()
 		
 	def forward(self, x):
@@ -65,8 +66,10 @@ class SimpleCompModel(nn.Module):
 			ffn_output = layer_block['ffn'](x)
 			x = layer_block['norm2'](x + ffn_output)
 		
-		value_pred = (self.value_classifier(x[:, -1])) # FIXME - replaces the op
-		return value_pred
+		# value_pred = (self.value_classifier(x[:, -1])) # FIXME - replaces the op
+		# return value_pred
+		posenc_pred = self.posenc_proj(x)
+		return posenc_pred
 
 	def save_model(self, path: str):
 		"""Saves the model's configuration and state dictionary."""
@@ -243,6 +246,17 @@ def prepare_data(data_tensor, device, modulo):
 	return (torch.FloatTensor(inputs).to(device), 
 			torch.LongTensor(value_targets).to(device))
 
+def prepare_data_posenc(data_tensor, device):
+	inputs = data_tensor.copy()
+	# Mask the value
+	inputs[:, :, -16:] = 0
+
+	# Extract targets
+	targets = data_tensor[:, :, -16:]
+
+	return (torch.FloatTensor(inputs).to(device),
+			torch.FloatTensor(targets).to(device))
+
 def train_model1(num_epochs=40, batch_size=128, hidden_dim=96, num_heads=4, device='auto', modulo=19, attn_impl=""):
 	
 	if device == 'auto':
@@ -255,18 +269,19 @@ def train_model1(num_epochs=40, batch_size=128, hidden_dim=96, num_heads=4, devi
 	
 	print(f"Using device: {device}")
 	
-	data = genData3(batch_size * 1000, modulo) ## NOTE
+	data = genData4(batch_size * 1000, modulo) ## NOTE
 	dataset = TensorDataset(torch.tensor(data))
 	train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
 	if attn_impl == "hypergraph":
 		n_layers = 2
 	else:
-		n_layers = 4
+		n_layers = 6
 
 	model = SimpleCompModel(hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl).to(device)
 	optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-	criterion = nn.CrossEntropyLoss()
+	# criterion = nn.CrossEntropyLoss() # NOTE
+	criterion = nn.MSELoss()
 	model.printParamCount()
 
 	fd_losslog = open(f'losslog_trainModel1_{attn_impl}.txt', 'w')
@@ -281,13 +296,13 @@ def train_model1(num_epochs=40, batch_size=128, hidden_dim=96, num_heads=4, devi
 		total = 0
 		
 		for batch_idx, (inputs_np,) in enumerate(train_loader):
-			inputs, value_targets = prepare_data(inputs_np.numpy(), device, modulo)
+			inputs, targets = prepare_data_posenc(inputs_np.numpy(), device)
 			
 			optimizer.zero_grad()
 			value_pred = model(inputs)
 			
 			# Calculate losses
-			loss = (criterion(value_pred, value_targets))
+			loss = (criterion(value_pred, targets))
 			
 			loss.backward()
 			optimizer.step()
@@ -300,8 +315,8 @@ def train_model1(num_epochs=40, batch_size=128, hidden_dim=96, num_heads=4, devi
 			total_loss += loss.item()
 			total += inputs.size(0)
 			
-			# Calculate accuracies
-			correct_vals += (torch.argmax(value_pred, dim=1) == value_targets).sum().item()
+			# # Calculate accuracies
+			# correct_vals += (torch.argmax(value_pred, dim=1) == value_targets).sum().item() #FIXME
 		
 		avg_loss = total_loss / len(train_loader)
 		val_accuracy = 100 * correct_vals / total

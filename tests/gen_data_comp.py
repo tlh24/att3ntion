@@ -132,21 +132,75 @@ def genData3(bs, md):
 
 	return x
 
+OPERATORS = ['+', '-', '*', '/']
+
 class Expression:
 	def __init__(self, value=None, operator=None, left=None, right=None):
 		self.value = value
-		self.operator = operator
+		self.op = operator
 		self.left = left
 		self.right = right
+		self.lparen_loc = 0
+		self.loc = 0 # doubles for either value or op
+		self.rparen_loc = 0
 
 	def __str__(self):
 		if self.value is not None:
 			return str(self.value)
-		return f"({self.left} {self.operator} {self.right})"
+		operator = OPERATORS[self.op]
+		return f"({self.left} {operator} {self.right})"
+
+	def setLocRec(self, loc):
+		if self.value is not None:
+			self.loc = loc
+			return loc + 1
+		else:
+			self.lparen_loc = loc
+			loc += 1
+			loc = self.left.setLocRec(loc)
+			self.loc = loc # operator
+			loc += 1
+			loc = self.right.setLocRec(loc)
+			self.rparen_loc = loc
+			loc += 1
+			return loc
+
+	def getLoc(self):
+		return self.loc
+
+	def printLoc(self):
+		if self.value is not None:
+			return str(self.loc)
+		return f"({self.left.printLoc()} {self.loc} {self.right.printLoc()})"
+
+	def printParentLoc(self, parent):
+		if self.value is not None:
+			return str(parent)
+		return f"({self.left.printParentLoc(self.loc)} {parent} {self.right.printParentLoc(self.loc)})"
+
+	def encode(self, md, x, b, pos_enc):
+		# need to just encode the left and right childeren
+		c = self.loc
+		if self.value is not None:
+			x[b,c,self.value+5] = 1
+			x[b,c,md+5:md+5+8] = pos_enc[c] # abs loc
+		else:
+			lc = self.lparen_loc
+			rc = self.rparen_loc
+			x[b,lc,0] = -1 # "("
+			x[b,lc,md+5:md+5+8] = pos_enc[lc] # abs loc
+			self.left.encode(md, x, b, pos_enc)
+			x[b,c,self.op] = 1
+			x[b,c,md+5:md+5+8] = pos_enc[c] # abs loc
+			x[b,c,md+5+8:md+5+16] = pos_enc[self.left.getLoc()]
+			x[b,c,md+5+16:md+5+24] = pos_enc[self.right.getLoc()]
+			self.right.encode(md, x, b, pos_enc)
+			x[b,rc,1] = -1 # ")"
+			x[b,rc,md+5:md+5+8] = pos_enc[rc] # abs loc
+			x[b,rc,md+5+8:md+5+16] = 0 # no parent
 
 class ExpressionGenerator:
 	"""Recursively generates random arithmetic expression trees."""
-	OPERATORS = ['+', '-', '*', '/']
 
 	def __init__(self, max_terms, modulo):
 		self.max_terms = max(2, max_terms) # Need at least 2 terms for an op
@@ -162,7 +216,7 @@ class ExpressionGenerator:
 		if terms_count <= 1:
 			return Expression(value=random.randrange(self.modulo))
 
-		op = random.choice(self.OPERATORS)
+		op = random.randrange(4)
 
 		# Split the remaining terms between left and right children.
 		left_terms = random.randint(1, terms_count - 1)
@@ -178,23 +232,38 @@ class ExpressionGenerator:
 
 		return Expression(operator=op, left=left_child, right=right_child)
 
-def genData4(bs, md):
+def genData4(bs, md, do_print=False):
 	'''
 	Task 4: from random arithmetic expressions,
 	generate parse trees
 	'''
-	pos_enc = np.zeros((10,8), dtype=np.float32)
-	indx = np.linspace(0, 2*3.1415926, 10)
+	pos_enc = np.zeros((16,8), dtype=np.float32)
+	indx = np.linspace(0, 2*3.1415926, 16)
 	for i in range(4):
 		freq = 2**(i/3)
 		pos_enc[:, 2*i  ] = np.sin(indx * freq)
 		pos_enc[:, 2*i+1] = np.cos(indx * freq)
 
+	rng = np.random.default_rng()
 	x = np.zeros((bs, 16, md + 5 + 8*3), dtype=np.float32)
-	exp_gen = ExpressionGenerator(5, 19)
-	for i in range(bs):
+	exp_gen = ExpressionGenerator(4, 19)
+	for b in range(bs):
 		tree = exp_gen.generate()
-		print(tree)
+		tree.setLocRec(0)
+		if do_print:
+			print("expr:", tree)
+			print("loc :", tree.printLoc())
+			print("ploc:", tree.printParentLoc(15))
+			print(" ")
+		pos_enc_permute = rng.permutation(pos_enc, axis=0)
+		tree.encode(md, x, b, pos_enc_permute)
+		# encode the result
+		x[b, 15, 4] = 1
+		x[b, 15, md+5:md+5+8] = pos_enc_permute[15]
+		x[b, 15, md+5+8:md+5+16] = pos_enc_permute[tree.getLoc()]
+
+	return x
+
 
 if __name__ == '__main__':
 	# genData1(15, 19, True)
@@ -209,4 +278,11 @@ if __name__ == '__main__':
 	# 	axs[j,k].imshow(np.squeeze(x[i,...]))
 	# plt.show()
 
-	genData4(10)
+	x = genData4(6, 19)
+	print(x.shape)
+	fig,axs = plt.subplots(3,2)
+	for i in range(6):
+		j = i // 2
+		k = i % 2
+		axs[j,k].imshow(np.squeeze(x[i,...]))
+	plt.show()
