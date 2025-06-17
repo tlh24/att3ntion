@@ -20,12 +20,13 @@ import pdb
 
 class SimpleCompModel(nn.Module):
 	"""Model with hypergraph attention layer."""
-	def __init__(self, hidden_dim:int, num_heads:int, n_layers:int, attn_impl:str=''):
+	def __init__(self, hidden_dim:int, num_heads:int, n_layers:int, attn_impl:str='', n_recurse:int=1):
 		super().__init__()
 		input_dim = 48
 		self.embedding_proj = nn.Linear(input_dim, hidden_dim)
 		self.rotary_emb = RotaryEmbedding(dim = hidden_dim)
 		self.attn_impl = attn_impl
+		self.n_recurse = n_recurse
 		
 		self.repeated_layers = nn.ModuleList()
 		for _ in range(n_layers):
@@ -59,12 +60,13 @@ class SimpleCompModel(nn.Module):
 	def forward(self, x):
 		x = self.embedding_proj(x)
 
-		for layer_block in self.repeated_layers:
-			# attn_output = layer_block['attention'](x, self.rotary_emb)
-			attn_output = layer_block['attention'](x, None)
-			x = layer_block['norm1'](x + attn_output)
-			ffn_output = layer_block['ffn'](x)
-			x = layer_block['norm2'](x + ffn_output)
+		for r in range(self.n_recurse):
+			for layer_block in self.repeated_layers:
+				# attn_output = layer_block['attention'](x, self.rotary_emb)
+				attn_output = layer_block['attention'](x, None)
+				x = layer_block['norm1'](x + attn_output)
+				ffn_output = layer_block['ffn'](x)
+				x = layer_block['norm2'](x + ffn_output)
 		
 		# value_pred = (self.value_classifier(x[:, -1])) # FIXME - replaces the op
 		# return value_pred
@@ -274,12 +276,12 @@ def train_model1(num_epochs=40, batch_size=128, hidden_dim=96, num_heads=4, devi
 	train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
 	if attn_impl == "hypergraph":
-		n_layers = 2
+		n_layers = 1
 	else:
-		n_layers = 6
+		n_layers = 2
 
-	model = SimpleCompModel(hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl).to(device)
-	optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+	model = SimpleCompModel(hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=4).to(device)
+	optimizer = torch.optim.Adam(model.parameters(), lr=0.001, amsgrad=True)
 	# criterion = nn.CrossEntropyLoss() # NOTE
 	criterion = nn.MSELoss()
 	model.printParamCount()

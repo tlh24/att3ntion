@@ -205,6 +205,8 @@ class ExpressionGenerator:
 	def __init__(self, max_terms, modulo):
 		self.max_terms = max(2, max_terms) # Need at least 2 terms for an op
 		self.modulo = modulo
+		self.catalan = [2, 5, 14, 42, 132, 429, 1430, 4862]
+		self.catalan_cumsum = np.cumsum(self.catalan)
 
 	def generate(self):
 		"""Public method to generate a new expression tree."""
@@ -237,30 +239,33 @@ def genData4(bs, md, do_print=False):
 	Task 4: from random arithmetic expressions,
 	generate parse trees
 	'''
-	pos_enc = np.zeros((16,8), dtype=np.float32)
-	indx = np.linspace(0, 2*3.1415926, 16)
-	for i in range(4):
-		freq = 2**(i/3)
-		pos_enc[:, 2*i  ] = np.sin(indx * freq)
-		pos_enc[:, 2*i+1] = np.cos(indx * freq)
+	ntok = 22
+	pos_enc = np.zeros((ntok,8), dtype=np.float32)
+	indx = np.linspace(0, 2*3.1415926, ntok)
 
 	rng = np.random.default_rng()
-	x = np.zeros((bs, 16, md + 5 + 8*3), dtype=np.float32)
-	exp_gen = ExpressionGenerator(4, 19)
+	x = np.zeros((bs, ntok, md + 5 + 8*3), dtype=np.float32)
+	exp_gen = ExpressionGenerator(6, 19)
 	for b in range(bs):
 		tree = exp_gen.generate()
 		tree.setLocRec(0)
 		if do_print:
 			print("expr:", tree)
 			print("loc :", tree.printLoc())
-			print("ploc:", tree.printParentLoc(15))
+			print("ploc:", tree.printParentLoc(ntok-1))
 			print(" ")
-		pos_enc_permute = rng.permutation(pos_enc, axis=0)
-		tree.encode(md, x, b, pos_enc_permute)
+		# pos_enc_permute = rng.permutation(pos_enc, axis=0)
+		# pos_enc_permute = np.copy(pos_enc)
+		for i in range(4):
+			freq = 2**(i/3)
+			rand_phase = np.random.uniform(0, 3.1415926*2)
+			pos_enc[:, 2*i  ] = np.sin(indx * freq + rand_phase)
+			pos_enc[:, 2*i+1] = np.cos(indx * freq + rand_phase)
+		tree.encode(md, x, b, pos_enc)
 		# encode the result
-		x[b, 15, 4] = 1
-		x[b, 15, md+5:md+5+8] = pos_enc_permute[15]
-		x[b, 15, md+5+8:md+5+16] = pos_enc_permute[tree.getLoc()]
+		x[b, -1, 4] = 1
+		x[b, -1, md+5:md+5+8] = pos_enc[-1]
+		x[b, -1, md+5+8:md+5+16] = pos_enc[tree.getLoc()]
 
 	return x
 
@@ -278,10 +283,10 @@ if __name__ == '__main__':
 	# 	axs[j,k].imshow(np.squeeze(x[i,...]))
 	# plt.show()
 
-	x = genData4(6, 19)
+	x = genData4(8, 19, do_print=True)
 	print(x.shape)
-	fig,axs = plt.subplots(3,2)
-	for i in range(6):
+	fig,axs = plt.subplots(4,2)
+	for i in range(8):
 		j = i // 2
 		k = i % 2
 		axs[j,k].imshow(np.squeeze(x[i,...]))
