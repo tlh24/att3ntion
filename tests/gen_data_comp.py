@@ -254,7 +254,7 @@ def genData4(bs, md, do_print=False):
 
 	rng = np.random.default_rng()
 	x = np.zeros((bs, ntok, md + 5 + 8*3), dtype=np.float32)
-	exp_gen = ExpressionGenerator(7, 19)
+	exp_gen = ExpressionGenerator(6, 19) # NOTE
 	for b in range(bs):
 		tree = exp_gen.generate()
 		tree.setLocRec(0)

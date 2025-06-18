@@ -307,16 +307,18 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device='auto', m
 		end_event = torch.cuda.Event(enable_timing=True)
 
 		
-		for batch_idx, (inputs_np,) in enumerate(train_loader):
+		for batch_indx, (inputs_np,) in enumerate(train_loader):
 			inputs, targets = prepare_data_posenc(inputs_np.numpy(), device)
 
-			if batch_indx % 25 == 0:
+			if batch_indx % 100 == 0:
 				start_event.record()
 			optimizer.zero_grad()
 
 			with autocast('cuda', dtype=torch.bfloat16):
 				value_pred = model(inputs)
 				loss = (criterion(value_pred, targets))
+			# value_pred = model(inputs)
+			# loss = (criterion(value_pred, targets))
 			
 			loss.backward()
 			optimizer.step()
@@ -329,11 +331,11 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device='auto', m
 			total_loss += loss.item()
 			total += inputs.size(0)
 			
-			if batch_indx % 25 == 0:
+			if batch_indx % 100 == 0:
 				end_event.record()
 				torch.cuda.synchronize()
 				amp_time = start_event.elapsed_time(end_event)
-				print("amp_time:", amp_time, "ms")
+				print("batch time:", amp_time, "ms")
 
 			# # Calculate accuracies
 			# correct_vals += (torch.argmax(value_pred, dim=1) == value_targets).sum().item() #FIXME
