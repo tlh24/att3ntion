@@ -79,14 +79,13 @@ class SimpleCompModel(nn.Module):
 		torch.save(self.state_dict(), path)
 		print(f"saved model to {path}")
 
-	@classmethod
-	def load_model(cls, path: str, device):
+	def load_model(self, path: str, device):
 		"""Loads a model from a file."""
 		checkpoint = torch.load(path, map_location=device)
-		model.load_state_dict(checkpoint)
-		model.to(device)
-		model.eval() # Set to evaluation mode by default
-		return model
+		self.load_state_dict(checkpoint)
+		self.to(device)
+		self.eval() # Set to evaluation mode by default
+		return
 
 	def printParamCount(self):
 		trainable_params = sum(
@@ -224,7 +223,7 @@ class CompModel(nn.Module):
 		self.eval() # Set to evaluation mode by default
 		return
 
-	def load_model(cls, path: str, device):
+	def load_model(path: str, device):
 		"""Loads a model from a file."""
 		checkpoint = torch.load(path, map_location=device)
 		self.load_state_dict(checkpoint)
@@ -281,7 +280,11 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device='auto', m
 	else:
 		n_layers = 2
 
-	model = SimpleCompModel(hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=5).to(device)
+	model = SimpleCompModel(hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=6).to(device)
+	try:
+		model.load_model(f"comp_model_{attn_impl}.pt", device)
+	except:
+		print("train_model1: could not load the saved model weights")
 	optimizer = torch.optim.Adam(model.parameters(), lr=0.001, amsgrad=True)
 	# criterion = nn.CrossEntropyLoss() # NOTE
 	criterion = nn.MSELoss()
@@ -343,6 +346,9 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device='auto', m
 		avg_loss = total_loss / len(train_loader)
 		val_accuracy = 100 * correct_vals / total
 		print(f'Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Result Acc: {val_accuracy:.2f}%')
+
+		# save after each epoch
+		model.save_model(f"comp_model_{args.attn_impl}.pt")
 
 	fd_losslog.close()
 	return model
@@ -419,7 +425,7 @@ def train_model2(num_epochs, batch_size, hidden_dim, num_heads, device='cpu', mo
 
 if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='Train analogy model')
-	parser.add_argument('--device', type=str, default='auto', choices=['cpu', 'cuda', 'auto'],
+	parser.add_argument('--device', type=str, default='auto',
 						help='Device to use (cpu, cuda, auto)')
 	parser.add_argument('--epochs', type=int, default=15, help='Number of epochs')
 	parser.add_argument('--batch-size', type=int, default=32, help='Batch size for training')
