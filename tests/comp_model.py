@@ -1,8 +1,9 @@
+import numpy as np
+import argparse
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-import numpy as np
-import argparse
+from torch.amp import autocast
 from rotary_embedding_torch import RotaryEmbedding
 
 import sys
@@ -259,7 +260,7 @@ def prepare_data_posenc(data_tensor, device):
 	return (torch.FloatTensor(inputs).to(device),
 			torch.FloatTensor(targets).to(device))
 
-def train_model1(num_epochs=40, batch_size=128, hidden_dim=96, num_heads=4, device='auto', modulo=19, attn_impl=""):
+def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device='auto', modulo=19, attn_impl=""):
 	
 	if device == 'auto':
 		if torch.cuda.is_available():
@@ -280,11 +281,16 @@ def train_model1(num_epochs=40, batch_size=128, hidden_dim=96, num_heads=4, devi
 	else:
 		n_layers = 2
 
-	model = SimpleCompModel(hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=4).to(device)
+	model = SimpleCompModel(hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=5).to(device)
 	optimizer = torch.optim.Adam(model.parameters(), lr=0.001, amsgrad=True)
 	# criterion = nn.CrossEntropyLoss() # NOTE
 	criterion = nn.MSELoss()
 	model.printParamCount()
+
+	bf16_supported = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+	print(f"Bfloat16 supported: {bf16_supported}")
+	print("\n--- Running with Automatic Mixed Precision ---")
+
 
 	fd_losslog = open(f'losslog_trainModel1_{attn_impl}.txt', 'w')
 
@@ -296,15 +302,21 @@ def train_model1(num_epochs=40, batch_size=128, hidden_dim=96, num_heads=4, devi
 		correct_ops = 0
 		correct_vals = 0
 		total = 0
+
+		start_event = torch.cuda.Event(enable_timing=True)
+		end_event = torch.cuda.Event(enable_timing=True)
+
 		
 		for batch_idx, (inputs_np,) in enumerate(train_loader):
 			inputs, targets = prepare_data_posenc(inputs_np.numpy(), device)
-			
+
+			if batch_indx % 25 == 0:
+				start_event.record()
 			optimizer.zero_grad()
-			value_pred = model(inputs)
-			
-			# Calculate losses
-			loss = (criterion(value_pred, targets))
+
+			with autocast('cuda', dtype=torch.bfloat16):
+				value_pred = model(inputs)
+				loss = (criterion(value_pred, targets))
 			
 			loss.backward()
 			optimizer.step()
@@ -317,6 +329,12 @@ def train_model1(num_epochs=40, batch_size=128, hidden_dim=96, num_heads=4, devi
 			total_loss += loss.item()
 			total += inputs.size(0)
 			
+			if batch_indx % 25 == 0:
+				end_event.record()
+				torch.cuda.synchronize()
+				amp_time = start_event.elapsed_time(end_event)
+				print("amp_time:", amp_time, "ms")
+
 			# # Calculate accuracies
 			# correct_vals += (torch.argmax(value_pred, dim=1) == value_targets).sum().item() #FIXME
 		
@@ -327,7 +345,7 @@ def train_model1(num_epochs=40, batch_size=128, hidden_dim=96, num_heads=4, devi
 	fd_losslog.close()
 	return model
 
-def train_model2(num_epochs=100, batch_size=128, hidden_dim=128, num_heads=4, device='cpu', modulo=23, attn_impl=""):
+def train_model2(num_epochs, batch_size, hidden_dim, num_heads, device='cpu', modulo=23, attn_impl=""):
 
 	if device == 'auto':
 		if torch.cuda.is_available():
@@ -402,7 +420,7 @@ if __name__ == '__main__':
 	parser.add_argument('--device', type=str, default='auto', choices=['cpu', 'cuda', 'auto'],
 						help='Device to use (cpu, cuda, auto)')
 	parser.add_argument('--epochs', type=int, default=15, help='Number of epochs')
-	parser.add_argument('--batch-size', type=int, default=128, help='Batch size for training')
+	parser.add_argument('--batch-size', type=int, default=32, help='Batch size for training')
 	parser.add_argument('--modulo', type=int, default=19, help='Modulo for arithmetic operations')
 	parser.add_argument('--hidden-dim', type=int, default=96, help='Hidden dimension size')
 	parser.add_argument('--num-heads', type=int, default=4, help='Number of attention heads')

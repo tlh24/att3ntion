@@ -1,6 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import random
+import pdb
 
 def randint(k):
 	return np.random.randint(k)
@@ -205,12 +206,20 @@ class ExpressionGenerator:
 	def __init__(self, max_terms, modulo):
 		self.max_terms = max(2, max_terms) # Need at least 2 terms for an op
 		self.modulo = modulo
+		# these cataland numbers start at 2.
 		self.catalan = [2, 5, 14, 42, 132, 429, 1430, 4862]
+		self.catalan[0] = 2 + 10 # increase the frequency of the
+		self.catalan[1] = 5 + 15 # simple expr
+		self.catalan[2] = 14 + 25
 		self.catalan_cumsum = np.cumsum(self.catalan)
 
 	def generate(self):
-		"""Public method to generate a new expression tree."""
-		return self._generate_recursive(self.max_terms)
+		r = random.randrange(0, self.catalan_cumsum[self.max_terms-2])
+		terms = np.sum(self.catalan_cumsum < r) + 2 # offset
+		# print("terms:", terms)
+		if terms > self.max_terms:
+			pdb.set_trace()
+		return self._generate_recursive(terms)
 
 	def _generate_recursive(self, terms_count):
 		"""The core recursive generation logic."""
@@ -239,13 +248,13 @@ def genData4(bs, md, do_print=False):
 	Task 4: from random arithmetic expressions,
 	generate parse trees
 	'''
-	ntok = 22
+	ntok = 28
 	pos_enc = np.zeros((ntok,8), dtype=np.float32)
 	indx = np.linspace(0, 2*3.1415926, ntok)
 
 	rng = np.random.default_rng()
 	x = np.zeros((bs, ntok, md + 5 + 8*3), dtype=np.float32)
-	exp_gen = ExpressionGenerator(6, 19)
+	exp_gen = ExpressionGenerator(7, 19)
 	for b in range(bs):
 		tree = exp_gen.generate()
 		tree.setLocRec(0)
@@ -283,6 +292,7 @@ if __name__ == '__main__':
 	# 	axs[j,k].imshow(np.squeeze(x[i,...]))
 	# plt.show()
 
+	x = genData4(800, 19, do_print=False) # Test
 	x = genData4(8, 19, do_print=True)
 	print(x.shape)
 	fig,axs = plt.subplots(4,2)
