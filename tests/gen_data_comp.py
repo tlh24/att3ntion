@@ -200,6 +200,12 @@ class Expression:
 			x[b,rc,md+5:md+5+8] = pos_enc[rc] # abs loc
 			x[b,rc,md+5+8:md+5+16] = 0 # no parent
 
+	def evaluate(self, md:int):
+		# recusively evaluate the expression
+		if self.value is not None:
+			return self.value % md
+		return modOp(self.left.evaluate(md), self.right.evaluate(md), self.op, md)
+
 class ExpressionGenerator:
 	"""Recursively generates random arithmetic expression trees."""
 
@@ -208,9 +214,9 @@ class ExpressionGenerator:
 		self.modulo = modulo
 		# these cataland numbers start at 2.
 		self.catalan = [2, 5, 14, 42, 132, 429, 1430, 4862]
-		self.catalan[0] = 2 + 10 # increase the frequency of the
-		self.catalan[1] = 5 + 15 # simple expr
-		self.catalan[2] = 14 + 25
+		self.catalan[0] = 2 + 30 # increase the frequency of the
+		self.catalan[1] = 5 + 30 # simple expr
+		self.catalan[2] = 14 + 30 # our models r kiddos
 		self.catalan_cumsum = np.cumsum(self.catalan)
 
 	def generate(self):
@@ -272,7 +278,9 @@ def genData4(bs, md, do_print=False):
 			pos_enc[:, 2*i+1] = np.cos(indx * freq + rand_phase)
 		tree.encode(md, x, b, pos_enc)
 		# encode the result
+		result = tree.evaluate(md)
 		x[b, -1, 4] = 1
+		x[b, -1, result+5] = 1
 		x[b, -1, md+5:md+5+8] = pos_enc[-1]
 		x[b, -1, md+5+8:md+5+16] = pos_enc[tree.getLoc()]
 

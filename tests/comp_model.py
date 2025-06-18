@@ -280,7 +280,7 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device='auto', m
 	else:
 		n_layers = 2
 
-	model = SimpleCompModel(hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=6).to(device)
+	model = SimpleCompModel(hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=4).to(device)
 	try:
 		model.load_model(f"comp_model_{attn_impl}.pt", device)
 	except:
