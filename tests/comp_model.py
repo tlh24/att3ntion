@@ -5,6 +5,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from torch.amp import autocast
 from rotary_embedding_torch import RotaryEmbedding
+import matplotlib.pyplot as plt
 
 import sys
 from pathlib import Path
@@ -21,7 +22,7 @@ import pdb
 
 class SimpleCompModel(nn.Module):
 	"""Model with hypergraph attention layer."""
-	def __init__(self, hidden_dim:int, num_heads:int, n_layers:int, attn_impl:str='', n_recurse:int=1):
+	def __init__(self, hidden_dim:int, num_heads:int, n_layers:int, attn_impl:str='', n_recurse:int=1, modulo:int=11):
 		super().__init__()
 		input_dim = 40
 		self.embedding_proj = nn.Linear(input_dim, hidden_dim)
@@ -38,9 +39,9 @@ class SimpleCompModel(nn.Module):
 
 			norm1_layer = nn.LayerNorm(hidden_dim)
 			ffn_layer = nn.Sequential(
-				nn.Linear(hidden_dim, 3 * hidden_dim),
+				nn.Linear(hidden_dim, 4 * hidden_dim),
 				nn.ReLU(),
-				nn.Linear(3 * hidden_dim, hidden_dim)
+				nn.Linear(4 * hidden_dim, hidden_dim)
 			)
 			norm2_layer = nn.LayerNorm(hidden_dim)
 
@@ -54,7 +55,7 @@ class SimpleCompModel(nn.Module):
 				)
 		
 		# self.op_classifier = nn.Linear(hidden_dim, 4)
-		self.value_classifier = nn.Linear(hidden_dim, 28)
+		self.value_classifier = nn.Linear(hidden_dim, modulo)
 		self.posenc_proj = nn.Linear(hidden_dim, 16)
 		self.gelu = QuickGELU()
 		
@@ -71,7 +72,7 @@ class SimpleCompModel(nn.Module):
 		
 		value_pred = (self.value_classifier(x[:, -1]))
 		posenc_pred = self.posenc_proj(x)
-		return posenc_pred, value_pred
+		return x, posenc_pred, value_pred
 
 	def save_model(self, path: str):
 		"""Saves the model's configuration and state dictionary."""
@@ -254,7 +255,7 @@ def prepare_data_posenc(data_tensor, device, modulo):
 	inputs[:, -1, 5:modulo+5] = 0
 
 	# Extract targets
-	value_targets = np.argmax(data_tensor[:, -1, 5:5+modulo], axis=1)
+	value_targets = np.argmax(data_tensor[:, -1, 5:5+modulo], axis=-1)
 	pos_targets = data_tensor[:, :, -16:]
 
 	return (torch.FloatTensor(inputs).to(device), \
@@ -273,7 +274,7 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 	
 	print(f"Using device: {device}")
 	
-	data = genData4(batch_size * 1000, modulo) ## NOTE
+	data = genData4(batch_size * 1000, modulo, do_print=False) ## NOTE
 	dataset = TensorDataset(torch.tensor(data))
 	train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
@@ -282,12 +283,12 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 	else:
 		n_layers = 4
 
-	model = SimpleCompModel(hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=3).to(device)
+	model = SimpleCompModel(hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=1, modulo=modulo).to(device)
 	try:
 		model.load_model(f"comp_model_{attn_impl}.pt", device)
 	except:
 		print("train_model1: could not load the saved model weights")
-	optimizer = torch.optim.Adam(model.parameters(), lr=0.001, amsgrad=True)
+	optimizer = torch.optim.Adam(model.parameters(), lr=0.001, amsgrad=False)
 	criterion_ce = nn.CrossEntropyLoss() # NOTE
 	criterion_mse = nn.MSELoss()
 	model.printParamCount()
@@ -320,9 +321,10 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 			optimizer.zero_grad()
 
 			with autocast('cuda', dtype=torch.bfloat16):
-				pos_pred, value_pred = model(inputs)
+				outputs, pos_pred, value_pred = model(inputs)
 				loss = 10*criterion_mse(pos_pred, pos_targets) + \
 					0.2*criterion_ce(value_pred, value_targets)
+				# loss = criterion_ce(value_pred, value_targets)
 			# value_pred = model(inputs)
 			# loss = (criterion(value_pred, targets))
 			
@@ -343,6 +345,7 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 				amp_time = start_event.elapsed_time(end_event)
 				print("batch time:", amp_time, "ms")
 
+
 			# Calculate accuracies
 			correct_vals += (torch.argmax(value_pred, dim=1) == value_targets).sum().item()
 		
@@ -352,6 +355,19 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 
 		# save after each epoch
 		model.save_model(f"comp_model_{args.attn_impl}.pt")
+
+		# visualize it
+		fig,ax = plt.subplots(2,2, figsize=(12,9))
+		ax[0,0].imshow(pos_pred.detach().float().cpu().numpy()[0,:,:])
+		ax[0,0].set_title("pos_pred")
+		ax[0,1].imshow(outputs.detach().float().cpu().numpy()[0,:,:])
+		ax[0,1].set_title("outputs")
+		ax[1,0].imshow(pos_targets.detach().float().cpu().numpy()[0,:,:])
+		ax[1,0].set_title("pos_targets")
+		ax[1,1].plot(value_pred.detach().float().cpu().numpy()[0,:], 'r')
+		ax[1,1].plot(value_targets.detach().float().cpu().numpy()[0],1, 'ko')
+		ax[1,1].set_title("value pred and target")
+		plt.show()
 
 	fd_losslog.close()
 	return model
