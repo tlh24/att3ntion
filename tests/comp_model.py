@@ -288,7 +288,7 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 		model.load_model(f"comp_model_{attn_impl}.pt", device)
 	except:
 		print("train_model1: could not load the saved model weights")
-	optimizer = torch.optim.Adam(model.parameters(), lr=0.001, amsgrad=False)
+	optimizer = torch.optim.Adam(model.parameters(), lr=0.001, amsgrad=True)
 	criterion_ce = nn.CrossEntropyLoss() # NOTE
 	criterion_mse = nn.MSELoss()
 	model.printParamCount()
@@ -322,9 +322,9 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 
 			with autocast('cuda', dtype=torch.bfloat16):
 				outputs, pos_pred, value_pred = model(inputs)
-				loss = 10*criterion_mse(pos_pred, pos_targets) + \
-					0.2*criterion_ce(value_pred, value_targets)
-				# loss = criterion_ce(value_pred, value_targets)
+				# loss = 10*criterion_mse(pos_pred, pos_targets) # + \
+					# 0.2*criterion_ce(value_pred, value_targets)
+				loss = criterion_ce(value_pred, value_targets)
 			# value_pred = model(inputs)
 			# loss = (criterion(value_pred, targets))
 			
@@ -356,18 +356,18 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 		# save after each epoch
 		model.save_model(f"comp_model_{args.attn_impl}.pt")
 
-		# visualize it
-		fig,ax = plt.subplots(2,2, figsize=(12,9))
-		ax[0,0].imshow(pos_pred.detach().float().cpu().numpy()[0,:,:])
-		ax[0,0].set_title("pos_pred")
-		ax[0,1].imshow(outputs.detach().float().cpu().numpy()[0,:,:])
-		ax[0,1].set_title("outputs")
-		ax[1,0].imshow(pos_targets.detach().float().cpu().numpy()[0,:,:])
-		ax[1,0].set_title("pos_targets")
-		ax[1,1].plot(value_pred.detach().float().cpu().numpy()[0,:], 'r')
-		ax[1,1].plot(value_targets.detach().float().cpu().numpy()[0],1, 'ko')
-		ax[1,1].set_title("value pred and target")
-		plt.show()
+		# # visualize it
+		# fig,ax = plt.subplots(2,2, figsize=(12,9))
+		# ax[0,0].imshow(pos_pred.detach().float().cpu().numpy()[0,:,:])
+		# ax[0,0].set_title("pos_pred")
+		# ax[0,1].imshow(outputs.detach().float().cpu().numpy()[0,:,:])
+		# ax[0,1].set_title("outputs")
+		# ax[1,0].imshow(pos_targets.detach().float().cpu().numpy()[0,:,:])
+		# ax[1,0].set_title("pos_targets")
+		# ax[1,1].plot(value_pred.detach().float().cpu().numpy()[0,:], 'r')
+		# ax[1,1].plot(value_targets.detach().float().cpu().numpy()[0],1, 'ko')
+		# ax[1,1].set_title("value pred and target")
+		# plt.show()
 
 	fd_losslog.close()
 	return model
