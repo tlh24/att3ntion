@@ -98,8 +98,9 @@ def benchmark():
     # --- Run Custom CUDA & PyTorch Benchmarks Second ---
     print("\n--- Custom CUDA & PyTorch C++ Reference Benchmarks ---")
     header_custom = (f"{'Seq Len':<10} | "
-                     f"{'CUDA ms':<12} | {'CUDA MB':<12} | {'CUDA VRAM':<12} | "
-                     f"{'Torch ms':<12} | {'Torch MB':<12} | {'Torch VRAM':<12}")
+                     f"{'CUDA ms':<12} | {'Torch ms':<12} | "
+                     f"{'CUDA MB':<12} | {'Torch MB':<12} | "
+                     f"{'CUDA VRAM':<12} | {'Torch VRAM':<12}")
     print(header_custom)
     print("-" * len(header_custom))
 
@@ -176,20 +177,31 @@ def benchmark():
             total_time_pytorch_ref = float('nan')
 
         # --- Print Results for Custom Benchmarks ---
-        print(f"{I_dim:<10} | ", end="")
+        cuda_time_str = f"{total_time_manual_cuda * 1000:<12.4f}"
+        cuda_mem_str = f"{peak_mem_manual_cuda_mb:<12.2f}"
+        cuda_vram_str = f"{manual_vram_used_mb:<12.2f}"
         if total_time_manual_cuda == float('inf'):
-            print(f"{'CUDA OOM':<12} | {'N/A':<12} | {'N/A':<12} | ", end="")
+            cuda_time_str = f"{'OOM':<12}"
+            cuda_mem_str = f"{'N/A':<12}"
+            cuda_vram_str = f"{'N/A':<12}"
         elif total_time_manual_cuda == float('nan'):
-            print(f"{'CUDA Error':<12} | {'N/A':<12} | {'N/A':<12} | ", end="")
-        else:
-            print(f"{total_time_manual_cuda * 1000:<12.4f} | {peak_mem_manual_cuda_mb:<12.2f} | {manual_vram_used_mb:<12.2f} | ", end="")
+            cuda_time_str = f"{'Error':<12}"
+            cuda_mem_str = f"{'N/A':<12}"
+            cuda_vram_str = f"{'N/A':<12}"
 
+        torch_time_str = f"{total_time_pytorch_ref * 1000:<12.4f}"
+        torch_mem_str = f"{peak_mem_pytorch_ref_mb:<12.2f}"
+        torch_vram_str = f"{pytorch_ref_vram_used_mb:<12.2f}"
         if total_time_pytorch_ref == float('inf'):
-            print(f"{'Torch OOM':<12} | {'N/A':<12} | {'N/A':<12}")
+            torch_time_str = f"{'OOM':<12}"
+            torch_mem_str = f"{'N/A':<12}"
+            torch_vram_str = f"{'N/A':<12}"
         elif total_time_pytorch_ref == float('nan'):
-            print(f"{'Torch Error':<12} | {'N/A':<12} | {'N/A':<12}")
-        else:
-            print(f"{total_time_pytorch_ref * 1000:<12.4f} | {peak_mem_pytorch_ref_mb:<12.2f} | {pytorch_ref_vram_used_mb:<12.2f}")
+            torch_time_str = f"{'Error':<12}"
+            torch_mem_str = f"{'N/A':<12}"
+            torch_vram_str = f"{'N/A':<12}"
+        
+        print(f"{I_dim:<10} | {cuda_time_str} | {torch_time_str} | {cuda_mem_str} | {torch_mem_str} | {cuda_vram_str} | {torch_vram_str}")
 
     print("-" * len(header_custom))
 
