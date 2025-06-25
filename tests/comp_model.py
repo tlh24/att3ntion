@@ -5,6 +5,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from torch.amp import autocast
 from rotary_embedding_torch import RotaryEmbedding
+import matplotlib.pyplot as plt
 
 import sys
 from pathlib import Path
@@ -21,9 +22,9 @@ import pdb
 
 class SimpleCompModel(nn.Module):
 	"""Model with hypergraph attention layer."""
-	def __init__(self, hidden_dim:int, num_heads:int, n_layers:int, attn_impl:str='', n_recurse:int=1):
+	def __init__(self, hidden_dim:int, num_heads:int, n_layers:int, attn_impl:str='', n_recurse:int=1, modulo:int=11):
 		super().__init__()
-		input_dim = 48
+		input_dim = 40
 		self.embedding_proj = nn.Linear(input_dim, hidden_dim)
 		self.rotary_emb = RotaryEmbedding(dim = hidden_dim)
 		self.attn_impl = attn_impl
@@ -38,9 +39,9 @@ class SimpleCompModel(nn.Module):
 
 			norm1_layer = nn.LayerNorm(hidden_dim)
 			ffn_layer = nn.Sequential(
-				nn.Linear(hidden_dim, 3 * hidden_dim),
+				nn.Linear(hidden_dim, 4 * hidden_dim),
 				nn.ReLU(),
-				nn.Linear(3 * hidden_dim, hidden_dim)
+				nn.Linear(4 * hidden_dim, hidden_dim)
 			)
 			norm2_layer = nn.LayerNorm(hidden_dim)
 
@@ -54,7 +55,7 @@ class SimpleCompModel(nn.Module):
 				)
 		
 		# self.op_classifier = nn.Linear(hidden_dim, 4)
-		self.value_classifier = nn.Linear(hidden_dim, 28)
+		self.value_classifier = nn.Linear(hidden_dim, modulo)
 		self.posenc_proj = nn.Linear(hidden_dim, 16)
 		self.gelu = QuickGELU()
 		
@@ -69,24 +70,22 @@ class SimpleCompModel(nn.Module):
 				ffn_output = layer_block['ffn'](x)
 				x = layer_block['norm2'](x + ffn_output)
 		
-		# value_pred = (self.value_classifier(x[:, -1])) # FIXME - replaces the op
-		# return value_pred
+		value_pred = (self.value_classifier(x[:, -1]))
 		posenc_pred = self.posenc_proj(x)
-		return posenc_pred
+		return x, posenc_pred, value_pred
 
 	def save_model(self, path: str):
 		"""Saves the model's configuration and state dictionary."""
 		torch.save(self.state_dict(), path)
 		print(f"saved model to {path}")
 
-	@classmethod
-	def load_model(cls, path: str, device):
+	def load_model(self, path: str, device):
 		"""Loads a model from a file."""
 		checkpoint = torch.load(path, map_location=device)
-		model.load_state_dict(checkpoint)
-		model.to(device)
-		model.eval() # Set to evaluation mode by default
-		return model
+		self.load_state_dict(checkpoint)
+		self.to(device)
+		self.eval() # Set to evaluation mode by default
+		return
 
 	def printParamCount(self):
 		trainable_params = sum(
@@ -224,7 +223,7 @@ class CompModel(nn.Module):
 		self.eval() # Set to evaluation mode by default
 		return
 
-	def load_model(cls, path: str, device):
+	def load_model(path: str, device):
 		"""Loads a model from a file."""
 		checkpoint = torch.load(path, map_location=device)
 		self.load_state_dict(checkpoint)
@@ -243,24 +242,27 @@ def prepare_data(data_tensor, device, modulo):
 	# Mask the value
 	inputs[:, -1, :] = 0
 	
-	# Extract targets
 	value_targets = np.argmax(data_tensor[:, -1, 5:5+modulo], axis=1)
 	
 	return (torch.FloatTensor(inputs).to(device), 
 			torch.LongTensor(value_targets).to(device))
 
-def prepare_data_posenc(data_tensor, device):
+def prepare_data_posenc(data_tensor, device, modulo):
 	inputs = data_tensor.copy()
-	# Mask the value
+	# Mask the parse posenc
 	inputs[:, :, -16:] = 0
+	# mask the last token value (but not position)
+	inputs[:, -1, 5:modulo+5] = 0
 
 	# Extract targets
-	targets = data_tensor[:, :, -16:]
+	value_targets = np.argmax(data_tensor[:, -1, 5:5+modulo], axis=-1)
+	pos_targets = data_tensor[:, :, -16:]
 
-	return (torch.FloatTensor(inputs).to(device),
-			torch.FloatTensor(targets).to(device))
+	return (torch.FloatTensor(inputs).to(device), \
+			torch.FloatTensor(pos_targets).to(device), \
+			torch.LongTensor(value_targets).to(device))
 
-def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device='auto', modulo=19, attn_impl=""):
+def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, attn_impl=""):
 	
 	if device == 'auto':
 		if torch.cuda.is_available():
@@ -272,19 +274,23 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device='auto', m
 	
 	print(f"Using device: {device}")
 	
-	data = genData4(batch_size * 1000, modulo) ## NOTE
+	data = genData4(batch_size * 1000, modulo, do_print=False) ## NOTE
 	dataset = TensorDataset(torch.tensor(data))
 	train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
 	if attn_impl == "hypergraph":
-		n_layers = 1
-	else:
 		n_layers = 2
+	else:
+		n_layers = 4
 
-	model = SimpleCompModel(hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=5).to(device)
+	model = SimpleCompModel(hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=1, modulo=modulo).to(device)
+	try:
+		model.load_model(f"comp_model_{attn_impl}.pt", device)
+	except:
+		print("train_model1: could not load the saved model weights")
 	optimizer = torch.optim.Adam(model.parameters(), lr=0.001, amsgrad=True)
-	# criterion = nn.CrossEntropyLoss() # NOTE
-	criterion = nn.MSELoss()
+	criterion_ce = nn.CrossEntropyLoss() # NOTE
+	criterion_mse = nn.MSELoss()
 	model.printParamCount()
 
 	bf16_supported = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
@@ -308,15 +314,17 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device='auto', m
 
 		
 		for batch_indx, (inputs_np,) in enumerate(train_loader):
-			inputs, targets = prepare_data_posenc(inputs_np.numpy(), device)
+			inputs, pos_targets, value_targets = prepare_data_posenc(inputs_np.numpy(), device, modulo)
 
 			if batch_indx % 100 == 0:
 				start_event.record()
 			optimizer.zero_grad()
 
 			with autocast('cuda', dtype=torch.bfloat16):
-				value_pred = model(inputs)
-				loss = (criterion(value_pred, targets))
+				outputs, pos_pred, value_pred = model(inputs)
+				# loss = 10*criterion_mse(pos_pred, pos_targets) # + \
+					# 0.2*criterion_ce(value_pred, value_targets)
+				loss = criterion_ce(value_pred, value_targets)
 			# value_pred = model(inputs)
 			# loss = (criterion(value_pred, targets))
 			
@@ -337,12 +345,29 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device='auto', m
 				amp_time = start_event.elapsed_time(end_event)
 				print("batch time:", amp_time, "ms")
 
-			# # Calculate accuracies
-			# correct_vals += (torch.argmax(value_pred, dim=1) == value_targets).sum().item() #FIXME
+
+			# Calculate accuracies
+			correct_vals += (torch.argmax(value_pred, dim=1) == value_targets).sum().item()
 		
 		avg_loss = total_loss / len(train_loader)
 		val_accuracy = 100 * correct_vals / total
 		print(f'Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Result Acc: {val_accuracy:.2f}%')
+
+		# save after each epoch
+		model.save_model(f"comp_model_{args.attn_impl}.pt")
+
+		# # visualize it
+		# fig,ax = plt.subplots(2,2, figsize=(12,9))
+		# ax[0,0].imshow(pos_pred.detach().float().cpu().numpy()[0,:,:])
+		# ax[0,0].set_title("pos_pred")
+		# ax[0,1].imshow(outputs.detach().float().cpu().numpy()[0,:,:])
+		# ax[0,1].set_title("outputs")
+		# ax[1,0].imshow(pos_targets.detach().float().cpu().numpy()[0,:,:])
+		# ax[1,0].set_title("pos_targets")
+		# ax[1,1].plot(value_pred.detach().float().cpu().numpy()[0,:], 'r')
+		# ax[1,1].plot(value_targets.detach().float().cpu().numpy()[0],1, 'ko')
+		# ax[1,1].set_title("value pred and target")
+		# plt.show()
 
 	fd_losslog.close()
 	return model
@@ -419,11 +444,11 @@ def train_model2(num_epochs, batch_size, hidden_dim, num_heads, device='cpu', mo
 
 if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='Train analogy model')
-	parser.add_argument('--device', type=str, default='auto', choices=['cpu', 'cuda', 'auto'],
+	parser.add_argument('--device', type=str, default='auto',
 						help='Device to use (cpu, cuda, auto)')
 	parser.add_argument('--epochs', type=int, default=15, help='Number of epochs')
 	parser.add_argument('--batch-size', type=int, default=32, help='Batch size for training')
-	parser.add_argument('--modulo', type=int, default=19, help='Modulo for arithmetic operations')
+	parser.add_argument('--modulo', type=int, default=11, help='Modulo for arithmetic operations')
 	parser.add_argument('--hidden-dim', type=int, default=96, help='Hidden dimension size')
 	parser.add_argument('--num-heads', type=int, default=4, help='Number of attention heads')
 	parser.add_argument('--attn-impl', type=str, default='hypergraph', choices=['hypergraph', 'graph'],

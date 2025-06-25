@@ -120,7 +120,7 @@ def genData3(bs, md):
 		ai = randint(8)
 		bi = randint(8)
 		op = randint(4)
-		c = modOp(d[ai], d[bi], op, md)
+		c,_ = modOp(d[ai], d[bi], op, md)
 		for k in range(8):
 			x[b,k,d[k]+5] = 1
 		x[b,8,op] = 1
@@ -200,6 +200,13 @@ class Expression:
 			x[b,rc,md+5:md+5+8] = pos_enc[rc] # abs loc
 			x[b,rc,md+5+8:md+5+16] = 0 # no parent
 
+	def evaluate(self, md:int):
+		# recusively evaluate the expression
+		if self.value is not None:
+			return self.value % md
+		c,_ = modOp(self.left.evaluate(md), self.right.evaluate(md), self.op, md)
+		return c
+
 class ExpressionGenerator:
 	"""Recursively generates random arithmetic expression trees."""
 
@@ -208,9 +215,9 @@ class ExpressionGenerator:
 		self.modulo = modulo
 		# these cataland numbers start at 2.
 		self.catalan = [2, 5, 14, 42, 132, 429, 1430, 4862]
-		self.catalan[0] = 2 + 10 # increase the frequency of the
-		self.catalan[1] = 5 + 15 # simple expr
-		self.catalan[2] = 14 + 25
+		self.catalan[0] = 2 + 30 # increase the frequency of the
+		self.catalan[1] = 5 + 20 # simple expr
+		self.catalan[2] = 14 + 20 # our models r kiddos
 		self.catalan_cumsum = np.cumsum(self.catalan)
 
 	def generate(self):
@@ -248,13 +255,13 @@ def genData4(bs, md, do_print=False):
 	Task 4: from random arithmetic expressions,
 	generate parse trees
 	'''
-	ntok = 28
+	ntok = 16
 	pos_enc = np.zeros((ntok,8), dtype=np.float32)
 	indx = np.linspace(0, 2*3.1415926, ntok)
 
 	rng = np.random.default_rng()
 	x = np.zeros((bs, ntok, md + 5 + 8*3), dtype=np.float32)
-	exp_gen = ExpressionGenerator(6, 19) # NOTE
+	exp_gen = ExpressionGenerator(2, md) # NOTE!!!
 	for b in range(bs):
 		tree = exp_gen.generate()
 		tree.setLocRec(0)
@@ -262,7 +269,6 @@ def genData4(bs, md, do_print=False):
 			print("expr:", tree)
 			print("loc :", tree.printLoc())
 			print("ploc:", tree.printParentLoc(ntok-1))
-			print(" ")
 		# pos_enc_permute = rng.permutation(pos_enc, axis=0)
 		# pos_enc_permute = np.copy(pos_enc)
 		for i in range(4):
@@ -272,7 +278,11 @@ def genData4(bs, md, do_print=False):
 			pos_enc[:, 2*i+1] = np.cos(indx * freq + rand_phase)
 		tree.encode(md, x, b, pos_enc)
 		# encode the result
+		result = tree.evaluate(md)
+		if do_print:
+			print("res: ", result)
 		x[b, -1, 4] = 1
+		x[b, -1, result+5] = 1
 		x[b, -1, md+5:md+5+8] = pos_enc[-1]
 		x[b, -1, md+5+8:md+5+16] = pos_enc[tree.getLoc()]
 
@@ -304,8 +314,8 @@ if __name__ == '__main__':
 	# 	axs[j,k].imshow(np.squeeze(x[i,...]))
 	# plt.show()
 
-	x = genData4(800, 19, do_print=False) # Test
-	x = genData4(8, 19, do_print=True)
+	x = genData4(800, 11, do_print=False) # Test
+	x = genData4(8, 11, do_print=True)
 	print(x.shape)
 	fig,axs = plt.subplots(4,2)
 	for i in range(8):
