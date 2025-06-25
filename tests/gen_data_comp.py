@@ -278,6 +278,18 @@ def genData4(bs, md, do_print=False):
 
 	return x
 
+def genData5(bs,md):
+	'''
+	Can a hypergraph transformer add and remove tokens?
+	'''
+	ntok = 16
+	pos_enc = np.zeros((ntok,8), dtype=np.float32)
+	indx = np.linspace(0, 2*3.1415926, ntok)
+	rng = np.random.default_rng()
+	x = np.zeros((bs, ntok, md + 5 + 8*3), dtype=np.float32)
+
+	for b in range(bs):
+
 
 if __name__ == '__main__':
 	# genData1(15, 19, True)
