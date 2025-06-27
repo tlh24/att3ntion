@@ -1,6 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import random
+import math
 import pdb
 
 def randint(k):
@@ -288,17 +289,66 @@ def genData4(bs, md, do_print=False):
 
 	return x
 
-def genData5(bs,md):
+def genData5(bs,md, do_print):
 	'''
 	Can a hypergraph transformer add and remove tokens?
 	'''
-	ntok = 16
+	ntok = 32
 	pos_enc = np.zeros((ntok,8), dtype=np.float32)
-	indx = np.linspace(0, 2*3.1415926, ntok)
-	rng = np.random.default_rng()
-	x = np.zeros((bs, ntok, md + 5 + 8*3), dtype=np.float32)
+	indx = np.linspace(0, (ntok-1)*2*math.pi, ntok)
+	for i in range(4):
+		# gray code: [0][1] has a period of 4
+		# [2][3] has a period of sqrt(4*8) = sqrt(32) = 4 sqrt(2)
+		# [4][5] period of 8..
+		# period = 4 * (math.sqrt(2.0))**i
+		period = 4 * 2.0**i
+		phase = math.pi / period # indx is scaled by 2 pi
+		pos_enc[:, 2*i  ] = -np.cos(indx / period + phase)
+		pos_enc[:, 2*i+1] = np.sin(indx / period + phase)
+	x = np.zeros((bs, ntok, md + 8), dtype=np.float32)
+	y = np.zeros_like(x)
+
+	x[:, :, md:] = pos_enc # static --
+	y[:, :, md:] = pos_enc # but /could/ be permuted?
 
 	for b in range(bs):
+		s = np.random.randint(0, high=md-1, size=(ntok,), dtype=int)
+		# where there is a 0, remove the token.
+		# for 1, add one token before.
+		sp = np.ones((ntok,), dtype=int) * (md-1) #default new token fill
+		# make sure it can copy arbitrary vector content.
+		noiz = np.random.uniform(low = 0, high=1, size=(ntok,8))
+		noizp = np.zeros_like(noiz)
+		j = 0
+		l = 0
+		for k in range(ntok):
+			if s[k] == 0:
+				# skip this token, don't copy, don't increment.
+				l += 1 # noop
+			elif s[k] == 1:
+				if j < ntok:
+					sp[j] = md-1 #new token tag
+					j += 1
+				if j < ntok:
+					sp[j] = s[k]
+					noizp[j] = noiz[k]
+					j += 1
+			else:
+				if j < ntok:
+					sp[j] = s[k]
+					noizp[j] = noiz[k]
+					j += 1
+		if do_print:
+			print("starting sequence:")
+			print(s)
+			print("after insert/delete:")
+			print(sp)
+		indx = np.arange(ntok, dtype=int)
+		x[b, indx, s[indx]] = 1
+		y[b, indx, sp[indx]] = 1
+		x[b, :, 8:16] += noiz
+		y[b, :, 8:16] += noizp
+	return x, y
 
 
 if __name__ == '__main__':
@@ -314,12 +364,20 @@ if __name__ == '__main__':
 	# 	axs[j,k].imshow(np.squeeze(x[i,...]))
 	# plt.show()
 
-	x = genData4(800, 11, do_print=False) # Test
-	x = genData4(8, 11, do_print=True)
+	# x = genData4(800, 11, do_print=False) # Test
+	# x = genData4(8, 11, do_print=True)
+	# print(x.shape)
+	# fig,axs = plt.subplots(4,2)
+	# for i in range(8):
+	# 	j = i // 2
+	# 	k = i % 2
+	# 	axs[j,k].imshow(np.squeeze(x[i,...]))
+	# plt.show()
+
+	x,y = genData5(2, 24-8, do_print=True)
 	print(x.shape)
-	fig,axs = plt.subplots(4,2)
-	for i in range(8):
-		j = i // 2
-		k = i % 2
-		axs[j,k].imshow(np.squeeze(x[i,...]))
+	fig,axs = plt.subplots(2,2)
+	for i in range(2):
+		axs[0,i].imshow(np.squeeze(x[i,...]))
+		axs[1,i].imshow(np.squeeze(y[i,...]))
 	plt.show()
