@@ -17,7 +17,7 @@ if parent_dir_str not in sys.path:
 
 from hyper_attn_pytorch import HypergraphAttention_Naive, GraphAttention_Naive, QuickGELU
 # from hyper_attn_cpp_wrapper import HypergraphAttentionCPP
-from gen_data_comp import genData1, genData2, genData3, genData4
+from gen_data_comp import genData1, genData2, genData3, genData5
 import pdb
 
 class SimpleCompModel(nn.Module):
