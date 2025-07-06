@@ -169,17 +169,16 @@ def run_test():
         ["Y_s_", "PASS" if ys__close else "FAIL", (Y_s__cpu - Y_s__cuda_cpu).abs().max().item() if not ys__close else 0]
     ]
     
-    print("\nForward Pass Results:")
-    print_table(["Output", "Status", "Max Diff"], forward_results)
-
     all_passed = yq_close and yr_close and ys_close and yq__close and yr__close and ys__close
-    
-    if all_passed:
-        print("\n*** Forward Pass Equivalence Test Passed! ***")
-        return True # Return True if all passed
-    else:
+
+    if not all_passed: # Only print detailed results if some tests failed
+        print("\nForward Pass Results:")
+        print_table(["Output", "Status", "Max Diff"], forward_results)
         print("\n*** Forward Pass Equivalence Test Failed! ***")
         return False # Return False if any failed
+    else:
+        # Do not print "Passed" message here if all pass, will be handled by main
+        return True # Return True if all passed
 
 def run_backward_test():
     print("\n-------------------------------------")
@@ -274,15 +273,14 @@ def run_backward_test():
             results.append([name, "FAIL", f"Error: {str(e)}"])
             all_passed = False
     
-    print("\nBackward Pass Results:")
-    print_table(["Gradient", "Status", "Max Diff/Error"], results)
-    
-    if all_passed:
-        print("\n*** Backward Pass Equivalence Test Passed! ***")
-        return True # Return True if all passed
-    else:
+    if not all_passed: # Only print detailed results if some tests failed
+        print("\nBackward Pass Results:")
+        print_table(["Gradient", "Status", "Max Diff/Error"], results)
         print("\n*** Backward Pass Equivalence Test Failed! ***")
         return False # Return False if any failed
+    else:
+        # Do not print "Passed" message here if all pass, will be handled by main
+        return True # Return True if all passed
 
 
 def get_grad_output_cuda(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_):
@@ -307,21 +305,20 @@ def get_grad_output_cuda(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_):
     return grad_output_combined
 
 configs = [
-    (1, 2, 4, 4, 4, 8),   
-    (1, 2, 6, 6, 6, 8),  
-    (1, 2, 8, 8, 8, 8),  
-    (1, 2, 12, 12, 12, 8),  
-    (1, 2, 16, 16, 16, 8),  
-    (1, 2, 24, 24, 24, 8),  
-    (1, 2, 32, 32, 32, 8),  
-    (1, 2, 48, 48, 48, 8),
-    (1, 2, 64, 64, 64, 8),
-    (1, 2, 96, 96, 96, 8),
-    (1, 2, 128, 128, 128, 8),
-    (1, 2, 256, 256, 256, 8),
-    (1, 2, 512, 512, 512, 8),
-    # (1, 2, 1024, 1024, 1024, 8),
-    # (1, 2, 4096, 4096, 4096, 8), # Uncomment this line if you want to test larger sizes
+    (8, 2, 4, 4, 4, 8),   
+    (8, 2, 6, 6, 6, 8),  
+    (8, 2, 8, 8, 8, 8),  
+    (8, 2, 12, 12, 12, 8),  
+    (8, 2, 16, 16, 16, 8),  
+    (8, 2, 24, 24, 24, 8),  
+    (8, 2, 32, 32, 32, 8),  
+    (8, 2, 48, 48, 48, 8),
+    (8, 2, 64, 64, 64, 8),
+    (8, 2, 96, 96, 96, 8),
+    (8, 2, 128, 128, 128, 8),
+    (8, 2, 256, 256, 256, 8),
+    (8, 2, 512, 512, 512, 8),
+    # (1, 2, 1024, 1024, 1024, 8), //OOM
 ]
 
 def benchmark():
@@ -332,51 +329,53 @@ def benchmark():
     print("=" * 80)
 
     # --- Run Vanilla Attention Benchmark First ---
-    print("\n--- Vanilla PyTorch Self-Attention Benchmark ---")
-    header_vanilla = (f"{'Seq Len':<15} | "
-                      f"{'Vanilla ms':<15} | {'Vanilla MB':<15} | {'Vanilla VRAM':<15}")
-    print(header_vanilla)
-    print("-" * len(header_vanilla))
+    # print("\n--- Vanilla PyTorch Self-Attention Benchmark ---")
+    # header_vanilla = (f"{'Seq Len':<15} | "
+    #                   f"{'Vanilla ms':<15} | {'Vanilla MB':<15} | {'Vanilla VRAM':<15}")
+    # print(header_vanilla)
+    # print("-" * len(header_vanilla))
 
-    for B, H, I_dim, J_dim, K_dim, D_dim in configs:
-        try:
-            embedding_dim = H * D_dim
-            seq_len_vanilla = I_dim
+    # for B, H, I_dim, J_dim, K_dim, D_dim in configs:
+    #     try:
+    #         embedding_dim = H * D_dim
+    #         seq_len_vanilla = I_dim
             
-            x_vanilla = torch.rand(B, seq_len_vanilla, embedding_dim, device='cuda', dtype=torch.float32, requires_grad=True)
+    #         x_vanilla = torch.rand(B, seq_len_vanilla, embedding_dim, device='cuda', dtype=torch.float32, requires_grad=True)
 
-            vanilla_attention_model = SelfAttention(
-                embedding_dim=embedding_dim,
-                num_heads=H,
-                dropout_rate=dropout_rate
-            ).to('cuda')
+    #         vanilla_attention_model = SelfAttention(
+    #             embedding_dim=embedding_dim,
+    #             num_heads=H,
+    #             dropout_rate=dropout_rate
+    #         ).to('cuda')
 
-            torch.cuda.reset_peak_memory_stats()
+    #         torch.cuda.reset_peak_memory_stats()
             
-            handle = nvmlDeviceGetHandleByIndex(0)
-            pre_used = nvmlDeviceGetMemoryInfo(handle).used
+    #         handle = nvmlDeviceGetHandleByIndex(0)
+    #         pre_used = nvmlDeviceGetMemoryInfo(handle).used
             
-            torch.cuda.synchronize()
-            start_time = time.perf_counter()
+    #         torch.cuda.synchronize()
+    #         start_time = time.perf_counter()
             
-            output_vanilla = vanilla_attention_model(x_vanilla)
-            loss_vanilla = output_vanilla.sum()
-            loss_vanilla.backward()
+    #         output_vanilla = vanilla_attention_model(x_vanilla)
+    #         loss_vanilla = output_vanilla.sum()
+    #         loss_vanilla.backward()
             
-            torch.cuda.synchronize()
-            total_time = time.perf_counter() - start_time
+    #         torch.cuda.synchronize()
+    #         total_time = time.perf_counter() - start_time
             
-            post_used = nvmlDeviceGetMemoryInfo(handle).used
-            vram_used_mb = (post_used - pre_used) / (1024 * 1024)
-            peak_mem_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+    #         post_used = nvmlDeviceGetMemoryInfo(handle).used
+    #         vram_used_mb = (post_used - pre_used) / (1024 * 1024)
+    #         peak_mem_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
             
-            print(f"{I_dim:<15} | {total_time * 1000:<15.4f} | {peak_mem_mb:<15.2f} | {vram_used_mb:<15.2f}")
+    #         print(f"{I_dim:<15} | {total_time * 1000:<15.4f} | {peak_mem_mb:<15.2f} | {vram_used_mb:<15.2f}")
 
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
-            print(f"{I_dim:<15} | {'OOM':<15} | {'N/A':<15} | {'N/A':<15}")
-        except Exception as e:
-            print(f"{I_dim:<15} | {'Error':<15} | {'N/A':<15} | {'N/A':<15}")
+    #     except torch.cuda.OutOfMemoryError:
+    #         torch.cuda.empty_cache()
+    #         print(f"{I_dim:<15} | {'OOM':<15} | {'N/A':<15} | {'N/A':<15}")
+    #     except Exception as e:
+    #         print(f"{I_dim:<15} | {'Error':<15} | {'N/A':<15} | {'N/A':<15}")
+
+    # print("-" * len(header_vanilla)) # Keep the separator printing, but it's part of the commented section.
 
     # --- Run Custom CUDA & PyTorch Benchmarks Second ---
     print("\n--- Custom CUDA & PyTorch C++ Reference Benchmarks ---")
