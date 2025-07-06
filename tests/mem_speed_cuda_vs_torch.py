@@ -1,42 +1,62 @@
 import torch
-import time
 import os
 import sys
-import hyper_attn_cpp_manual # Built from setup.py
-import hyper_attn_cpp_reference # Built from setup.py
-from self_attn_pytorch import SelfAttention
-from pynvml import *
-nvmlInit()
+import time # Add this import
+from pynvml import * # Add this import
+from self_attn_pytorch import SelfAttention # Add this import
 
-# --- Equivalence Test Configuration ---
-B_test = 2
-H_test = 2
-I_test = 4
-J_test = 4
-K_test = 4
-D_test = 8
-dtype_test = torch.float32
+# Import extensions (assuming they are compiled and accessible)
+# The order of imports matters for shared library loading, ensure pytorch-related ones are first if there are conflicts.
+parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, parent_dir)
+
+try:
+    import hyper_attn_cpp_manual as manual_att3ntion
+    import hyper_attn_cpp_reference # Add this import
+    print("Successfully imported C++/CUDA extensions.")
+except ImportError:
+    print("\nError: Failed to import the C++/CUDA extension 'hyper_attn_cpp_manual' or 'hyper_attn_cpp_reference'.")
+    print("Please ensure the extensions have been compiled successfully and the names match setup.py.")
+    sys.exit(1)
+
+
+# --- Configuration ---
+B = 2
+H = 2
+I = 4
+J = 4
+K = 4
+D = 8
+dtype = torch.float32
 device_cpu = torch.device("cpu")
 device_cuda = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 rtol = 1e-4
 atol = 1e-5
 
-def generate_test_inputs(device):
-    """Generates random input tensors on the specified device for equivalence testing."""
-    Q = torch.randn(B_test, H_test, I_test, D_test, dtype=dtype_test, device=device)
-    R = torch.randn(B_test, H_test, J_test, D_test, dtype=dtype_test, device=device)
-    S = torch.randn(B_test, H_test, K_test, D_test, dtype=dtype_test, device=device)
-    Vq_1 = torch.randn(B_test, H_test, I_test, D_test, dtype=dtype_test, device=device)
-    Vq_2 = torch.randn(B_test, H_test, I_test, D_test, dtype=dtype_test, device=device)
-    Vr_1 = torch.randn(B_test, H_test, J_test, D_test, dtype=dtype_test, device=device)
-    Vr_2 = torch.randn(B_test, H_test, J_test, D_test, dtype=dtype_test, device=device)
-    Vs_1 = torch.randn(B_test, H_test, K_test, D_test, dtype=dtype_test, device=device)
-    Vs_2 = torch.randn(B_test, H_test, K_test, D_test, dtype=dtype_test, device=device)
+print(f"Testing Gather Equivalence (CPU vs CUDA)")
+print(f"Parameters: B={B}, H={H}, I={I}, J={J}, K={K}, D={D}")
+print(f"CPU Device: {device_cpu}")
+print(f"CUDA Device: {device_cuda}")
+
+# ---> Verify LD_LIBRARY_PATH before import <---
+print(f"LD_LIBRARY_PATH before import: {os.environ.get('LD_LIBRARY_PATH')}")
+
+
+def generate_inputs(device):
+    """Generates random input tensors on the specified device."""
+    Q = torch.randn(B, H, I, D, dtype=dtype, device=device)
+    R = torch.randn(B, H, J, D, dtype=dtype, device=device)
+    S = torch.randn(B, H, K, D, dtype=dtype, device=device)
+    Vq_1 = torch.randn(B, H, I, D, dtype=dtype, device=device)
+    Vq_2 = torch.randn(B, H, I, D, dtype=dtype, device=device)
+    Vr_1 = torch.randn(B, H, J, D, dtype=dtype, device=device)
+    Vr_2 = torch.randn(B, H, J, D, dtype=dtype, device=device)
+    Vs_1 = torch.randn(B, H, K, D, dtype=dtype, device=device)
+    Vs_2 = torch.randn(B, H, K, D, dtype=dtype, device=device)
     dropout_rate = 0.0
     return Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
 
-def print_equivalence_table(headers, rows):
-    """Helper function to print formatted tables for equivalence test results."""
+def print_table(headers, rows):
     col_widths = [len(h) for h in headers]
     for row in rows:
         for i, item in enumerate(row):
@@ -51,29 +71,25 @@ def print_equivalence_table(headers, rows):
         row_str = " | ".join(str(item).ljust(col_widths[i]) for i, item in enumerate(row))
         print(f"| {row_str} |")
 
-def test_forward_equivalence():
-    """Test forward pass equivalence between CPU and CUDA implementations."""
-    print(f"\nTesting Forward Pass Equivalence (CPU vs CUDA)")
-    print(f"Parameters: B={B_test}, H={H_test}, I={I_test}, J={J_test}, K={K_test}, D={D_test}")
+def run_test():
+    print("\nRunning forward pass on CPU...")
+    Q_cpu, R_cpu, S_cpu, Vq_1_cpu, Vq_2_cpu, Vr_1_cpu, Vr_2_cpu, Vs_1_cpu, Vs_2_cpu, dr_cpu = generate_inputs(device_cpu)
     
-    # Generate inputs on CPU
-    print("Running forward pass on CPU...")
-    Q_cpu, R_cpu, S_cpu, Vq_1_cpu, Vq_2_cpu, Vr_1_cpu, Vr_2_cpu, Vs_1_cpu, Vs_2_cpu, dr_cpu = generate_test_inputs(device_cpu)
+    assert Q_cpu.device.type == 'cpu', "Input tensors not on CPU!"
     
     try:
-        Y_tuple_cpu = hyper_attn_cpp_manual.forward(Q_cpu, R_cpu, S_cpu, Vq_1_cpu, Vq_2_cpu, Vr_1_cpu, Vr_2_cpu, Vs_1_cpu, Vs_2_cpu, dr_cpu)
+        Y_tuple_cpu = manual_att3ntion.forward(Q_cpu, R_cpu, S_cpu, Vq_1_cpu, Vq_2_cpu, Vr_1_cpu, Vr_2_cpu, Vs_1_cpu, Vs_2_cpu, dr_cpu)
         Y_q_cpu, Y_r_cpu, Y_s_cpu, Y_q__cpu, Y_r__cpu, Y_s__cpu = Y_tuple_cpu
         print("CPU forward pass completed.")
     except Exception as e:
         print(f"Error during CPU forward pass: {e}")
-        return False
+        sys.exit(1) # Original code exits, for combination we need to return status
 
     if not torch.cuda.is_available():
-        print("CUDA not available. Skipping CUDA execution and comparison.")
-        return True  # Consider this a pass if CUDA is not available
+        print("\nCUDA not available. Skipping CUDA execution and comparison.")
+        return True # Considered a pass if CUDA is not available
 
-    # Move inputs to CUDA
-    print("Moving inputs to CUDA device...")
+    print("\nMoving inputs to CUDA device...")
     try:
         Q_cuda = Q_cpu.to(device_cuda)
         R_cuda = R_cpu.to(device_cuda)
@@ -84,23 +100,23 @@ def test_forward_equivalence():
         Vr_2_cuda = Vr_2_cpu.to(device_cuda)
         Vs_1_cuda = Vs_1_cpu.to(device_cuda)
         Vs_2_cuda = Vs_2_cpu.to(device_cuda)
-        dr_cuda = dr_cpu
+        dr_cuda = dr_cpu 
+        assert Q_cuda.device.type == 'cuda', "Input tensors not on CUDA!"
+        print("Inputs moved to CUDA.")
     except Exception as e:
         print(f"Error moving inputs to CUDA: {e}")
-        return False
+        sys.exit(1) # Original code exits, for combination we need to return status
 
-    # Run CUDA forward pass
     print("Running forward pass on CUDA...")
     try:
-        Y_tuple_cuda = hyper_attn_cpp_manual.forward(Q_cuda, R_cuda, S_cuda, Vq_1_cuda, Vq_2_cuda, Vr_1_cuda, Vr_2_cuda, Vs_1_cuda, Vs_2_cuda, dr_cuda)
+        Y_tuple_cuda = manual_att3ntion.forward(Q_cuda, R_cuda, S_cuda, Vq_1_cuda, Vq_2_cuda, Vr_1_cuda, Vr_2_cuda, Vs_1_cuda, Vs_2_cuda, dr_cuda)
         Y_q_cuda, Y_r_cuda, Y_s_cuda, Y_q__cuda, Y_r__cuda, Y_s__cuda = Y_tuple_cuda
         print("CUDA forward pass completed.")
     except Exception as e:
         print(f"Error during CUDA forward pass: {e}")
-        return False
+        sys.exit(1) # Original code exits, for combination we need to return status
 
-    # Compare results
-    print("Comparing CPU and CUDA outputs...")
+    print("\nComparing CPU and CUDA outputs...")
     Y_q_cuda_cpu = Y_q_cuda.cpu()
     Y_r_cuda_cpu = Y_r_cuda.cpu()
     Y_s_cuda_cpu = Y_s_cuda.cpu()
@@ -108,24 +124,38 @@ def test_forward_equivalence():
     Y_r__cuda_cpu = Y_r__cuda.cpu()
     Y_s__cuda_cpu = Y_s__cuda.cpu()
 
-    # Check shapes
-    shapes_match = all([
-        Y_q_cpu.shape == Y_q_cuda_cpu.shape,
-        Y_r_cpu.shape == Y_r_cuda_cpu.shape,
-        Y_s_cpu.shape == Y_s_cuda_cpu.shape,
-        Y_q__cpu.shape == Y_q__cuda_cpu.shape,
-        Y_r__cpu.shape == Y_r__cuda_cpu.shape,
-        Y_s__cpu.shape == Y_s__cuda_cpu.shape
-    ])
-    
-    if not shapes_match:
-        print("ERROR: Shape mismatches detected!")
-        return False
+    shape_match = True
+    if Y_q_cpu.shape != Y_q_cuda_cpu.shape:
+        print(f"ERROR: Y_q shape mismatch! CPU: {Y_q_cpu.shape}, CUDA: {Y_q_cuda_cpu.shape}")
+        shape_match = False
+    if Y_r_cpu.shape != Y_r_cuda_cpu.shape:
+        print(f"ERROR: Y_r shape mismatch! CPU: {Y_r_cpu.shape}, CUDA: {Y_r_cuda_cpu.shape}")
+        shape_match = False
+    if Y_s_cpu.shape != Y_s_cuda_cpu.shape:
+        print(f"ERROR: Y_s shape mismatch! CPU: {Y_s_cpu.shape}, CUDA: {Y_s_cuda_cpu.shape}")
+        shape_match = False
+    if Y_q__cpu.shape != Y_q__cuda_cpu.shape:
+        print(f"ERROR: Y_q_ shape mismatch! CPU: {Y_q__cpu.shape}, CUDA: {Y_q__cuda_cpu.shape}")
+        shape_match = False
+    if Y_r__cpu.shape != Y_r__cuda_cpu.shape:
+        print(f"ERROR: Y_r_ shape mismatch! CPU: {Y_r__cpu.shape}, CUDA: {Y_r__cuda_cpu.shape}")
+        shape_match = False
+    if Y_s__cpu.shape != Y_s__cuda_cpu.shape:
+        print(f"ERROR: Y_s_ shape mismatch! CPU: {Y_s__cpu.shape}, CUDA: {Y_s__cuda_cpu.shape}")
+        shape_match = False
+        
+    if not shape_match:
+        print("Exiting due to shape mismatches.")
+        return False # Return False instead of sys.exit(1)
+    else:
+        print("Shapes match.")
 
-    # Check numerical equivalence
+    # Check numerical equivalence for gather outputs
     yq_close = torch.allclose(Y_q_cpu, Y_q_cuda_cpu, rtol=rtol, atol=atol)
     yr_close = torch.allclose(Y_r_cpu, Y_r_cuda_cpu, rtol=rtol, atol=atol)
     ys_close = torch.allclose(Y_s_cpu, Y_s_cuda_cpu, rtol=rtol, atol=atol)
+    
+    # Check numerical equivalence for scatter outputs
     yq__close = torch.allclose(Y_q__cpu, Y_q__cuda_cpu, rtol=rtol, atol=atol)
     yr__close = torch.allclose(Y_r__cpu, Y_r__cuda_cpu, rtol=rtol, atol=atol)
     ys__close = torch.allclose(Y_s__cpu, Y_s__cuda_cpu, rtol=rtol, atol=atol)
@@ -140,30 +170,32 @@ def test_forward_equivalence():
     ]
     
     print("\nForward Pass Results:")
-    print_equivalence_table(["Output", "Status", "Max Diff"], forward_results)
+    print_table(["Output", "Status", "Max Diff"], forward_results)
 
     all_passed = yq_close and yr_close and ys_close and yq__close and yr__close and ys__close
     
     if all_passed:
-        print("*** Forward Pass Equivalence Test Passed! ***")
-        return True
+        print("\n*** Forward Pass Equivalence Test Passed! ***")
+        return True # Return True if all passed
     else:
-        print("*** Forward Pass Equivalence Test Failed! ***")
-        return False
+        print("\n*** Forward Pass Equivalence Test Failed! ***")
+        return False # Return False if any failed
 
-def test_backward_equivalence():
-    """Test backward pass equivalence between CPU and CUDA implementations."""
-    print("\nTesting Backward Pass Equivalence (CPU vs CUDA)")
+def run_backward_test():
+    print("\n-------------------------------------")
+    print("Testing Backward Equivalence (CPU vs CUDA)")
+    print("-------------------------------------")
     
-    # Generate inputs on CPU
-    Q_cpu, R_cpu, S_cpu, Vq_1_cpu, Vq_2_cpu, Vr_1_cpu, Vr_2_cpu, Vs_1_cpu, Vs_2_cpu, dr_cpu = generate_test_inputs(device_cpu)
+    print("\nGenerating inputs for backward pass on CPU...")
+    Q_cpu, R_cpu, S_cpu, Vq_1_cpu, Vq_2_cpu, Vr_1_cpu, Vr_2_cpu, Vs_1_cpu, Vs_2_cpu, dr_cpu = generate_inputs(device_cpu)
     
-    N_grad = max(I_test, J_test, K_test)
-    grad_output_cpu = torch.randn(B_test, H_test, N_grad, D_test, dtype=dtype_test, device=device_cpu)
+    N_grad = max(I, J, K)
+    grad_output_cpu = torch.randn(B, H, N_grad, D, dtype=dtype, device=device_cpu)
+    print(f"Generated grad_output_cpu with shape: {grad_output_cpu.shape}")
 
     print("Running backward pass on CPU...")
     try:
-        grads_tuple_cpu = hyper_attn_cpp_manual.backward(
+        grads_tuple_cpu = manual_att3ntion.backward(
             grad_output_cpu,
             Q_cpu, R_cpu, S_cpu, 
             Vq_1_cpu, Vq_2_cpu, Vr_1_cpu, Vr_2_cpu, Vs_1_cpu, Vs_2_cpu, 
@@ -175,14 +207,15 @@ def test_backward_equivalence():
         print("CPU backward pass completed.")
     except Exception as e:
         print(f"Error during CPU backward pass: {e}")
-        return False
+        import traceback
+        traceback.print_exc()
+        return False # Return False instead of sys.exit(1)
 
     if not torch.cuda.is_available():
-        print("CUDA not available. Skipping CUDA backward execution and comparison.")
-        return True
+        print("\nCUDA not available. Skipping CUDA backward execution and comparison.")
+        return True # Considered a pass if CUDA is not available
 
-    # Move inputs to CUDA
-    print("Moving inputs to CUDA device for backward pass...")
+    print("\nMoving inputs to CUDA device for backward pass...")
     try:
         Q_cuda = Q_cpu.to(device_cuda)
         R_cuda = R_cpu.to(device_cuda)
@@ -194,14 +227,15 @@ def test_backward_equivalence():
         Vs_1_cuda = Vs_1_cpu.to(device_cuda)
         Vs_2_cuda = Vs_2_cpu.to(device_cuda) 
         grad_output_cuda = grad_output_cpu.to(device_cuda)
-        dr_cuda = dr_cpu
+        dr_cuda = dr_cpu 
+        print("Inputs moved to CUDA for backward pass.")
     except Exception as e:
         print(f"Error moving inputs to CUDA for backward pass: {e}")
-        return False
+        sys.exit(1) # Original code exits, for combination we need to return status
 
     print("Running backward pass on CUDA...")
     try:
-        grads_tuple_cuda = hyper_attn_cpp_manual.backward(
+        grads_tuple_cuda = manual_att3ntion.backward(
             grad_output_cuda,
             Q_cuda, R_cuda, S_cuda, 
             Vq_1_cuda, Vq_2_cuda, Vr_1_cuda, Vr_2_cuda, Vs_1_cuda, Vs_2_cuda, 
@@ -210,10 +244,11 @@ def test_backward_equivalence():
         print("CUDA backward pass completed.")
     except Exception as e:
         print(f"Error during CUDA backward pass: {e}")
-        return False
+        import traceback
+        traceback.print_exc()
+        return False # Return False instead of sys.exit(1)
 
-    # Compare results
-    print("Comparing CPU and CUDA gradient outputs...")
+    print("\nComparing CPU and CUDA gradient outputs...")
     
     results = []
     all_passed = True
@@ -240,33 +275,15 @@ def test_backward_equivalence():
             all_passed = False
     
     print("\nBackward Pass Results:")
-    print_equivalence_table(["Gradient", "Status", "Max Diff/Error"], results)
+    print_table(["Gradient", "Status", "Max Diff/Error"], results)
     
     if all_passed:
-        print("*** Backward Pass Equivalence Test Passed! ***")
-        return True
+        print("\n*** Backward Pass Equivalence Test Passed! ***")
+        return True # Return True if all passed
     else:
-        print("*** Backward Pass Equivalence Test Failed! ***")
-        return False
+        print("\n*** Backward Pass Equivalence Test Failed! ***")
+        return False # Return False if any failed
 
-def run_equivalence_tests():
-    """Run both forward and backward equivalence tests."""
-    print("=" * 60)
-    print("CUDA EQUIVALENCE TESTING")
-    print("=" * 60)
-    
-    forward_passed = test_forward_equivalence()
-    if not forward_passed:
-        return False
-        
-    backward_passed = test_backward_equivalence()
-    if not backward_passed:
-        return False
-        
-    print("\n" + "=" * 60)
-    print("ALL EQUIVALENCE TESTS PASSED! Proceeding with benchmarks...")
-    print("=" * 60)
-    return True
 
 def get_grad_output_cuda(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_):
     B, H, I, D = Y_q.shape
@@ -289,25 +306,25 @@ def get_grad_output_cuda(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_):
     
     return grad_output_combined
 
-def benchmark():
-    configs = [
-        (1, 2, 4, 4, 4, 8),   
-        (1, 2, 6, 6, 6, 8),  
-        (1, 2, 8, 8, 8, 8),  
-        (1, 2, 12, 12, 12, 8),  
-        (1, 2, 16, 16, 16, 8),  
-        (1, 2, 24, 24, 24, 8),  
-        (1, 2, 32, 32, 32, 8),  
-        (1, 2, 48, 48, 48, 8),
-        (1, 2, 64, 64, 64, 8),
-        (1, 2, 96, 96, 96, 8),
-        (1, 2, 128, 128, 128, 8), #fails for larger inputs due to shared memory size / need to make this dynamic
-        (1, 2, 256, 256, 256, 8),
-        (1, 2, 512, 512, 512, 8),
-        (1, 2, 1024, 1024, 1024, 8),
-        # (1, 2, 4096, 4096, 4096, 8),
-    ]
+configs = [
+    (1, 2, 4, 4, 4, 8),   
+    (1, 2, 6, 6, 6, 8),  
+    (1, 2, 8, 8, 8, 8),  
+    (1, 2, 12, 12, 12, 8),  
+    (1, 2, 16, 16, 16, 8),  
+    (1, 2, 24, 24, 24, 8),  
+    (1, 2, 32, 32, 32, 8),  
+    (1, 2, 48, 48, 48, 8),
+    (1, 2, 64, 64, 64, 8),
+    (1, 2, 96, 96, 96, 8),
+    (1, 2, 128, 128, 128, 8),
+    (1, 2, 256, 256, 256, 8),
+    (1, 2, 512, 512, 512, 8),
+    # (1, 2, 1024, 1024, 1024, 8),
+    # (1, 2, 4096, 4096, 4096, 8), # Uncomment this line if you want to test larger sizes
+]
 
+def benchmark():
     dropout_rate = 0.0 # Keep dropout off for direct comparison of core ops
 
     print("\n" + "=" * 80)
@@ -401,11 +418,11 @@ def benchmark():
             torch.cuda.synchronize()
             start_time = time.perf_counter()
 
-            Y_q_mc, Y_r_mc, Y_s_mc, Y_q__mc, Y_r__mc, Y_s__mc = hyper_attn_cpp_manual.forward(
+            Y_q_mc, Y_r_mc, Y_s_mc, Y_q__mc, Y_r__mc, Y_s__mc = manual_att3ntion.forward(
                 Q.clone(), R.clone(), S.clone(), Vq_1.clone(), Vq_2.clone(),
                 Vr_1.clone(), Vr_2.clone(), Vs_1.clone(), Vs_2.clone(), dropout_rate)
             grad_output_cuda = get_grad_output_cuda(Y_q_mc, Y_r_mc, Y_s_mc, Y_q__mc, Y_r__mc, Y_s__mc)
-            grads_manual = hyper_attn_cpp_manual.backward(
+            grads_manual = manual_att3ntion.backward(
                 grad_output_cuda, Q.clone(), R.clone(), S.clone(), Vq_1.clone(), Vq_2.clone(),
                 Vr_1.clone(), Vr_2.clone(), Vs_1.clone(), Vs_2.clone(), dropout_rate)
             
@@ -477,30 +494,31 @@ def benchmark():
 
     print("-" * len(header_custom))
 
+
 if __name__ == '__main__':
-    if not torch.cuda.is_available():
-        print("CUDA is not available. Aborting benchmark.")
+    nvmlInit() # Initialize NVML
+    
+    print("=" * 60)
+    print("CUDA EQUIVALENCE TESTING")
+    print("=" * 60)
+    
+    forward_passed = run_test()
+    backward_passed = run_backward_test() 
+    
+    if forward_passed and backward_passed:
+        print("\n" + "=" * 60)
+        print("ALL EQUIVALENCE TESTS PASSED! Proceeding with benchmarks...")
+        print("=" * 60)
+        if torch.cuda.is_available():
+            print(f"CUDA Device: {torch.cuda.get_device_name(0)}")
+            benchmark()
+        else:
+            print("CUDA not available. Skipping benchmarks.")
     else:
-        print(f"CUDA Device: {torch.cuda.get_device_name(0)}")
-        try:
-            import hyper_attn_cpp_manual
-            import hyper_attn_cpp_reference
-            print("Extensions imported successfully.")
-            
-            # First run equivalence tests
-            if run_equivalence_tests():
-                # Only run benchmarks if equivalence tests pass
-                benchmark()
-            else:
-                print("\n" + "=" * 60)
-                print("EQUIVALENCE TESTS FAILED - SKIPPING BENCHMARKS")
-                print("Please fix the implementation issues before benchmarking.")
-                print("=" * 60)
-                sys.exit(1)
-                
-        except ImportError as e:
-            print(f"ImportError: {e}")
-            print("Please ensure the extensions are compiled and accessible.")
-        except Exception as e:
-            print(f"An unexpected error occurred: {e}")
-    nvmlShutdown()
+        print("\n" + "=" * 60)
+        print("EQUIVALENCE TESTS FAILED - SKIPPING BENCHMARKS")
+        print("Please fix the implementation issues before benchmarking.")
+        print("=" * 60)
+        sys.exit(1) # Exit with an error code if tests fail
+    
+    nvmlShutdown() # Shutdown NVML 
