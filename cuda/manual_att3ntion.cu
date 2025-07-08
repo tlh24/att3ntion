@@ -296,7 +296,7 @@ void Yq_gather_kernel_tiled(
     auto blk   = cg::this_thread_block();     // 32 threads
 
     /* -------- shared-memory scratch -------- */
-    extern __shared__ float smem[];
+    extern __shared__ float smem[]; //dynamically size array in shared memory 
     float* q_vec   = smem;                             // D
     float* r_tile  = q_vec   + D;                      // TILE_J * D
     float* s_tile  = r_tile  + TILE_J * D;             // TILE_K * D
@@ -449,17 +449,6 @@ void Yq_gather_kernel_tiled(
 #define TILE_K 16
 
 #define TILE_I 16
-
-__device__ inline float block_reduce_sum(float v, float* buf)
-{
-// ... existing code ...
-extern "C" __global__
-void Yq_gather_kernel_tiled(
-        const float* __restrict__ Q,
-// ... existing code ...
-    for (int d = threadIdx.x; d < D; d += blk.size())
-        Y[q_off + d] = y_val;
-}
 
 extern "C" __global__
 void Yr_gather_kernel_tiled(
@@ -800,16 +789,6 @@ __global__ void Yr_gather_kernel(
     int B, int H, int I, int J, int K, int D,
     float scale){
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-__global__ void Yr_gather_kernel(
-    const float* __restrict__ R_query, // R is the 'query' for this dimension
-    const float* __restrict__ Q,
-    const float* __restrict__ S,
-    const float* __restrict__ V1,      // Vq_1
-    const float* __restrict__ V2,      // Vs_1
-    float*       __restrict__ Y,       // Y_r
-    int B, int H, int I, int J, int K, int D,
-    float scale){
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (int64_t)B*H*J*D) return;
 
     int d = idx % D;
@@ -945,6 +924,148 @@ __global__ void Ys_gather_kernel(
 
     Y[idx] = y_val;}
 
+__device__ inline float compute_dot_product_cuda(
+    const float* __restrict__ Q, 
+    const float* __restrict__ R, 
+    const float* __restrict__ S,
+    int b, int h, int i, int j, int k, 
+    int B, int H, int I, int J, int K, int D){
+    // Calculate base pointers using passed dimensions
+    const float* q_vec = Q + (((int64_t)b * H + h) * I + i) * D;
+    const float* r_vec = R + (((int64_t)b * H + h) * J + j) * D;
+    const float* s_vec = S + (((int64_t)b * H + h) * K + k) * D;
+
+    float dot = 0.0f;
+    #pragma unroll 4
+    for (int d = 0; d < D; ++d) {
+        dot += q_vec[d] * r_vec[d] * s_vec[d];
+    }
+    return dot;}
+
+__device__ inline float compute_single_softmax_attn_cuda(
+    const float* __restrict__ Q, 
+    const float* __restrict__ R, 
+    const float* __restrict__ S,
+    int b, int h, int i_target, int j_target, int k_target,
+    int B, int H, int I, int J, int K, int D,
+    float scale,
+    int fixed_dim ){
+    float max_val = -1.0e30f;
+    float sum_exp = 0.0f;
+
+    // --- First Pass: Find Max --- 
+    if (fixed_dim == 0) { //Aq
+        for (int j_idx = 0; j_idx < J; ++j_idx) {
+            for (int k_idx = 0; k_idx < K; ++k_idx) {
+                float dot = compute_dot_product_cuda(Q, R, S, b, h, i_target, j_idx, k_idx, B, H, I, J, K, D);
+                max_val = fmaxf(max_val, dot * scale);
+            }
+        }
+    }
+    else if (fixed_dim == 1) { // Ar
+        for (int i_idx = 0; i_idx < I; ++i_idx) {
+            for (int k_idx = 0; k_idx < K; ++k_idx) {
+                float dot = compute_dot_product_cuda(Q, R, S, b, h, i_idx, j_target, k_idx, B, H, I, J, K, D);
+                max_val = fmaxf(max_val, dot * scale);
+            }
+        }
+    } else { // fixed_dim == 2
+        for (int i_idx = 0; i_idx < I; ++i_idx) {
+            for (int j_idx = 0; j_idx < J; ++j_idx) {
+                float dot = compute_dot_product_cuda(Q, R, S, b, h, i_idx, j_idx, k_target, B, H, I, J, K, D);
+                max_val = fmaxf(max_val, dot * scale);
+            }
+        }
+    }
+
+    // --- Second Pass: Compute Sum Exp ---
+    if (fixed_dim == 0) { // Aq
+        for (int j_idx = 0; j_idx < J; ++j_idx) {
+            for (int k_idx = 0; k_idx < K; ++k_idx) {
+                float dot = compute_dot_product_cuda(Q, R, S, b, h, i_target, j_idx, k_idx, B, H, I, J, K, D);
+                sum_exp += expf(dot * scale - max_val);
+            }
+        }
+    }
+    else if (fixed_dim == 1) { // Ar
+        for (int i_idx = 0; i_idx < I; ++i_idx) {
+            for (int k_idx = 0; k_idx < K; ++k_idx) {
+                float dot = compute_dot_product_cuda(Q, R, S, b, h, i_idx, j_target, k_idx, B, H, I, J, K, D);
+                sum_exp += expf(dot * scale - max_val);
+            }
+        }
+    } else { // As
+        for (int i_idx = 0; i_idx < I; ++i_idx) {
+            for (int j_idx = 0; j_idx < J; ++j_idx) {
+                float dot = compute_dot_product_cuda(Q, R, S, b, h, i_idx, j_idx, k_target, B, H, I, J, K, D);
+                sum_exp += expf(dot * scale - max_val);
+            }
+        }
+    }
+
+    // --- Compute final value for the target indices ---
+    float target_dot = compute_dot_product_cuda(Q, R, S, b, h, i_target, j_target, k_target, B, H, I, J, K, D);
+    
+    // Handle potential division by zero if sum_exp is very small
+    if (sum_exp <= 1e-20f) {
+        int num_elements;
+        if (fixed_dim == 0) num_elements = J * K;
+        else if (fixed_dim == 1) num_elements = I * K;
+        else /* fixed_dim == 2 */ num_elements = I * J;
+        // If the target dot was also the max (or close), return uniform prob, else 0.
+        return (fabsf(target_dot * scale - max_val) < 1e-5f) ? (1.0f / (float)num_elements) : 0.0f;
+    }
+    
+    return expf(target_dot * scale - max_val) / sum_exp;}
+
+
+
+
+__global__ void Yq_scatter_kernel(
+    const float* Q,
+    const float* R,
+    const float* S,
+    const float* Vr_2, 
+    const float* Vs_2, 
+    float*       Y_q_, 
+    int B, int H, int I, int J, int K, int D,
+    float scale){
+    // global thread index [0 .. B*H*I*D)
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (int64_t)B*H*I*D) return;
+
+    // decode (b,h,i,d) from idx - this thread computes Y_q_[b,h,i,d]
+    int d = idx % D;
+    int tmp = idx / D;
+    int i = tmp % I;
+    tmp = tmp / I;
+    int h = tmp % H;
+    int b = tmp / H;
+
+    float accum_val = 0.0f;
+
+    // Iterate over the dimensions we sum over (j and k)
+    for (int j = 0; j < J; ++j) {
+        const float* vr2_vec = Vr_2 + (((int64_t)b * H + h) * J + j) * D;
+        for (int k = 0; k < K; ++k) {
+            const float* vs2_vec = Vs_2 + (((int64_t)b * H + h) * K + k) * D;
+
+            // Ar[b,h,i,j,k] (softmax over i',k' for fixed j)
+            float attn_ar = compute_single_softmax_attn_cuda(Q, R, S, b, h, i, j, k, B, H, I, J, K, D, scale, 1);
+            
+            //As[b,h,i,j,k] (softmax over i',j' for fixed k)
+            float attn_as = compute_single_softmax_attn_cuda(Q, R, S, b, h, i, j, k, B, H, I, J, K, D, scale, 2);
+
+            // Get value components for the specific d
+            float vr2_val = vr2_vec[d];
+            float vs2_val = vs2_vec[d];
+
+            // Ar * As * Vr_2 * Vs_2
+            accum_val += attn_ar * attn_as * vr2_val * vs2_val;
+        }
+    }
+
+    Y_q_[idx] = accum_val;}
 __global__ void Yq_scatter_kernel_optimized(
     const float* __restrict__ Ar_slice, 
     const float* __restrict__ As_slice,
@@ -1154,6 +1275,17 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
             B, H, I, J, K, D, scale);
     }
 
+    //SCATTER 
+    {
+        const int64_t N = (int64_t)B*H*I*D;
+        const dim3 blocks((N + threads - 1) / threads);
+        Yq_scatter_kernel<<<blocks, threads>>>(
+            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
+            Vr_2.data_ptr<float>(), Vs_2.data_ptr<float>(), 
+            Y_q_.data_ptr<float>(), 
+            B, H, I, J, K, D, scale);
+    }
+
 
     // --- OPTIMIZED SCATTER Calls (Slice-wise) --- 
     for (int b = 0; b < B; ++b) {
@@ -1172,18 +1304,18 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
             torch::Tensor Ar_slice_gpu = compute_Ar_slice_cuda_wrapper(A_slice_gpu);
             torch::Tensor As_slice_gpu = compute_As_slice_cuda_wrapper(A_slice_gpu);
 
-            // Y_q_ scatter
-            {
-                auto Y_q__slice_gpu = Y_q_.select(0, b).select(0, h);
-                const int64_t N = (int64_t)I*D;
-                const dim3 blocks((N + threads - 1) / threads);
-                Yq_scatter_kernel_optimized<<<blocks, threads>>>(
-                    Ar_slice_gpu.data_ptr<float>(), As_slice_gpu.data_ptr<float>(),
-                    Vr_2_slice_gpu.data_ptr<float>(), Vs_2_slice_gpu.data_ptr<float>(),
-                    Y_q__slice_gpu.data_ptr<float>(),
-                    I, J, K, D
-                );
-            }
+            // // Y_q_ scatter
+            // {
+            //     auto Y_q__slice_gpu = Y_q_.select(0, b).select(0, h);
+            //     const int64_t N = (int64_t)I*D;
+            //     const dim3 blocks((N + threads - 1) / threads);
+            //     Yq_scatter_kernel_optimized<<<blocks, threads>>>(
+            //         Ar_slice_gpu.data_ptr<float>(), As_slice_gpu.data_ptr<float>(),
+            //         Vr_2_slice_gpu.data_ptr<float>(), Vs_2_slice_gpu.data_ptr<float>(),
+            //         Y_q__slice_gpu.data_ptr<float>(),
+            //         I, J, K, D
+            //     );
+            // }
             // Y_r_ scatter
             {
                 auto Y_r__slice_gpu = Y_r_.select(0, b).select(0, h);
@@ -1219,101 +1351,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
 
 
 // --- Backward Pass ---
-__device__ inline float compute_dot_product_cuda(
-    const float* __restrict__ Q, 
-    const float* __restrict__ R, 
-    const float* __restrict__ S,
-    int b, int h, int i, int j, int k, 
-    int B, int H, int I, int J, int K, int D){
-    // Calculate base pointers using passed dimensions
-    const float* q_vec = Q + (((int64_t)b * H + h) * I + i) * D;
-    const float* r_vec = R + (((int64_t)b * H + h) * J + j) * D;
-    const float* s_vec = S + (((int64_t)b * H + h) * K + k) * D;
-
-    float dot = 0.0f;
-    #pragma unroll 4
-    for (int d = 0; d < D; ++d) {
-        dot += q_vec[d] * r_vec[d] * s_vec[d];
-    }
-    return dot;}
-__device__ inline float compute_single_softmax_attn_cuda(
-    const float* __restrict__ Q, 
-    const float* __restrict__ R, 
-    const float* __restrict__ S,
-    int b, int h, int i_target, int j_target, int k_target,
-    int B, int H, int I, int J, int K, int D,
-    float scale,
-    int fixed_dim ){
-    float max_val = -1.0e30f;
-    float sum_exp = 0.0f;
-
-    // --- First Pass: Find Max --- 
-    if (fixed_dim == 0) { //Aq
-        for (int j_idx = 0; j_idx < J; ++j_idx) {
-            for (int k_idx = 0; k_idx < K; ++k_idx) {
-                float dot = compute_dot_product_cuda(Q, R, S, b, h, i_target, j_idx, k_idx, B, H, I, J, K, D);
-                max_val = fmaxf(max_val, dot * scale);
-            }
-        }
-    }
-    else if (fixed_dim == 1) { // Ar
-        for (int i_idx = 0; i_idx < I; ++i_idx) {
-            for (int k_idx = 0; k_idx < K; ++k_idx) {
-                float dot = compute_dot_product_cuda(Q, R, S, b, h, i_idx, j_target, k_idx, B, H, I, J, K, D);
-                max_val = fmaxf(max_val, dot * scale);
-            }
-        }
-    } else { // fixed_dim == 2
-        for (int i_idx = 0; i_idx < I; ++i_idx) {
-            for (int j_idx = 0; j_idx < J; ++j_idx) {
-                float dot = compute_dot_product_cuda(Q, R, S, b, h, i_idx, j_idx, k_target, B, H, I, J, K, D);
-                max_val = fmaxf(max_val, dot * scale);
-            }
-        }
-    }
-
-    // --- Second Pass: Compute Sum Exp ---
-    if (fixed_dim == 0) { // Aq
-        for (int j_idx = 0; j_idx < J; ++j_idx) {
-            for (int k_idx = 0; k_idx < K; ++k_idx) {
-                float dot = compute_dot_product_cuda(Q, R, S, b, h, i_target, j_idx, k_idx, B, H, I, J, K, D);
-                sum_exp += expf(dot * scale - max_val);
-            }
-        }
-    }
-    else if (fixed_dim == 1) { // Ar
-        for (int i_idx = 0; i_idx < I; ++i_idx) {
-            for (int k_idx = 0; k_idx < K; ++k_idx) {
-                float dot = compute_dot_product_cuda(Q, R, S, b, h, i_idx, j_target, k_idx, B, H, I, J, K, D);
-                sum_exp += expf(dot * scale - max_val);
-            }
-        }
-    } else { // As
-        for (int i_idx = 0; i_idx < I; ++i_idx) {
-            for (int j_idx = 0; j_idx < J; ++j_idx) {
-                float dot = compute_dot_product_cuda(Q, R, S, b, h, i_idx, j_idx, k_target, B, H, I, J, K, D);
-                sum_exp += expf(dot * scale - max_val);
-            }
-        }
-    }
-
-    // --- Compute final value for the target indices ---
-    float target_dot = compute_dot_product_cuda(Q, R, S, b, h, i_target, j_target, k_target, B, H, I, J, K, D);
-    
-    // Handle potential division by zero if sum_exp is very small
-    if (sum_exp <= 1e-20f) {
-        int num_elements;
-        if (fixed_dim == 0) num_elements = J * K;
-        else if (fixed_dim == 1) num_elements = I * K;
-        else /* fixed_dim == 2 */ num_elements = I * J;
-        // If the target dot was also the max (or close), return uniform prob, else 0.
-        return (fabsf(target_dot * scale - max_val) < 1e-5f) ? (1.0f / (float)num_elements) : 0.0f;
-    }
-    
-    return expf(target_dot * scale - max_val) / sum_exp;}
-
-
-
 
 __global__ void gather_grad_Vq1_kernel_optimized(
     const float* __restrict__ gradY_slice,     // [N, D]
