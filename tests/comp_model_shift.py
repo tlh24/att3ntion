@@ -24,7 +24,7 @@ class SimpleCompModel(nn.Module):
 	"""Model with hypergraph attention layer."""
 	def __init__(self, hidden_dim:int, num_heads:int, n_layers:int, attn_impl:str='', n_recurse:int=1, modulo:int=11):
 		super().__init__()
-		self.input_dim = 24
+		self.input_dim = 28
 		self.embedding_proj = nn.Linear(self.input_dim, hidden_dim)
 		self.rotary_emb = RotaryEmbedding(dim = hidden_dim)
 		self.attn_impl = attn_impl
@@ -135,13 +135,14 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 	criterion_ce = nn.CrossEntropyLoss() # NOTE
 	criterion_mse = nn.MSELoss()
 	model.printParamCount()
+	model = torch.compile(model, mode="max-autotune")
 
 	bf16_supported = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
 	print(f"Bfloat16 supported: {bf16_supported}")
 	print("--- Running with Automatic Mixed Precision ---")
 
 
-	fd_losslog = open(f'losslog_trainModel1_{attn_impl}.txt', 'w')
+	fd_losslog = open(f'losslog_{attn_impl}.txt', 'w')
 
 	print("\ntrain_model1 started...")
 	uu = 0
@@ -211,7 +212,7 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 			plt.show()
 
 		# save after each epoch
-		model.save_model(f"comp_model_{args.attn_impl}.pt")
+		model.save_model(f"comp_model_{args.attn}.pt")
 
 	# validation!
 	total_loss = 0
@@ -256,11 +257,11 @@ if __name__ == '__main__':
 	parser.add_argument('--batch-size', type=int, default=32, help='Batch size for training')
 	parser.add_argument('--modulo', type=int, default=16, help='Modulo for arithmetic operations')
 	parser.add_argument('--hidden-dim', type=int, default=96, help='Hidden dimension size')
-	parser.add_argument('--num-heads', type=int, default=4, help='Number of attention heads')
-	parser.add_argument('--attn-impl', type=str, default='hypergraph', choices=['hypergraph', 'graph'],
+	parser.add_argument('--heads', type=int, default=4, help='Number of attention heads')
+	parser.add_argument('--attn', type=str, default='hypergraph', choices=['hypergraph', 'graph'],
 						help='Attention implementation to use')
 	args = parser.parse_args()
-	
+
 	# torch.manual_seed(42)
 	# np.random.seed(42)
 	
@@ -269,8 +270,8 @@ if __name__ == '__main__':
 		device=args.device,
 		modulo=args.modulo,
 		hidden_dim=args.hidden_dim,
-		num_heads=args.num_heads,
-		attn_impl=args.attn_impl,
+		num_heads=args.heads,
+		attn_impl=args.attn,
 		batch_size=args.batch_size
 	)
 

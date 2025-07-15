@@ -289,23 +289,39 @@ def genData4(bs, md, do_print=False):
 
 	return x
 
-def genData5(bs,md, do_print):
+def graycodePosEnc(ntok, nbits):
 	'''
-	Can a hypergraph transformer add and remove tokens?
+	Generate a graycode
+	seems more principled than standard SPE?
 	'''
-	ntok = 32
-	pos_enc = np.zeros((ntok,8), dtype=np.float32)
+	pos_enc = np.zeros((ntok,nbits*2), dtype=np.float32)
 	indx = np.linspace(0, (ntok-1)*2*math.pi, ntok)
-	for i in range(4):
+	for i in range(nbits):
 		# gray code: [0][1] has a period of 4
 		# [2][3] has a period of sqrt(4*8) = sqrt(32) = 4 sqrt(2)
 		# [4][5] period of 8..
 		# period = 4 * (math.sqrt(2.0))**i
+		# above is slower - does not help?
 		period = 4 * 2.0**i
 		phase = math.pi / period # indx is scaled by 2 pi
-		pos_enc[:, 2*i  ] = -np.cos(indx / period + phase)
-		pos_enc[:, 2*i+1] = np.sin(indx / period + phase)
-	x = np.zeros((bs, ntok, md + 8), dtype=np.float32)
+		if True:
+			# sinusoidal, seems to work better?
+			pos_enc[:, 2*i  ] = -np.cos(indx / period + phase)
+			pos_enc[:, 2*i+1] = np.sin(indx / period + phase)
+		else:
+			# graycode! (thresholded)
+			pos_enc[:, 2*i  ] = np.cos(indx / period + phase) < 0
+			pos_enc[:, 2*i+1] = np.sin(indx / period + phase) < 0
+	return pos_enc
+
+def genData5(bs,md, do_print):
+	'''
+	Can a hypergraph transformer add and remove tokens?
+	'''
+	ntok = 128
+	nbits = 6
+	pos_enc = graycodePosEnc(ntok, nbits)
+	x = np.zeros((bs, ntok, md + nbits*2), dtype=np.float32)
 	y = np.zeros_like(x)
 
 	x[:, :, md:] = pos_enc # static --
@@ -350,6 +366,54 @@ def genData5(bs,md, do_print):
 		y[b, :, 8:16] += noizp
 	return x, y
 
+def genData6(bs, do_print):
+	'''
+	train the network to accurately multiply two one-digit
+	base 16 numbers.  Yes, the computer can do trillions of these things per sec .. this is super inefficient.  But.
+	'''
+	md = 8 + 16 + 8 # one-hot indicators, digits, pointer,
+	ntok = 8
+	nbits = 4
+
+	pos_enc = graycodePosEnc(ntok, nbits)
+	x = np.zeros((bs, ntok, md + nbits*2), dtype=np.float32)
+	y = np.zeros_like(x)
+	x[:, :, -nbits*2:] = pos_enc
+	y[:, :, -nbits*2:] = pos_enc # this will be overwritten
+
+	for b in range(bs):
+		va = randint(16)
+		vb = randint(16)
+		vc = va*vb
+		vc0 = vc % 16
+		vc1 = vc // 16
+		def encode(tok, val):
+			x[b, tok, 0] = 1.0 # occupied!
+			x[b, tok, val] += 1.0
+		encode(0, va + 8)
+		encode(1, 3) # * : +-*/=? -> 123456
+		encode(2, vb + 8)
+		encode(3, 5) # =
+		encode(4, 6) # ? (result)
+		# last two entries are left empty / free.
+
+		def encodeY(tok, val):
+			y[b, tok, 0] = 1.0 # occupied!
+			y[b, tok, val] += 1.0
+		encodeY(4, vc0 + 8)
+		if vc1 > 0:
+			# encode a pointer
+			y[b, 4, 24:32] = y[b, 5, 32:40]
+			encodeY(5, vc1 + 8)
+			# leave the pointer field in tok 5 empty = Null
+		# else:
+			# noop - leave the pointer field in tok 4 empty.
+		# this means we need to measure loss:
+		# cross-entropy over the digit (both 4 & 5)
+		# MSE over pointer field (both)
+	# TODO later: we need to vary the allocation & make sure the pointer op still works.
+	# which is OK, since we're only allocating one token.
+	return x, y
 
 if __name__ == '__main__':
 	# genData1(15, 19, True)
@@ -378,6 +442,6 @@ if __name__ == '__main__':
 	print(x.shape)
 	fig,axs = plt.subplots(2,2)
 	for i in range(2):
-		axs[0,i].imshow(np.squeeze(x[i,...]))
-		axs[1,i].imshow(np.squeeze(y[i,...]))
+		axs[0,i].imshow(np.squeeze(x[i,...]).T)
+		axs[1,i].imshow(np.squeeze(y[i,...]).T)
 	plt.show()
