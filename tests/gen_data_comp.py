@@ -411,7 +411,7 @@ def genData6(bs, do_print):
 		# this means we need to measure loss:
 		# cross-entropy over the digit (both 4 & 5)
 		# MSE over pointer field (both)
-	# TODO later: we need to vary the allocation & make sure the pointer op still works.
+	# TODO TODO: we need to vary the allocation & make sure the pointer op still works.
 	# which is OK, since we're only allocating one token.
 	return x, y
 
