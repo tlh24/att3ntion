@@ -17,7 +17,7 @@ if parent_dir_str not in sys.path:
 
 from hyper_attn_pytorch import HypergraphAttention_Naive, GraphAttention_Naive, QuickGELU
 # from hyper_attn_cpp_wrapper import HypergraphAttentionCPP
-from gen_data_comp import genData1, genData2, genData3, genData4
+from gen_data_comp import genData1, genData2, genData3, genData5
 import pdb
 
 class SimpleCompModel(nn.Module):
@@ -274,7 +274,7 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 	
 	print(f"Using device: {device}")
 	
-	data = genData4(batch_size * 1000, modulo, do_print=False) ## NOTE
+	data = genData4(batch_size * 1000, modulo, do_print=False)
 	dataset = TensorDataset(torch.tensor(data))
 	train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
@@ -335,7 +335,7 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 			fd_losslog.write(f"{uu}\t{lloss}\t0.0\n")
 			fd_losslog.flush()
 			uu += 1
-			
+
 			total_loss += loss.item()
 			total += inputs.size(0)
 			

@@ -1,6 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import random
+import math
 import pdb
 
 def randint(k):
@@ -288,6 +289,131 @@ def genData4(bs, md, do_print=False):
 
 	return x
 
+def graycodePosEnc(ntok, nbits):
+	'''
+	Generate a graycode
+	seems more principled than standard SPE?
+	'''
+	pos_enc = np.zeros((ntok,nbits*2), dtype=np.float32)
+	indx = np.linspace(0, (ntok-1)*2*math.pi, ntok)
+	for i in range(nbits):
+		# gray code: [0][1] has a period of 4
+		# [2][3] has a period of sqrt(4*8) = sqrt(32) = 4 sqrt(2)
+		# [4][5] period of 8..
+		# period = 4 * (math.sqrt(2.0))**i
+		# above is slower - does not help?
+		period = 4 * 2.0**i
+		phase = math.pi / period # indx is scaled by 2 pi
+		if True:
+			# sinusoidal, seems to work better?
+			pos_enc[:, 2*i  ] = -np.cos(indx / period + phase)
+			pos_enc[:, 2*i+1] = np.sin(indx / period + phase)
+		else:
+			# graycode! (thresholded)
+			pos_enc[:, 2*i  ] = np.cos(indx / period + phase) < 0
+			pos_enc[:, 2*i+1] = np.sin(indx / period + phase) < 0
+	return pos_enc
+
+def genData5(bs,md, do_print):
+	'''
+	Can a hypergraph transformer add and remove tokens?
+	'''
+	ntok = 128
+	nbits = 6
+	pos_enc = graycodePosEnc(ntok, nbits)
+	x = np.zeros((bs, ntok, md + nbits*2), dtype=np.float32)
+	y = np.zeros_like(x)
+
+	x[:, :, md:] = pos_enc # static --
+	y[:, :, md:] = pos_enc # but /could/ be permuted?
+
+	for b in range(bs):
+		s = np.random.randint(0, high=md-1, size=(ntok,), dtype=int)
+		# where there is a 0, remove the token.
+		# for 1, add one token before.
+		sp = np.ones((ntok,), dtype=int) * (md-1) #default new token fill
+		# make sure it can copy arbitrary vector content.
+		noiz = np.random.uniform(low = 0, high=1, size=(ntok,8))
+		noizp = np.zeros_like(noiz)
+		j = 0
+		l = 0
+		for k in range(ntok):
+			if s[k] == 0:
+				# skip this token, don't copy, don't increment.
+				l += 1 # noop
+			elif s[k] == 1:
+				if j < ntok:
+					sp[j] = md-1 #new token tag
+					j += 1
+				if j < ntok:
+					sp[j] = s[k]
+					noizp[j] = noiz[k]
+					j += 1
+			else:
+				if j < ntok:
+					sp[j] = s[k]
+					noizp[j] = noiz[k]
+					j += 1
+		if do_print:
+			print("starting sequence:")
+			print(s)
+			print("after insert/delete:")
+			print(sp)
+		indx = np.arange(ntok, dtype=int)
+		x[b, indx, s[indx]] = 1
+		y[b, indx, sp[indx]] = 1
+		x[b, :, 8:16] += noiz
+		y[b, :, 8:16] += noizp
+	return x, y
+
+def genData6(bs, do_print):
+	'''
+	train the network to accurately multiply two one-digit
+	base 16 numbers.  Yes, the computer can do trillions of these things per sec .. this is super inefficient.  But.
+	'''
+	md = 8 + 16 + 8 # one-hot indicators, digits, pointer,
+	ntok = 8
+	nbits = 4
+
+	pos_enc = graycodePosEnc(ntok, nbits)
+	x = np.zeros((bs, ntok, md + nbits*2), dtype=np.float32)
+	y = np.zeros_like(x)
+	x[:, :, -nbits*2:] = pos_enc
+	y[:, :, -nbits*2:] = pos_enc # this will be overwritten
+
+	for b in range(bs):
+		va = randint(16)
+		vb = randint(16)
+		vc = va*vb
+		vc0 = vc % 16
+		vc1 = vc // 16
+		def encode(tok, val):
+			x[b, tok, 0] = 1.0 # occupied!
+			x[b, tok, val] += 1.0
+		encode(0, va + 8)
+		encode(1, 3) # * : +-*/=? -> 123456
+		encode(2, vb + 8)
+		encode(3, 5) # =
+		encode(4, 6) # ? (result)
+		# last two entries are left empty / free.
+
+		def encodeY(tok, val):
+			y[b, tok, 0] = 1.0 # occupied!
+			y[b, tok, val] += 1.0
+		encodeY(4, vc0 + 8)
+		if vc1 > 0:
+			# encode a pointer
+			y[b, 4, 24:32] = y[b, 5, 32:40]
+			encodeY(5, vc1 + 8)
+			# leave the pointer field in tok 5 empty = Null
+		# else:
+			# noop - leave the pointer field in tok 4 empty.
+		# this means we need to measure loss:
+		# cross-entropy over the digit (both 4 & 5)
+		# MSE over pointer field (both)
+	# TODO TODO: we need to vary the allocation & make sure the pointer op still works.
+	# which is OK, since we're only allocating one token.
+	return x, y
 
 if __name__ == '__main__':
 	# genData1(15, 19, True)
@@ -302,12 +428,20 @@ if __name__ == '__main__':
 	# 	axs[j,k].imshow(np.squeeze(x[i,...]))
 	# plt.show()
 
-	x = genData4(800, 11, do_print=False) # Test
-	x = genData4(8, 11, do_print=True)
+	# x = genData4(800, 11, do_print=False) # Test
+	# x = genData4(8, 11, do_print=True)
+	# print(x.shape)
+	# fig,axs = plt.subplots(4,2)
+	# for i in range(8):
+	# 	j = i // 2
+	# 	k = i % 2
+	# 	axs[j,k].imshow(np.squeeze(x[i,...]))
+	# plt.show()
+
+	x,y = genData5(2, 24-8, do_print=True)
 	print(x.shape)
-	fig,axs = plt.subplots(4,2)
-	for i in range(8):
-		j = i // 2
-		k = i % 2
-		axs[j,k].imshow(np.squeeze(x[i,...]))
+	fig,axs = plt.subplots(2,2)
+	for i in range(2):
+		axs[0,i].imshow(np.squeeze(x[i,...]).T)
+		axs[1,i].imshow(np.squeeze(y[i,...]).T)
 	plt.show()
