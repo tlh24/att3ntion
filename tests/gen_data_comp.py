@@ -366,6 +366,15 @@ def genData5(bs,md, do_print):
 		y[b, :, 8:16] += noizp
 	return x, y
 
+def plotData5():
+	x,y = genData5(2, 24-8, do_print=True)
+	print(x.shape)
+	fig,axs = plt.subplots(2,2)
+	for i in range(2):
+		axs[0,i].imshow(np.squeeze(x[i,...]).T)
+		axs[1,i].imshow(np.squeeze(y[i,...]).T)
+	plt.show()
+
 def genData6(bs, do_print):
 	'''
 	train the network to accurately multiply two one-digit
@@ -411,9 +420,22 @@ def genData6(bs, do_print):
 		# this means we need to measure loss:
 		# cross-entropy over the digit (both 4 & 5)
 		# MSE over pointer field (both)
+		if do_print:
+			print(f"{va} * {vb} = {vc} = 0x{vc1:x}{vc0:x}")
 	# TODO TODO: we need to vary the allocation & make sure the pointer op still works.
 	# which is OK, since we're only allocating one token.
 	return x, y
+
+def plotData6():
+	bs = 2
+	x, y = genData6(bs, True)
+	fig,axs = plt.subplots(bs,2)
+	for b in range(bs):
+		axs[b, 0].imshow(np.squeeze(x[b,:,:]).T)
+		axs[b, 1].imshow(np.squeeze(y[b,:,:]).T)
+		axs[b,0].set_title('X')
+		axs[b,1].set_title('Y')
+	plt.show()
 
 if __name__ == '__main__':
 	# genData1(15, 19, True)
@@ -438,10 +460,4 @@ if __name__ == '__main__':
 	# 	axs[j,k].imshow(np.squeeze(x[i,...]))
 	# plt.show()
 
-	x,y = genData5(2, 24-8, do_print=True)
-	print(x.shape)
-	fig,axs = plt.subplots(2,2)
-	for i in range(2):
-		axs[0,i].imshow(np.squeeze(x[i,...]).T)
-		axs[1,i].imshow(np.squeeze(y[i,...]).T)
-	plt.show()
+	plotData6()
