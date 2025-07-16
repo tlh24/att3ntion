@@ -81,13 +81,13 @@ class HypergraphAttention_Naive(nn.Module):
 		As = torch.softmax(dot_product_s.flatten(3, 4), dim=-1).reshape(dot_product.shape)
 		As = As.permute(0, 1, 3, 4, 2) 
 		
-        # Aq = self.dropout(Aq)
+		# Aq = self.dropout(Aq)
 		# Ar = self.dropout(Ar)
 		# As = self.dropout(As)
 		# No dropout for testing backprop
-		self.dropout_mask_q = torch.ones_like(Aq)
-		self.dropout_mask_r = torch.ones_like(Ar)
-		self.dropout_mask_s = torch.ones_like(As)
+		# self.dropout_mask_q = torch.ones_like(Aq)
+		# self.dropout_mask_r = torch.ones_like(Ar)
+		# self.dropout_mask_s = torch.ones_like(As)
 		
 		# Gather operations
 		# hence the 'diamond' operation is multiply.
@@ -95,7 +95,7 @@ class HypergraphAttention_Naive(nn.Module):
 		Y_r = torch.einsum('bhijk,bhid,bhkd->bhjd', Ar, Vq, Vs)  
 		Y_s = torch.einsum('bhijk,bhid,bhjd->bhkd', As, Vq, Vr) 
 		
-		# Scatter opeartions
+		# Scatter operations
 		# Y_q_ = torch.einsum('bhijk,bhjd->bhid', Ar, Vr_) + \
 		# 		 torch.einsum('bhijk,bhkd->bhid', As, Vs_)
 		# Y_r_ = torch.einsum('bhijk,bhid->bhjd', Aq, Vq_) + \
