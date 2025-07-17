@@ -181,7 +181,7 @@ class Expression:
 		return f"({self.left.printParentLoc(self.loc)} {parent} {self.right.printParentLoc(self.loc)})"
 
 	def encode(self, md, x, b, pos_enc):
-		# need to just encode the left and right childeren
+		# need to just encode the left and right children
 		c = self.loc
 		if self.value is not None:
 			x[b,c,self.value+5] = 1

@@ -322,9 +322,9 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 
 			with autocast('cuda', dtype=torch.bfloat16):
 				outputs, pos_pred, value_pred = model(inputs)
-				# loss = 10*criterion_mse(pos_pred, pos_targets) # + \
-					# 0.2*criterion_ce(value_pred, value_targets)
-				loss = criterion_ce(value_pred, value_targets)
+				loss = 10*criterion_mse(pos_pred, pos_targets) + \
+					0.2*criterion_ce(value_pred, value_targets)
+				# loss = criterion_ce(value_pred, value_targets)
 			# value_pred = model(inputs)
 			# loss = (criterion(value_pred, targets))
 			
@@ -355,18 +355,19 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 		# save after each epoch
 		model.save_model(f"comp_model_{args.attn_impl}.pt")
 
-		# # visualize it
-		# fig,ax = plt.subplots(2,2, figsize=(12,9))
-		# ax[0,0].imshow(pos_pred.detach().float().cpu().numpy()[0,:,:])
-		# ax[0,0].set_title("pos_pred")
-		# ax[0,1].imshow(outputs.detach().float().cpu().numpy()[0,:,:])
-		# ax[0,1].set_title("outputs")
-		# ax[1,0].imshow(pos_targets.detach().float().cpu().numpy()[0,:,:])
-		# ax[1,0].set_title("pos_targets")
-		# ax[1,1].plot(value_pred.detach().float().cpu().numpy()[0,:], 'r')
-		# ax[1,1].plot(value_targets.detach().float().cpu().numpy()[0],1, 'ko')
-		# ax[1,1].set_title("value pred and target")
-		# plt.show()
+		# visualize it
+		if False:
+			fig,ax = plt.subplots(2,2, figsize=(12,9))
+			ax[0,0].imshow(pos_pred.detach().float().cpu().numpy()[0,:,:])
+			ax[0,0].set_title("pos_pred")
+			ax[0,1].imshow(outputs.detach().float().cpu().numpy()[0,:,:])
+			ax[0,1].set_title("outputs")
+			ax[1,0].imshow(pos_targets.detach().float().cpu().numpy()[0,:,:])
+			ax[1,0].set_title("pos_targets")
+			ax[1,1].plot(value_pred.detach().float().cpu().numpy()[0,:], 'r')
+			ax[1,1].plot(value_targets.detach().float().cpu().numpy()[0],1, 'ko')
+			ax[1,1].set_title("value pred and target")
+			plt.show()
 
 	fd_losslog.close()
 	return model
@@ -445,7 +446,7 @@ if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='Train analogy model')
 	parser.add_argument('--device', type=str, default='auto',
 						help='Device to use (cpu, cuda, auto)')
-	parser.add_argument('--epochs', type=int, default=15, help='Number of epochs')
+	parser.add_argument('--epochs', type=int, default=10, help='Number of epochs')
 	parser.add_argument('--batch-size', type=int, default=32, help='Batch size for training')
 	parser.add_argument('--modulo', type=int, default=11, help='Modulo for arithmetic operations')
 	parser.add_argument('--hidden-dim', type=int, default=96, help='Hidden dimension size')
@@ -461,7 +462,7 @@ if __name__ == '__main__':
 	# print(genData(3, args.modulo, do_print=True))
 	
 	model = train_model1(
-		num_epochs=4,
+		num_epochs=args.epochs,
 		device=args.device,
 		modulo=args.modulo,
 		hidden_dim=args.hidden_dim,

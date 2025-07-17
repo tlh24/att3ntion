@@ -91,21 +91,24 @@ class HypergraphAttention_Naive(nn.Module):
 		
 		# Gather operations
 		# hence the 'diamond' operation is multiply.
-		Y_q = torch.einsum('bhijk,bhjd,bhkd->bhid', Aq, Vr, Vs)  
-		Y_r = torch.einsum('bhijk,bhid,bhkd->bhjd', Ar, Vq, Vs)  
-		Y_s = torch.einsum('bhijk,bhid,bhjd->bhkd', As, Vq, Vr) 
+		Y_q = torch.einsum('bhijk,bhjd,bhkd->bhid', Aq, Vr, Vs)
+		Y_r = torch.einsum('bhijk,bhid,bhkd->bhjd', Ar, Vq, Vs)
+		Y_s = torch.einsum('bhijk,bhid,bhjd->bhkd', As, Vq, Vr)
 		
 		# Scatter operations
-		# Y_q_ = torch.einsum('bhijk,bhjd->bhid', Ar, Vr_) + \
-		# 		 torch.einsum('bhijk,bhkd->bhid', As, Vs_)
-		# Y_r_ = torch.einsum('bhijk,bhid->bhjd', Aq, Vq_) + \
-		# 		 torch.einsum('bhijk,bhkd->bhjd', As, Vs_)
-		# Y_s_ = torch.einsum('bhijk,bhid->bhkd', Aq, Vq_) + \
-		# 		 torch.einsum('bhijk,bhjd->bhkd', Ar, Vr_)
-			 
-		Y_q_ = torch.einsum('bhijk,bhjd,bhijk,bhkd->bhid', Ar, Vr_, As, Vs_)
-		Y_r_ = torch.einsum('bhijk,bhid,bhijk,bhkd->bhjd', Aq, Vq_, As, Vs_)
-		Y_s_ = torch.einsum('bhijk,bhid,bhijk,bhjd->bhkd', Aq, Vq_, Ar, Vr_)
+		if False:
+		# 'diamond' op is add
+			Y_q_ = torch.einsum('bhijk,bhjd->bhid', Ar, Vr_) + \
+					torch.einsum('bhijk,bhkd->bhid', As, Vs_)
+			Y_r_ = torch.einsum('bhijk,bhid->bhjd', Aq, Vq_) + \
+					torch.einsum('bhijk,bhkd->bhjd', As, Vs_)
+			Y_s_ = torch.einsum('bhijk,bhid->bhkd', Aq, Vq_) + \
+					torch.einsum('bhijk,bhjd->bhkd', Ar, Vr_)
+		else:
+			# 'diamond' op is mul
+			Y_q_ = torch.einsum('bhijk,bhjd,bhijk,bhkd->bhid', Ar, Vr_, As, Vs_)
+			Y_r_ = torch.einsum('bhijk,bhid,bhijk,bhkd->bhjd', Aq, Vq_, As, Vs_)
+			Y_s_ = torch.einsum('bhijk,bhid,bhijk,bhjd->bhkd', Aq, Vq_, Ar, Vr_)
 		
 		Y_q = self.gelu(Y_q) # test!
 		Y_r = self.gelu(Y_r)

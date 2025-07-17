@@ -71,13 +71,13 @@ Scatter operations:
 V'_q = W'_{vq} X \qquad V'_r = W'_{vr} X \qquad V'_s = W'_{vs} X \\
 
 Y'_r[..,j,d] = \sum_{i,k} A_q[..,i,j,k] * V'_q[..,i,d] 
-				+ A_s[..,i,j,k] * V'_s[..,k,d] \\
+				\diamond A_s[..,i,j,k] * V'_s[..,k,d] \\
 
 Y'_s[..,k,d] = \sum_{i,j} A_q[..,i,j,k] * V'_q[..,i,d] 
-				+ A_r[..,i,j,k] * V'_r[..,k,d] \\
+				\diamond A_r[..,i,j,k] * V'_r[..,k,d] \\
 
 Y'_q[..,i,d] = \sum_{j,k} A_r[..,i,j,k] * V'_r[..,j,d] 
-				+ A_s[..,i,j,k] * V'_s[..,k,d] \\
+				\diamond A_s[..,i,j,k] * V'_s[..,k,d] \\
 }
 ```
 As mentioned above, the scatter $V$ and $W$ tensors can be tied to the gather $V$ and $W$.  Finally: 
