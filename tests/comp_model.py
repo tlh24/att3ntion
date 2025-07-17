@@ -17,7 +17,7 @@ if parent_dir_str not in sys.path:
 
 from hyper_attn_pytorch import HypergraphAttention_Naive, GraphAttention_Naive, QuickGELU
 # from hyper_attn_cpp_wrapper import HypergraphAttentionCPP
-from gen_data_comp import genData1, genData2, genData3, genData5
+from gen_data_comp import genData1, genData2, genData3, genData4
 import pdb
 
 class SimpleCompModel(nn.Module):
@@ -283,7 +283,7 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 	else:
 		n_layers = 4
 
-	model = SimpleCompModel(hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=1, modulo=modulo).to(device)
+	model = SimpleCompModel(hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=3, modulo=modulo).to(device)
 	try:
 		model.load_model(f"comp_model_{attn_impl}.pt", device)
 	except:
@@ -344,7 +344,6 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 				torch.cuda.synchronize()
 				amp_time = start_event.elapsed_time(end_event)
 				print("batch time:", amp_time, "ms")
-
 
 			# Calculate accuracies
 			correct_vals += (torch.argmax(value_pred, dim=1) == value_targets).sum().item()

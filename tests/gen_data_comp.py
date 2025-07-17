@@ -289,6 +289,17 @@ def genData4(bs, md, do_print=False):
 
 	return x
 
+def plotData4():
+	x = genData4(800, 11, do_print=False) # Test
+	x = genData4(8, 11, do_print=True)
+	print(x.shape)
+	fig,axs = plt.subplots(4,2)
+	for i in range(8):
+		j = i // 2
+		k = i % 2
+		axs[j,k].imshow(np.squeeze(x[i,...]))
+	plt.show()
+
 def graycodePosEnc(ntok, nbits):
 	'''
 	Generate a graycode
@@ -450,14 +461,4 @@ if __name__ == '__main__':
 	# 	axs[j,k].imshow(np.squeeze(x[i,...]))
 	# plt.show()
 
-	# x = genData4(800, 11, do_print=False) # Test
-	# x = genData4(8, 11, do_print=True)
-	# print(x.shape)
-	# fig,axs = plt.subplots(4,2)
-	# for i in range(8):
-	# 	j = i // 2
-	# 	k = i % 2
-	# 	axs[j,k].imshow(np.squeeze(x[i,...]))
-	# plt.show()
-
-	plotData6()
+	plotData4()
