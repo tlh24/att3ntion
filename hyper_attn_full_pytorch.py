@@ -1,11 +1,21 @@
 import torch
 import torch.nn as nn
+from torch.autograd import Function
 import math
 import pdb
 
 class QuickGELU(nn.Module):
 	def forward(self, x: torch.Tensor):
 		return x * torch.sigmoid(1.702 * x)
+
+
+# class HypergraphAttention(Function):
+# 	@staticmethod
+# 	def forward(ctx, Q, R, S, Vq, Vr, Vs):
+#
+# 	@staticmethod
+# 	def backward(ctx, d_Y):
+
 
 class HypergraphAttention(nn.Module):
 	def __init__(self, d_model, n_heads, dropout_rate=0, **kwargs):
@@ -110,7 +120,7 @@ class HypergraphAttention(nn.Module):
 		return y 
 
 	def backward(self, x, dL_dy):
-		pdb.set_trace()
+		pdb.set_trace() # not called!  shoot.
 		batch_size, ntok, d_model = x.shape
 		
 		grads = {}

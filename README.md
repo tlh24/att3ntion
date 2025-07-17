@@ -52,15 +52,15 @@ V_q = W_{vq} X \qquad V_r = W_{vr} X \qquad V_s = W_{vs} X \\
 
 A_q[..,i,j,k] = \frac{ e^{A[..,i,j,k]} }{ \sum_{j,k} e^{A[..,i,j,k]} } \\
 
-Y_q[..,i,d] = \sum_{j,k} A_q[..,i,j,k] ( V_r[..,j,d] \diamond V_s[;;,k,d] )\\
+Y_q[..,i,d] = \sum_{j,k} A_q[..,i,j,k] ( V_r[..,j,d] \diamond V_s[..,k,d] )\\
 
 A_r[..,i,j,k] = \frac{ e^{A[..,i,j,k]} }{ \sum_{i,k} e^{A[..,i,j,k]} } \\
 
-Y_r[..,i,d] = \sum_{i,k} A_r[..,i,j,k] ( V_q[..,i,d] \diamond V_s[;;,k,d] )\\
+Y_r[..,i,d] = \sum_{i,k} A_r[..,i,j,k] ( V_q[..,i,d] \diamond V_s[..,k,d] )\\
 
 A_s[..,i,j,k] = \frac{ e^{A[..,i,j,k]} }{ \sum_{i,j} e^{A[..,i,j,k]} } \\
 
-Y_s[..,i,d] = \sum_{i,j} A_s[..,i,j,k] ( V_q[..,i,d] \diamond V_r[;;,j,d] )\\
+Y_s[..,i,d] = \sum_{i,j} A_s[..,i,j,k] ( V_q[..,i,d] \diamond V_r[..,j,d] )\\
 }
 ```
 Where $\large \diamond$ is either $\large +$ or $\large *$.  
@@ -71,13 +71,13 @@ Scatter operations:
 V'_q = W'_{vq} X \qquad V'_r = W'_{vr} X \qquad V'_s = W'_{vs} X \\
 
 Y'_r[..,j,d] = \sum_{i,k} A_q[..,i,j,k] * V'_q[..,i,d] 
-				+ A_s[..,i,j,k] * V'_s[..,k,d] \\
+				\diamond A_s[..,i,j,k] * V'_s[..,k,d] \\
 
 Y'_s[..,k,d] = \sum_{i,j} A_q[..,i,j,k] * V'_q[..,i,d] 
-				+ A_r[..,i,j,k] * V'_r[..,k,d] \\
+				\diamond A_r[..,i,j,k] * V'_r[..,k,d] \\
 
 Y'_q[..,i,d] = \sum_{j,k} A_r[..,i,j,k] * V'_r[..,j,d] 
-				+ A_s[..,i,j,k] * V'_s[..,k,d] \\
+				\diamond A_s[..,i,j,k] * V'_s[..,k,d] \\
 }
 ```
 As mentioned above, the scatter $V$ and $W$ tensors can be tied to the gather $V$ and $W$.  Finally: 

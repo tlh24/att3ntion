@@ -14,10 +14,14 @@ def genData(bs, md, do_print=False):
 		
 	assert(md < 32-4)
 	x = np.zeros((bs, 8, 32), dtype=int)
-		
+
+	n_ambig = 0
+	n_sampled = 0
+	expression_set = set()
 	for b in range(bs): 
 		unambig = False
 		while not unambig: 
+			n_sampled += 1
 			va = randint(md)
 			vb = randint(md-1) + 1 # avoid divide by zero and noops
 			op = np.random.randint(4)
@@ -28,6 +32,8 @@ def genData(bs, md, do_print=False):
 			# another way to do this is to sort the 4, calculate the differences, and compare that to zero - this requires 3 comparisons but potentially 4 swaps, so better to just do the 6 comparisons.
 			if vc0 != vc1 and vc2 != vc3 and vc0 != vc2 and vc1 != vc3 and vc0 != vc3 and vc1 != vc2: 
 				unambig = True
+			else:
+				n_ambig += 1
 		# in contrast, D op E is always deterministic so don't need to check if the inference is unambiguous.  
 		vd = randint(md)
 		ve = randint(md-1) + 1
@@ -55,20 +61,25 @@ def genData(bs, md, do_print=False):
 		x[b,6,ve+4] = 1
 		x[b,7,vf+4] = 1 # must be masked
 		
-		if do_print: 
-			match op: 
-				case 0: 
-					ops = '+'
-				case 1: 
-					ops = '-'
-				case 2: 
-					ops = '*'
-				case 3: 
-					ops = '/'
-			print(f"if {va} op {vb} = {vc} then {vd} op {ve} = f  (op = {ops}, f = {vf})")
+		match op:
+			case 0:
+				ops = '+'
+			case 1:
+				ops = '-'
+			case 2:
+				ops = '*'
+			case 3:
+				ops = '/'
+		s = f"if {va} op {vb} = {vc} then {vd} op {ve} = f  (op = {ops}, f = {vf})"
+		expression_set.add(s)
+		if do_print:
+			print(s)
 	# endfor b
+	print(f"ambiguous: {n_ambig} / {n_sampled}, {100*n_ambig/n_sampled}% batch_size:{bs} unique:{len(expression_set)}")
 	return x
 
 
 if __name__ == '__main__':
-	genData(10, 7, True)
+	genData(1500000, 19, False)
+	# unique seems to asymptope at 1512 with m = 7
+	# ~319k m = 19
