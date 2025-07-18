@@ -300,13 +300,15 @@ def plotData4():
 		axs[j,k].imshow(np.squeeze(x[i,...]))
 	plt.show()
 
-def graycodePosEnc(ntok, nbits):
+def graycodePosEnc(ntok, nbits, rand_phase=False):
 	'''
 	Generate a graycode
 	seems more principled than standard SPE?
 	'''
 	pos_enc = np.zeros((ntok,nbits*2), dtype=np.float32)
 	indx = np.linspace(0, (ntok-1)*2*math.pi, ntok)
+	if rand_phase:
+		phase_offset = np.random.uniform() * 2 * math.pi
 	for i in range(nbits):
 		# gray code: [0][1] has a period of 4
 		# [2][3] has a period of sqrt(4*8) = sqrt(32) = 4 sqrt(2)
@@ -314,7 +316,7 @@ def graycodePosEnc(ntok, nbits):
 		# period = 4 * (math.sqrt(2.0))**i
 		# above is slower - does not help?
 		period = 4 * 2.0**i
-		phase = math.pi / period # indx is scaled by 2 pi
+		phase = math.pi / period + rand_phase# indx is scaled by 2 pi
 		if True:
 			# sinusoidal, seems to work better?
 			pos_enc[:, 2*i  ] = -np.cos(indx / period + phase)
@@ -395,7 +397,7 @@ def genData6(bs, do_print):
 	ntok = 8
 	nbits = 4
 
-	pos_enc = graycodePosEnc(ntok, nbits)
+	pos_enc = graycodePosEnc(ntok, nbits, rand_phase=True)
 	x = np.zeros((bs, ntok, md + nbits*2), dtype=np.float32)
 	y = np.zeros_like(x)
 	x[:, :, -nbits*2:] = pos_enc
@@ -404,14 +406,18 @@ def genData6(bs, do_print):
 	for b in range(bs):
 		va = randint(16)
 		vb = randint(16)
-		vc = va*vb
+		op = randint(2)
+		if op == 0:
+			vc = va + vb
+		else:
+			vc = va*vb
 		vc0 = vc % 16
 		vc1 = vc // 16
 		def encode(tok, val):
 			x[b, tok, 0] = 1.0 # occupied!
 			x[b, tok, val] += 1.0
 		encode(0, va + 8)
-		encode(1, 3) # * : +-*/=? -> 123456
+		encode(1, 1+op*2) # * : +-*/=? -> 123456
 		encode(2, vb + 8)
 		encode(3, 5) # =
 		encode(4, 6) # ? (result)
