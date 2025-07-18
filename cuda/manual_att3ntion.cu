@@ -678,6 +678,403 @@ void Ys_gather_flash_kernel(
         Y[query_base_off + d] = o_sh[d];
     }
 }
+
+// --- START of FLASH Yq' SCATTER IMPLEMENTATION ---
+
+// Tile dimensions. These can be tuned for performance.
+#define TILE_I 16
+#define TILE_J 16
+#define TILE_K 16
+
+// Kernel 1: Compute online softmax stats (m, l) for Ar = softmax_{i,k}(A)
+// Grid: (J, B * H), Block: (256)
+__global__ void Ar_stats_kernel_batched(
+    const float* __restrict__ Q, const float* __restrict__ R, const float* __restrict__ S,
+    float* __restrict__ m_j_out, float* __restrict__ l_j_out,
+    int B, int H, int I, int J, int K, int D, float scale
+) {
+    // --- Grid/Block Mapping ---
+    // Each block computes the stats for a single j_idx, for a single batch/head.
+    const int j_idx = blockIdx.x;
+    const int bh_idx = blockIdx.y;
+    
+    if (j_idx >= J) return;
+
+    const int tid = threadIdx.x;
+    const int block_size = blockDim.x;
+
+    // --- Pointers ---
+    const int64_t q_bh_offset = (int64_t)bh_idx * I * D;
+    const int64_t r_bh_offset = (int64_t)bh_idx * J * D;
+    const int64_t s_bh_offset = (int64_t)bh_idx * K * D;
+
+    const float* Q_slice = Q + q_bh_offset;
+    const float* R_slice = R + r_bh_offset;
+    const float* S_slice = S + s_bh_offset;
+
+    // --- Shared Memory ---
+    extern __shared__ float smem[];
+    float* r_vec_sh = smem;                              // D
+    float* q_tile = r_vec_sh + D;                        // TILE_I * D
+    float* s_tile = q_tile + TILE_I * D;                 // TILE_K * D
+    float* p_tile = s_tile + TILE_K * D;                 // TILE_I * TILE_K (for intermediate dots)
+    float* red_buf = p_tile + TILE_I * TILE_K;           // block_size (for reduction)
+
+    // --- Load R[j] into shared memory ---
+    for(int d=tid; d<D; d+=block_size) {
+        r_vec_sh[d] = R_slice[j_idx * D + d];
+    }
+    
+    // Each thread holds a local copy of the block-wide stats
+    float m_block = -1e30f;
+    float l_block = 0.0f;
+
+    __syncthreads();
+
+    // --- Main Loop: Iterate over all i and k tiles ---
+    for (int i0 = 0; i0 < I; i0 += TILE_I) {
+        for (int k0 = 0; k0 < K; k0 += TILE_K) {
+            // Cooperatively load Q and S tiles
+            for (int idx = tid; idx < TILE_I * D; idx += block_size) {
+                int i_load = i0 + (idx/D);
+                if(i_load < I) q_tile[idx] = Q_slice[i_load * D + (idx%D)];
+            }
+            for (int idx = tid; idx < TILE_K * D; idx += block_size) {
+                int k_load = k0 + (idx/D);
+                if(k_load < K) s_tile[idx] = S_slice[k_load * D + (idx%D)];
+            }
+            __syncthreads();
+
+            // --- Compute dot products for this tile and store in p_tile ---
+            for (int flat_idx = tid; flat_idx < TILE_I * TILE_K; flat_idx += block_size) {
+                int i_tile_idx = flat_idx / TILE_K;
+                int k_tile_idx = flat_idx % TILE_K;
+                
+                float dot = 0.0f;
+                if (i0 + i_tile_idx < I && k0 + k_tile_idx < K) {
+                    const float* q_vec_sh = q_tile + i_tile_idx * D;
+                    const float* s_vec_sh = s_tile + k_tile_idx * D;
+                    for(int d=0; d<D; ++d) dot += q_vec_sh[d] * r_vec_sh[d] * s_vec_sh[d];
+                    p_tile[flat_idx] = dot * scale;
+                } else {
+                    p_tile[flat_idx] = -1e30f; // Padding
+                }
+            }
+            __syncthreads();
+
+            // --- Parallel reduction to find tile max (m_tile) ---
+            float m_tile_thread = -1e30f;
+            for (int flat_idx = tid; flat_idx < TILE_I * TILE_K; flat_idx += block_size) {
+                m_tile_thread = fmaxf(m_tile_thread, p_tile[flat_idx]);
+            }
+            red_buf[tid] = m_tile_thread;
+            __syncthreads();
+            for (int s = block_size / 2; s > 0; s >>= 1) {
+                if (tid < s) red_buf[tid] = fmaxf(red_buf[tid], red_buf[tid + s]);
+                __syncthreads();
+            }
+            float m_tile = red_buf[0];
+
+            // --- Parallel reduction to find tile sum_exp (l_tile) ---
+            float l_tile_thread = 0.0f;
+            for (int flat_idx = tid; flat_idx < TILE_I * TILE_K; flat_idx += block_size) {
+                if (p_tile[flat_idx] > -1e29f) { // Check if it's not padding
+                    l_tile_thread += expf(p_tile[flat_idx] - m_tile);
+                }
+            }
+            red_buf[tid] = l_tile_thread;
+            __syncthreads();
+            for (int s = block_size / 2; s > 0; s >>= 1) {
+                if (tid < s) red_buf[tid] += red_buf[tid + s];
+                __syncthreads();
+            }
+            float l_tile = red_buf[0];
+            
+            // --- Online update of block-wide stats (each thread updates its copy) ---
+            float m_new = fmaxf(m_block, m_tile);
+            l_block = expf(m_block - m_new) * l_block + expf(m_tile - m_new) * l_tile;
+            m_block = m_new;
+            __syncthreads(); // Sync to ensure all threads are ready for the next tile
+        }
+    }
+    
+    // --- Write final stats to global memory (only thread 0) ---
+    if (tid == 0) {
+        m_j_out[bh_idx * J + j_idx] = m_block;
+        l_j_out[bh_idx * J + j_idx] = l_block;
+    }
+}
+
+// Kernel 2: Compute online softmax stats (m, l) for As = softmax_{i,j}(A)
+// Grid: (K, B * H), Block: (256)
+__global__ void As_stats_kernel_batched(
+    const float* __restrict__ Q, const float* __restrict__ R, const float* __restrict__ S,
+    float* __restrict__ m_k_out, float* __restrict__ l_k_out,
+    int B, int H, int I, int J, int K, int D, float scale
+) {
+    // --- Grid/Block Mapping ---
+    const int k_idx = blockIdx.x;
+    const int bh_idx = blockIdx.y;
+    if (k_idx >= K) return;
+
+    const int tid = threadIdx.x;
+    const int block_size = blockDim.x;
+
+    // --- Pointers ---
+    const int64_t q_bh_offset = (int64_t)bh_idx * I * D;
+    const int64_t r_bh_offset = (int64_t)bh_idx * J * D;
+    const int64_t s_bh_offset = (int64_t)bh_idx * K * D;
+
+    const float* Q_slice = Q + q_bh_offset;
+    const float* R_slice = R + r_bh_offset;
+    const float* S_slice = S + s_bh_offset;
+
+    // --- Shared Memory ---
+    extern __shared__ float smem[];
+    float* s_vec_sh = smem;                              // D
+    float* q_tile = s_vec_sh + D;                        // TILE_I * D
+    float* r_tile = q_tile + TILE_I * D;                 // TILE_J * D
+    float* p_tile = r_tile + TILE_J * D;                 // TILE_I * TILE_J
+    float* red_buf = p_tile + TILE_I * TILE_J;           // block_size
+
+    for(int d=tid; d<D; d+=block_size) s_vec_sh[d] = S_slice[k_idx * D + d];
+    
+    float m_block = -1e30f;
+    float l_block = 0.0f;
+    __syncthreads();
+
+    // --- Main Loop: Iterate over all i and j tiles ---
+    for (int i0 = 0; i0 < I; i0 += TILE_I) {
+        for (int j0 = 0; j0 < J; j0 += TILE_J) {
+            // Cooperatively load Q and R tiles
+            for (int idx = tid; idx < TILE_I * D; idx += block_size) {
+                int i_load = i0 + (idx/D);
+                if(i_load < I) q_tile[idx] = Q_slice[i_load * D + (idx%D)];
+            }
+            for (int idx = tid; idx < TILE_J * D; idx += block_size) {
+                int j_load = j0 + (idx/D);
+                if(j_load < J) r_tile[idx] = R_slice[j_load * D + (idx%D)];
+            }
+            __syncthreads();
+
+            // Compute dot products
+            for (int flat_idx = tid; flat_idx < TILE_I * TILE_J; flat_idx += block_size) {
+                int i_tile_idx = flat_idx / TILE_J;
+                int j_tile_idx = flat_idx % TILE_J;
+                float dot = 0.0f;
+                if (i0 + i_tile_idx < I && j0 + j_tile_idx < J) {
+                    const float* q_vec_sh = q_tile + i_tile_idx * D;
+                    const float* r_vec_sh = r_tile + j_tile_idx * D;
+                    for(int d=0; d<D; ++d) dot += q_vec_sh[d] * r_vec_sh[d] * s_vec_sh[d];
+                    p_tile[flat_idx] = dot * scale;
+                } else {
+                    p_tile[flat_idx] = -1e30f;
+                }
+            }
+            __syncthreads();
+
+            // Find tile max (m_tile)
+            float m_tile_thread = -1e30f;
+            for (int i = tid; i < TILE_I*TILE_J; i+=block_size) m_tile_thread = fmaxf(m_tile_thread, p_tile[i]);
+            red_buf[tid] = m_tile_thread;
+            __syncthreads();
+            for (int s=block_size/2; s>0; s>>=1) if (tid<s) red_buf[tid] = fmaxf(red_buf[tid], red_buf[tid+s]);
+            __syncthreads();
+            float m_tile = red_buf[0];
+
+            // Find tile sum_exp (l_tile)
+            float l_tile_thread = 0.0f;
+            for (int i = tid; i < TILE_I*TILE_J; i+=block_size) {
+                if(p_tile[i] > -1e29f) l_tile_thread += expf(p_tile[i] - m_tile);
+            }
+            red_buf[tid] = l_tile_thread;
+            __syncthreads();
+            for (int s=block_size/2; s>0; s>>=1) if (tid<s) red_buf[tid] += red_buf[tid+s];
+            __syncthreads();
+            float l_tile = red_buf[0];
+
+            // Online update
+            float m_new = fmaxf(m_block, m_tile);
+            l_block = expf(m_block - m_new) * l_block + expf(m_tile - m_new) * l_tile;
+            m_block = m_new;
+            __syncthreads();
+        }
+    }
+    
+    if (tid == 0) {
+        m_k_out[bh_idx * K + k_idx] = m_block;
+        l_k_out[bh_idx * K + k_idx] = l_block;
+    }
+}
+
+// Kernel 3: Fused accumulation using pre-computed stats
+// Grid: ((I + TILE_I - 1) / TILE_I, B * H), Block: (D, TILE_I)
+__global__ void accumulation_kernel_batched(
+    const float* __restrict__ Q, const float* __restrict__ R, const float* __restrict__ S,
+    const float* __restrict__ Vr_2, const float* __restrict__ Vs_2,
+    const float* __restrict__ m_j_in, const float* __restrict__ l_j_in,
+    const float* __restrict__ m_k_in, const float* __restrict__ l_k_in,
+    float* __restrict__ Y_q_,
+    int B, int H, int I, int J, int K, int D, float scale
+) {
+    // --- Grid/Block Mapping ---
+    const int i_tile_idx_grid = blockIdx.x;
+    const int bh_idx = blockIdx.y;
+
+    const int d_idx = threadIdx.x;
+    const int i_local_idx = threadIdx.y;
+
+    const int i_base = i_tile_idx_grid * TILE_I;
+    const int i_idx = i_base + i_local_idx;
+
+    if (i_idx >= I) return;
+
+    // --- Pointers ---
+    const int64_t q_bh_offset = (int64_t)bh_idx * I * D;
+    const int64_t r_bh_offset = (int64_t)bh_idx * J * D;
+    const int64_t s_bh_offset = (int64_t)bh_idx * K * D;
+    const int64_t vr_bh_offset = (int64_t)bh_idx * J * D;
+    const int64_t vs_bh_offset = (int64_t)bh_idx * K * D;
+    const int64_t mj_bh_offset = (int64_t)bh_idx * J;
+    const int64_t mk_bh_offset = (int64_t)bh_idx * K;
+    const int64_t yq_bh_offset = (int64_t)bh_idx * I * D;
+
+    // --- Shared Memory ---
+    extern __shared__ float smem[];
+    float* q_tile = smem;                             // TILE_I * D
+    float* r_tile = q_tile + TILE_I * D;              // TILE_J * D
+    float* s_tile = r_tile + TILE_J * D;              // TILE_K * D
+    float* vr_tile = s_tile + TILE_K * D;             // TILE_J * D
+    float* vs_tile = vr_tile + TILE_J * D;            // TILE_K * D
+    float* mj_tile = vs_tile + TILE_K * D;            // TILE_J
+    float* lj_tile = mj_tile + TILE_J;                // TILE_J
+    float* mk_tile = lj_tile + TILE_J;                // TILE_K
+    float* lk_tile = mk_tile + TILE_K;                // TILE_K
+
+    float o_local = 0.0f;
+
+    if (d_idx < D) q_tile[i_local_idx * D + d_idx] = Q[q_bh_offset + i_idx * D + d_idx];
+    __syncthreads();
+
+    for (int j0 = 0; j0 < J; j0 += TILE_J) {
+        int flat_thread_id = threadIdx.y * blockDim.x + threadIdx.x;
+        int threads_per_block = blockDim.x * blockDim.y;
+        
+        for (int idx = flat_thread_id; idx < TILE_J * D; idx += threads_per_block) {
+            int j = j0 + (idx/D);
+            if(j < J) {
+                r_tile[idx % (TILE_J*D)] = R[r_bh_offset + j * D + (idx % D)];
+                vr_tile[idx % (TILE_J*D)] = Vr_2[vr_bh_offset + j * D + (idx % D)];
+            }
+        }
+        for (int j_load = flat_thread_id; j_load < TILE_J; j_load += threads_per_block) {
+            if(j0 + j_load < J) {
+                 mj_tile[j_load] = m_j_in[mj_bh_offset + j0 + j_load];
+                 lj_tile[j_load] = l_j_in[mj_bh_offset + j0 + j_load];
+            }
+        }
+
+        for (int k0 = 0; k0 < K; k0 += TILE_K) {
+            for (int idx = flat_thread_id; idx < TILE_K * D; idx += threads_per_block) {
+                 int k = k0 + (idx/D);
+                 if(k < K) {
+                    s_tile[idx % (TILE_K*D)] = S[s_bh_offset + k * D + (idx % D)];
+                    vs_tile[idx % (TILE_K*D)] = Vs_2[vs_bh_offset + k * D + (idx % D)];
+                 }
+            }
+            for (int k_load = flat_thread_id; k_load < TILE_K; k_load += threads_per_block) {
+                if(k0 + k_load < K) {
+                    mk_tile[k_load] = m_k_in[mk_bh_offset + k0 + k_load];
+                    lk_tile[k_load] = l_k_in[mk_bh_offset + k0 + k_load];
+                }
+            }
+            __syncthreads();
+
+            const float* q_vec_sh = q_tile + i_local_idx * D;
+            for (int j_tile_idx = 0; j_tile_idx < TILE_J; ++j_tile_idx) {
+                if (j0 + j_tile_idx >= J) continue;
+                const float* r_vec_sh = r_tile + j_tile_idx * D;
+
+                for (int k_tile_idx = 0; k_tile_idx < TILE_K; ++k_tile_idx) {
+                    if (k0 + k_tile_idx >= K) continue;
+                    const float* s_vec_sh = s_tile + k_tile_idx * D;
+
+                    float dot = 0.0f;
+                    for (int d = 0; d < D; ++d) dot += q_vec_sh[d] * r_vec_sh[d] * s_vec_sh[d];
+                    float logit = dot * scale;
+
+                    float ar_val = expf(logit - mj_tile[j_tile_idx]) / lj_tile[j_tile_idx];
+                    float as_val = expf(logit - mk_tile[k_tile_idx]) / lk_tile[k_tile_idx];
+                    
+                    o_local += ar_val * as_val * vr_tile[j_tile_idx*D + d_idx] * vs_tile[k_tile_idx*D + d_idx];
+                }
+            }
+            __syncthreads();
+        }
+    }
+    
+    if (d_idx < D) Y_q_[yq_bh_offset + i_idx * D + d_idx] = o_local;
+}
+
+void Yq_scatter_flash_forward_cuda(
+    const at::Tensor& Q, const at::Tensor& R, const at::Tensor& S,
+    const at::Tensor& Vr_2, const at::Tensor& Vs_2,
+    at::Tensor& Y_q_, float scale
+) {
+    const auto B = Q.size(0);
+    const auto H = Q.size(1);
+    const auto I = Q.size(2);
+    const auto J = R.size(2);
+    const auto K = S.size(2);
+    const auto D = Q.size(3);
+    auto opts = Q.options();
+
+    auto m_j = torch::zeros({B, H, J}, opts);
+    auto l_j = torch::zeros({B, H, J}, opts);
+    auto m_k = torch::zeros({B, H, K}, opts);
+    auto l_k = torch::zeros({B, H, K}, opts);
+    
+    const int stats_threads = 256;
+    { // Ar stats
+        dim3 grid(J, B * H);
+        dim3 block(stats_threads);
+        size_t smem_size = sizeof(float) * (D + TILE_I*D + TILE_K*D + TILE_I*TILE_K + stats_threads);
+        Ar_stats_kernel_batched<<<grid, block, smem_size>>>(
+            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
+            m_j.data_ptr<float>(), l_j.data_ptr<float>(),
+            B, H, I, J, K, D, scale);
+    }
+    { // As stats
+        dim3 grid(K, B * H);
+        dim3 block(stats_threads);
+        size_t smem_size = sizeof(float) * (D + TILE_I*D + TILE_J*D + TILE_I*TILE_J + stats_threads);
+        As_stats_kernel_batched<<<grid, block, smem_size>>>(
+            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
+            m_k.data_ptr<float>(), l_k.data_ptr<float>(),
+            B, H, I, J, K, D, scale);
+    }
+
+    {
+        TORCH_CHECK(D * TILE_I <= 1024, "D * TILE_I must be <= 1024 for the 2D block size.");
+        dim3 grid((I + TILE_I - 1) / TILE_I, B * H);
+        dim3 block(D, TILE_I);
+        size_t smem_size = sizeof(float) * (
+            TILE_I*D + TILE_J*D + TILE_K*D + 
+            TILE_J*D + TILE_K*D +             
+            TILE_J + TILE_J + TILE_K + TILE_K
+        );
+        accumulation_kernel_batched<<<grid, block, smem_size>>>(
+            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
+            Vr_2.data_ptr<float>(), Vs_2.data_ptr<float>(),
+            m_j.data_ptr<float>(), l_j.data_ptr<float>(),
+            m_k.data_ptr<float>(), l_k.data_ptr<float>(),
+            Y_q_.data_ptr<float>(),
+            B, H, I, J, K, D, scale
+        );
+    }
+}
+
+// --- END of FLASH Yq' SCATTER IMPLEMENTATION ---
 __global__ void Yq_gather_kernel_naive(
     const float* __restrict__ Q, 
     const float* __restrict__ R, 
@@ -1235,7 +1632,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     //         Y_q_.data_ptr<float>(), 
     //         B, H, I, J, K, D, scale);
     // }
-
+    // --- NEW: FLASH SCATTER Yq' ---
+    Yq_scatter_flash_forward_cuda(Q, R, S, Vr_2, Vs_2, Y_q_, scale);
 
     // --- OPTIMIZED SCATTER Calls (Slice-wise) --- 
     for (int b = 0; b < B; ++b) {
@@ -1255,17 +1653,17 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
             torch::Tensor As_slice_gpu = compute_As_slice_cuda_wrapper(A_slice_gpu);
 
             // Y_q_ scatter
-            {
-                auto Y_q__slice_gpu = Y_q_.select(0, b).select(0, h);
-                const int64_t N = (int64_t)I*D;
-                const dim3 blocks((N + threads - 1) / threads);
-                Yq_scatter_kernel_optimized<<<blocks, threads>>>(
-                    Ar_slice_gpu.data_ptr<float>(), As_slice_gpu.data_ptr<float>(),
-                    Vr_2_slice_gpu.data_ptr<float>(), Vs_2_slice_gpu.data_ptr<float>(),
-                    Y_q__slice_gpu.data_ptr<float>(),
-                    I, J, K, D
-                );
-            }
+            // {
+            //     auto Y_q__slice_gpu = Y_q_.select(0, b).select(0, h);
+            //     const int64_t N = (int64_t)I*D;
+            //     const dim3 blocks((N + threads - 1) / threads);
+            //     Yq_scatter_kernel_optimized<<<blocks, threads>>>(
+            //         Ar_slice_gpu.data_ptr<float>(), As_slice_gpu.data_ptr<float>(),
+            //         Vr_2_slice_gpu.data_ptr<float>(), Vs_2_slice_gpu.data_ptr<float>(),
+            //         Y_q__slice_gpu.data_ptr<float>(),
+            //         I, J, K, D
+            //     );
+            // }
             // Y_r_ scatter
             {
                 auto Y_r__slice_gpu = Y_r_.select(0, b).select(0, h);
