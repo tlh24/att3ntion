@@ -97,7 +97,7 @@ class HypergraphAttention_Naive(nn.Module):
 		
 		# Scatter operations
 		if False:
-		# 'diamond' op is add
+		# 'diamond' op is add; this seems very slightly slower
 			Y_q_ = torch.einsum('bhijk,bhjd->bhid', Ar, Vr_) + \
 					torch.einsum('bhijk,bhkd->bhid', As, Vs_)
 			Y_r_ = torch.einsum('bhijk,bhid->bhjd', Aq, Vq_) + \

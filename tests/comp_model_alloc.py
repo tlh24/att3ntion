@@ -123,11 +123,11 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 	
 	print(f"Using device: {device}")
 	
-	x, y = genData5(batch_size * 1000, modulo, do_print=False)
+	x, y = genData6(batch_size * 1000, do_print=False)
 	dataset = TensorDataset(torch.tensor(x), torch.tensor(y))
 	train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-	x_v, y_v = genData5(batch_size * 1000, modulo, do_print=False)
+	x_v, y_v = genData6(batch_size * 1000, do_print=False)
 	dataset_v = TensorDataset(torch.tensor(x_v), torch.tensor(y_v))
 	loader_v = DataLoader(dataset_v, batch_size=batch_size, shuffle=True)
 
@@ -142,10 +142,10 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 	except:
 		print("train_model1: could not load the saved model weights")
 	optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, amsgrad=True)
-	criterion_ce = nn.CrossEntropyLoss() # NOTE
+	criterion_ce = nn.CrossEntropyLoss(reduction='none')
 	criterion_mse = nn.MSELoss()
 	model.printParamCount()
-	model = torch.compile(model, mode="max-autotune")
+	model = torch.compile(model) # mode="max-autotune"
 
 	bf16_supported = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
 	print(f"Bfloat16 supported: {bf16_supported}")
@@ -169,6 +169,8 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 		for batch_indx, (inputs_np,outputs_np) in enumerate(train_loader):
 			inputs = torch.FloatTensor(inputs_np).to(device)
 			targets = torch.FloatTensor(outputs_np).to(device)
+			value_targets = torch.FloatTensor(outputs_np[:, 4:6, 8:24]).to(device)
+			value_targets = value_targets.permute(0, 2, 1) # for cross eentropy loss - it measures CE over axis 1
 
 			if batch_indx % 100 == 0:
 				start_event.record()
@@ -176,7 +178,8 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 
 			with autocast('cuda', dtype=torch.bfloat16):
 				pred = model(inputs)
-				loss = criterion_mse(pred, targets)
+				loss = criterion_mse(pred[:,4:6,-16:], targets[:,4:6,-16:])
+				loss += torch.mean(criterion_ce(pred[:,4:6,8:24].permute(0,2,1), value_targets) * targets[:, 4:6, 0]) # mask off unused tokens
 
 			loss.backward()
 			optimizer.step()
@@ -230,13 +233,16 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 		for batch_indx, (inputs_np,outputs_np) in enumerate(loader_v):
 			inputs = torch.FloatTensor(inputs_np).to(device)
 			targets = torch.FloatTensor(outputs_np).to(device)
+			value_targets = torch.FloatTensor(outputs_np[:, 4:6, 8:24]).to(device)
+			value_targets = value_targets.permute(0, 2, 1) # for cross eentropy loss - it measures CE over axis 1
 
 			if batch_indx % 100 == 0:
 				start_event.record()
 
 			with autocast('cuda', dtype=torch.bfloat16):
 				pred = model(inputs)
-				loss = criterion_mse(pred, targets)
+				loss = criterion_mse(pred[:,4:6,-16:], targets[:,4:6,-16:])
+				loss += torch.mean(criterion_ce(pred[:,4:6,8:24].permute(0,2,1), value_targets) * targets[:, 4:6, 0])
 
 			if batch_indx % 100 == 0:
 				end_event.record()

@@ -262,7 +262,7 @@ def genData4(bs, md, do_print=False):
 
 	rng = np.random.default_rng()
 	x = np.zeros((bs, ntok, md + 5 + 8*3), dtype=np.float32)
-	exp_gen = ExpressionGenerator(2, md) # NOTE!!!
+	exp_gen = ExpressionGenerator(4, md) # NOTE!!!
 	for b in range(bs):
 		tree = exp_gen.generate()
 		tree.setLocRec(0)
@@ -391,7 +391,7 @@ def genData6(bs, do_print):
 	train the network to accurately multiply two one-digit
 	base 16 numbers.  Yes, the computer can do trillions of these things per sec .. this is super inefficient.  But.
 	'''
-	md = 8 + 16 + 8 # one-hot indicators, digits, pointer,
+	md = 8 + 16 + 8 # one-hot indicators, digits, pointer, [posenc]
 	ntok = 8
 	nbits = 4
 
@@ -461,4 +461,4 @@ if __name__ == '__main__':
 	# 	axs[j,k].imshow(np.squeeze(x[i,...]))
 	# plt.show()
 
-	plotData4()
+	plotData6()
