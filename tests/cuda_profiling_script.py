@@ -35,7 +35,7 @@ def main():
 
     # --- Configuration ---
     # Hardcoded single configuration for a focused profiling run
-    B, H, I_dim, J_dim, K_dim, D_dim = (1, 2, 128, 128, 128, 32)
+    B, H, I_dim, J_dim, K_dim, D_dim = (1, 2, 128, 128, 128, 64)
     dropout_rate = 0.0
     print(f"Profiling config (B,H,I,J,K,D): ({B},{H},{I_dim},{J_dim},{K_dim},{D_dim})")
 
