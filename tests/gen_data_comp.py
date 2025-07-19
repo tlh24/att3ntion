@@ -417,7 +417,7 @@ def genData6(bs, do_print):
 			x[b, tok, 0] = 1.0 # occupied!
 			x[b, tok, val] += 1.0
 		encode(0, va + 8)
-		encode(1, 1+op*2) # * : +-*/=? -> 123456
+		encode(1, 1+op*2) # * : +-*/=?() -> 12345678
 		encode(2, vb + 8)
 		encode(3, 5) # =
 		encode(4, 6) # ? (result)
@@ -453,6 +453,69 @@ def plotData6():
 		axs[b,0].set_title('X')
 		axs[b,1].set_title('Y')
 	plt.show()
+
+def genData7(bs, do_print=False):
+	'''
+	Multiply two 2-digit hex numbers
+	Use local allocation for intermediate variables
+	'''
+	nop = 16 # _+-*/=?() -> 012345678
+	md = nop + 16 + 16 # one-hot indicators, digits, pointer*2, [posenc]
+	ntok = 16
+	nbits = 4
+
+	pos_enc = graycodePosEnc(ntok, nbits, rand_phase=True)
+	x = np.zeros((bs, ntok, md + nbits*2), dtype=np.float32)
+	y = np.zeros_like(x)
+	x[:, :, -nbits*2:] = pos_enc
+	y[:, :, -nbits*2:] = pos_enc # this will be overwritten
+
+	for b in range(bs):
+		step = randint(10)+1 # what step are we supervising?
+		va = randint(256)
+		vb = randint(256)
+		vc = va*vb
+		# convert these all to hex.
+		va0 = va & 0xf
+		va1 = (va >> 4) & 0xf
+		vb0 = vb & 0xf
+		vb1 = (vb >> 4) & 0xf
+		vc0 = vc & 0xf
+		vc1 = (vc >> 4) & 0xf
+		vc2 = (vc >> 4) & 0xf
+		vc3 = (vc >> 4) & 0xf
+		tok_ctr = 0
+		ctr = np.zeros(4)
+		def encode(z, val, pos_space):
+			z[b, tok_ctr, 0] = 1.0 # occupied!
+			z[b, tok_ctr, val] += 1.0
+			pos = ctr[pos_space]
+			z[b, tok_ctr, -8*(pos_space+1):-8*pos_space-1] = pos_enc[pos]
+			tok_ctr += 1
+			ctr[pos_space] += 1
+		# first encode the problem.
+		encode(x, 7, 0)
+		encode(x, va0+nop, 0) # little endian!
+		encode(x, va1+nop, 0)
+		encode(x, 3, 0)
+		encode(x, vb0+nop, 0)
+		encode(x, vb1+nop, 0)
+		encode(x, 8, 0)
+		# expand the arguments to one-digit operations.
+		# could also pass pointers - no difference with one digit
+		if step >= 1:
+			# just a copy op
+			encode(y, 7, 1) # (
+			encode(y, va0+nop, 1)
+			encode(y, 3, 1) # *
+			encode(y, vb0+nop, 1)
+			encode(y, 7, 1) # )
+			encode(y, 1, 1) # +
+			encode(y, 7, 1) # (
+			encode(y, va0+nop, 1)
+			encode(y, 3, 1) # *
+			encode(y, vb1+nop, 1)
+			encode(y, 7, 1)
 
 if __name__ == '__main__':
 	# genData1(15, 19, True)
