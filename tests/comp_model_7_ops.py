@@ -132,9 +132,9 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 	loader_v = DataLoader(dataset_v, batch_size=batch_size, shuffle=True)
 
 	if attn_impl == "hypergraph":
-		n_layers = 4
+		n_layers = 2
 	else:
-		n_layers = 8
+		n_layers = 4
 
 	model = SimpleCompModel(hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=1, modulo=modulo).to(device)
 	try:
