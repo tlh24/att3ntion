@@ -242,7 +242,7 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 			with autocast('cuda', dtype=torch.bfloat16):
 				pred = model(inputs)
 				loss = criterion_mse(pred[:,4:6,-16:], targets[:,4:6,-16:])
-				loss += torch.mean(criterion_ce(pred[:,4:6,8:24].permute(0,2,1), value_targets) * targets[:, 4:6, 0])
+				loss += torch.mean(criterion_ce(pred[:,4:6,8:24].permute(0,2,1), value_targets) * targets[:, 4:6, 0]) # mask off unused tokens
 
 			if batch_indx % 100 == 0:
 				end_event.record()
@@ -278,8 +278,7 @@ if __name__ == '__main__':
 						help='Attention implementation to use')
 	args = parser.parse_args()
 
-	# torch.manual_seed(42)
-	# np.random.seed(42)
+	print("This script tests the graph and hypergraph transformer on a one-digit multiply task")
 	
 	model = train_model1(
 		num_epochs=args.epochs,
