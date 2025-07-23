@@ -541,6 +541,7 @@ def genData7(bs, do_print=False):
 		x[b, :, -nbits*4:-nbits*2] = enc.pos_enc[0,:] # "vertical"
 		# e.g. everything starts off as flat..
 		task = b % 3
+		# task = 1
 		if task == 0:
 			va = randint(16)
 			vb = randint(16)
@@ -553,6 +554,8 @@ def genData7(bs, do_print=False):
 		if task == 1:
 			na = randint(4)+1
 			nb = randint(4)+1
+			# na = 4
+			# nb = 4
 			va = randint(16**na)
 			vb = randint(16**nb)
 			# encode the problem

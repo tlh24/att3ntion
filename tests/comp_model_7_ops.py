@@ -34,15 +34,15 @@ class SimpleCompModel(nn.Module):
 		self.repeated_layers = nn.ModuleList()
 		for _ in range(n_layers):
 			if attn_impl == "hypergraph":
-				attention_layer = HypergraphAttention_Naive(hidden_dim, num_heads)
+				attention_layer = HypergraphAttention_Naive(hidden_dim, num_heads, head_subspaces=False)
 			else:
-				attention_layer = GraphAttention_Naive(hidden_dim, num_heads)
+				attention_layer = GraphAttention_Naive(hidden_dim, num_heads, head_subspaces=True)
 
 			norm1_layer = nn.LayerNorm(hidden_dim)
 			ffn_layer = nn.Sequential(
-				nn.Linear(hidden_dim, 4 * hidden_dim),
+				nn.Linear(hidden_dim, 3 * hidden_dim),
 				nn.ReLU(),
-				nn.Linear(4 * hidden_dim, hidden_dim)
+				nn.Linear(3 * hidden_dim, hidden_dim)
 			)
 			norm2_layer = nn.LayerNorm(hidden_dim)
 
@@ -111,7 +111,7 @@ class SimpleCompModel(nn.Module):
 		f += bs * ntok * self.d_model**2 * self.input_dim # output proj
 		return f
 
-def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, attn_impl=""):
+def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, attn_impl="", log_name="", start_fresh=False):
 	
 	if device == 'auto':
 		if torch.cuda.is_available():
@@ -134,13 +134,14 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 	if attn_impl == "hypergraph":
 		n_layers = 2
 	else:
-		n_layers = 4
+		n_layers = 2
 
 	model = SimpleCompModel(hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=1, modulo=modulo).to(device)
-	try:
-		model.load_model(f"comp_model_{attn_impl}.pt", device)
-	except:
-		print("train_model1: could not load the saved model weights")
+	if not start_fresh:
+		try:
+			model.load_model(f"comp_model_{attn_impl}.pt", device)
+		except:
+			print("train_model1: could not load the saved model weights")
 	optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, amsgrad=True)
 	criterion_ce = nn.CrossEntropyLoss(reduction='none')
 	criterion_mse = nn.MSELoss()
@@ -152,7 +153,7 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 	print("--- Running with Automatic Mixed Precision ---")
 
 
-	fd_losslog = open(f'losslog_{attn_impl}.txt', 'w')
+	fd_losslog = open(f'losslog_{attn_impl}_{log_name}.txt', 'w')
 
 	print("\ntrain_model1 started...")
 	uu = 0
@@ -228,8 +229,9 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 				axs[j,3].set_title('err')
 			plt.show()
 
-		# save after each epoch
-		model.save_model(f"comp_model_{args.attn}.pt")
+		if not start_fresh:
+			# save after each epoch
+			model.save_model(f"comp_model_{args.attn}.pt")
 
 	# validation!
 	total_loss = 0
@@ -284,6 +286,11 @@ if __name__ == '__main__':
 	parser.add_argument('--heads', type=int, default=4, help='Number of attention heads')
 	parser.add_argument('--attn', type=str, default='hypergraph', choices=['hypergraph', 'graph'],
 						help='Attention implementation to use')
+	parser.add_argument('--log-name', type=str,
+						help='postfix logname')
+	parser.add_argument('--fresh', action='store_true',
+        help='Dont load or save model parameters.'
+    )
 	args = parser.parse_args()
 
 	print("This script tests the graph and hypergraph transformer on a one-digit multiply task, multi-digit add, and shift tasks.")
@@ -295,6 +302,8 @@ if __name__ == '__main__':
 		hidden_dim=args.hidden_dim,
 		num_heads=args.heads,
 		attn_impl=args.attn,
-		batch_size=args.batch_size
+		batch_size=args.batch_size,
+		log_name=args.log_name,
+		start_fresh=args.fresh
 	)
 
