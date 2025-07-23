@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from torch.amp import autocast
+import torch.nn.functional as F
 from rotary_embedding_torch import RotaryEmbedding
 import matplotlib.pyplot as plt
 
@@ -20,9 +21,22 @@ from hyper_attn_pytorch import HypergraphAttention_Naive, GraphAttention_Naive, 
 from gen_data_comp import genData7
 import pdb
 
+class SwiGLU(nn.Module):
+	"""
+	Swish Gated Linear Units based Feed-Forward Network.
+	"""
+	def __init__(self, in_features, hidden_features, out_features):
+		super().__init__()
+		self.w1 = nn.Linear(in_features, hidden_features)
+		self.w2 = nn.Linear(in_features, hidden_features)
+		self.w3 = nn.Linear(hidden_features, out_features)
+
+	def forward(self, x):
+		return self.w3(F.silu(self.w1(x)) * self.w2(x))
+
 class SimpleCompModel(nn.Module):
 	"""Model with hypergraph attention layer."""
-	def __init__(self, hidden_dim:int, num_heads:int, n_layers:int, attn_impl:str='', n_recurse:int=1, modulo:int=11):
+	def __init__(self, hidden_dim:int, num_heads:int, n_layers:int, attn_impl:str='', n_recurse:int=1):
 		super().__init__()
 		self.input_dim = 64
 		self.embedding_proj = nn.Linear(self.input_dim, hidden_dim)
@@ -39,11 +53,16 @@ class SimpleCompModel(nn.Module):
 				attention_layer = GraphAttention_Naive(hidden_dim, num_heads, head_subspaces=True)
 
 			norm1_layer = nn.LayerNorm(hidden_dim)
-			ffn_layer = nn.Sequential(
-				nn.Linear(hidden_dim, 3 * hidden_dim),
-				nn.ReLU(),
-				nn.Linear(3 * hidden_dim, hidden_dim)
-			)
+			if False:
+				ffn_layer = nn.Sequential(
+					nn.Linear(hidden_dim, 3 * hidden_dim),
+					nn.ReLU(),
+					nn.Linear(3 * hidden_dim, hidden_dim)
+				)
+			else:
+				ffn_layer = SwiGLU(hidden_dim, 2*hidden_dim, hidden_dim)
+				# keep the same number of parameters.
+
 			norm2_layer = nn.LayerNorm(hidden_dim)
 
 			self.repeated_layers.append(
@@ -111,7 +130,7 @@ class SimpleCompModel(nn.Module):
 		f += bs * ntok * self.d_model**2 * self.input_dim # output proj
 		return f
 
-def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, attn_impl="", log_name="", start_fresh=False):
+def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl="", log_name="", start_fresh=False):
 	
 	if device == 'auto':
 		if torch.cuda.is_available():
@@ -136,7 +155,7 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 	else:
 		n_layers = 2
 
-	model = SimpleCompModel(hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=1, modulo=modulo).to(device)
+	model = SimpleCompModel(hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=1).to(device)
 	if not start_fresh:
 		try:
 			model.load_model(f"comp_model_{attn_impl}.pt", device)
@@ -281,7 +300,6 @@ if __name__ == '__main__':
 						help='Device to use (cpu, cuda, auto)')
 	parser.add_argument('--epochs', type=int, default=5, help='Number of epochs')
 	parser.add_argument('--batch-size', type=int, default=32, help='Batch size for training')
-	parser.add_argument('--modulo', type=int, default=16, help='Modulo for arithmetic operations')
 	parser.add_argument('--hidden-dim', type=int, default=128, help='Hidden dimension size')
 	parser.add_argument('--heads', type=int, default=4, help='Number of attention heads')
 	parser.add_argument('--attn', type=str, default='hypergraph', choices=['hypergraph', 'graph'],
@@ -298,7 +316,6 @@ if __name__ == '__main__':
 	model = train_model1(
 		num_epochs=args.epochs,
 		device=args.device,
-		modulo=args.modulo,
 		hidden_dim=args.hidden_dim,
 		num_heads=args.heads,
 		attn_impl=args.attn,
