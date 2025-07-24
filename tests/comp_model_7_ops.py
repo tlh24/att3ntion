@@ -53,7 +53,7 @@ class SimpleCompModel(nn.Module):
 				attention_layer = GraphAttention_Naive(hidden_dim, num_heads, head_subspaces=True)
 
 			norm1_layer = nn.LayerNorm(hidden_dim)
-			if False:
+			if True:
 				ffn_layer = nn.Sequential(
 					nn.Linear(hidden_dim, 3 * hidden_dim),
 					nn.ReLU(),
@@ -91,8 +91,8 @@ class SimpleCompModel(nn.Module):
 				indx = torch.sort(decode[:,:,0].squeeze(), dim=-1, descending=False)
 				indx = indx
 			for layer_block in self.repeated_layers:
-				# attn_output = layer_block['attention'](x, self.rotary_emb)
-				attn_output = layer_block['attention'](x, None)
+				attn_output = layer_block['attention'](x, self.rotary_emb)
+				# attn_output = layer_block['attention'](x, None)
 				x = layer_block['norm1'](x + attn_output)
 				ffn_output = layer_block['ffn'](x)
 				x = layer_block['norm2'](x + ffn_output)
@@ -153,7 +153,7 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, attn_imp
 	if attn_impl == "hypergraph":
 		n_layers = 2
 	else:
-		n_layers = 2
+		n_layers = 4
 
 	model = SimpleCompModel(hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=1).to(device)
 	if not start_fresh:

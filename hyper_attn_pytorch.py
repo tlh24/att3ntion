@@ -201,6 +201,9 @@ class GraphAttention_Naive(nn.Module):
 		# V is [batch_size, n_heads, ntok, d_head]
 
 		A = torch.einsum('bhid,bhjd->bhij', Q, K)
+		if False: # causal attention
+			mask = torch.triu(torch.ones(ntok, ntok), diagonal=1).bool().to(x.device)
+			A = A.masked_fill(mask, -torch.inf) # Use a large negative value
 		A = torch.softmax(A, dim=-1)
 		y = torch.einsum('bhij,bhjd->bhid', A, V)
 

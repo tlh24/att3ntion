@@ -515,7 +515,7 @@ def genData7(bs, do_print=False):
 	x = np.zeros((bs, ntok, md), dtype=np.float32)
 	y = np.zeros_like(x)
 
-	def encHex(lst, val):
+	def encHex(lst, val, ndigits=0):
 		va0 = val & 0xf
 		va1 = (val >> 4) & 0xf
 		va2 = (val >> 8) & 0xf
@@ -523,15 +523,15 @@ def genData7(bs, do_print=False):
 		va4 = (val >> 16) & 0xf
 		va5 = (val >> 20) & 0xf
 		lst.append(va0)
-		if val >= 16:
+		if val >= 16 or ndigits >= 2:
 			lst.append(va1)
-		if val >= 256:
+		if val >= 256 or ndigits >= 3:
 			lst.append(va2)
-		if val >= 4096:
+		if val >= 4096 or ndigits >= 4:
 			lst.append(va3)
-		if val >= 65536:
+		if val >= 65536 or ndigits >= 5:
 			lst.append(va4)
-		if val >= 65536*16:
+		if val >= 65536*16 or ndigits >= 6:
 			lst.append(va5)
 
 	for b in range(bs):
@@ -540,9 +540,9 @@ def genData7(bs, do_print=False):
 		x[b, :, -nbits*2:] = enc.pos_enc # "horizontal"
 		x[b, :, -nbits*4:-nbits*2] = enc.pos_enc[0,:] # "vertical"
 		# e.g. everything starts off as flat..
-		task = b % 3
-		# task = 1
-		if task == 0:
+		# task = b % 3
+		task = 1
+		if task == 0: # very easy for both
 			va = randint(16)
 			vb = randint(16)
 			vc = va*vb
@@ -560,9 +560,9 @@ def genData7(bs, do_print=False):
 			vb = randint(16**nb)
 			# encode the problem
 			lst = []
-			encHex(lst, va)
+			encHex(lst, va, ndigits=4)
 			lst.append('+')
-			encHex(lst, vb)
+			encHex(lst, vb, ndigits=4)
 			enc.encodeList(x, b, lst)
 			# and the solution
 			vc = va + vb
@@ -570,7 +570,7 @@ def genData7(bs, do_print=False):
 			encHex(lst, vc)
 			enc.encodeList(y, b, lst)
 
-		if task == 2:
+		if task == 2: # also perfectly easy
 			na = randint(3)+1
 			shift = randint(2)+1
 			va = randint(16**na)
