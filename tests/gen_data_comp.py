@@ -508,7 +508,7 @@ def genData7(bs, do_print=False):
 	- shift left 1 and 2 places.
 	'''
 	nop = 16 # _+-*/=?() -> 012345678
-	ntok = 16
+	ntok = 28
 	nbits = 8
 
 	md = nop + 16 + (nbits*2)*2 # one-hot indicators, digits, 2d posenc
@@ -540,9 +540,9 @@ def genData7(bs, do_print=False):
 		x[b, :, -nbits*2:] = enc.pos_enc # "horizontal"
 		x[b, :, -nbits*4:-nbits*2] = enc.pos_enc[0,:] # "vertical"
 		# e.g. everything starts off as flat..
-		# task = b % 3
-		task = 1
-		if task == 0: # very easy for both
+		task = b % 4
+		task = 2
+		if task == 0: # add, very easy for both
 			va = randint(16)
 			vb = randint(16)
 			vc = va*vb
@@ -551,7 +551,16 @@ def genData7(bs, do_print=False):
 			enc.encodeList(x, b, [va, '*', vb])
 			enc.encodeList(y, b, [vc0, vc1])
 
-		if task == 1:
+		if task == 1: # multiply, very easy for both
+			va = randint(16)
+			vb = randint(16)
+			vc = va*vb
+			vc0 = vc & 0xf
+			vc1 = vc >> 4
+			enc.encodeList(x, b, [va, '*', vb])
+			enc.encodeList(y, b, [vc0, vc1])
+
+		if task == 2 and False:
 			na = randint(4)+1
 			nb = randint(4)+1
 			# na = 4
@@ -560,7 +569,7 @@ def genData7(bs, do_print=False):
 			vb = randint(16**nb)
 			# encode the problem
 			lst = []
-			encHex(lst, va, ndigits=4)
+			encHex(lst, va, ndigits=4) # ndigits makes it fixed
 			lst.append('+')
 			encHex(lst, vb, ndigits=4)
 			enc.encodeList(x, b, lst)
@@ -570,7 +579,38 @@ def genData7(bs, do_print=False):
 			encHex(lst, vc)
 			enc.encodeList(y, b, lst)
 
-		if task == 2: # also perfectly easy
+		# do task 2 in a different way, cascade fashion: spell out the carries
+		if task == 2:
+			na = randint(4)+1
+			nb = randint(4)+1
+			# na = 4
+			# nb = 4
+			va = randint(16**na)
+			vb = randint(16**nb)
+			# encode the problem
+			lst = []
+			encHex(lst, va)
+			lst.append('+')
+			encHex(lst, vb)
+			enc.encodeList(x, b, lst)
+			steps = max(na,nb) + 1
+			step = randint(steps)
+			# and the solution -- spell it out w/ carries
+			for i in range(steps-1):
+				vc = ((va >> (4*i)) & 0xf) + ((vb >> (4*i)) & 0xf)
+				lst = []
+				encHex(lst, vc << (4*i))
+				if i == step:
+					enc.encodeList(y, b, lst)
+				elif i < step:
+					enc.encodeList(x, b, lst)
+			if step == max(na,nb):
+				vc = va + vb
+				lst = []
+				encHex(lst, vc)
+				enc.encodeList(y, b, lst)
+
+		if task == 3: # also perfectly easy
 			na = randint(3)+1
 			shift = randint(2)+1
 			va = randint(16**na)

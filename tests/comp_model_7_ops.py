@@ -91,8 +91,8 @@ class SimpleCompModel(nn.Module):
 				indx = torch.sort(decode[:,:,0].squeeze(), dim=-1, descending=False)
 				indx = indx
 			for layer_block in self.repeated_layers:
-				attn_output = layer_block['attention'](x, self.rotary_emb)
-				# attn_output = layer_block['attention'](x, None)
+				# attn_output = layer_block['attention'](x, self.rotary_emb)
+				attn_output = layer_block['attention'](x, None)
 				x = layer_block['norm1'](x + attn_output)
 				ffn_output = layer_block['ffn'](x)
 				x = layer_block['norm2'](x + ffn_output)
@@ -125,7 +125,7 @@ class SimpleCompModel(nn.Module):
 			for layer_block in self.repeated_layers:
 				f += layer_block['attention'].calcFlops(x)
 				f += bs * ntok * self.d_model * 10 # layerNorm 1
-				f += bs * ntok * self.d_model**2 * 4 * 2 # ffn
+				f += bs * ntok * self.d_model**2 * 3 * 2 # ffn
 				f += bs * ntok * self.d_model * 10 # layerNorm 2
 		f += bs * ntok * self.d_model**2 * self.input_dim # output proj
 		return f
@@ -151,9 +151,9 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, attn_imp
 	loader_v = DataLoader(dataset_v, batch_size=batch_size, shuffle=True)
 
 	if attn_impl == "hypergraph":
-		n_layers = 2
+		n_layers = 3
 	else:
-		n_layers = 4
+		n_layers = 6
 
 	model = SimpleCompModel(hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=1).to(device)
 	if not start_fresh:
@@ -189,8 +189,8 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, attn_imp
 		for batch_indx, (inputs_np,outputs_np) in enumerate(train_loader):
 			inputs = torch.FloatTensor(inputs_np).to(device)
 			targets = torch.FloatTensor(outputs_np).to(device)
-			value_targets = torch.FloatTensor(outputs_np[:,:, 1:32]).to(device)
-			value_targets = value_targets.permute(0, 2, 1) # for cross eentropy loss - it measures CE over axis 1
+			value_targets = np.argmax(outputs_np[:,:,1:32], axis=2)
+			value_targets = torch.LongTensor(value_targets).to(device)
 
 			if batch_indx % 100 == 0:
 				start_event.record()
@@ -199,9 +199,11 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, attn_imp
 			with autocast('cuda', dtype=torch.bfloat16):
 				pred = model(inputs)
 				# posenc loss
-				loss = torch.mean( criterion_mse(pred[:,:,-32:], targets[:,:,-32:]) * targets[:,:,0] )
+				loss = torch.sum( criterion_mse(pred, targets))
 				# value and op loss
-				loss += torch.mean(criterion_ce(pred[:,:,1:32].permute(0,2,1), value_targets) * targets[:,:,0])
+				# celoss = criterion_ce( \
+				# 	pred[:,:,1:32].permute(0,2,1), value_targets)
+				# loss += torch.sum(celoss * targets[:,:,0])
 				# permute is to work with pytorch's cross-entropy calc
 				# for both, mask off unused tokens
 
@@ -216,15 +218,11 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, attn_imp
 			total_loss += loss.item()
 			total += inputs.size(0)
 			
-			if batch_indx % 100 == 0:
+			if batch_indx % 200 == 0:
 				end_event.record()
 				torch.cuda.synchronize()
 				amp_time = start_event.elapsed_time(end_event)
 				print("batch time:", amp_time, "ms")
-		
-		avg_loss = total_loss / len(train_loader)
-		val_accuracy = 100 * correct_vals / total
-		print(f'Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Result Acc: {val_accuracy:.2f}%')
 
 		# plot the inputs / outputs
 		if False:
@@ -247,6 +245,10 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, attn_imp
 				axs[j,2].set_title('pred')
 				axs[j,3].set_title('err')
 			plt.show()
+		
+		avg_loss = total_loss / len(train_loader)
+		val_accuracy = 100 * correct_vals / total
+		print(f'Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Result Acc: {val_accuracy:.2f}%')
 
 		if not start_fresh:
 			# save after each epoch
@@ -273,7 +275,7 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, attn_imp
 				# permute is to work with pytorch's cross-entropy calc
 				# for both, mask off unused tokens
 
-			if batch_indx % 100 == 0:
+			if batch_indx % 200 == 0:
 				end_event.record()
 				torch.cuda.synchronize()
 				amp_time = start_event.elapsed_time(end_event)

@@ -26,7 +26,7 @@ class HypergraphAttention_Naive(nn.Module):
 		else:
 			self.d_head = d_model
 		self.head_subspaces = head_subspaces
-		self.d_val = self.d_head*2 # expansion!
+		self.d_val = self.d_head*1 # expansion!
 		
 		self.Wq = nn.Linear(d_model, self.d_head*n_heads, bias=False, **kwargs)
 		self.Wr = nn.Linear(d_model, self.d_head*n_heads, bias=False, **kwargs)
@@ -36,7 +36,7 @@ class HypergraphAttention_Naive(nn.Module):
 		self.Wv_r = nn.Linear(d_model, self.d_val*n_heads*2, bias=True, **kwargs)
 		self.Wv_s = nn.Linear(d_model, self.d_val*n_heads*2, bias=True, **kwargs)
 		
-		self.Wo = nn.Linear(d_model*2, d_model, bias=True, **kwargs)
+		self.Wo = nn.Linear(self.d_val, d_model, bias=True, **kwargs)
 		
 		self.dropout = nn.Dropout(dropout_rate)
 		self.gelu = QuickGELU()
@@ -140,21 +140,21 @@ class HypergraphAttention_Naive(nn.Module):
 		bs, ntok, d_model = x.shape
 		f = 0.0
 		# QRS proj = [..., d_model] @ [d_model, n_heads*d_model]
-		f += 3 * bs * ntok * d_model**2 * self.n_heads*d_model
+		f += 3 * bs * ntok * d_model**2 * self.n_heads*self.d_head
 		# Value proj = [..., d_model] @ [d_model, n_heads*d_model*2]
-		f += 3 * bs * ntok * d_model**2 * self.n_heads*d_model*2
+		f += 3 * bs * ntok * d_model**2 * self.n_heads*self.d_val*2
 		# attn - '2' is from the 3-way multiply
-		f += bs * self.n_heads * ntok**3 * d_model * 2
+		f += bs * self.n_heads * ntok**3 * self.d_head * 2
 		# 3 softmaxes - 2 is from the softmax itself.
 		f += bs * self.n_heads * ntok**3 * 2 * 3
 		# gather
-		f += bs * self.n_heads * ntok**3 * d_model * 3
+		f += bs * self.n_heads * ntok**3 * self.d_val * 3
 		# scatter - 3 comes from the 4 arguments to each
-		f += bs * self.n_heads * ntok**3 * d_model * 3 * 3
+		f += bs * self.n_heads * ntok**3 * self.d_val * 3 * 3
 		# combine & Gelu
-		f += bs * self.n_heads * ntok * d_model * (6 + 6)
+		f += bs * self.n_heads * ntok * self.d_val * (6 + 6)
 		# Wo = [..., d_model] @ [d_model, d_model]
-		f += bs * self.n_heads * ntok * d_model**2
+		f += bs * self.n_heads * ntok * d_model * self.d_val
 
 		return f
 
