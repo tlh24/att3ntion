@@ -18,7 +18,7 @@ if parent_dir_str not in sys.path:
 
 from hyper_attn_pytorch import HypergraphAttention_Naive, GraphAttention_Naive, QuickGELU
 # from hyper_attn_cpp_wrapper import HypergraphAttentionCPP
-from gen_data_comp import genData7
+from gen_data_comp import genData3, genData7
 import pdb
 
 class SwiGLU(nn.Module):
@@ -36,9 +36,9 @@ class SwiGLU(nn.Module):
 
 class SimpleCompModel(nn.Module):
 	"""Model with hypergraph attention layer."""
-	def __init__(self, hidden_dim:int, num_heads:int, n_layers:int, attn_impl:str='', n_recurse:int=1):
+	def __init__(self, input_dim:int, hidden_dim:int, num_heads:int, n_layers:int, attn_impl:str='', n_recurse:int=1):
 		super().__init__()
-		self.input_dim = 64
+		self.input_dim = input_dim
 		self.embedding_proj = nn.Linear(self.input_dim, hidden_dim)
 		self.rotary_emb = RotaryEmbedding(dim = hidden_dim)
 		self.attn_impl = attn_impl
@@ -130,7 +130,24 @@ class SimpleCompModel(nn.Module):
 		f += bs * ntok * self.d_model**2 * self.input_dim # output proj
 		return f
 
-def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl="", log_name="", start_fresh=False):
+def calcLoss(task, pred, targets):
+	if task == 3:
+		value_targets = torch.argmax(targets[:,-1,5:40], axis=-1)
+		loss = F.cross_entropy( \
+			pred[:,-1,5:40], value_targets)
+	if task == 7:
+		value_targets = torch.argmax(targets[:,:,1:32], axis=2)
+		# posenc loss
+		loss = torch.sum( F.mse_loss(pred[:,:,-32:], targets[:,:,-32:]) )
+		# value and op loss
+		celoss = F.cross_entropy( \
+			pred[:,:,1:32].permute(0,2,1), value_targets)
+		loss += torch.sum(celoss * targets[:,:,0])
+		# permute is to work with pytorch's cross-entropy calc
+		# for both, mask off unused tokens
+	return loss
+
+def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl="", log_name="", start_fresh=False, task=3):
 	
 	if device == 'auto':
 		if torch.cuda.is_available():
@@ -142,28 +159,32 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, attn_imp
 	
 	print(f"Using device: {device}")
 	
-	x, y = genData7(batch_size * 1000, do_print=False)
+	if task == 3:
+		x, y = genData3(batch_size * 1000, do_print=False)
+		x_v, y_v = genData3(batch_size * 1000, do_print=False)
+	if task == 7:
+		x, y = genData7(batch_size * 1000, do_print=False)
+		x_v, y_v = genData7(batch_size * 1000, do_print=False)
+
 	dataset = TensorDataset(torch.tensor(x), torch.tensor(y))
 	train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-	x_v, y_v = genData7(batch_size * 1000, do_print=False)
 	dataset_v = TensorDataset(torch.tensor(x_v), torch.tensor(y_v))
 	loader_v = DataLoader(dataset_v, batch_size=batch_size, shuffle=True)
 
 	if attn_impl == "hypergraph":
-		n_layers = 3
+		n_layers = 2
 	else:
-		n_layers = 6
+		n_layers = 4
 
-	model = SimpleCompModel(hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=1).to(device)
+	input_dim = x.shape[2]
+	model = SimpleCompModel(input_dim, hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=1).to(device)
 	if not start_fresh:
 		try:
 			model.load_model(f"comp_model_{attn_impl}.pt", device)
 		except:
 			print("train_model1: could not load the saved model weights")
 	optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, amsgrad=True)
-	criterion_ce = nn.CrossEntropyLoss(reduction='none')
-	criterion_mse = nn.MSELoss()
 	model.printParamCount()
 	model = torch.compile(model) # mode="max-autotune"
 
@@ -172,7 +193,7 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, attn_imp
 	print("--- Running with Automatic Mixed Precision ---")
 
 
-	fd_losslog = open(f'losslog_{attn_impl}_{log_name}.txt', 'w')
+	fd_losslog = open(f'losslog_{attn_impl}_t{task}_{log_name}.txt', 'w')
 
 	print("\ntrain_model1 started...")
 	uu = 0
@@ -189,8 +210,6 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, attn_imp
 		for batch_indx, (inputs_np,outputs_np) in enumerate(train_loader):
 			inputs = torch.FloatTensor(inputs_np).to(device)
 			targets = torch.FloatTensor(outputs_np).to(device)
-			value_targets = np.argmax(outputs_np[:,:,1:32], axis=2)
-			value_targets = torch.LongTensor(value_targets).to(device)
 
 			if batch_indx % 100 == 0:
 				start_event.record()
@@ -198,14 +217,7 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, attn_imp
 
 			with autocast('cuda', dtype=torch.bfloat16):
 				pred = model(inputs)
-				# posenc loss
-				loss = torch.sum( criterion_mse(pred, targets))
-				# value and op loss
-				# celoss = criterion_ce( \
-				# 	pred[:,:,1:32].permute(0,2,1), value_targets)
-				# loss += torch.sum(celoss * targets[:,:,0])
-				# permute is to work with pytorch's cross-entropy calc
-				# for both, mask off unused tokens
+				loss = calcLoss(task, pred, targets)
 
 			loss.backward()
 			optimizer.step()
@@ -268,12 +280,7 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, attn_imp
 
 			with autocast('cuda', dtype=torch.bfloat16):
 				pred = model(inputs)
-				# posenc loss
-				loss = torch.mean( criterion_mse(pred[:,:,-32:], targets[:,:,-32:]) * targets[:,:,0] )
-				# value and op loss
-				loss += torch.mean(criterion_ce(pred[:,:,1:32].permute(0,2,1), value_targets) * targets[:,:,0])
-				# permute is to work with pytorch's cross-entropy calc
-				# for both, mask off unused tokens
+				loss = calcLoss(task, pred, targets)
 
 			if batch_indx % 200 == 0:
 				end_event.record()
@@ -309,13 +316,13 @@ if __name__ == '__main__':
 	parser.add_argument('--log-name', type=str,
 						help='postfix logname')
 	parser.add_argument('--fresh', action='store_true',
-        help='Dont load or save model parameters.'
-    )
+        help='Dont load or save model parameters.')
+	parser.add_argument('--task', type=int, help="what task to run the model on")
 	args = parser.parse_args()
 
-	print("This script tests the graph and hypergraph transformer on a one-digit multiply task, multi-digit add, and shift tasks.")
+	print("Task 7: This script tests the graph and hypergraph transformer on a one-digit multiply task, multi-digit add, and shift tasks.")
 	
-	model = train_model1(
+	model = trainModel(
 		num_epochs=args.epochs,
 		device=args.device,
 		hidden_dim=args.hidden_dim,
@@ -323,6 +330,7 @@ if __name__ == '__main__':
 		attn_impl=args.attn,
 		batch_size=args.batch_size,
 		log_name=args.log_name,
-		start_fresh=args.fresh
+		start_fresh=args.fresh,
+		task = args.task
 	)
 

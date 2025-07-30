@@ -102,27 +102,56 @@ def genData2(bs, md, do_print=False):
 	# endfor b
 	return x
 
-def genData3(bs, md):
+def graycodePosEnc(ntok, nbits, rand_phase=False):
+	'''
+	Generate a graycode
+	seems more principled than standard SPE?
+	'''
+	pos_enc = np.zeros((ntok,nbits*2), dtype=np.float32)
+	indx = np.linspace(0, (ntok-1)*2*math.pi, ntok)
+	if rand_phase:
+		phase_offset = np.random.uniform() * 2 * math.pi
+	else:
+		phase_offset = 0
+	for i in range(nbits):
+		# gray code: [0][1] has a period of 4
+		# [2][3] has a period of sqrt(4*8) = sqrt(32) = 4 sqrt(2)
+		# [4][5] period of 8..
+		# period = 4 * (math.sqrt(2.0))**i
+		#   above is slower - does not help?
+		period = 4 * 2.0**i
+		phase = math.pi / period + phase_offset # indx is scaled by 2 pi
+		if True:
+			# sinusoidal, seems to work better?
+			pos_enc[:, 2*i  ] = -np.cos(indx / period + phase)
+			pos_enc[:, 2*i+1] = np.sin(indx / period + phase)
+		else:
+			# graycode! (thresholded)
+			pos_enc[:, 2*i  ] = np.cos(indx / period + phase) < 0
+			pos_enc[:, 2*i+1] = np.sin(indx / period + phase) < 0
+	return pos_enc
+
+def genData3(bs, do_print=False):
 	'''
 	Task 3: from a list of 8 integers,
 	compute the op of two of them based on *pointers*
 	rather than positional arguments.
 	This ought to be easy.
 	'''
-	pos_enc = np.zeros((10,8), dtype=np.float32)
-	indx = np.linspace(0, 2*3.1415926, 10)
-	for i in range(4):
-		freq = 2**(i/3)
-		pos_enc[:, 2*i  ] = np.sin(indx * freq)
-		pos_enc[:, 2*i+1] = np.cos(indx * freq)
+	ntok = 10
+	nbits = 4
+	pos_enc = graycodePosEnc(ntok, nbits)
+	md = 64 - (5 + (nbits*2)*3) # 35
 
-	x = np.zeros((bs, 10, md + 5 + 8*3), dtype=np.float32)
+	x = np.zeros((bs, ntok, md + 5 + (nbits*2)*3), dtype=np.float32)
+	y = np.zeros_like(x)
 	for b in range(bs):
-		d = np.random.randint(1, md, size=(8,))
+		d = np.random.randint(1, 6, size=(8,))
 		ai = randint(8)
 		bi = randint(8)
 		op = randint(4)
 		c,_ = modOp(d[ai], d[bi], op, md)
+		# encode the list of 8 integers
 		for k in range(8):
 			x[b,k,d[k]+5] = 1
 		x[b,8,op] = 1
@@ -132,8 +161,27 @@ def genData3(bs, md):
 		x[b,8,md+5+8:md+5+16] = pos_enc[ai,:]
 		x[b,8,md+5+16:md+5+24] = pos_enc[bi,:]
 		x[b,9,md+5+8:md+5+16] = pos_enc[8,:] # point to op
+		# y[b,9, 5+d[ai]] = 1 # TEST - works super fast
+		# y[b,9, 5+d[bi]] = 1
+		y[b,9, 5+c] = 1
+		if do_print:
+			print(f"d[{ai}] + d[{bi}] = {d[ai]} + {d[bi]} = {c}")
 
-	return x
+	return x,y
+
+def plotData3():
+	x,y = genData3(800, do_print=False) # Test
+	bs = 3
+	x,y = genData3(bs, do_print=True)
+	fig,axs = plt.subplots(bs,2)
+	for b in range(bs):
+		im = axs[b, 0].imshow(np.squeeze(x[b,:,:]))
+		plt.colorbar(im, ax=axs[b, 0])
+		im = axs[b, 1].imshow(np.squeeze(y[b,:,:]))
+		plt.colorbar(im, ax=axs[b, 1])
+		axs[b,0].set_title('X')
+		axs[b,1].set_title('Y')
+	plt.show()
 
 OPERATORS = ['+', '-', '*', '/']
 
@@ -300,35 +348,6 @@ def plotData4():
 		k = i % 2
 		axs[j,k].imshow(np.squeeze(x[i,...]))
 	plt.show()
-
-def graycodePosEnc(ntok, nbits, rand_phase=False):
-	'''
-	Generate a graycode
-	seems more principled than standard SPE?
-	'''
-	pos_enc = np.zeros((ntok,nbits*2), dtype=np.float32)
-	indx = np.linspace(0, (ntok-1)*2*math.pi, ntok)
-	if rand_phase:
-		phase_offset = np.random.uniform() * 2 * math.pi
-	else:
-		phase_offset = 0
-	for i in range(nbits):
-		# gray code: [0][1] has a period of 4
-		# [2][3] has a period of sqrt(4*8) = sqrt(32) = 4 sqrt(2)
-		# [4][5] period of 8..
-		# period = 4 * (math.sqrt(2.0))**i
-		#   above is slower - does not help?
-		period = 4 * 2.0**i
-		phase = math.pi / period + phase_offset # indx is scaled by 2 pi
-		if True:
-			# sinusoidal, seems to work better?
-			pos_enc[:, 2*i  ] = -np.cos(indx / period + phase)
-			pos_enc[:, 2*i+1] = np.sin(indx / period + phase)
-		else:
-			# graycode! (thresholded)
-			pos_enc[:, 2*i  ] = np.cos(indx / period + phase) < 0
-			pos_enc[:, 2*i+1] = np.sin(indx / period + phase) < 0
-	return pos_enc
 
 def genData5(bs,md, do_print):
 	'''
@@ -738,6 +757,8 @@ if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='generate compositional data for training graph/hypergraph transformers')
 	parser.add_argument('-t', type=int, default=6, help='which test to run')
 	args = parser.parse_args()
+	if args.t == 3:
+		plotData3()
 	if args.t == 6:
 		plotData6()
 	if args.t == 7:
