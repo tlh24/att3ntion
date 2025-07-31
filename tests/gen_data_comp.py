@@ -32,6 +32,37 @@ def modOp(va, vb, op, md):
 			ops = '/'
 	return vc, ops
 
+def clipOp(va, vb, op, md):
+	def clip(x):
+		if x > md-1:
+			return md-1
+		if x < 0:
+			return 0
+		return x
+
+	vc0 = clip(va + vb)
+	vc1 = clip(va - vb)
+	vc2 = clip(va * vb)
+	if vb == 0:
+		vc3 = 0 # can't divide by zero!
+	else:
+		vc3 = clip(va // vb)
+
+	match op:
+		case 0:
+			vc = vc0
+			ops = '+'
+		case 1:
+			vc = vc1
+			ops = '-'
+		case 2:
+			vc = vc2
+			ops = '*'
+		case 3:
+			vc = vc3
+			ops = '/'
+	return vc, ops
+
 def genData1(bs, md, do_print=False):
 	'''
 	Task 1: learn the rules of modulo arithmetic.
@@ -140,12 +171,12 @@ def genData3(bs, do_print=False):
 	'''
 	ntok = 10
 	nbits = 4
-	pos_enc = graycodePosEnc(ntok, nbits)
 	md = 64 - (5 + (nbits*2)*3) # 35
 
 	x = np.zeros((bs, ntok, md + 5 + (nbits*2)*3), dtype=np.float32)
 	y = np.zeros_like(x)
 	for b in range(bs):
+		pos_enc = graycodePosEnc(ntok, nbits, rand_phase=True)
 		d = np.random.randint(1, 6, size=(8,))
 		ai = randint(8)
 		bi = randint(8)
@@ -254,7 +285,7 @@ class Expression:
 		# recusively evaluate the expression
 		if self.value is not None:
 			return self.value % md
-		c,_ = modOp(self.left.evaluate(md), self.right.evaluate(md), self.op, md)
+		c,_ = clipOp(self.left.evaluate(md), self.right.evaluate(md), self.op, md)
 		return c
 
 class ExpressionGenerator:
@@ -300,19 +331,20 @@ class ExpressionGenerator:
 
 		return Expression(operator=op, left=left_child, right=right_child)
 
-def genData4(bs, md, do_print=False):
+def genData4(bs, do_print=False):
 	'''
 	Task 4: from random arithmetic expressions,
 	generate parse trees
 	'''
 	ntok = 16
-	pos_enc = np.zeros((ntok,8), dtype=np.float32)
-	indx = np.linspace(0, 2*3.1415926, ntok)
+	nbits = 4 # hardcoded in class expression
+	md = 64 - (5 + (nbits*2)*3) # 35
 
 	rng = np.random.default_rng()
 	x = np.zeros((bs, ntok, md + 5 + 8*3), dtype=np.float32)
-	exp_gen = ExpressionGenerator(4, md) # NOTE!!!
+	exp_gen = ExpressionGenerator(2, 7) # NOTE!!!
 	for b in range(bs):
+		pos_enc = graycodePosEnc(ntok, nbits, rand_phase=True)
 		tree = exp_gen.generate()
 		tree.setLocRec(0)
 		if do_print:
@@ -321,11 +353,6 @@ def genData4(bs, md, do_print=False):
 			print("ploc:", tree.printParentLoc(ntok-1))
 		# pos_enc_permute = rng.permutation(pos_enc, axis=0)
 		# pos_enc_permute = np.copy(pos_enc)
-		for i in range(4):
-			freq = 2**(i/3)
-			rand_phase = np.random.uniform(0, 3.1415926*2)
-			pos_enc[:, 2*i  ] = np.sin(indx * freq + rand_phase)
-			pos_enc[:, 2*i+1] = np.cos(indx * freq + rand_phase)
 		tree.encode(md, x, b, pos_enc)
 		# encode the result
 		result = tree.evaluate(md)
@@ -336,17 +363,23 @@ def genData4(bs, md, do_print=False):
 		x[b, -1, md+5:md+5+8] = pos_enc[-1]
 		x[b, -1, md+5+8:md+5+16] = pos_enc[tree.getLoc()]
 
-	return x
+	y = np.array(x)
+	x[:,:,md+5+8:] = 0 # mask the pointers.
+	x[:,-1, 5:5+md] = 0 # mask the result.
+	return x,y
 
 def plotData4():
-	x = genData4(800, 11, do_print=False) # Test
-	x = genData4(8, 11, do_print=True)
-	print(x.shape)
-	fig,axs = plt.subplots(4,2)
-	for i in range(8):
-		j = i // 2
-		k = i % 2
-		axs[j,k].imshow(np.squeeze(x[i,...]))
+	x,y = genData4(800, do_print=False) # Test
+	bs = 3
+	x,y = genData4(8, do_print=True)
+	fig,axs = plt.subplots(bs,2)
+	for b in range(bs):
+		im = axs[b, 0].imshow(np.squeeze(x[b,:,:]))
+		plt.colorbar(im, ax=axs[b, 0])
+		im = axs[b, 1].imshow(np.squeeze(y[b,:,:]))
+		plt.colorbar(im, ax=axs[b, 1])
+		axs[b,0].set_title('X')
+		axs[b,1].set_title('Y')
 	plt.show()
 
 def genData5(bs,md, do_print):
@@ -759,6 +792,8 @@ if __name__ == '__main__':
 	args = parser.parse_args()
 	if args.t == 3:
 		plotData3()
+	if args.t == 4:
+		plotData4()
 	if args.t == 6:
 		plotData6()
 	if args.t == 7:

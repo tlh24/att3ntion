@@ -18,7 +18,7 @@ if parent_dir_str not in sys.path:
 
 from hyper_attn_pytorch import HypergraphAttention_Naive, GraphAttention_Naive, QuickGELU
 # from hyper_attn_cpp_wrapper import HypergraphAttentionCPP
-from gen_data_comp import genData3, genData7
+from gen_data_comp import genData3, genData4, genData7
 import pdb
 
 class SwiGLU(nn.Module):
@@ -135,10 +135,16 @@ def calcLoss(task, pred, targets):
 		value_targets = torch.argmax(targets[:,-1,5:40], axis=-1)
 		loss = F.cross_entropy( \
 			pred[:,-1,5:40], value_targets)
+	if task == 4:
+		# can it calculate the parse-tree pointers?
+		loss = F.mse_loss(pred[:,:,-16:], targets[:,:,-16:])
+		value_targets = torch.argmax(targets[:,-1,5:40], axis=-1)
+		loss += 0.01* F.cross_entropy( \
+			pred[:,-1,5:40], value_targets)
 	if task == 7:
 		value_targets = torch.argmax(targets[:,:,1:32], axis=2)
 		# posenc loss
-		loss = torch.sum( F.mse_loss(pred[:,:,-32:], targets[:,:,-32:]) )
+		loss = F.mse_loss(pred[:,:,-32:], targets[:,:,-32:])
 		# value and op loss
 		celoss = F.cross_entropy( \
 			pred[:,:,1:32].permute(0,2,1), value_targets)
@@ -160,11 +166,14 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	print(f"Using device: {device}")
 	
 	if task == 3:
-		x, y = genData3(batch_size * 1000, do_print=False)
-		x_v, y_v = genData3(batch_size * 1000, do_print=False)
+		gen_func = genData3
+	if task == 4:
+		gen_func = genData4
 	if task == 7:
-		x, y = genData7(batch_size * 1000, do_print=False)
-		x_v, y_v = genData7(batch_size * 1000, do_print=False)
+		gen_func = genData7
+
+	x, y = gen_func(batch_size * 1000, do_print=False)
+	x_v, y_v = gen_func(batch_size * 1000, do_print=False)
 
 	dataset = TensorDataset(torch.tensor(x), torch.tensor(y))
 	train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -178,7 +187,11 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 		n_layers = 4
 
 	input_dim = x.shape[2]
-	model = SimpleCompModel(input_dim, hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=1).to(device)
+	n_recurse = 1
+	if task == 4:
+		n_recurse = 2
+
+	model = SimpleCompModel(input_dim, hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse).to(device)
 	if not start_fresh:
 		try:
 			model.load_model(f"comp_model_{attn_impl}.pt", device)
