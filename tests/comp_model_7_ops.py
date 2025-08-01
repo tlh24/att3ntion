@@ -134,8 +134,9 @@ def calcLoss(task, pred, targets):
 	n_correct = 0
 	if task == 3:
 		value_targets = torch.argmax(targets[:,-1,5:40], axis=-1)
-		loss = F.cross_entropy( \
-			pred[:,-1,5:40], value_targets)
+		loss = F.cross_entropy( pred[:,-1,5:40], value_targets)
+		with torch.no_grad():
+			n_correct = torch.sum(torch.argmax(pred[:,-1,5:40], axis=-1) == value_targets).item()
 	if task == 4:
 		# can it calculate the parse-tree pointers?
 		loss = F.mse_loss(pred[:,:,-16:], targets[:,:,-16:])
@@ -345,7 +346,7 @@ if __name__ == '__main__':
 						help='postfix logname')
 	parser.add_argument('--fresh', action='store_true',
         help='Dont load or save model parameters.')
-	parser.add_argument('--task', type=int, help="what task to run the model on")
+	parser.add_argument('--task', type=int, help="what task to run the model on", required=True)
 	args = parser.parse_args()
 
 	# print("Task 7: This script tests the graph and hypergraph transformer on a one-digit multiply task, multi-digit add, and shift tasks.")
