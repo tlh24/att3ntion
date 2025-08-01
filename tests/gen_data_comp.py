@@ -151,15 +151,14 @@ def graycodePosEnc(ntok, nbits, rand_phase=False):
 		# period = 4 * (math.sqrt(2.0))**i
 		#   above is slower - does not help?
 		period = 4 * 2.0**i
-		phase = math.pi / period + phase_offset # indx is scaled by 2 pi
 		if True:
 			# sinusoidal, seems to work better?
-			pos_enc[:, 2*i  ] = -np.cos(indx / period + phase)
-			pos_enc[:, 2*i+1] = np.sin(indx / period + phase)
+			pos_enc[:, 2*i  ] = -np.cos(indx / period + phase_offset)
+			pos_enc[:, 2*i+1] = np.sin(indx / period + phase_offset)
 		else:
 			# graycode! (thresholded)
-			pos_enc[:, 2*i  ] = np.cos(indx / period + phase) < 0
-			pos_enc[:, 2*i+1] = np.sin(indx / period + phase) < 0
+			pos_enc[:, 2*i  ] = np.cos(indx / period + phase_offset) < 0
+			pos_enc[:, 2*i+1] = np.sin(indx / period + phase_offset) < 0
 	return pos_enc
 
 def genData3(bs, do_print=False):
@@ -227,16 +226,17 @@ class Expression:
 		self.rparen_loc = 0
 
 	def __str__(self):
-		if self.value is not None:
+		if self.op is None:
 			return str(self.value)
 		operator = OPERATORS[self.op]
 		return f"({self.left} {operator} {self.right})"
 
 	def setLocRec(self, loc):
-		if self.value is not None:
+		if self.op is None:
 			self.loc = loc
 			return loc + 1
 		else:
+			self.value = 0 # clear the value if it's an op
 			self.lparen_loc = loc
 			loc += 1
 			loc = self.left.setLocRec(loc)
@@ -256,36 +256,45 @@ class Expression:
 		return f"({self.left.printLoc()} {self.loc} {self.right.printLoc()})"
 
 	def printParentLoc(self, parent):
-		if self.value is not None:
+		if self.op is None:
 			return str(parent)
 		return f"({self.left.printParentLoc(self.loc)} {parent} {self.right.printParentLoc(self.loc)})"
 
 	def encode(self, md, x, b, pos_enc):
 		# need to just encode the left and right children
 		c = self.loc
-		if self.value is not None:
+		if self.op is None:
 			x[b,c,self.value+5] = 1
 			x[b,c,md+5:md+5+8] = pos_enc[c] # abs loc
+			return c+1
 		else:
 			lc = self.lparen_loc
 			rc = self.rparen_loc
 			x[b,lc,0] = -1 # "("
+			x[b,lc,5] = 1 # paren is zero
 			x[b,lc,md+5:md+5+8] = pos_enc[lc] # abs loc
 			self.left.encode(md, x, b, pos_enc)
 			x[b,c,self.op] = 1
+			if self.value is not None:
+				x[b,c,self.value+5] = 1
+			else:
+				x[b,c,5] = 1 # default to zero
 			x[b,c,md+5:md+5+8] = pos_enc[c] # abs loc
 			x[b,c,md+5+8:md+5+16] = pos_enc[self.left.getLoc()]
 			x[b,c,md+5+16:md+5+24] = pos_enc[self.right.getLoc()]
 			self.right.encode(md, x, b, pos_enc)
 			x[b,rc,1] = -1 # ")"
+			x[b,rc,5] = 1 # paren is zero
 			x[b,rc,md+5:md+5+8] = pos_enc[rc] # abs loc
 			x[b,rc,md+5+8:md+5+16] = 0 # no parent
+			return rc+1
 
 	def evaluate(self, md:int):
 		# recusively evaluate the expression
-		if self.value is not None:
-			return self.value % md
+		if self.op is None:
+			return self.value
 		c,_ = clipOp(self.left.evaluate(md), self.right.evaluate(md), self.op, md)
+		self.value = c # save for supervised learning
 		return c
 
 class ExpressionGenerator:
@@ -331,22 +340,65 @@ class ExpressionGenerator:
 
 		return Expression(operator=op, left=left_child, right=right_child)
 
+class ExpressionGeneratorDepth:
+	"""Recursively generates random arithmetic expression trees."""
+
+	def __init__(self, max_depth, modulo):
+		self.max_depth = max(1, max_depth) # Need at least 2 terms for an op
+		self.modulo = modulo
+		# these cataland numbers start at 2.
+		self.n_depth = [2, 6, 16, 25, 36]
+		self.n_depth_cumsum = np.cumsum(self.n_depth)
+
+	def generate(self):
+		# unlike the original code, which tries to make all
+		# expressions equally probable (via catalan numbers),
+		# just generate a random depth, weighted by n_depth
+		r = random.randrange(0, self.n_depth_cumsum[self.max_depth-1])
+		depth = np.sum(self.n_depth_cumsum < r) + 1
+		# print("depth:", depth)
+		if depth > self.max_depth:
+			pdb.set_trace()
+		return self._generate_recursive(depth)
+
+	def _generate_recursive(self, depth):
+		"""The core recursive generation logic."""
+		# Base case: if only one term is left, it must be a number.
+		if depth <= 0:
+			return Expression(value=1+random.randrange(self.modulo-1))
+
+		op = random.randrange(4)
+
+		r = random.randrange(0, self.n_depth_cumsum[depth-1])
+		left_depth = np.sum(self.n_depth_cumsum < r) # no offset
+		left_child = self._generate_recursive(left_depth)
+
+		r = random.randrange(0, self.n_depth_cumsum[depth-1])
+		right_depth = np.sum(self.n_depth_cumsum < r) # no offset
+		right_child = self._generate_recursive(right_depth)
+
+		return Expression(operator=op, left=left_child, right=right_child)
+
 def genData4(bs, do_print=False):
 	'''
 	Task 4: from random arithmetic expressions,
-	generate parse trees
+	generate parse trees & evaluate them
 	'''
-	ntok = 16
+	ntok = 8
 	nbits = 4 # hardcoded in class expression
 	md = 64 - (5 + (nbits*2)*3) # 35
 
 	rng = np.random.default_rng()
 	x = np.zeros((bs, ntok, md + 5 + 8*3), dtype=np.float32)
-	exp_gen = ExpressionGenerator(2, 7) # NOTE!!!
+	y = np.zeros_like(x)
+	exp_gen = ExpressionGeneratorDepth(1, 7) # NOTE!!!
 	for b in range(bs):
 		pos_enc = graycodePosEnc(ntok, nbits, rand_phase=True)
-		tree = exp_gen.generate()
-		tree.setLocRec(0)
+		val = 0
+		while val == 0:
+			tree = exp_gen.generate()
+			val = tree.evaluate(md)
+		tree.setLocRec(0) # also resets eval.
 		if do_print:
 			print("expr:", tree)
 			print("loc :", tree.printLoc())
@@ -355,23 +407,26 @@ def genData4(bs, do_print=False):
 		# pos_enc_permute = np.copy(pos_enc)
 		tree.encode(md, x, b, pos_enc)
 		# encode the result
-		result = tree.evaluate(md)
+		result = tree.evaluate(md) # sets internal values of the ops
 		if do_print:
 			print("res: ", result)
+		n = tree.encode(md, y, b, pos_enc)
 		x[b, -1, 4] = 1
-		x[b, -1, result+5] = 1
-		x[b, -1, md+5:md+5+8] = pos_enc[-1]
-		x[b, -1, md+5+8:md+5+16] = pos_enc[tree.getLoc()]
+		x[b, n:, md+5:md+5+8] = pos_enc[n:]
+		x[b, :, md+5+8:] = 0 # mask pointer
+		x[b, n:-1, 5] = 1 # default zero
+		y[b, -1, 4] = 1
+		y[b, -1, result+5] = 1
+		y[b, n:, md+5:md+5+8] = pos_enc[n:]
+		y[b, n:-1, 5] = 1 # default zero
+		y[b, -1, md+5+8:md+5+16] = pos_enc[tree.getLoc()]
 
-	y = np.array(x)
-	x[:,:,md+5+8:] = 0 # mask the pointers.
-	x[:,-1, 5:5+md] = 0 # mask the result.
 	return x,y
 
 def plotData4():
 	x,y = genData4(800, do_print=False) # Test
-	bs = 3
-	x,y = genData4(8, do_print=True)
+	bs = 4
+	x,y = genData4(bs, do_print=True)
 	fig,axs = plt.subplots(bs,2)
 	for b in range(bs):
 		im = axs[b, 0].imshow(np.squeeze(x[b,:,:]))

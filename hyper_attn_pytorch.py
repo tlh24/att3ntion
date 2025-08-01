@@ -36,7 +36,7 @@ class HypergraphAttention_Naive(nn.Module):
 		self.Wv_r = nn.Linear(d_model, self.d_val*n_heads*2, bias=True, **kwargs)
 		self.Wv_s = nn.Linear(d_model, self.d_val*n_heads*2, bias=True, **kwargs)
 		
-		self.Wo = nn.Linear(self.d_val, d_model, bias=True, **kwargs)
+		self.Wo = nn.Linear(self.d_model, d_model, bias=True, **kwargs)
 		
 		self.dropout = nn.Dropout(dropout_rate)
 		self.gelu = QuickGELU()

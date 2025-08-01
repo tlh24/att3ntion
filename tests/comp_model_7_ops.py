@@ -48,7 +48,7 @@ class SimpleCompModel(nn.Module):
 		self.repeated_layers = nn.ModuleList()
 		for _ in range(n_layers):
 			if attn_impl == "hypergraph":
-				attention_layer = HypergraphAttention_Naive(hidden_dim, num_heads, head_subspaces=False)
+				attention_layer = HypergraphAttention_Naive(hidden_dim, num_heads, head_subspaces=True)
 			else:
 				attention_layer = GraphAttention_Naive(hidden_dim, num_heads, head_subspaces=True)
 
@@ -131,6 +131,7 @@ class SimpleCompModel(nn.Module):
 		return f
 
 def calcLoss(task, pred, targets):
+	n_correct = 0
 	if task == 3:
 		value_targets = torch.argmax(targets[:,-1,5:40], axis=-1)
 		loss = F.cross_entropy( \
@@ -138,9 +139,12 @@ def calcLoss(task, pred, targets):
 	if task == 4:
 		# can it calculate the parse-tree pointers?
 		loss = F.mse_loss(pred[:,:,-16:], targets[:,:,-16:])
-		value_targets = torch.argmax(targets[:,-1,5:40], axis=-1)
+		value_targets = torch.argmax(targets[:,:,5:40], axis=-1)
 		loss += 0.01* F.cross_entropy( \
-			pred[:,-1,5:40], value_targets)
+			pred[:,:,5:40].permute(0,2,1), value_targets)
+		with torch.no_grad():
+			# we only really care about the final answer
+			n_correct = torch.sum(torch.argmax(pred[:,-1,5:40], axis=-1) == value_targets[:,-1]).item()
 	if task == 7:
 		value_targets = torch.argmax(targets[:,:,1:32], axis=2)
 		# posenc loss
@@ -151,7 +155,7 @@ def calcLoss(task, pred, targets):
 		loss += torch.sum(celoss * targets[:,:,0])
 		# permute is to work with pytorch's cross-entropy calc
 		# for both, mask off unused tokens
-	return loss
+	return loss, n_correct
 
 def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl="", log_name="", start_fresh=False, task=3):
 	
@@ -189,7 +193,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	input_dim = x.shape[2]
 	n_recurse = 1
 	if task == 4:
-		n_recurse = 2
+		n_recurse = 1
 
 	model = SimpleCompModel(input_dim, hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse).to(device)
 	if not start_fresh:
@@ -230,7 +234,8 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 
 			with autocast('cuda', dtype=torch.bfloat16):
 				pred = model(inputs)
-				loss = calcLoss(task, pred, targets)
+				loss, n_correct = calcLoss(task, pred, targets)
+				correct_vals += n_correct
 
 			loss.backward()
 			optimizer.step()
@@ -254,16 +259,21 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 			fig,axs = plt.subplots(2, 4, figsize=(13,10))
 			def mangle(t):
 				return t.detach().cpu().squeeze().float().numpy()
-			def plot(r, c, t):
+			def plot(r, c, t, blank=False):
 				g = mangle(t)
+				if task == 4 and blank: # mask areas with no loss
+					g[:,:5] = 0
+					mx = np.max(g[:,5:40], axis=-1)
+					mx = np.expand_dims(mx, -1)
+					g[:,5:40] = g[:,5:40] / (mx+1)
 				im = axs[r,c].imshow( g )
 				plt.colorbar(im, ax=axs[r,c])
 
 			for j in range(2):
 				plot(j,0, inputs[j,...])
 				plot(j,1, targets[j,...])
-				plot(j,2, pred[j,...])
-				plot(j,3, pred[j,...] - targets[j,...])
+				plot(j,2, pred[j,...], True)
+				plot(j,3, pred[j,...] - targets[j,...], True)
 
 				axs[j,0].set_title('input')
 				axs[j,1].set_title('target')
@@ -272,8 +282,8 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 			plt.show()
 		
 		avg_loss = total_loss / len(train_loader)
-		val_accuracy = 100 * correct_vals / total
-		print(f'Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Result Acc: {val_accuracy:.2f}%')
+		train_accuracy = 100 * correct_vals / total
+		print(f'Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Result Acc: {train_accuracy:.2f}%')
 
 		if not start_fresh:
 			# save after each epoch
@@ -281,6 +291,8 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 
 	# validation!
 	total_loss = 0
+	correct_vals = 0
+	total = 0
 	with torch.no_grad():
 		for batch_indx, (inputs_np,outputs_np) in enumerate(loader_v):
 			inputs = torch.FloatTensor(inputs_np).to(device)
@@ -293,7 +305,9 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 
 			with autocast('cuda', dtype=torch.bfloat16):
 				pred = model(inputs)
-				loss = calcLoss(task, pred, targets)
+				loss, n_correct = calcLoss(task, pred, targets)
+			correct_vals += n_correct
+			total += inputs.shape[0]
 
 			if batch_indx % 200 == 0:
 				end_event.record()
@@ -311,7 +325,8 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 			total_loss += loss.item()
 
 		avg_loss = total_loss / len(train_loader)
-		print(f'Validation Loss: {avg_loss:.4f},')
+		val_accuracy = 100 * correct_vals / total
+		print(f'Validation Loss: {avg_loss:.4f}, accuracy {val_accuracy}')
 
 	fd_losslog.close()
 	return model
@@ -333,7 +348,7 @@ if __name__ == '__main__':
 	parser.add_argument('--task', type=int, help="what task to run the model on")
 	args = parser.parse_args()
 
-	print("Task 7: This script tests the graph and hypergraph transformer on a one-digit multiply task, multi-digit add, and shift tasks.")
+	# print("Task 7: This script tests the graph and hypergraph transformer on a one-digit multiply task, multi-digit add, and shift tasks.")
 	
 	model = trainModel(
 		num_epochs=args.epochs,
