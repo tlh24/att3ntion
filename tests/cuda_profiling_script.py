@@ -1,5 +1,9 @@
 import torch
 import hyper_attn_cpp_manual
+import subprocess
+import sys
+import datetime
+import os
 
 def get_grad_output_cuda(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_):
     """
@@ -22,23 +26,20 @@ def get_grad_output_cuda(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_):
     
     return grad_output_combined
 
-def main():
+def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim):
     """
-    Runs a single configuration of the manual CUDA attention mechanism
-    for targeted profiling with tools like NVIDIA Nsight Compute (ncu).
+    Contains the core logic for running the CUDA kernels.
+    This is what the profiler will measure.
     """
     if not torch.cuda.is_available():
         print("CUDA is not available. Aborting.")
         return
 
     print(f"Using device: {torch.cuda.get_device_name(0)}")
-
-    # --- Configuration ---
-    # Hardcoded single configuration for a focused profiling run
-    B, H, I_dim, J_dim, K_dim, D_dim = (1, 2, 128, 128, 128, 64)
-    dropout_rate = 0.0
     print(f"Profiling config (B,H,I,J,K,D): ({B},{H},{I_dim},{J_dim},{K_dim},{D_dim})")
 
+    dropout_rate = 0.0
+    
     # --- Tensor Initialization ---
     Q = torch.rand(B, H, I_dim, D_dim, device='cuda', dtype=torch.float32)
     R = torch.rand(B, H, J_dim, D_dim, device='cuda', dtype=torch.float32)
@@ -51,8 +52,6 @@ def main():
     Vs_2 = torch.rand(B, H, K_dim, D_dim, device='cuda', dtype=torch.float32)
 
     # --- Execution ---
-    # The profiler (ncu) hooks into the CUDA API, so we just need to execute the functions.
-    
     # Forward Pass
     Y_q_mc, Y_r_mc, Y_s_mc, Y_q__mc, Y_r__mc, Y_s__mc = hyper_attn_cpp_manual.forward(
         Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
@@ -70,16 +69,57 @@ def main():
         Vs_1, Vs_2,
         dropout_rate
     )
-
-    # This final synchronize is important to ensure the GPU has finished all work
-    # before the script exits, guaranteeing the profiler captures everything.
     torch.cuda.synchronize()
+    print("\nCUDA kernel run finished successfully.")
 
+
+def launch_profiler():
+    """
+    Constructs and launches the ncu profiling command.
+    """
+    # --- Configuration ---
+    # You can now change these values directly in the script for a new run
+    B, H, I_dim, J_dim, K_dim, D_dim = (1, 2, 128, 128, 128, 64)
+    KERNEL_NAME = "Yq_scatter_flash"
+    
+    # Dynamically generate the report filename
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_filename = f"profiling_reports/{KERNEL_NAME}_B{B}_H{H}_I{I_dim}_J{J_dim}_K{K_dim}_D{D_dim}_{timestamp}.ncu-rep"
+
+    # Ensure the output directory exists
+    os.makedirs(os.path.dirname(output_filename), exist_ok=True)
+
+    # Construct the ncu command
+    ncu_command = [
+        "ncu",
+        "--set", "full",
+        "-k", KERNEL_NAME,
+        "--section", "SchedulerStats",
+        "--section", "InstructionStats",
+        "--section", "MemoryWorkloadAnalysis",
+        "-o", output_filename,
+        sys.executable,  # Use the current python executable
+        __file__,       # Pass the script itself as the target
+        "--no-profile"  # Flag to tell the script not to launch ncu again
+    ]
+
+    print(f"Executing profiling command: {' '.join(ncu_command)}")
+    # Use subprocess to run the command
+    subprocess.run(ncu_command, check=True)
     print("\nCUDA profiling script finished successfully.")
+
 
 if __name__ == '__main__':
     try:
-        main()
+        # Check if we should run the kernels directly or launch the profiler
+        if "--no-profile" in sys.argv:
+            # This branch is executed when ncu calls the script
+            B, H, I_dim, J_dim, K_dim, D_dim = (1, 2, 128, 128, 128, 64)
+            run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim)
+        else:
+            # This is the main branch that launches the profiler
+            launch_profiler()
+
     except ImportError:
         print("\nImportError: Could not import 'hyper_attn_cpp_manual'.")
         print("Please ensure the extension is compiled via 'python setup.py install' or 'develop'.")
