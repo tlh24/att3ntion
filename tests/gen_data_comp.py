@@ -168,34 +168,39 @@ def genData3(bs, do_print=False):
 	rather than positional arguments.
 	This ought to be easy.
 	'''
-	ntok = 10
+	ntok = 16
 	nbits = 4
 	md = 64 - (5 + (nbits*2)*3) # 35
 
 	x = np.zeros((bs, ntok, md + 5 + (nbits*2)*3), dtype=np.float32)
 	y = np.zeros_like(x)
+	nd = ntok - 2
 	for b in range(bs):
 		pos_enc = graycodePosEnc(ntok, nbits, rand_phase=True)
-		d = np.random.randint(1, 6, size=(8,))
-		ai = randint(8)
-		bi = randint(8)
+		d = np.random.randint(1, 8, size=(nd,))
+		ai = randint(nd)
+		bi = randint(nd)
 		op = randint(4)
-		c,_ = modOp(d[ai], d[bi], op, md)
-		# encode the list of 8 integers
-		for k in range(8):
+		c,ops = clipOp(d[ai], d[bi], op, md)
+		# encode the list of nd integers
+		for k in range(nd):
 			x[b,k,d[k]+5] = 1
-		x[b,8,op] = 1
-		x[b,9,4 ] = 1 # result
+		x[b,nd,op] = 1
+		x[b,nd+1,4 ] = 1 # result
 		# positional encoding
 		x[b,:,md+5:md+5+8] = pos_enc
-		x[b,8,md+5+8:md+5+16] = pos_enc[ai,:]
-		x[b,8,md+5+16:md+5+24] = pos_enc[bi,:]
-		x[b,9,md+5+8:md+5+16] = pos_enc[8,:] # point to op
-		# y[b,9, 5+d[ai]] = 1 # TEST - works super fast
-		# y[b,9, 5+d[bi]] = 1
-		y[b,9, 5+c] = 1
+		x[b,nd,md+5+8:md+5+16] = pos_enc[ai,:]
+		x[b,nd,md+5+16:md+5+24] = pos_enc[bi,:]
+		x[b,nd+1,md+5+8:md+5+16] = pos_enc[8,:] # point to op
+		# y[b,nd+1, 5+d[ai]] = 1 # TEST - works super fast
+		# y[b,nd+1, 5+d[bi]] = 1
+		# y[b,nd+1,md+5+8:md+5+16] = pos_enc[ai,:] # copy pointer
+		# y[b,nd+1,md+5+16:md+5+24] = pos_enc[bi,:]
+		y[b,nd+1, 5+c] = 1
 		if do_print:
-			print(f"d[{ai}] + d[{bi}] = {d[ai]} + {d[bi]} = {c}")
+			for i in range(nd):
+				print(d[i], end=' ')
+			print(f"\nd[{ai}] {ops} d[{bi}] = {d[ai]} {ops} {d[bi]} = {c}")
 
 	return x,y
 
@@ -384,14 +389,14 @@ def genData4(bs, do_print=False):
 	Task 4: from random arithmetic expressions,
 	generate parse trees & evaluate them
 	'''
-	ntok = 8
+	ntok = 32
 	nbits = 4 # hardcoded in class expression
 	md = 64 - (5 + (nbits*2)*3) # 35
 
 	rng = np.random.default_rng()
 	x = np.zeros((bs, ntok, md + 5 + 8*3), dtype=np.float32)
 	y = np.zeros_like(x)
-	exp_gen = ExpressionGeneratorDepth(1, 7) # NOTE!!!
+	exp_gen = ExpressionGeneratorDepth(3, 7) # NOTE!!!
 	for b in range(bs):
 		pos_enc = graycodePosEnc(ntok, nbits, rand_phase=True)
 		val = 0
@@ -401,7 +406,7 @@ def genData4(bs, do_print=False):
 		tree.setLocRec(0) # also resets eval.
 		if do_print:
 			print("expr:", tree)
-			print("loc :", tree.printLoc())
+			print("res loc :", tree.printLoc())
 			print("ploc:", tree.printParentLoc(ntok-1))
 		# pos_enc_permute = rng.permutation(pos_enc, axis=0)
 		# pos_enc_permute = np.copy(pos_enc)

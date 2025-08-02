@@ -1,5 +1,6 @@
 import numpy as np
 import argparse
+import inspect
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -130,6 +131,36 @@ class SimpleCompModel(nn.Module):
 		f += bs * ntok * self.d_model**2 * self.input_dim # output proj
 		return f
 
+	def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+		# this is from nanoGPT!
+		# start with all of the candidate parameters
+		param_dict = {pn: p for pn, p in self.named_parameters()}
+		# filter out those that do not require grad
+		param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+		# create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+		# i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+		decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+		nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+		optim_groups = [
+			{'params': decay_params, 'weight_decay': weight_decay},
+			{'params': nodecay_params, 'weight_decay': 0.0}
+		]
+		num_decay_params = sum(p.numel() for p in decay_params)
+		num_nodecay_params = sum(p.numel() for p in nodecay_params)
+		print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+		print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+		# Create AdamW optimizer and use the fused version if it is available
+		fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+		use_fused = fused_available and device_type == 'cuda'
+		extra_args = dict(fused=True) if use_fused else dict()
+		extra_args = {**extra_args, 'amsgrad': False}
+		optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+		# optimizer = torch.optim.NAdam(optim_groups, lr=learning_rate)
+		print(f"using fused AdamW: {use_fused}")
+
+		return optimizer
+
+
 def calcLoss(task, pred, targets):
 	n_correct = 0
 	if task == 3:
@@ -158,7 +189,7 @@ def calcLoss(task, pred, targets):
 		# for both, mask off unused tokens
 	return loss, n_correct
 
-def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl="", log_name="", start_fresh=False, task=3):
+def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl="", log_name="", start_fresh=False, task=3, replicate=1):
 	
 	if device == 'auto':
 		if torch.cuda.is_available():
@@ -199,10 +230,16 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	model = SimpleCompModel(input_dim, hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse).to(device)
 	if not start_fresh:
 		try:
-			model.load_model(f"comp_model_{attn_impl}.pt", device)
+			model.load_model(f"comp_model_{attn_impl}_r{replicate}.pt", device)
 		except:
 			print("train_model1: could not load the saved model weights")
-	optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, amsgrad=True)
+	# from nanogpt:
+	learning_rate = 6e-4 # max learning rate
+	weight_decay = 1e-2 # karpathy 1e-1, default 1e-2
+	beta1 = 0.9 # default 0.9, both.
+	beta2 = 0.95 # karpathy 0.95, default 0.999
+	optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), 'cuda')
+	# optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, amsgrad=True)
 	model.printParamCount()
 	model = torch.compile(model) # mode="max-autotune"
 
@@ -211,7 +248,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	print("--- Running with Automatic Mixed Precision ---")
 
 
-	fd_losslog = open(f'losslog_{attn_impl}_t{task}_{log_name}.txt', 'w')
+	fd_losslog = open(f'losslog_{attn_impl}_t{task}_{log_name}_r{replicate}.txt', 'w')
 
 	print("\ntrain_model1 started...")
 	uu = 0
@@ -243,7 +280,6 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 
 			lloss = loss.detach().cpu().item()
 			fd_losslog.write(f"{uu}\t{lloss}\t0.0\n")
-			fd_losslog.flush()
 			uu += 1
 
 			total_loss += loss.item()
@@ -254,6 +290,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 				torch.cuda.synchronize()
 				amp_time = start_event.elapsed_time(end_event)
 				print("batch time:", amp_time, "ms")
+				fd_losslog.flush()
 
 		# plot the inputs / outputs
 		if False:
@@ -288,8 +325,9 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 
 		if not start_fresh:
 			# save after each epoch
-			model.save_model(f"comp_model_{args.attn}.pt")
+			model.save_model(f"comp_model_{args.attn}_r{replicate}.pt")
 
+	fd_losslog.flush()
 	# validation!
 	total_loss = 0
 	correct_vals = 0
@@ -317,10 +355,10 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 				f = model.calcFlops(inputs)
 				print("batch time:", amp_time, "ms")
 				print(f"{(f/1e9) / (amp_time / 1000.0)} GFlops approx")
+				fd_losslog.flush()
 
 			lloss = loss.detach().cpu().item()
 			fd_losslog.write(f"{uu}\t{lloss}\t0.0\n")
-			fd_losslog.flush()
 			uu += 1
 
 			total_loss += loss.item()
@@ -329,6 +367,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 		val_accuracy = 100 * correct_vals / total
 		print(f'Validation Loss: {avg_loss:.4f}, accuracy {val_accuracy}')
 
+	fd_losslog.flush()
 	fd_losslog.close()
 	return model
 
@@ -338,7 +377,7 @@ if __name__ == '__main__':
 						help='Device to use (cpu, cuda, auto)')
 	parser.add_argument('--epochs', type=int, default=5, help='Number of epochs')
 	parser.add_argument('--batch-size', type=int, default=32, help='Batch size for training')
-	parser.add_argument('--hidden-dim', type=int, default=128, help='Hidden dimension size')
+	parser.add_argument('--hidden', type=int, default=128, help='Hidden dimension size')
 	parser.add_argument('--heads', type=int, default=4, help='Number of attention heads')
 	parser.add_argument('--attn', type=str, default='hypergraph', choices=['hypergraph', 'graph'],
 						help='Attention implementation to use')
@@ -347,6 +386,7 @@ if __name__ == '__main__':
 	parser.add_argument('--fresh', action='store_true',
         help='Dont load or save model parameters.')
 	parser.add_argument('--task', type=int, help="what task to run the model on", required=True)
+	parser.add_argument('--repl', type=int, help="what replicate this is",)
 	args = parser.parse_args()
 
 	# print("Task 7: This script tests the graph and hypergraph transformer on a one-digit multiply task, multi-digit add, and shift tasks.")
@@ -354,12 +394,13 @@ if __name__ == '__main__':
 	model = trainModel(
 		num_epochs=args.epochs,
 		device=args.device,
-		hidden_dim=args.hidden_dim,
+		hidden_dim=args.hidden,
 		num_heads=args.heads,
 		attn_impl=args.attn,
 		batch_size=args.batch_size,
 		log_name=args.log_name,
 		start_fresh=args.fresh,
-		task = args.task
+		task = args.task,
+		replicate = args.repl
 	)
 
