@@ -1082,8 +1082,8 @@ __global__ void Yr_scatter_flash(
     const float* __restrict__ m_i_in, const float* __restrict__ l_i_in,
     const float* __restrict__ m_k_in, const float* __restrict__ l_k_in,
     float* __restrict__ Y_r_,
-    int B, int H, int I, int J, int K, int D, float scale
-) {
+    int B, int H, int I, int J, int K, int D, float scale)
+{
     // --- Grid/Block Mapping ---
     const int j_tile_idx_grid = blockIdx.x;
     const int bh_idx = blockIdx.y;
@@ -1108,12 +1108,12 @@ __global__ void Yr_scatter_flash(
 
     // --- Shared Memory Layout ---
     extern __shared__ float smem[];
-    float4* r_tile_f4 = (float4*)smem;
-    float4* q_tile_f4 = r_tile_f4 + TILE_J * (D / 4);
-    float4* s_tile_f4 = q_tile_f4 + TILE_I * (D / 4);
-    float4* vq_tile_f4 = s_tile_f4 + TILE_K * (D / 4);
-    float4* vs_tile_f4 = vq_tile_f4 + TILE_I * (D / 4);
-    float* mi_tile = (float*)(vs_tile_f4 + TILE_K * (D / 4));
+    float* r_tile = (float*)smem;
+    float* q_tile = r_tile + TILE_J * D;
+    float* s_tile = q_tile + TILE_I * D;
+    float* vq_tile = s_tile + TILE_K * D;
+    float* vs_tile = vq_tile + TILE_I * D;
+    float* mi_tile = (float*)(vs_tile + TILE_K * D);
     float* li_tile = mi_tile + TILE_I;
     float* mk_tile = li_tile + TILE_I;
     float* lk_tile = mk_tile + TILE_K;
@@ -1125,27 +1125,27 @@ __global__ void Yr_scatter_flash(
     // Initialize the shared memory accumulator tile
     o_tile[j_local_idx * D + d_idx] = 0.0f;
 
-    // --- Load R tile for this block using float4 ---
-    for (int load_idx_f4 = flat_thread_id_2d; load_idx_f4 < TILE_J * (D / 4); load_idx_f4 += threads_per_block) {
-        int row_in_tile = load_idx_f4 / (D / 4);
-        int col_in_f4 = load_idx_f4 % (D / 4);
+    // --- Load R tile for this block ---
+    for (int load_idx = flat_thread_id_2d; load_idx < TILE_J * D; load_idx += threads_per_block) {
+        int row_in_tile = load_idx / D;
+        int col_in_float = load_idx % D;
         int j_global = j_base + row_in_tile;
         if (j_global < J) {
-            r_tile_f4[row_in_tile * (D / 4) + col_in_f4] = 
-                ((const float4*)(R + r_bh_offset))[j_global * (D / 4) + col_in_f4];
+            r_tile[row_in_tile * D + col_in_float] =
+                R[r_bh_offset + j_global * D + col_in_float];
         }
     }
     __syncthreads();
 
     for (int i0 = 0; i0 < I; i0 += TILE_I) {
         // --- Cooperative loading for i-related tiles ---
-        for (int load_idx_f4 = flat_thread_id_2d; load_idx_f4 < TILE_I * (D / 4); load_idx_f4 += threads_per_block) {
-            int row_in_tile = load_idx_f4 / (D / 4);
-            int col_in_f4 = load_idx_f4 % (D / 4);
+        for (int load_idx = flat_thread_id_2d; load_idx < TILE_I * D; load_idx += threads_per_block) {
+            int row_in_tile = load_idx / D;
+            int col_in_float = load_idx % D;
             int i_global = i0 + row_in_tile;
             if (i_global < I) {
-                q_tile_f4[row_in_tile * (D / 4) + col_in_f4] = ((const float4*)(Q + q_bh_offset))[i_global * (D / 4) + col_in_f4];
-                vq_tile_f4[row_in_tile * (D / 4) + col_in_f4] = ((const float4*)(Vq_2 + vq_bh_offset))[i_global * (D / 4) + col_in_f4];
+                q_tile[row_in_tile * D + col_in_float] = Q[q_bh_offset + i_global * D + col_in_float];
+                vq_tile[row_in_tile * D + col_in_float] = Vq_2[vq_bh_offset + i_global * D + col_in_float];
             }
         }
         for (int i_load = flat_thread_id_2d; i_load < TILE_I; i_load += threads_per_block) {
@@ -1157,13 +1157,13 @@ __global__ void Yr_scatter_flash(
 
         for (int k0 = 0; k0 < K; k0 += TILE_K) {
             // --- Cooperative loading for k-related tiles ---
-            for (int load_idx_f4 = flat_thread_id_2d; load_idx_f4 < TILE_K * (D / 4); load_idx_f4 += threads_per_block) {
-                int row_in_tile = load_idx_f4 / (D / 4);
-                int col_in_f4 = load_idx_f4 % (D / 4);
+            for (int load_idx = flat_thread_id_2d; load_idx < TILE_K * D; load_idx += threads_per_block) {
+                int row_in_tile = load_idx / D;
+                int col_in_float = load_idx % D;
                 int k_global = k0 + row_in_tile;
                 if (k_global < K) {
-                    s_tile_f4[row_in_tile * (D / 4) + col_in_f4] = ((const float4*)(S + s_bh_offset))[k_global * (D / 4) + col_in_f4];
-                    vs_tile_f4[row_in_tile * (D / 4) + col_in_f4] = ((const float4*)(Vs_2 + vs_bh_offset))[k_global * (D / 4) + col_in_f4];
+                    s_tile[row_in_tile * D + col_in_float] = S[s_bh_offset + k_global * D + col_in_float];
+                    vs_tile[row_in_tile * D + col_in_float] = Vs_2[vs_bh_offset + k_global * D + col_in_float];
                  }
             }
             for (int k_load = flat_thread_id_2d; k_load < TILE_K; k_load += threads_per_block) {
@@ -1175,32 +1175,28 @@ __global__ void Yr_scatter_flash(
             __syncthreads();
 
             // --- Fused Computation ---
-            const float4* r_vec_f4 = r_tile_f4 + j_local_idx * (D / 4);
+            const float* r_vec = r_tile + j_local_idx * D;
 
             for (int i_tile_idx = 0; i_tile_idx < TILE_I; ++i_tile_idx) {
                 if (i0 + i_tile_idx >= I) continue;
-                const float4* q_vec_f4 = q_tile_f4 + i_tile_idx * (D / 4);
+                const float* q_vec = q_tile + i_tile_idx * D;
                 float inv_li = 1.0f / li_tile[i_tile_idx];
 
                 for (int k_tile_idx = 0; k_tile_idx < TILE_K; ++k_tile_idx) {
                     if (k0 + k_tile_idx >= K) continue;
-                    const float4* s_vec_f4 = s_tile_f4 + k_tile_idx * (D / 4);
+                    const float* s_vec = s_tile + k_tile_idx * D;
                     float inv_lk = 1.0f / lk_tile[k_tile_idx];
 
                     float dot = 0.0f;
-                    #pragma unroll
-                    for (int d4 = 0; d4 < D / 4; ++d4) {
-                        float4 q = q_vec_f4[d4];
-                        float4 r = r_vec_f4[d4];
-                        float4 s = s_vec_f4[d4];
-                        dot += q.x * r.x * s.x + q.y * r.y * s.y + q.z * r.z * s.z + q.w * r.w * s.w;
+                    for (int d = 0; d < D; ++d) {
+                        dot += q_vec[d] * r_vec[d] * s_vec[d];
                     }
                     float logit = dot * scale;
 
                     float aq_val = expf(logit - mi_tile[i_tile_idx]) * inv_li;
                     float as_val = expf(logit - mk_tile[k_tile_idx]) * inv_lk;
                     
-                    o_tile[j_local_idx * D + d_idx] += aq_val * as_val * ((float*)vq_tile_f4)[i_tile_idx*D + d_idx] * ((float*)vs_tile_f4)[k_tile_idx*D + d_idx];
+                    o_tile[j_local_idx * D + d_idx] += aq_val * as_val * vq_tile[i_tile_idx*D + d_idx] * vs_tile[k_tile_idx*D + d_idx];
                 }
             }
             __syncthreads();
