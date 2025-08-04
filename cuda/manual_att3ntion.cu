@@ -871,47 +871,50 @@ __global__ void Yq_scatter_flash(
 
     // --- Shared Memory Layout ---
     extern __shared__ float smem[];
-    float4* q_tile_f4 = (float4*)smem;
-    float4* r_tile_f4 = q_tile_f4 + TILE_I * (D / 4);
-    float4* s_tile_f4 = r_tile_f4 + TILE_J * (D / 4);
-    float4* vr_tile_f4 = s_tile_f4 + TILE_K * (D / 4);
-    float4* vs_tile_f4 = vr_tile_f4 + TILE_J * (D / 4);
-    float* mj_tile = (float*)(vs_tile_f4 + TILE_K * (D / 4));
+
+    float* q_tile = (float*)smem;
+    float* r_tile = q_tile + TILE_I * D;
+    float* s_tile = r_tile + TILE_J * D;
+    float* vr_tile = s_tile + TILE_K * D;
+    float* vs_tile = vr_tile + TILE_J * D;
+
+    float* mj_tile = vs_tile + TILE_K * D;
     float* lj_tile = mj_tile + TILE_J;
     float* mk_tile = lj_tile + TILE_J;
     float* lk_tile = mk_tile + TILE_K;
-    // Hypothesis #1: Use shared memory for the output accumulator tile
-    float* o_tile = lk_tile + TILE_K; // size: TILE_I * D
+
+    float* o_tile = lk_tile + TILE_K;
+    float* attn_scores_tile = o_tile + TILE_I * D; // New: one score per 'i' in the tile
     
     int flat_thread_id_2d = threadIdx.y * blockDim.x + threadIdx.x;
     int threads_per_block = blockDim.x * blockDim.y;
     
-    // Initialize the shared memory accumulator tile
     o_tile[i_local_idx * D + d_idx] = 0.0f;
 
-    // --- Load Q tile for this block using float4 ---
-    for (int load_idx_f4 = flat_thread_id_2d; load_idx_f4 < TILE_I * (D / 4); load_idx_f4 += threads_per_block) {
-        int row_in_tile = load_idx_f4 / (D / 4);
-        int col_in_f4 = load_idx_f4 % (D / 4);
+    // --- Load Q tile for this block shaped (TILE_I, D)---
+    for (int load_idx = flat_thread_id_2d; load_idx < TILE_I * D; load_idx += threads_per_block) {
+        int row_in_tile = load_idx / D;
+        int col_in_tile = load_idx % D;
         int i_global = i_base + row_in_tile;
-        if (i_global < I) {
-            q_tile_f4[row_in_tile * (D / 4) + col_in_f4] = 
-                ((const float4*)(Q + q_bh_offset))[i_global * (D / 4) + col_in_f4];
+        if (i_global < I) { // ensure threads don't read data out of bounds
+            q_tile[row_in_tile * D + col_in_tile] = 
+                Q[q_bh_offset + i_global * D + col_in_tile];
         }
     }
     __syncthreads();
 
-    // The j0 loop is removed; this block handles a single j-tile defined by blockIdx.y
-    // --- Cooperative loading for j-related tiles ---
-    for (int load_idx_f4 = flat_thread_id_2d; load_idx_f4 < TILE_J * (D / 4); load_idx_f4 += threads_per_block) {
-        int row_in_tile = load_idx_f4 / (D / 4);
-        int col_in_f4 = load_idx_f4 % (D / 4);
+    // --- Cooperative loading for j-related tiles shaped (TILE_J, D) ---
+    for (int load_idx = flat_thread_id_2d; load_idx < TILE_J * D; load_idx += threads_per_block) {
+        int row_in_tile = load_idx / D;
+        int col_in_tile = load_idx % D;
         int j_global = j0 + row_in_tile;
         if (j_global < J) {
-            r_tile_f4[row_in_tile * (D / 4) + col_in_f4] = ((const float4*)(R + r_bh_offset))[j_global * (D / 4) + col_in_f4];
-            vr_tile_f4[row_in_tile * (D / 4) + col_in_f4] = ((const float4*)(Vr_2 + vr_bh_offset))[j_global * (D / 4) + col_in_f4];
+            r_tile[row_in_tile * D + col_in_tile] = R[r_bh_offset + j_global * D + col_in_tile];
+            vr_tile[row_in_tile * D + col_in_tile] = Vr_2[vr_bh_offset + j_global * D + col_in_tile];
         }
     }
+
+    // load mj and lj tiles shaped (TILE_J)
     for (int j_load = flat_thread_id_2d; j_load < TILE_J; j_load += threads_per_block) {
         if (j0 + j_load < J) {
              mj_tile[j_load] = m_j_in[mj_bh_offset + j0 + j_load];
@@ -919,15 +922,15 @@ __global__ void Yq_scatter_flash(
         }
     }
 
-    for (int k0 = 0; k0 < K; k0 += TILE_K) {
+    for (int k0 = 0; k0 < K; k0 += TILE_K) { // for each S of length tile K
         // --- Cooperative loading for k-related tiles ---
-        for (int load_idx_f4 = flat_thread_id_2d; load_idx_f4 < TILE_K * (D / 4); load_idx_f4 += threads_per_block) {
-            int row_in_tile = load_idx_f4 / (D / 4);
-            int col_in_f4 = load_idx_f4 % (D / 4);
+        for (int load_idx = flat_thread_id_2d; load_idx < TILE_K * D; load_idx += threads_per_block) {
+            int row_in_tile = load_idx / D;
+            int col_in_tile = load_idx % D;
             int k_global = k0 + row_in_tile;
             if (k_global < K) {
-                s_tile_f4[row_in_tile * (D / 4) + col_in_f4] = ((const float4*)(S + s_bh_offset))[k_global * (D / 4) + col_in_f4];
-                vs_tile_f4[row_in_tile * (D / 4) + col_in_f4] = ((const float4*)(Vs_2 + vs_bh_offset))[k_global * (D / 4) + col_in_f4];
+                s_tile[row_in_tile * D + col_in_tile] = S[s_bh_offset + k_global * D + col_in_tile];
+                vs_tile[row_in_tile * D + col_in_tile] = Vs_2[vs_bh_offset + k_global * D + col_in_tile];
              }
         }
         for (int k_load = flat_thread_id_2d; k_load < TILE_K; k_load += threads_per_block) {
@@ -939,19 +942,26 @@ __global__ void Yq_scatter_flash(
         __syncthreads();
 
         // --- Fused Computation ---
-        const float4* q_vec_f4 = q_tile_f4 + i_local_idx * (D / 4);
+        const float* q_vec = q_tile + i_local_idx * D;
 
         for (int j_tile_idx = 0; j_tile_idx < TILE_J; ++j_tile_idx) {
             if (j0 + j_tile_idx >= J) continue;
-            const float4* r_vec_f4 = r_tile_f4 + j_tile_idx * (D / 4);
+            const float* r_vec = r_tile + j_tile_idx * D;
             float inv_lj = 1.0f / lj_tile[j_tile_idx];
+            float current_mj = mj_tile[j_tile_idx];
 
             for (int k_tile_idx = 0; k_tile_idx < TILE_K; ++k_tile_idx) {
                 if (k0 + k_tile_idx >= K) continue;
-                const float4* s_vec_f4 = s_tile_f4 + k_tile_idx * (D / 4);
+                
+                // --- Step 2.1: Scalar Computation by a Single Thread per 'i' ---
+                if (d_idx == 0) {
+                    const float* s_vec = s_tile + k_tile_idx * D;
                 float inv_lk = 1.0f / lk_tile[k_tile_idx];
 
-                // Vectorized dot product (reverted back to single accumulator)
+                    const float4* q_vec_f4 = (const float4*)q_vec;
+                    const float4* r_vec_f4 = (const float4*)r_vec;
+                    const float4* s_vec_f4 = (const float4*)s_vec;
+
                 float dot = 0.0f;
                 #pragma unroll
                 for (int d4 = 0; d4 < D / 4; ++d4) {
@@ -962,14 +972,34 @@ __global__ void Yq_scatter_flash(
                 }
                 float logit = dot * scale;
 
-                float ar_val = expf(logit - mj_tile[j_tile_idx]) * inv_lj;
+                    float ar_val = expf(logit - current_mj) * inv_lj;
                 float as_val = expf(logit - mk_tile[k_tile_idx]) * inv_lk;
                 
-                // Accumulate final value into shared memory
-                o_tile[i_local_idx * D + d_idx] += ar_val * as_val * ((float*)vr_tile_f4)[j_tile_idx*D + d_idx] * ((float*)vs_tile_f4)[k_tile_idx*D + d_idx];
+                    // Store the combined scalar attention score in our new shared memory buffer
+                    attn_scores_tile[i_local_idx] = ar_val * as_val;
+                }
+                
+                // --- Step 2.2: Synchronize Block ---
+                // Wait for all scalar computations to finish and be visible to all threads.
+                __syncthreads();
+                
+                // --- Step 2.3: Parallel Vector Update ---
+                // All D threads for this 'i' read the same score and update their slice of the output.
+                const float* vr_vec = vr_tile + j_tile_idx * D;
+                const float* vs_vec = vs_tile + k_tile_idx * D;
+                float combined_attn_val = attn_scores_tile[i_local_idx];
+                
+                if (d_idx < D) {
+                    o_tile[i_local_idx * D + d_idx] += combined_attn_val * vr_vec[d_idx] * vs_vec[d_idx];
+            }
+
+                // --- Step 2.4: Synchronize Block Again ---
+                // This is crucial to prevent a race condition where the next 'k' iteration
+                // overwrites attn_scores_tile before all threads from the current 'k' are done reading it.
+        __syncthreads();
             }
         }
-        __syncthreads();
+        // __syncthreads(); // This one from your original code is now redundant because of the sync inside the k-loop
     }
     
     // --- Write final result to global memory ---
