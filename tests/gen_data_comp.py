@@ -358,8 +358,8 @@ class ExpressionGeneratorDepth:
 	def __init__(self, max_depth, modulo):
 		self.max_depth = max(1, max_depth) # Need at least 2 terms for an op
 		self.modulo = modulo
-		# these cataland numbers start at 2.
-		self.n_depth = [2, 6, 16, 25, 36]
+		# these 'catalan' numbers start at 2.
+		self.n_depth = [2, 10, 25, 49, 81]
 		self.n_depth_cumsum = np.cumsum(self.n_depth)
 
 	def generate(self):
@@ -403,7 +403,7 @@ def genData4(bs, do_print=False):
 	rng = np.random.default_rng()
 	x = np.zeros((bs, ntok, md + 5 + 8*3), dtype=np.float32)
 	y = np.zeros_like(x)
-	exp_gen = ExpressionGeneratorDepth(3, 7) # NOTE!!!
+	exp_gen = ExpressionGeneratorDepth(4, 7) # NOTE!!!
 	for b in range(bs):
 		pos_enc = graycodePosEnc(ntok, nbits, rand_phase=True)
 		full = False

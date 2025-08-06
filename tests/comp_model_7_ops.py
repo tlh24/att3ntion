@@ -77,26 +77,33 @@ class SimpleCompModel(nn.Module):
 		self.output_proj = nn.Linear(hidden_dim, self.input_dim)
 		self.gelu = QuickGELU()
 		
-	def forward(self, x):
-		x = self.embedding_proj(x)
-
+	def forward(self, x, b):
+		skip = b % (self.n_recurse)
+		if skip > 0:
+			with torch.no_grad():
+				x = self.embedding_proj(x)
+		else:
+			x = self.embedding_proj(x)
 		for r in range(self.n_recurse):
 			'''allocation module:
 			each token has access to one extra token per
 			full pass through the network.
 			'''
-			with torch.no_grad():
-				decode = self.output_proj(x)
-				# decode the least active tokens from the first index
-				# of the decoded latents.
-				indx = torch.sort(decode[:,:,0].squeeze(), dim=-1, descending=False)
-				indx = indx
-			for layer_block in self.repeated_layers:
-				# attn_output = layer_block['attention'](x, self.rotary_emb)
-				attn_output = layer_block['attention'](x, None)
-				x = layer_block['norm1'](x + attn_output)
-				ffn_output = layer_block['ffn'](x)
-				x = layer_block['norm2'](x + ffn_output)
+			if r < skip:
+				with torch.no_grad():
+					for layer_block in self.repeated_layers:
+						# attn_output = layer_block['attention'](x, self.rotary_emb)
+						attn_output = layer_block['attention'](x, None)
+						x = layer_block['norm1'](x + attn_output)
+						ffn_output = layer_block['ffn'](x)
+						x = layer_block['norm2'](x + ffn_output)
+			else:
+				for layer_block in self.repeated_layers:
+					# attn_output = layer_block['attention'](x, self.rotary_emb)
+					attn_output = layer_block['attention'](x, None)
+					x = layer_block['norm1'](x + attn_output)
+					ffn_output = layer_block['ffn'](x)
+					x = layer_block['norm2'](x + ffn_output)
 		
 		return self.output_proj(x)
 
@@ -189,7 +196,7 @@ def calcLoss(task, pred, targets):
 		# for both, mask off unused tokens
 	return loss, n_correct
 
-def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl="", log_name="", start_fresh=False, task=3, replicate=1):
+def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl="", log_name="", save_model=False, task=3, replicate=1):
 	
 	if device == 'auto':
 		if torch.cuda.is_available():
@@ -225,10 +232,10 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	input_dim = x.shape[2]
 	n_recurse = 1
 	if task == 4:
-		n_recurse = 3
+		n_recurse = 4
 
 	model = SimpleCompModel(input_dim, hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse).to(device)
-	if not start_fresh:
+	if save_model:
 		try:
 			model.load_model(f"comp_model_{attn_impl}_r{replicate}.pt", device)
 		except:
@@ -271,7 +278,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 			optimizer.zero_grad()
 
 			with autocast('cuda', dtype=torch.bfloat16):
-				pred = model(inputs)
+				pred = model(inputs, batch_indx)
 				loss, n_correct = calcLoss(task, pred, targets)
 				correct_vals += n_correct
 
@@ -323,7 +330,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 		train_accuracy = 100 * correct_vals / total
 		print(f'Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Result Acc: {train_accuracy:.2f}%')
 
-		if not start_fresh:
+		if save_model:
 			# save after each epoch
 			model.save_model(f"comp_model_{args.attn}_r{replicate}.pt")
 
@@ -343,7 +350,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 				start_event.record()
 
 			with autocast('cuda', dtype=torch.bfloat16):
-				pred = model(inputs)
+				pred = model(inputs, 0)
 				loss, n_correct = calcLoss(task, pred, targets)
 			correct_vals += n_correct
 			total += inputs.shape[0] * inputs.shape[1]
@@ -375,7 +382,7 @@ if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='Train analogy model')
 	parser.add_argument('--device', type=str, default='auto',
 						help='Device to use (cpu, cuda, auto)')
-	parser.add_argument('--epochs', type=int, default=5, help='Number of epochs')
+	parser.add_argument('--epochs', type=int, default=10, help='Number of epochs')
 	parser.add_argument('--batch-size', type=int, default=32, help='Batch size for training')
 	parser.add_argument('--hidden', type=int, default=128, help='Hidden dimension size')
 	parser.add_argument('--heads', type=int, default=4, help='Number of attention heads')
@@ -383,8 +390,8 @@ if __name__ == '__main__':
 						help='Attention implementation to use')
 	parser.add_argument('--log-name', type=str,
 						help='postfix logname')
-	parser.add_argument('--fresh', action='store_true',
-        help='Dont load or save model parameters.')
+	parser.add_argument('--save', action='store_true',
+        help='Load and save model parameters.')
 	parser.add_argument('--task', type=int, help="what task to run the model on", required=True)
 	parser.add_argument('--repl', type=int, default=1, help="what replicate this is",)
 	args = parser.parse_args()
@@ -399,7 +406,7 @@ if __name__ == '__main__':
 		attn_impl=args.attn,
 		batch_size=args.batch_size,
 		log_name=args.log_name,
-		start_fresh=args.fresh,
+		save_model=args.save,
 		task = args.task,
 		replicate = args.repl
 	)
