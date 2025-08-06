@@ -260,6 +260,13 @@ class Expression:
 			return str(self.loc)
 		return f"({self.left.printLoc()} {self.loc} {self.right.printLoc()})"
 
+	def count(self):
+		if self.op is None:
+			return 1 # ourself
+		else:
+			# 3 is for (,op,)
+			return 3 + self.left.count() + self.right.count()
+
 	def printParentLoc(self, parent):
 		if self.op is None:
 			return str(parent)
@@ -399,33 +406,42 @@ def genData4(bs, do_print=False):
 	exp_gen = ExpressionGeneratorDepth(3, 7) # NOTE!!!
 	for b in range(bs):
 		pos_enc = graycodePosEnc(ntok, nbits, rand_phase=True)
-		val = 0
-		while val == 0:
-			tree = exp_gen.generate()
-			val = tree.evaluate(md)
-		tree.setLocRec(0) # also resets eval.
-		if do_print:
-			print("expr:", tree)
-			print("res loc :", tree.printLoc())
-			print("ploc:", tree.printParentLoc(ntok-1))
-		# pos_enc_permute = rng.permutation(pos_enc, axis=0)
-		# pos_enc_permute = np.copy(pos_enc)
-		tree.encode(md, x, b, pos_enc)
-		# encode the result
-		result = tree.evaluate(md) # sets internal values of the ops
-		if do_print:
-			print("res: ", result)
-		n = tree.encode(md, y, b, pos_enc)
-		x[b, -1, 4] = 1
-		x[b, n:, md+5:md+5+8] = pos_enc[n:]
-		x[b, :, md+5+8:] = 0 # mask pointer
-		x[b, n:-1, 5] = 1 # default zero
-		y[b, -1, 4] = 1
-		y[b, -1, result+5] = 1
-		y[b, n:, md+5:md+5+8] = pos_enc[n:]
-		y[b, n:-1, 5] = 1 # default zero
-		y[b, -1, md+5+8:md+5+16] = pos_enc[tree.getLoc()]
+		full = False
+		cnt = 0
+		while not full:
+			# could do a much better packing alg ..meh
+			val = 0
+			while val == 0:
+				tree = exp_gen.generate()
+				val = tree.evaluate(md)
+			# pos_enc_permute = rng.permutation(pos_enc, axis=0)
+			# pos_enc_permute = np.copy(pos_enc)
+			n = tree.count()
+			if n + 1 + cnt < 32: # one spot for the result
+				tree.setLocRec(cnt) # also resets eval.
+				if do_print:
+					print(f"[{b}] expr:", tree)
+					print(f"[{b}] res loc :", tree.printLoc())
+					print(f"[{b}] ploc:", tree.printParentLoc(tree.getLoc()))
+				tree.encode(md, x, b, pos_enc)
+				# encode the result
+				result = tree.evaluate(md) # sets internal values of the ops
+				if do_print:
+					print(f"[{b}] res: ", result)
+				tree.encode(md, y, b, pos_enc)
+				cnt += n
+				x[b, cnt, 4] = 1
+				x[b, cnt, md+5:md+5+8] = pos_enc[cnt]
+				y[b, cnt, 4] = 1
+				y[b, cnt, result+5] = 1
+				y[b, cnt, md+5:md+5+8] = pos_enc[cnt]
+				y[b, cnt, md+5+8:md+5+16] = pos_enc[tree.getLoc()] # predict this!
+			else:
+				full = True
+				x[b, cnt:, 5] = 1 # default zero value
+				y[b, cnt:, 5] = 1 # o/w crossentropy is undefined
 
+	x[:, :, md+5+8:] = 0 # mask pointer: model must predict
 	return x,y
 
 def plotData4():

@@ -176,7 +176,7 @@ def calcLoss(task, pred, targets):
 			pred[:,:,5:40].permute(0,2,1), value_targets)
 		with torch.no_grad():
 			# we only really care about the final answer
-			n_correct = torch.sum(torch.argmax(pred[:,-1,5:40], axis=-1) == value_targets[:,-1]).item()
+			n_correct = torch.sum(torch.argmax(pred[:,:,5:40], axis=-1) == value_targets).item()
 	if task == 7:
 		value_targets = torch.argmax(targets[:,:,1:32], axis=2)
 		# posenc loss
@@ -225,7 +225,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	input_dim = x.shape[2]
 	n_recurse = 1
 	if task == 4:
-		n_recurse = 1
+		n_recurse = 3
 
 	model = SimpleCompModel(input_dim, hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse).to(device)
 	if not start_fresh:
@@ -283,7 +283,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 			uu += 1
 
 			total_loss += loss.item()
-			total += inputs.size(0)
+			total += inputs.size(0) * inputs.size(1)
 			
 			if batch_indx % 200 == 0:
 				end_event.record()
@@ -346,7 +346,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 				pred = model(inputs)
 				loss, n_correct = calcLoss(task, pred, targets)
 			correct_vals += n_correct
-			total += inputs.shape[0]
+			total += inputs.shape[0] * inputs.shape[1]
 
 			if batch_indx % 200 == 0:
 				end_event.record()
@@ -386,7 +386,7 @@ if __name__ == '__main__':
 	parser.add_argument('--fresh', action='store_true',
         help='Dont load or save model parameters.')
 	parser.add_argument('--task', type=int, help="what task to run the model on", required=True)
-	parser.add_argument('--repl', type=int, help="what replicate this is",)
+	parser.add_argument('--repl', type=int, default=1, help="what replicate this is",)
 	args = parser.parse_args()
 
 	# print("Task 7: This script tests the graph and hypergraph transformer on a one-digit multiply task, multi-digit add, and shift tasks.")
