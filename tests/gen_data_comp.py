@@ -288,7 +288,7 @@ class Expression:
 			self.left.encode(md, x, b, pos_enc)
 			x[b,c,self.op] = 1
 			if self.value is not None:
-				x[b,c,self.value+5] = 1
+				x[b,c,self.value+5] = 1 # if op is evaluated
 			else:
 				x[b,c,5] = 1 # default to zero
 			x[b,c,md+5:md+5+8] = pos_enc[c] # abs loc
@@ -406,9 +406,9 @@ def genData4(bs, do_print=False):
 	exp_gen = ExpressionGeneratorDepth(4, 7) # NOTE!!!
 	for b in range(bs):
 		pos_enc = graycodePosEnc(ntok, nbits, rand_phase=True)
-		full = False
+		tries = 10
 		cnt = 0
-		while not full:
+		while tries > 0:
 			# could do a much better packing alg ..meh
 			val = 0
 			while val == 0:
@@ -417,7 +417,8 @@ def genData4(bs, do_print=False):
 			# pos_enc_permute = rng.permutation(pos_enc, axis=0)
 			# pos_enc_permute = np.copy(pos_enc)
 			n = tree.count()
-			if n + 1 + cnt < 32: # one spot for the result
+			result = tree.evaluate(md) # sets internal values of the ops
+			if n + 1 + cnt < 32 and result > 0 and result < md-1: # one spot for the result
 				tree.setLocRec(cnt) # also resets eval.
 				if do_print:
 					print(f"[{b}] expr:", tree)
@@ -436,10 +437,12 @@ def genData4(bs, do_print=False):
 				y[b, cnt, result+5] = 1
 				y[b, cnt, md+5:md+5+8] = pos_enc[cnt]
 				y[b, cnt, md+5+8:md+5+16] = pos_enc[tree.getLoc()] # predict this!
+				cnt += 1
 			else:
-				full = True
-				x[b, cnt:, 5] = 1 # default zero value
-				y[b, cnt:, 5] = 1 # o/w crossentropy is undefined
+				tries -= 1
+
+			# x[b, cnt:, 5] = 1 # default zero value
+			# y[b, cnt:, 5] = 1 # o/w crossentropy is undefined
 
 	x[:, :, md+5+8:] = 0 # mask pointer: model must predict
 	return x,y

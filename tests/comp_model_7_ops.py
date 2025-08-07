@@ -93,17 +93,25 @@ class SimpleCompModel(nn.Module):
 				with torch.no_grad():
 					for layer_block in self.repeated_layers:
 						# attn_output = layer_block['attention'](x, self.rotary_emb)
-						attn_output = layer_block['attention'](x, None)
-						x = layer_block['norm1'](x + attn_output)
-						ffn_output = layer_block['ffn'](x)
-						x = layer_block['norm2'](x + ffn_output)
+						xn = layer_block['norm1'](x)
+						attn_output = layer_block['attention'](xn, None)
+						x = x + attn_output
+						xn = layer_block['norm2'](x)
+						ffn_output = layer_block['ffn'](xn)
+						x = x + ffn_output
 			else:
 				for layer_block in self.repeated_layers:
 					# attn_output = layer_block['attention'](x, self.rotary_emb)
-					attn_output = layer_block['attention'](x, None)
-					x = layer_block['norm1'](x + attn_output)
-					ffn_output = layer_block['ffn'](x)
-					x = layer_block['norm2'](x + ffn_output)
+					xn = layer_block['norm1'](x)
+					attn_output = layer_block['attention'](xn, None)
+					x = x + attn_output
+					xn = layer_block['norm2'](x)
+					ffn_output = layer_block['ffn'](xn)
+					x = x + ffn_output
+					# attn_output = layer_block['attention'](x, None)
+					# x = layer_block['norm1'](x + attn_output)
+					# ffn_output = layer_block['ffn'](x)
+					# x = layer_block['norm2'](x + ffn_output)
 		
 		return self.output_proj(x)
 
@@ -245,8 +253,8 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	weight_decay = 1e-2 # karpathy 1e-1, default 1e-2
 	beta1 = 0.9 # default 0.9, both.
 	beta2 = 0.95 # karpathy 0.95, default 0.999
-	optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), 'cuda')
-	# optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, amsgrad=True)
+	# optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), 'cuda')
+	optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, amsgrad=True)
 	model.printParamCount()
 	model = torch.compile(model) # mode="max-autotune"
 
@@ -290,7 +298,10 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 			uu += 1
 
 			total_loss += loss.item()
-			total += inputs.size(0) * inputs.size(1)
+			if task == 4:
+				total += inputs.size(0) * inputs.size(1)
+			else:
+				total += inputs.size(0)
 			
 			if batch_indx % 200 == 0:
 				end_event.record()
@@ -353,7 +364,11 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 				pred = model(inputs, 0)
 				loss, n_correct = calcLoss(task, pred, targets)
 			correct_vals += n_correct
-			total += inputs.shape[0] * inputs.shape[1]
+
+			if task == 4:
+				total += inputs.size(0) * inputs.size(1)
+			else:
+				total += inputs.size(0)
 
 			if batch_indx % 200 == 0:
 				end_event.record()
