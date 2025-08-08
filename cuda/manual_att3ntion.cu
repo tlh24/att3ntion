@@ -889,7 +889,9 @@ __global__ void Yq_scatter_flash(
     float* lk_tile = mk_tile + TILE_K;
 
     float* o_tile = lk_tile + TILE_K;
-    float* attn_scores_tile = o_tile + TILE_I_SPECIAL * D; // New: one score per 'i' in the tile
+    // We no longer need attn_scores_tile, we can reuse that memory
+    // for the parallel reduction. Let's call it reduction_smem.
+    float* reduction_smem = o_tile + TILE_I_SPECIAL * D; 
     
     int flat_thread_id_2d = threadIdx.y * blockDim.x + threadIdx.x;
     int threads_per_block = blockDim.x * blockDim.y;
@@ -947,70 +949,59 @@ __global__ void Yq_scatter_flash(
         __syncthreads();
 
         // --- Fused Computation ---
-        const float* q_vec = q_tile + i_local_idx * D;
-
         for (int j_tile_idx = 0; j_tile_idx < TILE_J; ++j_tile_idx) {
             if (j0 + j_tile_idx >= J) continue;
-            const float* r_vec = r_tile + j_tile_idx * D;
-            float inv_lj = 1.0f / lj_tile[j_tile_idx];
-            float current_mj = mj_tile[j_tile_idx];
 
             for (int k_tile_idx = 0; k_tile_idx < TILE_K; ++k_tile_idx) {
                 if (k0 + k_tile_idx >= K) continue;
                 
-                // --- Step 2.1: Scalar Computation by a Single Thread per 'i' ---
-                if (d_idx == 0) {
+                // --- Step 2.1: Parallel Reduction for Dot Product ---
+                const float* q_vec = q_tile + i_local_idx * D;
+                const float* r_vec = r_tile + j_tile_idx * D;
                     const float* s_vec = s_tile + k_tile_idx * D;
-                float inv_lk = 1.0f / lk_tile[k_tile_idx];
 
-                    const float4* q_vec_f4 = (const float4*)q_vec;
-                    const float4* r_vec_f4 = (const float4*)r_vec;
-                    const float4* s_vec_f4 = (const float4*)s_vec;
+                // Each thread computes its partial product and stores it in shared memory.
+                // We use the first TILE_I_SPECIAL x D elements of our reduction memory.
+                reduction_smem[i_local_idx * D + d_idx] = q_vec[d_idx] * r_vec[d_idx] * s_vec[d_idx];
+                __syncthreads(); // Ensure all partial products are written before reduction starts.
 
-                float dot = 0.0f;
-                #pragma unroll
-                for (int d4 = 0; d4 < D / 4; ++d4) {
-                    float4 q = q_vec_f4[d4];
-                    float4 r = r_vec_f4[d4];
-                    float4 s = s_vec_f4[d4];
-                    dot += q.x * r.x * s.x + q.y * r.y * s.y + q.z * r.z * s.z + q.w * r.w * s.w;
+                // Perform the reduction in shared memory.
+                // This loop has minor, contained divergence but replaces the massive barrier stall.
+                for (int offset = D / 2; offset > 0; offset >>= 1) {
+                    if (d_idx < offset) {
+                        reduction_smem[i_local_idx * D + d_idx] += reduction_smem[i_local_idx * D + d_idx + offset];
+                    }
+                    __syncthreads();
                 }
-                float logit = dot * scale;
+                // The final dot product is now in reduction_smem[i_local_idx * D + 0].
 
+                // --- Step 2.2: Redundant but Parallel Scalar Computation ---
+                // All threads read the final dot product. No `if (d_idx == 0)`.
+                float dot = reduction_smem[i_local_idx * D];
+
+                // All threads perform the scalar math. This is the trade-off.
+                float inv_lj = 1.0f / lj_tile[j_tile_idx];
+                float current_mj = mj_tile[j_tile_idx];
+                float inv_lk = 1.0f / lk_tile[k_tile_idx];
+                float logit = dot * scale;
                     float ar_val = expf(logit - current_mj) * inv_lj;
                 float as_val = expf(logit - mk_tile[k_tile_idx]) * inv_lk;
-                
-                    // Store the combined scalar attention score in our new shared memory buffer
-                    attn_scores_tile[i_local_idx] = ar_val * as_val;
-                }
-                
-                // --- Step 2.2: Synchronize Block ---
-                // Wait for all scalar computations to finish and be visible to all threads.
-                __syncthreads();
+                float combined_attn_val = ar_val * as_val;
                 
                 // --- Step 2.3: Parallel Vector Update ---
-                // All D threads for this 'i' read the same score and update their slice of the output.
+                // NO __syncthreads() is needed here. The barrier stall is GONE.
                 const float* vr_vec = vr_tile + j_tile_idx * D;
                 const float* vs_vec = vs_tile + k_tile_idx * D;
-                float combined_attn_val = attn_scores_tile[i_local_idx];
-                
-                if (d_idx < D) {
                     o_tile[i_local_idx * D + d_idx] += combined_attn_val * vr_vec[d_idx] * vs_vec[d_idx];
             }
-
-                // --- Step 2.4: Synchronize Block Again ---
-                // This is crucial to prevent a race condition where the next 'k' iteration
-                // overwrites attn_scores_tile before all threads from the current 'k' are done reading it.
-        __syncthreads();
             }
-        }
-        // __syncthreads(); // This one from your original code is now redundant because of the sync inside the k-loop
+        __syncthreads(); // Sync after all j,k tiles are processed for this k0-block, before loading the next.
     }
     
     // --- Write final result to global memory ---
     // Use atomicAdd to safely accumulate results from different j-tile blocks
     float final_val = o_tile[i_local_idx * D + d_idx];
-    if (d_idx < D) atomicAdd(&Y_q_[yq_bh_offset + i_idx * D + d_idx], final_val);
+    if (i_idx < I && d_idx < D) atomicAdd(&Y_q_[yq_bh_offset + i_idx * D + d_idx], final_val);
 }
 
 void Yq_scatter_flash_launcher(
@@ -1064,7 +1055,7 @@ void Yq_scatter_flash_launcher(
         );
         dim3 block(D, TILE_I_SPECIAL);
         size_t smem_size = sizeof(float) * (
-            TILE_I*D + TILE_J*D + TILE_K*D + 
+            TILE_I_SPECIAL*D + TILE_J*D + TILE_K*D + 
             TILE_J*D + TILE_K*D +             
             TILE_J + TILE_J + TILE_K + TILE_K +
             TILE_I_SPECIAL*D // Add memory for the o_tile accumulator
