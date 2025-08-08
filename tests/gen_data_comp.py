@@ -590,7 +590,9 @@ def plotData6():
 
 class Encoder:
 	'''
-	helper class for
+	helper class for genData7
+	encodes individual values / symbols,
+	or encodes lists of values.
 	'''
 	def __init__(self, ntok, nbits, do_print):
 		self.tok_ctr = 0
@@ -634,12 +636,13 @@ class Encoder:
 def genData7(bs, do_print=False):
 	'''
 	train a network on one step tasks:
-	- multiply two single-digit hex numbers
-	- add two 1-4 digit hex numbers (requires 4+ layers for carry)
-	- shift left 1 and 2 places.
+	0 - add two single-digit numbers
+	1 - multiply two single-digit hex numbers
+	2 - add two 1-4 digit hex numbers (requires 4+ layers for carry)
+	3 - shift left 1 and 2 places.
 	'''
 	nop = 16 # _+-*/=?() -> 012345678
-	ntok = 28
+	ntok = 8 # 28
 	nbits = 8
 
 	md = nop + 16 + (nbits*2)*2 # one-hot indicators, digits, 2d posenc
@@ -664,6 +667,7 @@ def genData7(bs, do_print=False):
 			lst.append(va4)
 		if val >= 65536*16 or ndigits >= 6:
 			lst.append(va5)
+		return lst
 
 	for b in range(bs):
 		# new encoder per batch for a random phase.
@@ -672,15 +676,16 @@ def genData7(bs, do_print=False):
 		x[b, :, -nbits*4:-nbits*2] = enc.pos_enc[0,:] # "vertical"
 		# e.g. everything starts off as flat..
 		task = b % 4
-		task = 2
+		task = 0
 		if task == 0: # add, very easy for both
 			va = randint(16)
 			vb = randint(16)
 			vc = va*vb
 			vc0 = vc & 0xf
 			vc1 = vc >> 4
-			enc.encodeList(x, b, [va, '*', vb])
-			enc.encodeList(y, b, [vc0, vc1])
+			enc.encodeList(x, b, [va, '+', vb])
+			# enc.encodeList(y, b, [vc0, vc1])
+			enc.encodeList(y, b, encHex([], vc))
 
 		if task == 1: # multiply, very easy for both
 			va = randint(16)
@@ -700,14 +705,14 @@ def genData7(bs, do_print=False):
 			vb = randint(16**nb)
 			# encode the problem
 			lst = []
-			encHex(lst, va, ndigits=4) # ndigits makes it fixed
+			lst = encHex(lst, va, ndigits=4) # ndigits makes it fixed
 			lst.append('+')
-			encHex(lst, vb, ndigits=4)
+			lst = encHex(lst, vb, ndigits=4)
 			enc.encodeList(x, b, lst)
 			# and the solution
 			vc = va + vb
 			lst = []
-			encHex(lst, vc)
+			lst = encHex(lst, vc)
 			enc.encodeList(y, b, lst)
 
 		# do task 2 in a different way, cascade fashion: spell out the carries
@@ -720,9 +725,9 @@ def genData7(bs, do_print=False):
 			vb = randint(16**nb)
 			# encode the problem
 			lst = []
-			encHex(lst, va)
+			lst = encHex(lst, va)
 			lst.append('+')
-			encHex(lst, vb)
+			lst = encHex(lst, vb)
 			enc.encodeList(x, b, lst)
 			steps = max(na,nb) + 1
 			step = randint(steps)
@@ -730,7 +735,7 @@ def genData7(bs, do_print=False):
 			for i in range(steps-1):
 				vc = ((va >> (4*i)) & 0xf) + ((vb >> (4*i)) & 0xf)
 				lst = []
-				encHex(lst, vc << (4*i))
+				lst = encHex(lst, vc << (4*i))
 				if i == step:
 					enc.encodeList(y, b, lst)
 				elif i < step:
@@ -738,7 +743,7 @@ def genData7(bs, do_print=False):
 			if step == max(na,nb):
 				vc = va + vb
 				lst = []
-				encHex(lst, vc)
+				lst = encHex(lst, vc)
 				enc.encodeList(y, b, lst)
 
 		if task == 3: # also perfectly easy
@@ -746,7 +751,7 @@ def genData7(bs, do_print=False):
 			shift = randint(2)+1
 			va = randint(16**na)
 			lst = []
-			encHex(lst, va)
+			lst = encHex(lst, va)
 			if shift == 1:
 				lst.append('sl1')
 				vc = va*16
@@ -755,7 +760,7 @@ def genData7(bs, do_print=False):
 				vc = va*256
 			enc.encodeList(x, b, lst)
 			lst = []
-			encHex(lst, vc)
+			lst = encHex(lst, vc)
 			enc.encodeList(y, b, lst)
 
 	return x, y

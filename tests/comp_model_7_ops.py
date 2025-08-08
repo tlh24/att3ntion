@@ -178,11 +178,13 @@ class SimpleCompModel(nn.Module):
 
 def calcLoss(task, pred, targets):
 	n_correct = 0
+	n_possible = 0
 	if task == 3:
 		value_targets = torch.argmax(targets[:,-1,5:40], axis=-1)
 		loss = F.cross_entropy( pred[:,-1,5:40], value_targets)
 		with torch.no_grad():
 			n_correct = torch.sum(torch.argmax(pred[:,-1,5:40], axis=-1) == value_targets).item()
+			n_possible = pred.shape[0]
 	if task == 4:
 		# can it calculate the parse-tree pointers?
 		loss = F.mse_loss(pred[:,:,-16:], targets[:,:,-16:])
@@ -190,19 +192,25 @@ def calcLoss(task, pred, targets):
 		loss += 0.01* F.cross_entropy( \
 			pred[:,:,5:40].permute(0,2,1), value_targets)
 		with torch.no_grad():
-			# we only really care about the final answer
 			n_correct = torch.sum(torch.argmax(pred[:,:,5:40], axis=-1) == value_targets).item()
+			n_possible = pred.shape[0] * pred.shape[1]
 	if task == 7:
 		value_targets = torch.argmax(targets[:,:,1:32], axis=2)
 		# posenc loss
 		loss = F.mse_loss(pred[:,:,-32:], targets[:,:,-32:])
 		# value and op loss
 		celoss = F.cross_entropy( \
-			pred[:,:,1:32].permute(0,2,1), value_targets)
+			pred[:,:,1:32].permute(0,2,1), value_targets, reduction='none')
 		loss += torch.sum(celoss * targets[:,:,0])
 		# permute is to work with pytorch's cross-entropy calc
 		# for both, mask off unused tokens
-	return loss, n_correct
+		loss += F.mse_loss(pred[:,:,0], targets[:,:,0]) # occupied flag
+		with torch.no_grad():
+			n_correct = torch.sum( \
+				(torch.argmax(pred[:,:,1:32], axis=2) == value_targets) \
+					* targets[:,:,0] ).item()
+			n_possible = torch.sum( targets[:,:,0] ).item()
+	return loss, n_correct, n_possible
 
 def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl="", log_name="", save_model=False, task=3, replicate=1):
 	
@@ -287,7 +295,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 
 			with autocast('cuda', dtype=torch.bfloat16):
 				pred = model(inputs, batch_indx)
-				loss, n_correct = calcLoss(task, pred, targets)
+				loss, n_correct, n_possible = calcLoss(task, pred, targets)
 				correct_vals += n_correct
 
 			loss.backward()
@@ -298,10 +306,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 			uu += 1
 
 			total_loss += loss.item()
-			if task == 4:
-				total += inputs.size(0) * inputs.size(1)
-			else:
-				total += inputs.size(0)
+			total += n_possible
 			
 			if batch_indx % 200 == 0:
 				end_event.record()
@@ -362,13 +367,10 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 
 			with autocast('cuda', dtype=torch.bfloat16):
 				pred = model(inputs, 0)
-				loss, n_correct = calcLoss(task, pred, targets)
+				loss, n_correct, n_possible = calcLoss(task, pred, targets)
 			correct_vals += n_correct
 
-			if task == 4:
-				total += inputs.size(0) * inputs.size(1)
-			else:
-				total += inputs.size(0)
+			total += n_possible
 
 			if batch_indx % 200 == 0:
 				end_event.record()
@@ -399,8 +401,8 @@ if __name__ == '__main__':
 						help='Device to use (cpu, cuda, auto)')
 	parser.add_argument('--epochs', type=int, default=10, help='Number of epochs')
 	parser.add_argument('--batch-size', type=int, default=32, help='Batch size for training')
-	parser.add_argument('--hidden', type=int, default=128, help='Hidden dimension size')
-	parser.add_argument('--heads', type=int, default=4, help='Number of attention heads')
+	parser.add_argument('--hidden', type=int, default=256, help='Hidden dimension size')
+	parser.add_argument('--heads', type=int, default=8, help='Number of attention heads')
 	parser.add_argument('--attn', type=str, default='hypergraph', choices=['hypergraph', 'graph'],
 						help='Attention implementation to use')
 	parser.add_argument('--log-name', type=str,

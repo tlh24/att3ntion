@@ -10,7 +10,7 @@ if __name__ == '__main__':
 	end_event = torch.cuda.Event(enable_timing=True)
 	dtype = torch.bfloat16
 	siz = 8192
-	iters = int((8192 // siz)**3 * 128) # keep a ~constant time
+	iters = int((8192 // siz)**3 * 16) # keep a ~constant time
 	a = torch.randn(siz, siz, dtype=dtype, device=device)
 	b = torch.randn(siz, siz, dtype=dtype, device=device)
 	c = torch.randn(siz, siz, dtype=dtype, device=device)
