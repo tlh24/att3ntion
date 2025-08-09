@@ -53,7 +53,10 @@ class SimpleCompModel(nn.Module):
 			else:
 				attention_layer = GraphAttention_Naive(hidden_dim, num_heads, head_subspaces=True)
 
+			# norm1_layer = nn.RMSNorm(hidden_dim) # was LayerNorm
+			# norm2_layer = nn.RMSNorm(hidden_dim)
 			norm1_layer = nn.LayerNorm(hidden_dim)
+			norm2_layer = nn.LayerNorm(hidden_dim)
 			if True:
 				ffn_layer = nn.Sequential(
 					nn.Linear(hidden_dim, 3 * hidden_dim),
@@ -63,8 +66,6 @@ class SimpleCompModel(nn.Module):
 			else:
 				ffn_layer = SwiGLU(hidden_dim, 2*hidden_dim, hidden_dim)
 				# keep the same number of parameters.
-
-			norm2_layer = nn.LayerNorm(hidden_dim)
 
 			self.repeated_layers.append(
 				nn.ModuleDict({
@@ -316,7 +317,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 				fd_losslog.flush()
 
 		# plot the inputs / outputs
-		if False:
+		if epoch == (num_epochs-1) and False:
 			fig,axs = plt.subplots(2, 4, figsize=(13,10))
 			def mangle(t):
 				return t.detach().cpu().squeeze().float().numpy()
@@ -327,7 +328,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 					mx = np.max(g[:,5:40], axis=-1)
 					mx = np.expand_dims(mx, -1)
 					g[:,5:40] = g[:,5:40] / (mx+1)
-				im = axs[r,c].imshow( g )
+				im = axs[r,c].imshow( g.T )
 				plt.colorbar(im, ax=axs[r,c])
 
 			for j in range(2):

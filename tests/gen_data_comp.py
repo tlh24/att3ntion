@@ -642,10 +642,11 @@ def genData7(bs, do_print=False):
 	3 - shift left 1 and 2 places.
 	'''
 	nop = 16 # _+-*/=?() -> 012345678
-	ntok = 8 # 28
+	ntok = 28 # 8 for the simple tasks, 28 for sub-task 3
 	nbits = 8
 
-	md = nop + 16 + (nbits*2)*2 # one-hot indicators, digits, 2d posenc
+	md = nop + 16 + (nbits*2)*2*(1+2)
+	# one-hot indicators, digits, 2d posenc, 2 pointers
 	x = np.zeros((bs, ntok, md), dtype=np.float32)
 	y = np.zeros_like(x)
 
@@ -656,17 +657,31 @@ def genData7(bs, do_print=False):
 		va3 = (val >> 12) & 0xf
 		va4 = (val >> 16) & 0xf
 		va5 = (val >> 20) & 0xf
+		pos = len(lst)
+		lst_pos = []
 		lst.append(va0)
+		lst_pos.append(pos)
+		pos += 1
 		if val >= 16 or ndigits >= 2:
 			lst.append(va1)
+			lst_pos.append(pos)
+			pos += 1
 		if val >= 256 or ndigits >= 3:
 			lst.append(va2)
+			lst_pos.append(pos)
+			pos += 1
 		if val >= 4096 or ndigits >= 4:
 			lst.append(va3)
+			lst_pos.append(pos)
+			pos += 1
 		if val >= 65536 or ndigits >= 5:
 			lst.append(va4)
+			lst_pos.append(pos)
+			pos += 1
 		if val >= 65536*16 or ndigits >= 6:
 			lst.append(va5)
+			lst_pos.append(pos)
+			pos += 1
 		return lst
 
 	for b in range(bs):
@@ -676,7 +691,7 @@ def genData7(bs, do_print=False):
 		x[b, :, -nbits*4:-nbits*2] = enc.pos_enc[0,:] # "vertical"
 		# e.g. everything starts off as flat..
 		task = b % 4
-		task = 0
+		task = 2
 		if task == 0: # add, very easy for both
 			va = randint(16)
 			vb = randint(16)
@@ -694,7 +709,8 @@ def genData7(bs, do_print=False):
 			vc0 = vc & 0xf
 			vc1 = vc >> 4
 			enc.encodeList(x, b, [va, '*', vb])
-			enc.encodeList(y, b, [vc0, vc1])
+			# enc.encodeList(y, b, [vc0, vc1])
+			enc.encodeList(y, b, encHex([], vc))
 
 		if task == 2 and False:
 			na = randint(4)+1
@@ -715,8 +731,8 @@ def genData7(bs, do_print=False):
 			lst = encHex(lst, vc)
 			enc.encodeList(y, b, lst)
 
-		# do task 2 in a different way, cascade fashion: spell out the carries
-		if task == 2:
+		# do subtask 2 add in a different way, cascade fashion: spell out the carries
+		if task == 2 and False:
 			na = randint(4)+1
 			nb = randint(4)+1
 			# na = 4
@@ -732,7 +748,7 @@ def genData7(bs, do_print=False):
 			steps = max(na,nb) + 1
 			step = randint(steps)
 			# and the solution -- spell it out w/ carries
-			for i in range(steps-1):
+			for i in range(step-1):
 				vc = ((va >> (4*i)) & 0xf) + ((vb >> (4*i)) & 0xf)
 				lst = []
 				lst = encHex(lst, vc << (4*i))
@@ -745,6 +761,65 @@ def genData7(bs, do_print=False):
 				lst = []
 				lst = encHex(lst, vc)
 				enc.encodeList(y, b, lst)
+
+		# do subtask 3 in yet another different way - setup a graph
+		# then execute it
+		# start with a fixed graph; we can change it later?
+		if task == 2:
+			na = 3
+			nb = 3
+			va = randint(16**na)
+			vb = randint(16**nb)
+			lst = []
+			lst = encHex(lst, va, ndigits=na)
+			lst.append('+')
+			lst = encHex(lst, vb, ndigits=nb)
+			enc.encodeList(x, b, lst)
+			steps = 2 + max(na,nb) + 1
+			step = randint(steps)
+			# two-phase process:
+			# setup the graph, then execute it, alocating as needed.
+			vc0 = []
+			vc1 = []
+			for i in range(step-1):
+				if i == 0:
+					# setup graph for adding all digits in parallel
+					enc.encodeListPtrs(['+','+','+'],\
+						[(0,0),(0,1),(0,2)],[(0,4),(0,5),(0,6)], b, []) # y=1
+				if i == 1:
+					# do the calculations
+					for j in range(3):
+						vc = ((va >> 4*j) & 0xf) + ((vb >> 4*j) & 0xf)
+						vc0.append(vc & 0xf)
+						vc1.append((vc >> 4) & 0xf)
+					enc.encodeListPtrs(vc0, \
+						[(1,0),(1,1),(1,2)], None, b, []) # y=2
+					enc.encodeListPtrs(vc1, \
+						[(1,0),(1,1),(1,2)], [(2,0),(2,1),(2,2)], b, []) # y=3
+				if i == 2:
+					# add
+					enc.encodeListPtrs(['+'],\
+						[(2,1)],[(3,0)], b, []) # y=4
+				if i == 3:
+					# results
+					vd = vc0[1] + vc1[0]
+					vd0 = vd & 0xf
+					vd1 = (vd >> 4) & 0xf
+					enc.encodeListPtrs([vd0[1], vd1[0]], \
+						[(4,0),(4,0)], [(-1,-1),(5,0)], b, []) # y=5
+				if i == 4:
+					# seems we need some concept of 'loop' or 'generator' here
+					# add
+					enc.encodeListPtrs(['+'],\
+						[(5,1)],[(2,2)], b, []) # y=6
+				if i == 5:
+					vd = vd1 + vc2[0]
+					vd2 = vd & 0xf
+					vd3 = (vd >> 4) & 0xf
+					enc.encodeListPtrs([vd0[1], vd1[0]], \
+						[(4,0),(4,0)], [(-1,-1),(5,0)], b, []) # y=5
+
+
 
 		if task == 3: # also perfectly easy
 			na = randint(3)+1
