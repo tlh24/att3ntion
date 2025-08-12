@@ -679,7 +679,7 @@ def genData7(bs, do_print=False):
 	3 - shift left 1 and 2 places.
 	'''
 	nop = 16 # _+-*/=?() -> 012345678
-	ntok = 24 # 8 for the simple tasks, 28 for sub-task 3
+	ntok = 32 # 8 for the simple tasks, 28 for sub-task 3
 	nbits = 8
 
 	md = nop + 16 + (nbits*2)*2*(1+2)
@@ -803,8 +803,8 @@ def genData7(bs, do_print=False):
 		# then execute it
 		# start with a fixed graph; we can change it later?
 		if task == 2:
-			na = 3
-			nb = 3
+			na = 4
+			nb = 4
 			va = randint(16**na)
 			vb = randint(16**nb)
 			lst = []
@@ -813,6 +813,7 @@ def genData7(bs, do_print=False):
 			lst = encHex(lst, vb, ndigits=nb)
 			enc.encodeList(x, b, lst)
 			step = b % 4
+			ndigits = max(na, nb)
 			# two-phase process:
 			# setup the graph, then execute it, alocating as needed.
 			vc0 = []
@@ -822,29 +823,29 @@ def genData7(bs, do_print=False):
 				nonlocal x, y, b, vc0, vc1, vo
 				if i == 0:
 					# setup graph for adding all digits in parallel
-					enc.encodeListPtrs(z, b, ['+','+','+'],\
-						[(0,0),(0,1),(0,2)], [(0,4),(0,5),(0,6)]) # y=1
+					enc.encodeListPtrs(z, b, ['+','+','+','+'],\
+						[(0,0),(0,1),(0,2),(0,3)], [(0,5),(0,6),(0,7),(0,8)]) # y=1
 				if i == 1:
 					# do the calculations
-					for j in range(3):
+					for j in range(ndigits):
 						vc = ((va >> 4*j) & 0xf) + ((vb >> 4*j) & 0xf)
 						vc0.append(vc & 0xf)
 						vc1.append((vc >> 4) & 0xf)
 					enc.encodeListPtrs(z, b, vc0, \
-						[(1,0),(1,1),(1,2)], [(0,0),(0,0),(0,0)],) # y=2
+						[(1,0),(1,1),(1,2),(1,3)], [(0,0),(0,0),(0,0),(0,0)],) # y=2
 					enc.encodeListPtrs(z, b, vc1, \
-						[(1,0),(1,1),(1,2)], [(2,0),(2,1),(2,2)]) # y=3
+						[(1,0),(1,1),(1,2),(1,3)], [(2,0),(2,1),(2,2),(2,3)]) # y=3
 				if i == 2:
 					# ref vc0[0], vc0[1] + vc1[0], vc0[2] + vc1[1], ref vc1[2]
 					# there can be no cascaded carries here.
-					enc.encodeListPtrs(z, b, ['$','+','+','$'],\
-						[(2,0), (2,1), (2,2), (3,2)  ],\
-						[(0,0), (3,0), (3,1), (0,0)]) # y=4
+					enc.encodeListPtrs(z, b, ['$','+','+','+','$'],\
+						[(2,0), (2,1), (2,2), (2,3), (3,3)],\
+						[(0,0), (3,0), (3,1), (3,2), (0,0)]) # y=4
 				if i == 3:
 					# results
-					vo = [vc0[0], vc0[1]+vc1[0], vc0[2]+vc1[1], vc1[2]]
+					vo = [vc0[0], vc0[1]+vc1[0], vc0[2]+vc1[1], vc0[3]+vc1[2], vc1[3]]
 					enc.encodeListPtrs(z, b, vo, \
-						[(4,0),(4,1),(4,2),(4,3)], [(0,0),(5,0),(5,1),(5,2)]) # y=5
+						[(4,0),(4,1),(4,2),(4,3),(4,4)], [(0,0),(5,0),(5,1),(5,2),(5,3)]) # y=5
 				# TODO: point back to the original op, (0,3)
 
 			for i in range(step):

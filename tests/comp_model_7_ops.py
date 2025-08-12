@@ -244,9 +244,9 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	loader_v = DataLoader(dataset_v, batch_size=batch_size, shuffle=True)
 
 	if attn_impl == "hypergraph":
-		n_layers = 2
+		n_layers = 3
 	else:
-		n_layers = 4
+		n_layers = 6
 
 	input_dim = x.shape[2]
 	n_recurse = 1
