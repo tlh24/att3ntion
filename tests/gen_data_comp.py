@@ -635,13 +635,13 @@ class Encoder:
 		pos = self.horiz_ctr[pos_space]
 		# 2d addressing scheme!
 		nb = self.nbits
-		z[b, self.tok_ctr, -nb*2:] = self.pos_enc[pos, :]
-		z[b, self.tok_ctr, -nb*4:-nb*2] = self.pos_enc[pos_space, :]
+		# z[b, self.tok_ctr, -nb*2:] = self.pos_enc[pos, :]
+		# z[b, self.tok_ctr, -nb*4:-nb*2] = self.pos_enc[pos_space, :]
 		# encode the 2d lparent & rparent (seems so inefficient?)
-		z[b, self.tok_ctr, -nb*6 :-nb*4 ] = self.pos_enc[lparent[0], :]
-		z[b, self.tok_ctr, -nb*8 :-nb*6 ] = self.pos_enc[lparent[1], :]
-		z[b, self.tok_ctr, -nb*10:-nb*8 ] = self.pos_enc[rparent[0], :]
-		z[b, self.tok_ctr, -nb*12:-nb*10] = self.pos_enc[rparent[1], :]
+		# z[b, self.tok_ctr, -nb*6 :-nb*4 ] = self.pos_enc[lparent[0], :]
+		# z[b, self.tok_ctr, -nb*8 :-nb*6 ] = self.pos_enc[lparent[1], :]
+		# z[b, self.tok_ctr, -nb*10:-nb*8 ] = self.pos_enc[rparent[0], :]
+		# z[b, self.tok_ctr, -nb*12:-nb*10] = self.pos_enc[rparent[1], :]
 		self.tok_ctr += 1
 		self.horiz_ctr[pos_space] += 1
 		if self.do_print:
