@@ -94,7 +94,7 @@ class SimpleCompModel(nn.Module):
 				with torch.no_grad():
 					for layer_block in self.repeated_layers:
 						# attn_output = layer_block['attention'](x, self.rotary_emb)
-						xn = layer_block['norm1'](x)
+						xn = layer_block['norm1'](x) # PreNorm
 						attn_output = layer_block['attention'](xn, None)
 						x = x + attn_output
 						xn = layer_block['norm2'](x)
@@ -180,6 +180,8 @@ class SimpleCompModel(nn.Module):
 def calcLoss(task, pred, targets):
 	n_correct = 0
 	n_possible = 0
+	bs = pred.shape[0]
+	ntok = pred.shape[1]
 	if task == 3:
 		value_targets = torch.argmax(targets[:,-1,5:40], axis=-1)
 		loss = F.cross_entropy( pred[:,-1,5:40], value_targets)
@@ -197,8 +199,8 @@ def calcLoss(task, pred, targets):
 			n_possible = pred.shape[0] * pred.shape[1]
 	if task == 7:
 		value_targets = torch.argmax(targets[:,:,1:32], axis=2)
-		# posenc loss
-		loss = F.mse_loss(pred[:,:,-32:], targets[:,:,-32:])
+		# posenc & pointer loss
+		loss = torch.sum(F.mse_loss(pred[:,:,32:], targets[:,:,32:], reduction='none') * targets[:,:,0].unsqueeze(-1))
 		# value and op loss
 		celoss = F.cross_entropy( \
 			pred[:,:,1:32].permute(0,2,1), value_targets, reduction='none')
@@ -262,8 +264,8 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	weight_decay = 1e-2 # karpathy 1e-1, default 1e-2
 	beta1 = 0.9 # default 0.9, both.
 	beta2 = 0.95 # karpathy 0.95, default 0.999
-	# optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), 'cuda')
-	optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, amsgrad=True)
+	optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), 'cuda')
+	# optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, amsgrad=True)
 	model.printParamCount()
 	model = torch.compile(model) # mode="max-autotune"
 
@@ -300,6 +302,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 				correct_vals += n_correct
 
 			loss.backward()
+			torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 			optimizer.step()
 
 			lloss = loss.detach().cpu().item()

@@ -604,7 +604,7 @@ class Encoder:
 
 	def encode(self, z, b, val, pos_space):
 		if type(val) == str:
-			dic = [' ','+','-','*','/','=','?','(',')','sl1','sl2']
+			dic = [' ','+','-','*','/','=','?','(',')','sl1','sl2','$']
 			# technically it's shift /right/ since this is little-endian..
 			v = dic.index(val)
 		else:
@@ -624,6 +624,32 @@ class Encoder:
 			else:
 				print(f'{val:x}', end=' ')
 
+	def encodePtr(self, z, b, val, lparent, rparent, pos_space):
+		if type(val) == str:
+			dic = [' ','+','-','*','/','=','?','(',')','sl1','sl2','$']
+			v = dic.index(val)
+		else:
+			v = val + 16 # number of operations
+		z[b, self.tok_ctr, 0] = 1.0 # occupied!
+		z[b, self.tok_ctr, v] = 1.0
+		pos = self.horiz_ctr[pos_space]
+		# 2d addressing scheme!
+		nb = self.nbits
+		z[b, self.tok_ctr, -nb*2:] = self.pos_enc[pos, :]
+		z[b, self.tok_ctr, -nb*4:-nb*2] = self.pos_enc[pos_space, :]
+		# encode the 2d lparent & rparent (seems so inefficient?)
+		z[b, self.tok_ctr, -nb*6 :-nb*4 ] = self.pos_enc[lparent[0], :]
+		z[b, self.tok_ctr, -nb*8 :-nb*6 ] = self.pos_enc[lparent[1], :]
+		z[b, self.tok_ctr, -nb*10:-nb*8 ] = self.pos_enc[rparent[0], :]
+		z[b, self.tok_ctr, -nb*12:-nb*10] = self.pos_enc[rparent[1], :]
+		self.tok_ctr += 1
+		self.horiz_ctr[pos_space] += 1
+		if self.do_print:
+			if type(val) == str:
+				print(val, end=' ')
+			else:
+				print(f'{val:x}', end=' ')
+
 	def encodeList(self, z, b, val_list):
 		if self.do_print:
 			print(f"{self.vert_ctr}: ", end='')
@@ -632,6 +658,17 @@ class Encoder:
 		if self.do_print:
 			print(" ") # newline
 		self.vert_ctr += 1
+
+	def encodeListPtrs(self, z, b, val_list, lparents, rparents):
+		''' encode a list with pointers!'''
+		if self.do_print:
+			print(f"{self.vert_ctr}: ", end='')
+		for i in range(len(val_list)):
+			self.encodePtr(z, b, val_list[i], lparents[i], rparents[i], self.vert_ctr)
+		if self.do_print:
+			print(" ") # newline
+		self.vert_ctr += 1
+
 
 def genData7(bs, do_print=False):
 	'''
@@ -642,11 +679,11 @@ def genData7(bs, do_print=False):
 	3 - shift left 1 and 2 places.
 	'''
 	nop = 16 # _+-*/=?() -> 012345678
-	ntok = 28 # 8 for the simple tasks, 28 for sub-task 3
+	ntok = 24 # 8 for the simple tasks, 28 for sub-task 3
 	nbits = 8
 
 	md = nop + 16 + (nbits*2)*2*(1+2)
-	# one-hot indicators, digits, 2d posenc, 2 pointers
+	# one-hot indicators, digits, 2 pointers, 2d posenc
 	x = np.zeros((bs, ntok, md), dtype=np.float32)
 	y = np.zeros_like(x)
 
@@ -690,7 +727,7 @@ def genData7(bs, do_print=False):
 		x[b, :, -nbits*2:] = enc.pos_enc # "horizontal"
 		x[b, :, -nbits*4:-nbits*2] = enc.pos_enc[0,:] # "vertical"
 		# e.g. everything starts off as flat..
-		task = b % 4
+		# task = b % 4
 		task = 2
 		if task == 0: # add, very easy for both
 			va = randint(16)
@@ -775,51 +812,44 @@ def genData7(bs, do_print=False):
 			lst.append('+')
 			lst = encHex(lst, vb, ndigits=nb)
 			enc.encodeList(x, b, lst)
-			steps = 2 + max(na,nb) + 1
-			step = randint(steps)
+			step = b % 4
 			# two-phase process:
 			# setup the graph, then execute it, alocating as needed.
 			vc0 = []
 			vc1 = []
-			for i in range(step-1):
+			vo = []
+			def encodeStep(enc, z, i):
+				nonlocal x, y, b, vc0, vc1, vo
 				if i == 0:
 					# setup graph for adding all digits in parallel
-					enc.encodeListPtrs(['+','+','+'],\
-						[(0,0),(0,1),(0,2)],[(0,4),(0,5),(0,6)], b, []) # y=1
+					enc.encodeListPtrs(z, b, ['+','+','+'],\
+						[(0,0),(0,1),(0,2)], [(0,4),(0,5),(0,6)]) # y=1
 				if i == 1:
 					# do the calculations
 					for j in range(3):
 						vc = ((va >> 4*j) & 0xf) + ((vb >> 4*j) & 0xf)
 						vc0.append(vc & 0xf)
 						vc1.append((vc >> 4) & 0xf)
-					enc.encodeListPtrs(vc0, \
-						[(1,0),(1,1),(1,2)], None, b, []) # y=2
-					enc.encodeListPtrs(vc1, \
-						[(1,0),(1,1),(1,2)], [(2,0),(2,1),(2,2)], b, []) # y=3
+					enc.encodeListPtrs(z, b, vc0, \
+						[(1,0),(1,1),(1,2)], [(0,0),(0,0),(0,0)],) # y=2
+					enc.encodeListPtrs(z, b, vc1, \
+						[(1,0),(1,1),(1,2)], [(2,0),(2,1),(2,2)]) # y=3
 				if i == 2:
-					# add
-					enc.encodeListPtrs(['+'],\
-						[(2,1)],[(3,0)], b, []) # y=4
+					# ref vc0[0], vc0[1] + vc1[0], vc0[2] + vc1[1], ref vc1[2]
+					# there can be no cascaded carries here.
+					enc.encodeListPtrs(z, b, ['$','+','+','$'],\
+						[(2,0), (2,1), (2,2), (3,2)  ],\
+						[(0,0), (3,0), (3,1), (0,0)]) # y=4
 				if i == 3:
 					# results
-					vd = vc0[1] + vc1[0]
-					vd0 = vd & 0xf
-					vd1 = (vd >> 4) & 0xf
-					enc.encodeListPtrs([vd0[1], vd1[0]], \
-						[(4,0),(4,0)], [(-1,-1),(5,0)], b, []) # y=5
-				if i == 4:
-					# seems we need some concept of 'loop' or 'generator' here
-					# add
-					enc.encodeListPtrs(['+'],\
-						[(5,1)],[(2,2)], b, []) # y=6
-				if i == 5:
-					vd = vd1 + vc2[0]
-					vd2 = vd & 0xf
-					vd3 = (vd >> 4) & 0xf
-					enc.encodeListPtrs([vd0[1], vd1[0]], \
-						[(4,0),(4,0)], [(-1,-1),(5,0)], b, []) # y=5
+					vo = [vc0[0], vc0[1]+vc1[0], vc0[2]+vc1[1], vc1[2]]
+					enc.encodeListPtrs(z, b, vo, \
+						[(4,0),(4,1),(4,2),(4,3)], [(0,0),(5,0),(5,1),(5,2)]) # y=5
+				# TODO: point back to the original op, (0,3)
 
-
+			for i in range(step):
+				encodeStep(enc, x, i)
+			encodeStep(enc, y, step) # supervised target
 
 		if task == 3: # also perfectly easy
 			na = randint(3)+1
@@ -841,12 +871,12 @@ def genData7(bs, do_print=False):
 	return x, y
 
 def plotData7():
-	bs = 3
+	bs = 4
 	x, y = genData7(bs, True)
 	fig,axs = plt.subplots(bs,2)
 	for b in range(bs):
 		axs[b, 0].imshow(np.squeeze(x[b,:,:]))
-		axs[b, 1].imshow(np.squeeze(y[b,:,:]))
+		axs[b, 1].imshow(np.squeeze(y[b,:,:] + 0.25*x[b,:,:]))
 		axs[b,0].set_title('X')
 		axs[b,1].set_title('Y')
 	plt.show()
