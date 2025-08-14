@@ -635,13 +635,13 @@ class Encoder:
 		pos = self.horiz_ctr[pos_space]
 		# 2d addressing scheme!
 		nb = self.nbits
-		# z[b, self.tok_ctr, -nb*2:] = self.pos_enc[pos, :]
-		# z[b, self.tok_ctr, -nb*4:-nb*2] = self.pos_enc[pos_space, :]
+		z[b, self.tok_ctr, -nb*2:] = self.pos_enc[pos, :]
+		z[b, self.tok_ctr, -nb*4:-nb*2] = self.pos_enc[pos_space, :]
 		# encode the 2d lparent & rparent (seems so inefficient?)
-		# z[b, self.tok_ctr, -nb*6 :-nb*4 ] = self.pos_enc[lparent[0], :]
-		# z[b, self.tok_ctr, -nb*8 :-nb*6 ] = self.pos_enc[lparent[1], :]
-		# z[b, self.tok_ctr, -nb*10:-nb*8 ] = self.pos_enc[rparent[0], :]
-		# z[b, self.tok_ctr, -nb*12:-nb*10] = self.pos_enc[rparent[1], :]
+		z[b, self.tok_ctr, -nb*6 :-nb*4 ] = self.pos_enc[lparent[0], :]
+		z[b, self.tok_ctr, -nb*8 :-nb*6 ] = self.pos_enc[lparent[1], :]
+		z[b, self.tok_ctr, -nb*10:-nb*8 ] = self.pos_enc[rparent[0], :]
+		z[b, self.tok_ctr, -nb*12:-nb*10] = self.pos_enc[rparent[1], :]
 		self.tok_ctr += 1
 		self.horiz_ctr[pos_space] += 1
 		if self.do_print:
@@ -666,7 +666,7 @@ class Encoder:
 		for i in range(len(val_list)):
 			self.encodePtr(z, b, val_list[i], lparents[i], rparents[i], self.vert_ctr)
 		if self.do_print:
-			print(" ") # newline
+			print(lparents, rparents)
 		self.vert_ctr += 1
 
 
@@ -679,7 +679,7 @@ def genData7(bs, do_print=False):
 	3 - shift left 1 and 2 places.
 	'''
 	nop = 16 # _+-*/=?() -> 012345678
-	ntok = 32 # 8 for the simple tasks, 28 for sub-task 3
+	ntok = 52 # 8 for the simple tasks, 28 for sub-task 3
 	nbits = 8
 
 	md = nop + 16 + (nbits*2)*2*(1+2)
@@ -802,7 +802,7 @@ def genData7(bs, do_print=False):
 		# do subtask 3 in yet another different way - setup a graph
 		# then execute it
 		# start with a fixed graph; we can change it later?
-		if task == 2:
+		if task == 2 and False:
 			na = 4
 			nb = 4
 			va = randint(16**na)
@@ -837,7 +837,7 @@ def genData7(bs, do_print=False):
 						[(1,0),(1,1),(1,2),(1,3)], [(2,0),(2,1),(2,2),(2,3)]) # y=3
 				if i == 2:
 					# ref vc0[0], vc0[1] + vc1[0], vc0[2] + vc1[1], ref vc1[2]
-					# there can be no cascaded carries here.
+					# beware the cascaded carries!
 					enc.encodeListPtrs(z, b, ['$','+','+','+','$'],\
 						[(2,0), (2,1), (2,2), (2,3), (3,3)],\
 						[(0,0), (3,0), (3,1), (3,2), (0,0)]) # y=4
@@ -848,6 +848,96 @@ def genData7(bs, do_print=False):
 						[(4,0),(4,1),(4,2),(4,3),(4,4)], [(0,0),(5,0),(5,1),(5,2),(5,3)]) # y=5
 				# TODO: point back to the original op, (0,3)
 
+			for i in range(step):
+				encodeStep(enc, x, i)
+			encodeStep(enc, y, step) # supervised target
+
+		if task == 2:
+			na = randint(4) + 1
+			nb = randint(4) + 1
+			# na = 4
+			# nb = 4
+			va = randint(16**na)
+			vb = randint(16**nb)
+			lst = []
+			# encode the first digit with a leading zero
+			# which can be used for subsequent additions.
+			lst = [0]
+			lst = encHex(lst, va, ndigits=na)
+			lst.append('+')
+			lst = encHex(lst, vb, ndigits=nb)
+			lst.append('=') # need to delineate end-of-number/expression
+			enc.encodeList(x, b, lst)
+			ndigits = max(na, nb)
+			numsteps = 4 + 2*(ndigits-1) # dont count the problem.
+			step = numsteps -1
+
+			# two-phase process:
+			# setup the graph, then execute it, alocating as needed.
+			vc0 = [] # list of lists
+			vc1 = []
+			vo = []
+			def encodeStep(enc, z, i):
+				nonlocal x, y, b, vc0, vc1, vo
+				if i == 0:
+					# setup graph for adding all digits in parallel
+					ops = ['+' for _ in range(ndigits)]
+					lparent = [(0,i+1) for i in range(na)]
+					lparent.extend([(0,0) for _ in range(ndigits-na)])
+					rparent = [(0,na+i+2) for i in range(nb)]
+					rparent.extend([(0,0) for _ in range(ndigits-nb)])
+					enc.encodeListPtrs(z, b, ops, lparent, rparent) # y=1
+				if i == 1:
+					# do the calculations
+					vc0_ = []
+					vc1_ = []
+					for j in range(ndigits):
+						vc = ((va >> 4*j) & 0xf) + ((vb >> 4*j) & 0xf)
+						vc0_.append(vc & 0xf)
+						vc1_.append((vc >> 4) & 0xf)
+					lparent = [(1,i) for i in range(ndigits)]
+					rparent = [(0,0) for _ in range(ndigits)]
+					enc.encodeListPtrs(z, b, vc0_, lparent, rparent) # y=2
+					rparent = [(2,i) for i in range(ndigits)]
+					enc.encodeListPtrs(z, b, vc1_, lparent, rparent) # y=3
+					vc0.append(vc0_)
+					vc1.append(vc1_)
+				if i >= 2 and i < 2 + 2*(ndigits-1):
+					# ripple carries
+					vc0_ = []
+					vc1_ = []
+					ci = (i - 2)//2
+					if i % 2 == 0:
+						ops = ['+' for _ in range(ndigits-ci-1)]
+						lparent = [(2+3*ci,i+1) for i in range(ndigits-ci-1)]
+						rparent = [(3+3*ci,i) for i in range(ndigits-ci-1)]
+						enc.encodeListPtrs(z, b, ops, lparent, rparent)
+					else: # results
+						for j in range(ndigits-ci-1):
+							vc = vc0[ci][j+1] + vc1[ci][j]
+							vc0_.append(vc & 0xf)
+							vc1_.append((vc >> 4) & 0xf)
+						lparent = [(4+3*ci,i) for i in range(ndigits-ci-1)]
+						rparent = [(0,0) for _ in range(ndigits-ci-1)]
+						enc.encodeListPtrs(z, b, vc0_, lparent, rparent)
+						rparent = [(5+3*ci,i) for i in range(ndigits-ci-1)]
+						enc.encodeListPtrs(z, b, vc1_, lparent, rparent)
+						vc0.append(vc0_)
+						vc1.append(vc1_)
+				if i == 2 + 2*(ndigits-1):
+					ops = ['$' for _ in range(ndigits+1)]
+					lparent = [(2+i*3,0) for i in range(ndigits)]
+					lparent.append((3,ndigits-1)) # original carry but this isn't right
+					rparent = [(0,0) for _ in range(ndigits+1)]
+					enc.encodeListPtrs(z, b, ops, lparent, rparent)
+				if i == 3 + 2*(ndigits-1):
+					vo = [vc0[i][0] for i in range(ndigits)]
+					vo.append(vc1[0][ndigits-1])
+					lparent = [(ndigits*3+1,i) for i in range(ndigits+1)]
+					rparent = [(0,0) for _ in range(ndigits+1)]
+					enc.encodeListPtrs(z, b, vo, lparent, rparent)
+				# TODO: fix the cascaded carries! in an elegant way.
+				# TODO: point back to the original op
 			for i in range(step):
 				encodeStep(enc, x, i)
 			encodeStep(enc, y, step) # supervised target
@@ -872,7 +962,7 @@ def genData7(bs, do_print=False):
 	return x, y
 
 def plotData7():
-	bs = 4
+	bs = 3
 	x, y = genData7(bs, True)
 	fig,axs = plt.subplots(bs,2)
 	for b in range(bs):
