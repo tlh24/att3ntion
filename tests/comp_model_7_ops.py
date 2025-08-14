@@ -235,7 +235,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 		gen_func = genData7
 
 	x, y = gen_func(batch_size * 1000, do_print=False)
-	x_v, y_v = gen_func(batch_size * 1000, do_print=False)
+	x_v, y_v = gen_func(batch_size * 1000, do_print=False, validation=True)
 
 	dataset = TensorDataset(torch.tensor(x), torch.tensor(y))
 	train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)

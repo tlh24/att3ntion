@@ -670,7 +670,7 @@ class Encoder:
 		self.vert_ctr += 1
 
 
-def genData7(bs, do_print=False):
+def genData7(bs, do_print=False, validation=False):
 	'''
 	train a network on one step tasks:
 	0 - add two single-digit numbers
@@ -855,8 +855,9 @@ def genData7(bs, do_print=False):
 		if task == 2:
 			na = randint(4) + 1
 			nb = randint(4) + 1
-			# na = 4
-			# nb = 4
+			if validation:
+				na = 4
+				nb = 4
 			va = randint(16**na)
 			vb = randint(16**nb)
 			lst = []
@@ -870,7 +871,7 @@ def genData7(bs, do_print=False):
 			enc.encodeList(x, b, lst)
 			ndigits = max(na, nb)
 			numsteps = 4 + 2*(ndigits-1) # dont count the problem.
-			step = numsteps -1
+			step = b % numsteps
 
 			# two-phase process:
 			# setup the graph, then execute it, alocating as needed.
@@ -962,8 +963,8 @@ def genData7(bs, do_print=False):
 	return x, y
 
 def plotData7():
-	bs = 3
-	x, y = genData7(bs, True)
+	bs = 10
+	x, y = genData7(bs, True, True)
 	fig,axs = plt.subplots(bs,2)
 	for b in range(bs):
 		axs[b, 0].imshow(np.squeeze(x[b,:,:]))
