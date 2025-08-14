@@ -848,6 +848,8 @@ __global__ void Yq_scatter_flash(
     float* __restrict__ Y_q_,
     int B, int H, int I, int J, int K, int D, float scale
 ) {
+	// Q is [B, H, I, D] R is [B, H, J, D] S is [b, h, k, d]
+	// usually i == j == k
     // --- Grid Mapping---
     const int i_tile_idx_grid = blockIdx.x; // I split into tiles of TILE_I
     const int j_tile_idx_grid = blockIdx.y; // J split into tiles of TILE_J
