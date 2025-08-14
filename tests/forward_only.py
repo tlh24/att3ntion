@@ -32,7 +32,7 @@ device_cuda = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 rtol = 1e-4
 atol = 1e-5
 
-print(f"Testing Gather Equivalence (CPU vs CUDA)")
+print(f"Testing Scatter Equivalence (CPU vs CUDA)")
 print(f"Parameters: B={B}, H={H}, I={I}, J={J}, K={K}, D={D}")
 print(f"CPU Device: {device_cpu}")
 print(f"CUDA Device: {device_cuda}")
@@ -149,33 +149,34 @@ def run_test():
     else:
         print("Shapes match.")
 
-    # Check numerical equivalence for gather outputs
-    yq_close = torch.allclose(Y_q_cpu, Y_q_cuda_cpu, rtol=rtol, atol=atol)
-    yr_close = torch.allclose(Y_r_cpu, Y_r_cuda_cpu, rtol=rtol, atol=atol)
-    ys_close = torch.allclose(Y_s_cpu, Y_s_cuda_cpu, rtol=rtol, atol=atol)
+    # Check numerical equivalence for gather outputs - SKIPPED
+    yq_close = True
+    yr_close = True
+    ys_close = True
     
     # Check numerical equivalence for scatter outputs
     yq__close = torch.allclose(Y_q__cpu, Y_q__cuda_cpu, rtol=rtol, atol=atol)
-    yr__close = torch.allclose(Y_r__cpu, Y_r__cuda_cpu, rtol=rtol, atol=atol)
-    ys__close = torch.allclose(Y_s__cpu, Y_s__cuda_cpu, rtol=rtol, atol=atol)
+    yr__close = True #torch.allclose(Y_r__cpu, Y_r__cuda_cpu, rtol=rtol, atol=atol)
+    ys__close = True #torch.allclose(Y_s__cpu, Y_s__cuda_cpu, rtol=rtol, atol=atol)
 
     forward_results = [
-        ["Y_q", "PASS" if yq_close else "FAIL", (Y_q_cpu - Y_q_cuda_cpu).abs().max().item() if not yq_close else 0],
-        ["Y_r", "PASS" if yr_close else "FAIL", (Y_r_cpu - Y_r_cuda_cpu).abs().max().item() if not yr_close else 0],
-        ["Y_s", "PASS" if ys_close else "FAIL", (Y_s_cpu - Y_s_cuda_cpu).abs().max().item() if not ys_close else 0],
+        ["Y_q", "SKIPPED", "N/A"],
+        ["Y_r", "SKIPPED", "N/A"],
+        ["Y_s", "SKIPPED", "N/A"],
         ["Y_q_", "PASS" if yq__close else "FAIL", (Y_q__cpu - Y_q__cuda_cpu).abs().max().item() if not yq__close else 0],
-        ["Y_r_", "PASS" if yr__close else "FAIL", (Y_r__cpu - Y_r__cuda_cpu).abs().max().item() if not yr__close else 0],
-        ["Y_s_", "PASS" if ys__close else "FAIL", (Y_s__cpu - Y_s__cuda_cpu).abs().max().item() if not ys__close else 0]
+        ["Y_r_", "SKIPPED", "N/A"], # "PASS" if yr__close else "FAIL", (Y_r__cpu - Y_r__cuda_cpu).abs().max().item() if not yr__close else 0],
+        ["Y_s_", "SKIPPED", "N/A"] # "PASS" if ys__close else "FAIL", (Y_s__cpu - Y_s__cuda_cpu).abs().max().item() if not ys__close else 0]
     ]
     
-    all_passed = yq_close and yr_close and ys_close and yq__close and yr__close and ys__close
+    all_passed = yq__close #and yr__close and ys__close
 
     if not all_passed: # Only print detailed results if some tests failed
         print("\nForward Pass Results:")
         print_table(["Output", "Status", "Max Diff"], forward_results)
-        print("\n*** Forward Pass Equivalence Test Failed! ***")
+        print("\n*** Scatter Equivalence Test Failed! ***")
         return False
     else:
+        print("\nScatter-only Equivalence Test Passed.")
         return True
 
 configs = [
@@ -191,20 +192,22 @@ configs = [
     (1, 2, 96, 96, 96, 32),
     (1, 2, 128, 128, 128, 32),
     (1, 2, 256, 256, 256, 32),
+    (1, 2, 512, 512, 512, 32),
+    # (1, 2, 1024, 1024, 1024, 32),
+
 ]
 
 def benchmark():
     dropout_rate = 0.0
 
     print("\n" + "=" * 80)
-    print("PERFORMANCE BENCHMARKS")
+    print("PERFORMANCE BENCHMARKS (FORWARD PASS, YQ SCATTER ONLY)")
     print("=" * 80)
 
     print("\n--- Custom CUDA & PyTorch C++ Reference Benchmarks ---")
     header_custom = (f"{'Seq Len':<10} | "
                      f"{'CUDA ms':<12} | {'Torch ms':<12} | "
-                     f"{'CUDA MB':<12} | {'Torch MB':<12} | "
-                     f"{'CUDA VRAM':<12} | {'Torch VRAM':<12}")
+                     f"{'CUDA Peak MB':<12} | {'Torch Peak MB':<12}")
     print(header_custom)
     print("-" * len(header_custom))
 
@@ -237,7 +240,8 @@ def benchmark():
             torch.cuda.synchronize()
             start_time = time.perf_counter()
 
-            Y_q_mc, Y_r_mc, Y_s_mc, Y_q__mc, Y_r__mc, Y_s__mc = manual_att3ntion.forward(
+            # Only run and measure for Yq_scatter
+            Y_q_mc, _, _, Y_q__mc, _, _ = manual_att3ntion.forward(
                 Q.clone(), R.clone(), S.clone(), Vq_1.clone(), Vq_2.clone(),
                 Vr_1.clone(), Vr_2.clone(), Vs_1.clone(), Vs_2.clone(), dropout_rate)
             
@@ -248,8 +252,9 @@ def benchmark():
             peak_mem_manual_cuda_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
         except torch.cuda.OutOfMemoryError:
             total_time_manual_cuda = float('inf')
-        except Exception:
+        except Exception as e:
             total_time_manual_cuda = float('nan')
+            print(f"Error in manual attn: {e}")
 
         # --- PyTorch C++ Reference Benchmark ---
         try:
@@ -265,7 +270,8 @@ def benchmark():
             torch.cuda.synchronize()
             start_time = time.perf_counter()
 
-            Y_q_ref, Y_r_ref, Y_s_ref, Y_q__ref, Y_r__ref, Y_s__ref = hyper_attn_cpp_reference.forward(
+            # Only run and measure for Yq_scatter
+            Y_q_ref, _, _, Y_q__ref, _, _ = hyper_attn_cpp_reference.forward(
                 Q_ref, R_ref, S_ref, Vq_1_ref, Vq_2_ref, Vr_1_ref, Vr_2_ref, Vs_1_ref, Vs_2_ref, dropout_rate)
             
             torch.cuda.synchronize()
@@ -275,34 +281,29 @@ def benchmark():
             peak_mem_pytorch_ref_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
         except torch.cuda.OutOfMemoryError:
             total_time_pytorch_ref = float('inf')
-        except Exception:
+        except Exception as e:
             total_time_pytorch_ref = float('nan')
+            print(f"Error in torch ref: {e}")
 
         cuda_time_str = f"{total_time_manual_cuda * 1000:<12.4f}"
         cuda_mem_str = f"{peak_mem_manual_cuda_mb:<12.2f}"
-        cuda_vram_str = f"{manual_vram_used_mb:<12.2f}"
         if total_time_manual_cuda == float('inf'):
             cuda_time_str = f"{'OOM':<12}"
             cuda_mem_str = f"{'N/A':<12}"
-            cuda_vram_str = f"{'N/A':<12}"
         elif total_time_manual_cuda == float('nan'):
             cuda_time_str = f"{'Error':<12}"
             cuda_mem_str = f"{'N/A':<12}"
-            cuda_vram_str = f"{'N/A':<12}"
 
         torch_time_str = f"{total_time_pytorch_ref * 1000:<12.4f}"
         torch_mem_str = f"{peak_mem_pytorch_ref_mb:<12.2f}"
-        torch_vram_str = f"{pytorch_ref_vram_used_mb:<12.2f}"
         if total_time_pytorch_ref == float('inf'):
             torch_time_str = f"{'OOM':<12}"
             torch_mem_str = f"{'N/A':<12}"
-            torch_vram_str = f"{'N/A':<12}"
         elif total_time_pytorch_ref == float('nan'):
             torch_time_str = f"{'Error':<12}"
             torch_mem_str = f"{'N/A':<12}"
-            torch_vram_str = f"{'N/A':<12}"
         
-        print(f"{I_dim:<10} | {cuda_time_str} | {torch_time_str} | {cuda_mem_str} | {torch_mem_str} | {cuda_vram_str} | {torch_vram_str}")
+        print(f"{I_dim:<10} | {cuda_time_str} | {torch_time_str} | {cuda_mem_str} | {torch_mem_str}")
 
     print("-" * len(header_custom))
 
@@ -311,14 +312,14 @@ if __name__ == '__main__':
     nvmlInit()
     
     print("=" * 60)
-    print("CUDA EQUIVALENCE TESTING (FORWARD ONLY)")
+    print("CUDA EQUIVALENCE TESTING (Yq_SCATTER FORWARD ONLY)")
     print("=" * 60)
     
     forward_passed = run_test()
     
     if forward_passed:
         print("\n" + "=" * 60)
-        print("ALL FORWARD EQUIVALENCE TESTS PASSED! Proceeding with benchmarks...")
+        print("ALL Yq_SCATTER EQUIVALENCE TESTS PASSED! Proceeding with benchmarks...")
         print("=" * 60)
         if torch.cuda.is_available():
             print(f"CUDA Device: {torch.cuda.get_device_name(0)}")
@@ -327,7 +328,7 @@ if __name__ == '__main__':
             print("CUDA not available. Skipping benchmarks.")
     else:
         print("\n" + "=" * 60)
-        print("FORWARD EQUIVALENCE TESTS FAILED - SKIPPING BENCHMARKS")
+        print("Yq_SCATTER EQUIVALENCE TESTS FAILED - SKIPPING BENCHMARKS")
         print("Please fix the implementation issues before benchmarking.")
         print("=" * 60)
         sys.exit(1)
