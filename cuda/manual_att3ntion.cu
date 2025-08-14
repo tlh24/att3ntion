@@ -848,23 +848,23 @@ __global__ void Yq_scatter_flash(
     float* __restrict__ Y_q_,
     int B, int H, int I, int J, int K, int D, float scale
 ) {
-    // --- Grid/Block Mapping ---
-    const int i_tile_idx_grid = blockIdx.x;
-    const int j_tile_idx_grid = blockIdx.y;
+    // --- Grid Mapping---
+    const int i_tile_idx_grid = blockIdx.x; // I split into tiles of TILE_I
+    const int j_tile_idx_grid = blockIdx.y; // J split into tiles of TILE_J
     const int bh_idx = blockIdx.z;
 
-    const int d_idx = threadIdx.x;
-    const int i_local_idx = threadIdx.y;
+    // --- Thread Mapping ---
+    const int thread_d_idx = threadIdx.x; // curr thread's d_idx in (D, TILE_I)
+    const int thread_i_idx = threadIdx.y; // curr thread's i_idx in (TILE_I)
 
-    const int i_base = i_tile_idx_grid * TILE_I_SPECIAL;
-    const int i_idx = i_base + i_local_idx;
+    const int i_start = i_tile_idx_grid * TILE_I_SPECIAL; // start index of current I tile
+    const int j_start = j_tile_idx_grid * TILE_J; // start index of current J tile
 
-    const int j0 = j_tile_idx_grid * TILE_J;
+    const int i_idx = i_start + thread_i_idx; // global index of curr thread's I
 
-    // Early exit for blocks outside the valid problem space
-    if (i_idx >= I || j0 >= J) return;
+    if (i_idx >= I || j_start >= J) return; // check bounds
 
-    // --- Pointers ---
+    // --- Pointers to Global Memory ---
     const int64_t q_bh_offset = (int64_t)bh_idx * I * D;
     const int64_t r_bh_offset = (int64_t)bh_idx * J * D;
     const int64_t s_bh_offset = (int64_t)bh_idx * K * D;
@@ -877,55 +877,54 @@ __global__ void Yq_scatter_flash(
     // --- Shared Memory Layout ---
     extern __shared__ float smem[];
 
-    float* q_tile = (float*)smem;
+    float* q_tile = (float*)smem; 
     float* r_tile = q_tile + TILE_I_SPECIAL * D;
     float* s_tile = r_tile + TILE_J * D;
     float* vr_tile = s_tile + TILE_K * D;
     float* vs_tile = vr_tile + TILE_J * D;
 
+    // m=max of row, l= sum of exps
     float* mj_tile = vs_tile + TILE_K * D;
     float* lj_tile = mj_tile + TILE_J;
     float* mk_tile = lj_tile + TILE_J;
     float* lk_tile = mk_tile + TILE_K;
 
     float* o_tile = lk_tile + TILE_K;
-    // We no longer need attn_scores_tile, we can reuse that memory
-    // for the parallel reduction. Let's call it reduction_smem.
+
     float* reduction_smem = o_tile + TILE_I_SPECIAL * D; 
     
-    int flat_thread_id_2d = threadIdx.y * blockDim.x + threadIdx.x;
-    int threads_per_block = blockDim.x * blockDim.y;
+    int flat_thread_id_2d = threadIdx.y * blockDim.x + threadIdx.x; 
+    int threads_per_block = blockDim.x * blockDim.y; // tile I * D
     
-    o_tile[i_local_idx * D + d_idx] = 0.0f;
+    o_tile[thread_i_idx * D + thread_d_idx] = 0.0f;
 
-    // --- Load Q tile for this block shaped (TILE_I, D)---
+    // --- Load Q tile to smem (strided/coalesced layout)---
     for (int load_idx = flat_thread_id_2d; load_idx < TILE_I_SPECIAL * D; load_idx += threads_per_block) {
         int row_in_tile = load_idx / D;
         int col_in_tile = load_idx % D;
-        int i_global = i_base + row_in_tile;
-        if (i_global < I) { // ensure threads don't read data out of bounds
-            q_tile[row_in_tile * D + col_in_tile] = 
-                Q[q_bh_offset + i_global * D + col_in_tile];
+        int i_global = i_start + row_in_tile;
+        if (i_global < I) { // check bounds
+            q_tile[row_in_tile * D + col_in_tile] = Q[q_bh_offset + i_global * D + col_in_tile];
         }
     }
     __syncthreads();
 
-    // --- Cooperative loading for j-related tiles shaped (TILE_J, D) ---
+    // --- Load R and Vr2 tiles to smem (strided/coalesced layout) ---
     for (int load_idx = flat_thread_id_2d; load_idx < TILE_J * D; load_idx += threads_per_block) {
         int row_in_tile = load_idx / D;
         int col_in_tile = load_idx % D;
-        int j_global = j0 + row_in_tile;
+        int j_global = j_start + row_in_tile;
         if (j_global < J) {
             r_tile[row_in_tile * D + col_in_tile] = R[r_bh_offset + j_global * D + col_in_tile];
             vr_tile[row_in_tile * D + col_in_tile] = Vr_2[vr_bh_offset + j_global * D + col_in_tile];
         }
     }
 
-    // load mj and lj tiles shaped (TILE_J)
+    // load mj and lj tiles to smem (TILE_J)
     for (int j_load = flat_thread_id_2d; j_load < TILE_J; j_load += threads_per_block) {
-        if (j0 + j_load < J) {
-             mj_tile[j_load] = m_j_in[mj_bh_offset + j0 + j_load];
-             lj_tile[j_load] = l_j_in[mj_bh_offset + j0 + j_load];
+        if (j_start + j_load < J) {
+             mj_tile[j_load] = m_j_in[mj_bh_offset + j_start + j_load];
+             lj_tile[j_load] = l_j_in[mj_bh_offset + j_start + j_load];
         }
     }
 
@@ -949,59 +948,57 @@ __global__ void Yq_scatter_flash(
         __syncthreads();
 
         // --- Fused Computation ---
-        for (int j_tile_idx = 0; j_tile_idx < TILE_J; ++j_tile_idx) {
-            if (j0 + j_tile_idx >= J) continue;
+        for (int j_tile_idx = 0; j_tile_idx < TILE_J; ++j_tile_idx) { //j=0,1,2,...,TILE_J-1
+            if (j_start + j_tile_idx >= J) continue;
 
-            for (int k_tile_idx = 0; k_tile_idx < TILE_K; ++k_tile_idx) {
+            for (int k_tile_idx = 0; k_tile_idx < TILE_K; ++k_tile_idx) { //k=0,1,2,...,TILE_K-1
                 if (k0 + k_tile_idx >= K) continue;
                 
                 // --- Step 2.1: Parallel Reduction for Dot Product ---
-                const float* q_vec = q_tile + i_local_idx * D;
+                const float* q_vec = q_tile + thread_i_idx * D; // 0 to start
                 const float* r_vec = r_tile + j_tile_idx * D;
-                    const float* s_vec = s_tile + k_tile_idx * D;
+                const float* s_vec = s_tile + k_tile_idx * D;
 
-                // Each thread computes its partial product and stores it in shared memory.
-                // We use the first TILE_I_SPECIAL x D elements of our reduction memory.
-                reduction_smem[i_local_idx * D + d_idx] = q_vec[d_idx] * r_vec[d_idx] * s_vec[d_idx];
-                __syncthreads(); // Ensure all partial products are written before reduction starts.
+                // Each thread computes its product and stores it in smem
+                reduction_smem[thread_i_idx * D + thread_d_idx] = q_vec[thread_d_idx] * r_vec[thread_d_idx] * s_vec[thread_d_idx];
+                __syncthreads(); 
 
-                // Perform the reduction in shared memory.
-                // This loop has minor, contained divergence but replaces the massive barrier stall.
+                // Perform the reduction in smem.
                 for (int offset = D / 2; offset > 0; offset >>= 1) {
-                    if (d_idx < offset) {
-                        reduction_smem[i_local_idx * D + d_idx] += reduction_smem[i_local_idx * D + d_idx + offset];
+                    if (thread_d_idx < offset) {
+                        reduction_smem[thread_i_idx * D + thread_d_idx] += reduction_smem[thread_i_idx * D + thread_d_idx + offset];
                     }
                     __syncthreads();
                 }
-                // The final dot product is now in reduction_smem[i_local_idx * D + 0].
+                // The final dot product is now in reduction_smem[thread_i_idx * D + 0].
 
                 // --- Step 2.2: Redundant but Parallel Scalar Computation ---
-                // All threads read the final dot product. No `if (d_idx == 0)`.
-                float dot = reduction_smem[i_local_idx * D];
+                // All threads read the final dot product for curr I,J,K tile
 
-                // All threads perform the scalar math. This is the trade-off.
-                float inv_lj = 1.0f / lj_tile[j_tile_idx];
-                float current_mj = mj_tile[j_tile_idx];
-                float inv_lk = 1.0f / lk_tile[k_tile_idx];
+                float dot = reduction_smem[thread_i_idx * D];
                 float logit = dot * scale;
-                    float ar_val = expf(logit - current_mj) * inv_lj;
-                float as_val = expf(logit - mk_tile[k_tile_idx]) * inv_lk;
-                float combined_attn_val = ar_val * as_val;
+
+                float inv_lj = 1.0f / lj_tile[j_tile_idx]; 
+                float inv_lk = 1.0f / lk_tile[k_tile_idx]; 
+                float ar_val = expf(logit - mj_tile[j_tile_idx]) * inv_lj; //exp(dot - max) / sum of exps
+                float as_val = expf(logit - mk_tile[k_tile_idx]) * inv_lk; 
+                float combined_attn_val = ar_val * as_val; 
                 
                 // --- Step 2.3: Parallel Vector Update ---
                 // NO __syncthreads() is needed here. The barrier stall is GONE.
                 const float* vr_vec = vr_tile + j_tile_idx * D;
                 const float* vs_vec = vs_tile + k_tile_idx * D;
-                    o_tile[i_local_idx * D + d_idx] += combined_attn_val * vr_vec[d_idx] * vs_vec[d_idx];
+
+                o_tile[thread_i_idx * D + thread_d_idx] += combined_attn_val * vr_vec[thread_d_idx] * vs_vec[thread_d_idx];
             }
-            }
-        __syncthreads(); // Sync after all j,k tiles are processed for this k0-block, before loading the next.
+        }
+        __syncthreads(); // Sync after all j,k tiles are processed for this k0-block, before loading the next tile of K block.
     }
     
     // --- Write final result to global memory ---
-    // Use atomicAdd to safely accumulate results from different j-tile blocks
-    float final_val = o_tile[i_local_idx * D + d_idx];
-    if (i_idx < I && d_idx < D) atomicAdd(&Y_q_[yq_bh_offset + i_idx * D + d_idx], final_val);
+    // Use atomicAdd to safely accumulate results
+    float final_val = o_tile[thread_i_idx * D + thread_d_idx];
+    if (i_idx < I && thread_d_idx < D) atomicAdd(&Y_q_[yq_bh_offset + i_idx * D + thread_d_idx], final_val);
 }
 
 void Yq_scatter_flash_launcher(

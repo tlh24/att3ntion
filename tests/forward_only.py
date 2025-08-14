@@ -25,7 +25,7 @@ H = 2
 I = 4
 J = 4
 K = 4
-D = 8
+D = 64
 dtype = torch.float32
 device_cpu = torch.device("cpu")
 device_cuda = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -179,20 +179,20 @@ def run_test():
         print("\nScatter-only Equivalence Test Passed.")
         return True
 
-configs = [
-    (1, 2, 4, 4, 4, 32),   
-    (1, 2, 6, 6, 6, 32),  
-    (1, 2, 8, 8, 8, 32),  
-    (1, 2, 12, 12, 12, 32),  
-    (1, 2, 16, 16, 16, 32),  
-    (1, 2, 24, 24, 24, 32),  
-    (1, 2, 32, 32, 32, 32),  
-    (1, 2, 48, 48, 48, 32),
-    (1, 2, 64, 64, 64, 32),
-    (1, 2, 96, 96, 96, 32),
-    (1, 2, 128, 128, 128, 32),
-    (1, 2, 256, 256, 256, 32),
-    (1, 2, 512, 512, 512, 32),
+configs = [ # dims: b, h, i, j, k, d
+    (1, 1, 4, 4, 4, 64),   
+    (1, 1, 6, 6, 6, 64),  
+    (1, 1, 8, 8, 8, 64),  
+    (1, 1, 12, 12, 12, 64),  
+    (1, 1, 16, 16, 16, 64),  
+    (1, 1, 24, 24, 24, 64),  
+    (1, 1, 32, 32, 32, 64),  
+    (1, 1, 48, 48, 48, 64),
+    (1, 1, 64, 64, 64, 64),
+    (1, 1, 96, 96, 96, 64),
+    (1, 1, 128, 128, 128, 64),
+    (1, 1, 256, 256, 256, 64),
+    (1, 1, 512, 512, 512, 64),
     # (1, 2, 1024, 1024, 1024, 32),
 
 ]
@@ -207,11 +207,13 @@ def benchmark():
     print("\n--- Custom CUDA & PyTorch C++ Reference Benchmarks ---")
     header_custom = (f"{'Seq Len':<10} | "
                      f"{'CUDA ms':<12} | {'Torch ms':<12} | "
+                     f"{'CUDA TFLOP/s':<15} | {'Torch TFLOP/s':<15} | "
                      f"{'CUDA Peak MB':<12} | {'Torch Peak MB':<12}")
     print(header_custom)
     print("-" * len(header_custom))
 
     for B, H, I_dim, J_dim, K_dim, D_dim in configs:
+        flops = (B * H) * (4 * I_dim * J_dim * K_dim * D_dim + 3 * J_dim * K_dim * D_dim)
         try:
             Q = torch.rand(B, H, I_dim, D_dim, device='cuda', dtype=torch.float32)
             R = torch.rand(B, H, J_dim, D_dim, device='cuda', dtype=torch.float32)
@@ -285,25 +287,37 @@ def benchmark():
             total_time_pytorch_ref = float('nan')
             print(f"Error in torch ref: {e}")
 
+        cuda_tflops, torch_tflops = 0.0, 0.0
+        if total_time_manual_cuda > 0 and not (total_time_manual_cuda == float('inf') or total_time_manual_cuda == float('nan')):
+            cuda_tflops = (flops / total_time_manual_cuda) / 1e12
+        if total_time_pytorch_ref > 0 and not (total_time_pytorch_ref == float('inf') or total_time_pytorch_ref == float('nan')):
+            torch_tflops = (flops / total_time_pytorch_ref) / 1e12
+
         cuda_time_str = f"{total_time_manual_cuda * 1000:<12.4f}"
         cuda_mem_str = f"{peak_mem_manual_cuda_mb:<12.2f}"
+        cuda_tflops_str = f"{cuda_tflops:<15.4f}"
         if total_time_manual_cuda == float('inf'):
             cuda_time_str = f"{'OOM':<12}"
             cuda_mem_str = f"{'N/A':<12}"
+            cuda_tflops_str = f"{'N/A':<15}"
         elif total_time_manual_cuda == float('nan'):
             cuda_time_str = f"{'Error':<12}"
             cuda_mem_str = f"{'N/A':<12}"
+            cuda_tflops_str = f"{'N/A':<15}"
 
         torch_time_str = f"{total_time_pytorch_ref * 1000:<12.4f}"
         torch_mem_str = f"{peak_mem_pytorch_ref_mb:<12.2f}"
+        torch_tflops_str = f"{torch_tflops:<15.4f}"
         if total_time_pytorch_ref == float('inf'):
             torch_time_str = f"{'OOM':<12}"
             torch_mem_str = f"{'N/A':<12}"
+            torch_tflops_str = f"{'N/A':<15}"
         elif total_time_pytorch_ref == float('nan'):
             torch_time_str = f"{'Error':<12}"
             torch_mem_str = f"{'N/A':<12}"
+            torch_tflops_str = f"{'N/A':<15}"
         
-        print(f"{I_dim:<10} | {cuda_time_str} | {torch_time_str} | {cuda_mem_str} | {torch_mem_str}")
+        print(f"{I_dim:<10} | {cuda_time_str} | {torch_time_str} | {cuda_tflops_str} | {torch_tflops_str} | {cuda_mem_str} | {torch_mem_str}")
 
     print("-" * len(header_custom))
 
