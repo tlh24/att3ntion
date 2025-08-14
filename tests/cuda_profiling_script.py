@@ -4,6 +4,7 @@ import subprocess
 import sys
 import datetime
 import os
+import argparse
 
 def get_grad_output_cuda(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_):
     """
@@ -73,7 +74,7 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim):
     print("\nCUDA kernel run finished successfully.")
 
 
-def launch_profiler():
+def launch_profiler(report_filename=None):
     """
     Constructs and launches the ncu profiling command.
     """
@@ -83,8 +84,11 @@ def launch_profiler():
     KERNEL_NAME = "Yq_scatter_flash"
     
     # Dynamically generate the report filename
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_filename = f"profiling_reports/{KERNEL_NAME}_B{B}_H{H}_I{I_dim}_J{J_dim}_K{K_dim}_D{D_dim}_{timestamp}.ncu-rep"
+    if report_filename is None:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_filename = f"profiling_reports/{KERNEL_NAME}_B{B}_H{H}_I{I_dim}_J{J_dim}_K{K_dim}_D{D_dim}_{timestamp}.ncu-rep"
+    else:
+        output_filename = report_filename
 
     # Ensure the output directory exists
     os.makedirs(os.path.dirname(output_filename), exist_ok=True)
@@ -111,14 +115,21 @@ def launch_profiler():
 
 if __name__ == '__main__':
     try:
+        parser = argparse.ArgumentParser(description="Run CUDA profiling script.")
+        parser.add_argument("--no-profile", action="store_true",
+                            help="Run kernels directly without launching ncu profiler.")
+        parser.add_argument("--output-file", type=str, default=None,
+                            help="Specify the output filename for the ncu report.")
+        args = parser.parse_args()
+
         # Check if we should run the kernels directly or launch the profiler
-        if "--no-profile" in sys.argv:
+        if args.no_profile:
             # This branch is executed when ncu calls the script
             B, H, I_dim, J_dim, K_dim, D_dim = (1, 2, 128, 128, 128, 64)
             run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim)
         else:
             # This is the main branch that launches the profiler
-            launch_profiler()
+            launch_profiler(report_filename=args.output_file)
 
     except ImportError:
         print("\nImportError: Could not import 'hyper_attn_cpp_manual'.")
