@@ -19,6 +19,7 @@ setup(
                 'nvcc': [
                     '-O3',
                     '-gencode=arch=compute_86,code=sm_86',
+                    '-lineinfo'
                 ]
             }
         ),
