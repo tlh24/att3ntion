@@ -12,7 +12,8 @@ setup(
             name='hyper_attn_cpp_manual',
             sources=[
                 'cpp/manual_att3ntion.cpp',
-                'cuda/manual_att3ntion.cu'
+                'cuda/forward.cu',
+                'cuda/backward.cu'
             ],
             extra_compile_args={
                 'cxx': ['-O3'],
