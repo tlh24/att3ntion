@@ -2007,57 +2007,57 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
 
     const int threads = 256;
 
-    // GATHER
-    TORCH_CHECK(D % 4 == 0, "Head dimension D must be a multiple of 4 for the flash kernel.");
-    const int TpB = 128; // Threads per block
-    // Y_q Gather
-    {
-        dim3 grid(I, H, B);
-        dim3 block(TpB);
-        size_t smem_size = sizeof(float) * (D + TILE_J*D + TILE_K*D + TILE_J*D + TILE_K*D + TILE_J*TILE_K + TpB + 2 + D);
+    // // GATHER
+    // TORCH_CHECK(D % 4 == 0, "Head dimension D must be a multiple of 4 for the flash kernel.");
+    // const int TpB = 128; // Threads per block
+    // // Y_q Gather
+    // {
+    //     dim3 grid(I, H, B);
+    //     dim3 block(TpB);
+    //     size_t smem_size = sizeof(float) * (D + TILE_J*D + TILE_K*D + TILE_J*D + TILE_K*D + TILE_J*TILE_K + TpB + 2 + D);
 
-        Yq_gather_flash_kernel<<<grid, block, smem_size>>>(
-            reinterpret_cast<const float4*>(Q.data_ptr<float>()), 
-            reinterpret_cast<const float4*>(R.data_ptr<float>()), 
-            reinterpret_cast<const float4*>(S.data_ptr<float>()),
-            reinterpret_cast<const float4*>(Vr_1.data_ptr<float>()), 
-            reinterpret_cast<const float4*>(Vs_1.data_ptr<float>()),
-            Y_q.data_ptr<float>(), 
-            B, H, I, J, K, D, scale);
-    }
-    // Y_r Gather
-    {
-        dim3 grid(J, H, B);
-        dim3 block(TpB);
-        size_t smem_size = sizeof(float) * (D + TILE_I*D + TILE_K*D + TILE_I*D + TILE_K*D + TILE_I*TILE_K + TpB + 2 + D);
-        Yr_gather_flash_kernel<<<grid, block, smem_size>>>(
-            reinterpret_cast<const float4*>(R.data_ptr<float>()), 
-            reinterpret_cast<const float4*>(Q.data_ptr<float>()), 
-            reinterpret_cast<const float4*>(S.data_ptr<float>()), 
-            reinterpret_cast<const float4*>(Vq_1.data_ptr<float>()), 
-            reinterpret_cast<const float4*>(Vs_1.data_ptr<float>()), 
-            Y_r.data_ptr<float>(), 
-            B, H, I, J, K, D, scale);
-    }
-    // Y_s Gather
-    {
-        dim3 grid(K, H, B);
-        dim3 block(TpB);
-        size_t smem_size = sizeof(float) * (D + TILE_I*D + TILE_J*D + TILE_I*D + TILE_J*D + TILE_I*TILE_J + TpB + 2 + D);
-        Ys_gather_flash_kernel<<<grid, block, smem_size>>>(
-            reinterpret_cast<const float4*>(S.data_ptr<float>()), 
-            reinterpret_cast<const float4*>(Q.data_ptr<float>()), 
-            reinterpret_cast<const float4*>(R.data_ptr<float>()),
-            reinterpret_cast<const float4*>(Vq_1.data_ptr<float>()), 
-            reinterpret_cast<const float4*>(Vr_1.data_ptr<float>()), 
-            Y_s.data_ptr<float>(), 
-            B, H, I, J, K, D, scale);
-    }
+    //     Yq_gather_flash_kernel<<<grid, block, smem_size>>>(
+    //         reinterpret_cast<const float4*>(Q.data_ptr<float>()), 
+    //         reinterpret_cast<const float4*>(R.data_ptr<float>()), 
+    //         reinterpret_cast<const float4*>(S.data_ptr<float>()),
+    //         reinterpret_cast<const float4*>(Vr_1.data_ptr<float>()), 
+    //         reinterpret_cast<const float4*>(Vs_1.data_ptr<float>()),
+    //         Y_q.data_ptr<float>(), 
+    //         B, H, I, J, K, D, scale);
+    // }
+    // // Y_r Gather
+    // {
+    //     dim3 grid(J, H, B);
+    //     dim3 block(TpB);
+    //     size_t smem_size = sizeof(float) * (D + TILE_I*D + TILE_K*D + TILE_I*D + TILE_K*D + TILE_I*TILE_K + TpB + 2 + D);
+    //     Yr_gather_flash_kernel<<<grid, block, smem_size>>>(
+    //         reinterpret_cast<const float4*>(R.data_ptr<float>()), 
+    //         reinterpret_cast<const float4*>(Q.data_ptr<float>()), 
+    //         reinterpret_cast<const float4*>(S.data_ptr<float>()), 
+    //         reinterpret_cast<const float4*>(Vq_1.data_ptr<float>()), 
+    //         reinterpret_cast<const float4*>(Vs_1.data_ptr<float>()), 
+    //         Y_r.data_ptr<float>(), 
+    //         B, H, I, J, K, D, scale);
+    // }
+    // // Y_s Gather
+    // {
+    //     dim3 grid(K, H, B);
+    //     dim3 block(TpB);
+    //     size_t smem_size = sizeof(float) * (D + TILE_I*D + TILE_J*D + TILE_I*D + TILE_J*D + TILE_I*TILE_J + TpB + 2 + D);
+    //     Ys_gather_flash_kernel<<<grid, block, smem_size>>>(
+    //         reinterpret_cast<const float4*>(S.data_ptr<float>()), 
+    //         reinterpret_cast<const float4*>(Q.data_ptr<float>()), 
+    //         reinterpret_cast<const float4*>(R.data_ptr<float>()),
+    //         reinterpret_cast<const float4*>(Vq_1.data_ptr<float>()), 
+    //         reinterpret_cast<const float4*>(Vr_1.data_ptr<float>()), 
+    //         Y_s.data_ptr<float>(), 
+    //         B, H, I, J, K, D, scale);
+    // }
 
     // SCATTER 
     Yq_scatter_flash_launcher(Q, R, S, Vr_2, Vs_2, Y_q_, scale);
-    Yr_scatter_flash_launcher(Q, R, S, Vq_2, Vs_2, Y_r_, scale);
-    Ys_scatter_flash_launcher(Q, R, S, Vq_2, Vr_2, Y_s_, scale);
+    // Yr_scatter_flash_launcher(Q, R, S, Vq_2, Vs_2, Y_r_, scale);
+    // Ys_scatter_flash_launcher(Q, R, S, Vq_2, Vr_2, Y_s_, scale);
 
     cudaDeviceSynchronize(); 
     return std::make_tuple(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_);}

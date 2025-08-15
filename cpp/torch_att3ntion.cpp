@@ -34,35 +34,29 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     auto As = torch::softmax(dot_product_s.flatten(3, 4), -1).reshape_as(dot_product_s);
     As = As.permute({0, 1, 3, 4, 2});
     // auto As = torch::zeros_like(Aq); // Dummy tensor
-    
-    // Dropout only if necessary for Yq_scatter
-    // if (dropout_rate > 0.0) {
-    //     auto dropout = torch::nn::Dropout(torch::nn::DropoutOptions(dropout_rate));
-    //     // Only apply dropout to Aq and Ar (if used in ArAs for Yq_scatter)
-    //     Aq = dropout->forward(Aq);
-    //     Ar = dropout->forward(Ar);
-    //     As = dropout->forward(As); // As is also used
-    // }
 
-
-    // GATHER
+    // Gather operations
     // auto Y_q = torch::einsum("bhijk,bhjd,bhkd->bhid", {Aq, Vr_1, Vs_1});
     // auto Y_r = torch::einsum("bhijk,bhid,bhkd->bhjd", {Ar, Vq_1, Vs_1});
     // auto Y_s = torch::einsum("bhijk,bhid,bhjd->bhkd", {As, Vq_1, Vr_1});
-
-    // // Return dummy gather tensors (for testing)
-    // auto Y_q = torch::zeros_like(Vq_1);
-    // auto Y_r = torch::zeros_like(Vr_1);
-    // auto Y_s = torch::zeros_like(Vs_1);
     
-    // SCATTER (only compute Y_q_ for testing)
+    // Scatter operations
     auto ArAs = Ar * As;
     auto Y_q_ = torch::einsum("bhijk,bhjd,bhkd->bhid", {ArAs, Vr_2, Vs_2});
     
-    // Return dummy scatter tensors (for testing)
-    // auto Y_q_ = torch::zeros_like(Vq_2);
-    // auto Y_r_ = torch::zeros_like(Vr_2);
-    // auto Y_s_ = torch::zeros_like(Vs_2);
+    // auto AqAs = Aq * As;
+    // auto Y_r_ = torch::einsum("bhijk,bhid,bhkd->bhjd", {AqAs, Vq_2, Vs_2});
+    
+    // auto AqAr = Aq * Ar;
+    // auto Y_s_ = torch::einsum("bhijk,bhid,bhjd->bhkd", {AqAr, Vq_2, Vr_2});
+    
+    // Return dummy tensors (for testing)
+    auto Y_q = torch::zeros_like(Vq_1);
+    auto Y_r = torch::zeros_like(Vr_1);
+    auto Y_s = torch::zeros_like(Vs_1);
+    auto Y_r_ = torch::zeros_like(Vr_2);
+    auto Y_s_ = torch::zeros_like(Vs_2);
+
 
     return std::make_tuple(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_);
 }
