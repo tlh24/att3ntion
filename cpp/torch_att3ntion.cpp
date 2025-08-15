@@ -21,19 +21,19 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     dot_product = dot_product / std::sqrt(static_cast<double>(head_dim));
 
     // Aq - gathering to position i (softmax over j,k)
-    auto Aq = torch::softmax(dot_product.flatten(3, 4), -1).reshape_as(dot_product);
+    // auto Aq = torch::softmax(dot_product.flatten(3, 4), -1).reshape_as(dot_product);
     
     // Ar - gathering to position j (softmax over i,k)
-    // auto dot_product_r = dot_product.permute({0, 1, 3, 2, 4});
-    // auto Ar = torch::softmax(dot_product_r.flatten(3, 4), -1).reshape_as(dot_product_r);
-    // Ar = Ar.permute({0, 1, 3, 2, 4});
-    auto Ar = torch::zeros_like(Aq); // Dummy tensor
+    auto dot_product_r = dot_product.permute({0, 1, 3, 2, 4});
+    auto Ar = torch::softmax(dot_product_r.flatten(3, 4), -1).reshape_as(dot_product_r);
+    Ar = Ar.permute({0, 1, 3, 2, 4});
+    // auto Ar = torch::zeros_like(Aq); // Dummy tensor
     
     // As - gathering to position k (softmax over i,j)
-    // auto dot_product_s = dot_product.permute({0, 1, 4, 2, 3});
-    // auto As = torch::softmax(dot_product_s.flatten(3, 4), -1).reshape_as(dot_product_s);
-    // As = As.permute({0, 1, 3, 4, 2});
-    auto As = torch::zeros_like(Aq); // Dummy tensor
+    auto dot_product_s = dot_product.permute({0, 1, 4, 2, 3});
+    auto As = torch::softmax(dot_product_s.flatten(3, 4), -1).reshape_as(dot_product_s);
+    As = As.permute({0, 1, 3, 4, 2});
+    // auto As = torch::zeros_like(Aq); // Dummy tensor
     
     // Dropout only if necessary for Yq_scatter
     // if (dropout_rate > 0.0) {
@@ -43,23 +43,26 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     //     Ar = dropout->forward(Ar);
     //     As = dropout->forward(As); // As is also used
     // }
-    
-    auto Y_q = torch::einsum("bhijk,bhjd,bhkd->bhid", {Aq, Vr_1, Vs_1});
+
+
+    // GATHER
+    // auto Y_q = torch::einsum("bhijk,bhjd,bhkd->bhid", {Aq, Vr_1, Vs_1});
     // auto Y_r = torch::einsum("bhijk,bhid,bhkd->bhjd", {Ar, Vq_1, Vs_1});
     // auto Y_s = torch::einsum("bhijk,bhid,bhjd->bhkd", {As, Vq_1, Vr_1});
-    // // Return dummy tensors 
+
+    // // Return dummy gather tensors (for testing)
     // auto Y_q = torch::zeros_like(Vq_1);
-    auto Y_r = torch::zeros_like(Vr_1);
-    auto Y_s = torch::zeros_like(Vs_1);
+    // auto Y_r = torch::zeros_like(Vr_1);
+    // auto Y_s = torch::zeros_like(Vs_1);
     
-    // Scatter operations - ONLY compute Y_q_
-    // auto ArAs = Ar * As;
-    // auto Y_q_ = torch::einsum("bhijk,bhjd,bhkd->bhid", {ArAs, Vr_2, Vs_2});
+    // SCATTER (only compute Y_q_ for testing)
+    auto ArAs = Ar * As;
+    auto Y_q_ = torch::einsum("bhijk,bhjd,bhkd->bhid", {ArAs, Vr_2, Vs_2});
     
-    // Return dummy tensors for Y_r_ and Y_s_
-    auto Y_q_ = torch::zeros_like(Vq_2);
-    auto Y_r_ = torch::zeros_like(Vr_2);
-    auto Y_s_ = torch::zeros_like(Vs_2);
+    // Return dummy scatter tensors (for testing)
+    // auto Y_q_ = torch::zeros_like(Vq_2);
+    // auto Y_r_ = torch::zeros_like(Vr_2);
+    // auto Y_s_ = torch::zeros_like(Vs_2);
 
     return std::make_tuple(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_);
 }
