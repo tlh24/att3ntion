@@ -98,7 +98,13 @@ class HypergraphAttention(nn.Module):
 		Y_r = torch.einsum('bhijk,bhid,bhkd->bhjd', Ar, Vq, Vs)  
 		Y_s = torch.einsum('bhijk,bhid,bhjd->bhkd', As, Vq, Vr) 
 		
-		# Scatter opeartions
+		# Scatter operations
+		# optional softmax-transpose: redo A_q, A_r, A_s
+		# Aq - scattering to position i (softmax over i)
+		Aq = torch.softmax(dot_product, dim=2) # softmax over i
+		Ar = torch.softmax(dot_product, dim=3) # softmax over j
+		As = torch.softmax(dot_product, dim=4) # softmax over k
+
 		# Y_q_ = torch.einsum('bhijk,bhjd->bhid', Ar, Vr_) + \
 		# 		 torch.einsum('bhijk,bhkd->bhid', As, Vs_)
 		# Y_r_ = torch.einsum('bhijk,bhid->bhjd', Aq, Vq_) + \
