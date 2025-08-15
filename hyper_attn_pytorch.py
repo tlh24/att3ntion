@@ -102,6 +102,12 @@ class HypergraphAttention_Naive(nn.Module):
 		Y_s = torch.einsum('bhijk,bhid,bhjd->bhkd', As, Vq, Vr)
 		
 		# Scatter operations
+		if True:
+			# NOTE optional softmax-transpose: redo A_q, A_r, A_s
+			Aq = torch.softmax(dot_product, dim=2) # softmax over i
+			Ar = torch.softmax(dot_product, dim=3) # softmax over j
+			As = torch.softmax(dot_product, dim=4) # softmax over k
+
 		if False:
 		# 'diamond' op is add; this seems very slightly slower to converge
 		# in some tasks, it does not converge.
