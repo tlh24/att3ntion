@@ -6,7 +6,7 @@
 #include <tuple>  
 #include <iomanip> 
 #include <cuda_runtime.h> 
-
+#include "manual_att3ntion.h"
 // Forward declarations for CUDA 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
           torch::Tensor, torch::Tensor,
@@ -1248,7 +1248,7 @@ torch::Tensor compute_grad_A_single(
     const int K = S_slice.size(0);
     const int D = Q_slice.size(1);
     const int N = grad_output_slice.size(0); 
-    auto options = Q_slice.options(); 
+    // auto options = Q_slice.options(); 
 
     auto grad_output_acc = grad_output_slice.accessor<float, 2>();
     auto Vq_1_acc = Vq_1_slice.accessor<float, 2>();
@@ -1485,9 +1485,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     const int B = Q.size(0);
     const int H = Q.size(1);
 
-    const int I = Q.size(2);
-    const int J = R.size(2);
-    const int K = S.size(2);
+    // const int I = Q.size(2);
+    // const int J = R.size(2);
+    // const int K = S.size(2);
     const int D = Q.size(3);
     const float scale = 1.0f / std::sqrt(static_cast<float>(D));
 
@@ -1524,7 +1524,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             auto Vs_2_slice = Vs_2.select(0, b).select(0, h);
 
             auto grad_output_slice = grad_output.select(0, b).select(0, h);
-            const int N = grad_output_slice.size(0);
+            // const int N = grad_output_slice.size(0);
 
             torch::Tensor A_slice, Aq_slice, Ar_slice, As_slice;
             std::tie(A_slice, Aq_slice, Ar_slice, As_slice) =
