@@ -2,6 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import random
 import math
+import argparse
 import pdb
 
 def randint(k):
@@ -15,6 +16,37 @@ def modOp(va, vb, op, md):
 		vc3 = 0 # can't divide by zero!
 	else:
 		vc3 = (va // vb) % md
+
+	match op:
+		case 0:
+			vc = vc0
+			ops = '+'
+		case 1:
+			vc = vc1
+			ops = '-'
+		case 2:
+			vc = vc2
+			ops = '*'
+		case 3:
+			vc = vc3
+			ops = '/'
+	return vc, ops
+
+def clipOp(va, vb, op, md):
+	def clip(x):
+		if x > md-1:
+			return md-1
+		if x < 0:
+			return 0
+		return x
+
+	vc0 = clip(va + vb)
+	vc1 = clip(va - vb)
+	vc2 = clip(va * vb)
+	if vb == 0:
+		vc3 = 0 # can't divide by zero!
+	else:
+		vc3 = clip(va // vb)
 
 	match op:
 		case 0:
@@ -101,38 +133,90 @@ def genData2(bs, md, do_print=False):
 	# endfor b
 	return x
 
-def genData3(bs, md):
+def graycodePosEnc(ntok, nbits, rand_phase=False):
+	'''
+	Generate a graycode
+	seems more principled than standard SPE?
+	'''
+	pos_enc = np.zeros((ntok,nbits*2), dtype=np.float32)
+	indx = np.linspace(0, (ntok-1)*2*math.pi, ntok)
+	if rand_phase:
+		phase_offset = np.random.uniform() * 2 * math.pi
+	else:
+		phase_offset = 0
+	for i in range(nbits):
+		# gray code: [0][1] has a period of 4
+		# [2][3] has a period of sqrt(4*8) = sqrt(32) = 4 sqrt(2)
+		# [4][5] period of 8..
+		# period = 4 * (math.sqrt(2.0))**i
+		#   above is slower - does not help?
+		period = 4 * 2.0**i
+		if True:
+			# sinusoidal, seems to work better?
+			pos_enc[:, 2*i  ] = -np.cos(indx / period + phase_offset)
+			pos_enc[:, 2*i+1] = np.sin(indx / period + phase_offset)
+		else:
+			# graycode! (thresholded)
+			pos_enc[:, 2*i  ] = np.cos(indx / period + phase_offset) < 0
+			pos_enc[:, 2*i+1] = np.sin(indx / period + phase_offset) < 0
+	return pos_enc
+
+def genData3(bs, do_print=False):
 	'''
 	Task 3: from a list of 8 integers,
 	compute the op of two of them based on *pointers*
 	rather than positional arguments.
 	This ought to be easy.
 	'''
-	pos_enc = np.zeros((10,8), dtype=np.float32)
-	indx = np.linspace(0, 2*3.1415926, 10)
-	for i in range(4):
-		freq = 2**(i/3)
-		pos_enc[:, 2*i  ] = np.sin(indx * freq)
-		pos_enc[:, 2*i+1] = np.cos(indx * freq)
+	ntok = 16
+	nbits = 4
+	md = 64 - (5 + (nbits*2)*3) # 35
 
-	x = np.zeros((bs, 10, md + 5 + 8*3), dtype=np.float32)
+	x = np.zeros((bs, ntok, md + 5 + (nbits*2)*3), dtype=np.float32)
+	y = np.zeros_like(x)
+	nd = ntok - 2
 	for b in range(bs):
-		d = np.random.randint(1, md, size=(8,))
-		ai = randint(8)
-		bi = randint(8)
+		pos_enc = graycodePosEnc(ntok, nbits, rand_phase=True)
+		d = np.random.randint(1, 8, size=(nd,))
+		ai = randint(nd)
+		bi = randint(nd)
 		op = randint(4)
-		c,_ = modOp(d[ai], d[bi], op, md)
-		for k in range(8):
+		c,ops = clipOp(d[ai], d[bi], op, md)
+		# encode the list of nd integers
+		for k in range(nd):
 			x[b,k,d[k]+5] = 1
-		x[b,8,op] = 1
-		x[b,9,4 ] = 1 # result
+		x[b,nd,op] = 1
+		x[b,nd+1,4 ] = 1 # result
 		# positional encoding
 		x[b,:,md+5:md+5+8] = pos_enc
-		x[b,8,md+5+8:md+5+16] = pos_enc[ai,:]
-		x[b,8,md+5+16:md+5+24] = pos_enc[bi,:]
-		x[b,9,md+5+8:md+5+16] = pos_enc[8,:] # point to op
+		x[b,nd,md+5+8:md+5+16] = pos_enc[ai,:]
+		x[b,nd,md+5+16:md+5+24] = pos_enc[bi,:]
+		x[b,nd+1,md+5+8:md+5+16] = pos_enc[8,:] # point to op
+		# y[b,nd+1, 5+d[ai]] = 1 # TEST - works super fast
+		# y[b,nd+1, 5+d[bi]] = 1
+		# y[b,nd+1,md+5+8:md+5+16] = pos_enc[ai,:] # copy pointer
+		# y[b,nd+1,md+5+16:md+5+24] = pos_enc[bi,:]
+		y[b,nd+1, 5+c] = 1
+		if do_print:
+			for i in range(nd):
+				print(d[i], end=' ')
+			print(f"\nd[{ai}] {ops} d[{bi}] = {d[ai]} {ops} {d[bi]} = {c}")
 
-	return x
+	return x,y
+
+def plotData3():
+	x,y = genData3(800, do_print=False) # Test
+	bs = 3
+	x,y = genData3(bs, do_print=True)
+	fig,axs = plt.subplots(bs,2)
+	for b in range(bs):
+		im = axs[b, 0].imshow(np.squeeze(x[b,:,:]))
+		plt.colorbar(im, ax=axs[b, 0])
+		im = axs[b, 1].imshow(np.squeeze(y[b,:,:]))
+		plt.colorbar(im, ax=axs[b, 1])
+		axs[b,0].set_title('X')
+		axs[b,1].set_title('Y')
+	plt.show()
 
 OPERATORS = ['+', '-', '*', '/']
 
@@ -147,16 +231,17 @@ class Expression:
 		self.rparen_loc = 0
 
 	def __str__(self):
-		if self.value is not None:
+		if self.op is None:
 			return str(self.value)
 		operator = OPERATORS[self.op]
 		return f"({self.left} {operator} {self.right})"
 
 	def setLocRec(self, loc):
-		if self.value is not None:
+		if self.op is None:
 			self.loc = loc
 			return loc + 1
 		else:
+			self.value = 0 # clear the value if it's an op
 			self.lparen_loc = loc
 			loc += 1
 			loc = self.left.setLocRec(loc)
@@ -175,37 +260,53 @@ class Expression:
 			return str(self.loc)
 		return f"({self.left.printLoc()} {self.loc} {self.right.printLoc()})"
 
+	def count(self):
+		if self.op is None:
+			return 1 # ourself
+		else:
+			# 3 is for (,op,)
+			return 3 + self.left.count() + self.right.count()
+
 	def printParentLoc(self, parent):
-		if self.value is not None:
+		if self.op is None:
 			return str(parent)
 		return f"({self.left.printParentLoc(self.loc)} {parent} {self.right.printParentLoc(self.loc)})"
 
 	def encode(self, md, x, b, pos_enc):
 		# need to just encode the left and right children
 		c = self.loc
-		if self.value is not None:
+		if self.op is None:
 			x[b,c,self.value+5] = 1
 			x[b,c,md+5:md+5+8] = pos_enc[c] # abs loc
+			return c+1
 		else:
 			lc = self.lparen_loc
 			rc = self.rparen_loc
 			x[b,lc,0] = -1 # "("
+			x[b,lc,5] = 1 # paren is zero
 			x[b,lc,md+5:md+5+8] = pos_enc[lc] # abs loc
 			self.left.encode(md, x, b, pos_enc)
 			x[b,c,self.op] = 1
+			if self.value is not None:
+				x[b,c,self.value+5] = 1 # if op is evaluated
+			else:
+				x[b,c,5] = 1 # default to zero
 			x[b,c,md+5:md+5+8] = pos_enc[c] # abs loc
 			x[b,c,md+5+8:md+5+16] = pos_enc[self.left.getLoc()]
 			x[b,c,md+5+16:md+5+24] = pos_enc[self.right.getLoc()]
 			self.right.encode(md, x, b, pos_enc)
 			x[b,rc,1] = -1 # ")"
+			x[b,rc,5] = 1 # paren is zero
 			x[b,rc,md+5:md+5+8] = pos_enc[rc] # abs loc
 			x[b,rc,md+5+8:md+5+16] = 0 # no parent
+			return rc+1
 
 	def evaluate(self, md:int):
 		# recusively evaluate the expression
-		if self.value is not None:
-			return self.value % md
-		c,_ = modOp(self.left.evaluate(md), self.right.evaluate(md), self.op, md)
+		if self.op is None:
+			return self.value
+		c,_ = clipOp(self.left.evaluate(md), self.right.evaluate(md), self.op, md)
+		self.value = c # save for supervised learning
 		return c
 
 class ExpressionGenerator:
@@ -251,79 +352,114 @@ class ExpressionGenerator:
 
 		return Expression(operator=op, left=left_child, right=right_child)
 
-def genData4(bs, md, do_print=False):
+class ExpressionGeneratorDepth:
+	"""Recursively generates random arithmetic expression trees."""
+
+	def __init__(self, max_depth, modulo):
+		self.max_depth = max(1, max_depth) # Need at least 2 terms for an op
+		self.modulo = modulo
+		# these 'catalan' numbers start at 2.
+		self.n_depth = [2, 10, 25, 49, 81]
+		self.n_depth_cumsum = np.cumsum(self.n_depth)
+
+	def generate(self):
+		# unlike the original code, which tries to make all
+		# expressions equally probable (via catalan numbers),
+		# just generate a random depth, weighted by n_depth
+		r = random.randrange(0, self.n_depth_cumsum[self.max_depth-1])
+		depth = np.sum(self.n_depth_cumsum < r) + 1
+		# print("depth:", depth)
+		if depth > self.max_depth:
+			pdb.set_trace()
+		return self._generate_recursive(depth)
+
+	def _generate_recursive(self, depth):
+		"""The core recursive generation logic."""
+		# Base case: if only one term is left, it must be a number.
+		if depth <= 0:
+			return Expression(value=1+random.randrange(self.modulo-1))
+
+		op = random.randrange(4)
+
+		r = random.randrange(0, self.n_depth_cumsum[depth-1])
+		left_depth = np.sum(self.n_depth_cumsum < r) # no offset
+		left_child = self._generate_recursive(left_depth)
+
+		r = random.randrange(0, self.n_depth_cumsum[depth-1])
+		right_depth = np.sum(self.n_depth_cumsum < r) # no offset
+		right_child = self._generate_recursive(right_depth)
+
+		return Expression(operator=op, left=left_child, right=right_child)
+
+def genData4(bs, do_print=False):
 	'''
 	Task 4: from random arithmetic expressions,
-	generate parse trees
+	generate parse trees & evaluate them
 	'''
-	ntok = 16
-	pos_enc = np.zeros((ntok,8), dtype=np.float32)
-	indx = np.linspace(0, 2*3.1415926, ntok)
+	ntok = 32
+	nbits = 4 # hardcoded in class expression
+	md = 64 - (5 + (nbits*2)*3) # 35
 
 	rng = np.random.default_rng()
 	x = np.zeros((bs, ntok, md + 5 + 8*3), dtype=np.float32)
-	exp_gen = ExpressionGenerator(2, md) # NOTE!!!
+	y = np.zeros_like(x)
+	exp_gen = ExpressionGeneratorDepth(4, 7) # NOTE!!!
 	for b in range(bs):
-		tree = exp_gen.generate()
-		tree.setLocRec(0)
-		if do_print:
-			print("expr:", tree)
-			print("loc :", tree.printLoc())
-			print("ploc:", tree.printParentLoc(ntok-1))
-		# pos_enc_permute = rng.permutation(pos_enc, axis=0)
-		# pos_enc_permute = np.copy(pos_enc)
-		for i in range(4):
-			freq = 2**(i/3)
-			rand_phase = np.random.uniform(0, 3.1415926*2)
-			pos_enc[:, 2*i  ] = np.sin(indx * freq + rand_phase)
-			pos_enc[:, 2*i+1] = np.cos(indx * freq + rand_phase)
-		tree.encode(md, x, b, pos_enc)
-		# encode the result
-		result = tree.evaluate(md)
-		if do_print:
-			print("res: ", result)
-		x[b, -1, 4] = 1
-		x[b, -1, result+5] = 1
-		x[b, -1, md+5:md+5+8] = pos_enc[-1]
-		x[b, -1, md+5+8:md+5+16] = pos_enc[tree.getLoc()]
+		pos_enc = graycodePosEnc(ntok, nbits, rand_phase=True)
+		tries = 10
+		cnt = 0
+		while tries > 0:
+			# could do a much better packing alg ..meh
+			val = 0
+			while val == 0:
+				tree = exp_gen.generate()
+				val = tree.evaluate(md)
+			# pos_enc_permute = rng.permutation(pos_enc, axis=0)
+			# pos_enc_permute = np.copy(pos_enc)
+			n = tree.count()
+			result = tree.evaluate(md) # sets internal values of the ops
+			if n + 1 + cnt < 32 and result > 0 and result < md-1: # one spot for the result
+				tree.setLocRec(cnt) # also resets eval.
+				if do_print:
+					print(f"[{b}] expr:", tree)
+					print(f"[{b}] res loc :", tree.printLoc())
+					print(f"[{b}] ploc:", tree.printParentLoc(tree.getLoc()))
+				tree.encode(md, x, b, pos_enc)
+				# encode the result
+				result = tree.evaluate(md) # sets internal values of the ops
+				if do_print:
+					print(f"[{b}] res: ", result)
+				tree.encode(md, y, b, pos_enc)
+				cnt += n
+				x[b, cnt, 4] = 1
+				x[b, cnt, md+5:md+5+8] = pos_enc[cnt]
+				y[b, cnt, 4] = 1
+				y[b, cnt, result+5] = 1
+				y[b, cnt, md+5:md+5+8] = pos_enc[cnt]
+				y[b, cnt, md+5+8:md+5+16] = pos_enc[tree.getLoc()] # predict this!
+				cnt += 1
+			else:
+				tries -= 1
 
-	return x
+			# x[b, cnt:, 5] = 1 # default zero value
+			# y[b, cnt:, 5] = 1 # o/w crossentropy is undefined
+
+	x[:, :, md+5+8:] = 0 # mask pointer: model must predict
+	return x,y
 
 def plotData4():
-	x = genData4(800, 11, do_print=False) # Test
-	x = genData4(8, 11, do_print=True)
-	print(x.shape)
-	fig,axs = plt.subplots(4,2)
-	for i in range(8):
-		j = i // 2
-		k = i % 2
-		axs[j,k].imshow(np.squeeze(x[i,...]))
+	x,y = genData4(800, do_print=False) # Test
+	bs = 4
+	x,y = genData4(bs, do_print=True)
+	fig,axs = plt.subplots(bs,2)
+	for b in range(bs):
+		im = axs[b, 0].imshow(np.squeeze(x[b,:,:]))
+		plt.colorbar(im, ax=axs[b, 0])
+		im = axs[b, 1].imshow(np.squeeze(y[b,:,:]))
+		plt.colorbar(im, ax=axs[b, 1])
+		axs[b,0].set_title('X')
+		axs[b,1].set_title('Y')
 	plt.show()
-
-def graycodePosEnc(ntok, nbits):
-	'''
-	Generate a graycode
-	seems more principled than standard SPE?
-	'''
-	pos_enc = np.zeros((ntok,nbits*2), dtype=np.float32)
-	indx = np.linspace(0, (ntok-1)*2*math.pi, ntok)
-	for i in range(nbits):
-		# gray code: [0][1] has a period of 4
-		# [2][3] has a period of sqrt(4*8) = sqrt(32) = 4 sqrt(2)
-		# [4][5] period of 8..
-		# period = 4 * (math.sqrt(2.0))**i
-		# above is slower - does not help?
-		period = 4 * 2.0**i
-		phase = math.pi / period # indx is scaled by 2 pi
-		if True:
-			# sinusoidal, seems to work better?
-			pos_enc[:, 2*i  ] = -np.cos(indx / period + phase)
-			pos_enc[:, 2*i+1] = np.sin(indx / period + phase)
-		else:
-			# graycode! (thresholded)
-			pos_enc[:, 2*i  ] = np.cos(indx / period + phase) < 0
-			pos_enc[:, 2*i+1] = np.sin(indx / period + phase) < 0
-	return pos_enc
 
 def genData5(bs,md, do_print):
 	'''
@@ -391,11 +527,11 @@ def genData6(bs, do_print):
 	train the network to accurately multiply two one-digit
 	base 16 numbers.  Yes, the computer can do trillions of these things per sec .. this is super inefficient.  But.
 	'''
-	md = 8 + 16 + 8 # one-hot indicators, digits, pointer,
+	md = 8 + 16 + 8 # one-hot indicators, digits, pointer, [posenc]
 	ntok = 8
 	nbits = 4
 
-	pos_enc = graycodePosEnc(ntok, nbits)
+	pos_enc = graycodePosEnc(ntok, nbits, rand_phase=False)
 	x = np.zeros((bs, ntok, md + nbits*2), dtype=np.float32)
 	y = np.zeros_like(x)
 	x[:, :, -nbits*2:] = pos_enc
@@ -404,14 +540,18 @@ def genData6(bs, do_print):
 	for b in range(bs):
 		va = randint(16)
 		vb = randint(16)
-		vc = va*vb
+		op = randint(2)
+		if op == 0:
+			vc = va + vb
+		else:
+			vc = va*vb
 		vc0 = vc % 16
 		vc1 = vc // 16
 		def encode(tok, val):
 			x[b, tok, 0] = 1.0 # occupied!
 			x[b, tok, val] += 1.0
 		encode(0, va + 8)
-		encode(1, 3) # * : +-*/=? -> 123456
+		encode(1, 1+op*2) # * : +-*/=?() -> 12345678
 		encode(2, vb + 8)
 		encode(3, 5) # =
 		encode(4, 6) # ? (result)
@@ -448,17 +588,494 @@ def plotData6():
 		axs[b,1].set_title('Y')
 	plt.show()
 
+class Encoder:
+	'''
+	helper class for genData7
+	encodes individual values / symbols,
+	or encodes lists of values.
+	'''
+	def __init__(self, ntok, nbits, do_print):
+		self.tok_ctr = 0
+		self.vert_ctr = 0
+		self.horiz_ctr = np.zeros(16, dtype=int)
+		self.pos_enc = graycodePosEnc(ntok, nbits, rand_phase=False)
+		self.nbits = nbits
+		self.do_print = do_print
+
+	def encode(self, z, b, val, pos_space):
+		if type(val) == str:
+			dic = [' ','+','-','*','/','=','?','(',')','sl1','sl2','$']
+			# technically it's shift /right/ since this is little-endian..
+			v = dic.index(val)
+		else:
+			v = val + 16 # number of operations
+		z[b, self.tok_ctr, 0] = 1.0 # occupied!
+		z[b, self.tok_ctr, v] = 1.0
+		pos = self.horiz_ctr[pos_space]
+		# 2d addressing scheme!
+		nb = self.nbits
+		z[b, self.tok_ctr, -nb*2:] = self.pos_enc[pos, :]
+		z[b, self.tok_ctr, -nb*4:-nb*2] = self.pos_enc[pos_space, :]
+		self.tok_ctr += 1
+		self.horiz_ctr[pos_space] += 1
+		if self.do_print:
+			if type(val) == str:
+				print(val, end=' ')
+			else:
+				print(f'{val:x}', end=' ')
+
+	def encodePtr(self, z, b, val, lparent, rparent, pos_space):
+		if type(val) == str:
+			dic = [' ','+','-','*','/','=','?','(',')','sl1','sl2','$']
+			v = dic.index(val)
+		else:
+			v = val + 16 # number of operations
+		z[b, self.tok_ctr, 0] = 1.0 # occupied!
+		z[b, self.tok_ctr, v] = 1.0
+		pos = self.horiz_ctr[pos_space]
+		# 2d addressing scheme!
+		nb = self.nbits
+		z[b, self.tok_ctr, -nb*2:] = self.pos_enc[pos, :]
+		z[b, self.tok_ctr, -nb*4:-nb*2] = self.pos_enc[pos_space, :]
+		# encode the 2d lparent & rparent (seems so inefficient?)
+		z[b, self.tok_ctr, -nb*6 :-nb*4 ] = self.pos_enc[lparent[0], :]
+		z[b, self.tok_ctr, -nb*8 :-nb*6 ] = self.pos_enc[lparent[1], :]
+		z[b, self.tok_ctr, -nb*10:-nb*8 ] = self.pos_enc[rparent[0], :]
+		z[b, self.tok_ctr, -nb*12:-nb*10] = self.pos_enc[rparent[1], :]
+		self.tok_ctr += 1
+		self.horiz_ctr[pos_space] += 1
+		if self.do_print:
+			if type(val) == str:
+				print(val, end=' ')
+			else:
+				print(f'{val:x}', end=' ')
+
+	def encodeList(self, z, b, val_list):
+		if self.do_print:
+			print(f"{self.vert_ctr}: ", end='')
+		for val in val_list:
+			self.encode(z, b, val, self.vert_ctr)
+		if self.do_print:
+			print(" ") # newline
+		self.vert_ctr += 1
+
+	def encodeListPtrs(self, z, b, val_list, lparents, rparents):
+		''' encode a list with pointers!'''
+		if self.do_print:
+			print(f"{self.vert_ctr}: ", end='')
+		for i in range(len(val_list)):
+			self.encodePtr(z, b, val_list[i], lparents[i], rparents[i], self.vert_ctr)
+		if self.do_print:
+			print(lparents, rparents)
+		self.vert_ctr += 1
+
+
+def genData7(bs, do_print=False, validation=False):
+	'''
+	train a network on one step tasks:
+	0 - add two single-digit numbers
+	1 - multiply two single-digit hex numbers
+	2 - add two 1-4 digit hex numbers (requires 4+ layers for carry)
+	3 - shift left 1 and 2 places.
+	'''
+	nop = 16 # _+-*/=?() -> 012345678
+	ntok = 52 # 8 for the simple tasks, 28 for sub-task 3
+	nbits = 8
+
+	md = nop + 16 + (nbits*2)*2*(1+2)
+	# one-hot indicators, digits, 2 pointers, 2d posenc
+	x = np.zeros((bs, ntok, md), dtype=np.float32)
+	y = np.zeros_like(x)
+
+	def encHex(lst, val, ndigits=0):
+		va0 = val & 0xf
+		va1 = (val >> 4) & 0xf
+		va2 = (val >> 8) & 0xf
+		va3 = (val >> 12) & 0xf
+		va4 = (val >> 16) & 0xf
+		va5 = (val >> 20) & 0xf
+		pos = len(lst)
+		lst_pos = []
+		lst.append(va0)
+		lst_pos.append(pos)
+		pos += 1
+		if val >= 16 or ndigits >= 2:
+			lst.append(va1)
+			lst_pos.append(pos)
+			pos += 1
+		if val >= 256 or ndigits >= 3:
+			lst.append(va2)
+			lst_pos.append(pos)
+			pos += 1
+		if val >= 4096 or ndigits >= 4:
+			lst.append(va3)
+			lst_pos.append(pos)
+			pos += 1
+		if val >= 65536 or ndigits >= 5:
+			lst.append(va4)
+			lst_pos.append(pos)
+			pos += 1
+		if val >= 65536*16 or ndigits >= 6:
+			lst.append(va5)
+			lst_pos.append(pos)
+			pos += 1
+		return lst
+
+	for b in range(bs):
+		# new encoder per batch for a random phase.
+		enc = Encoder(ntok, nbits, do_print)
+		x[b, :, -nbits*2:] = enc.pos_enc # "horizontal"
+		x[b, :, -nbits*4:-nbits*2] = enc.pos_enc[0,:] # "vertical"
+		# e.g. everything starts off as flat..
+		# task = b % 4
+		task = 2
+		if task == 0: # add, very easy for both
+			va = randint(16)
+			vb = randint(16)
+			vc = va*vb
+			vc0 = vc & 0xf
+			vc1 = vc >> 4
+			enc.encodeList(x, b, [va, '+', vb])
+			# enc.encodeList(y, b, [vc0, vc1])
+			enc.encodeList(y, b, encHex([], vc))
+
+		if task == 1: # multiply, very easy for both
+			va = randint(16)
+			vb = randint(16)
+			vc = va*vb
+			vc0 = vc & 0xf
+			vc1 = vc >> 4
+			enc.encodeList(x, b, [va, '*', vb])
+			# enc.encodeList(y, b, [vc0, vc1])
+			enc.encodeList(y, b, encHex([], vc))
+
+		if task == 2 and False:
+			na = randint(4)+1
+			nb = randint(4)+1
+			# na = 4
+			# nb = 4
+			va = randint(16**na)
+			vb = randint(16**nb)
+			# encode the problem
+			lst = []
+			lst = encHex(lst, va, ndigits=4) # ndigits makes it fixed
+			lst.append('+')
+			lst = encHex(lst, vb, ndigits=4)
+			enc.encodeList(x, b, lst)
+			# and the solution
+			vc = va + vb
+			lst = []
+			lst = encHex(lst, vc)
+			enc.encodeList(y, b, lst)
+
+		# do subtask 2 add in a different way, cascade fashion: spell out the carries
+		if task == 2 and False:
+			na = randint(4)+1
+			nb = randint(4)+1
+			# na = 4
+			# nb = 4
+			va = randint(16**na)
+			vb = randint(16**nb)
+			# encode the problem
+			lst = []
+			lst = encHex(lst, va)
+			lst.append('+')
+			lst = encHex(lst, vb)
+			enc.encodeList(x, b, lst)
+			steps = max(na,nb) + 1
+			step = randint(steps)
+			# and the solution -- spell it out w/ carries
+			for i in range(step-1):
+				vc = ((va >> (4*i)) & 0xf) + ((vb >> (4*i)) & 0xf)
+				lst = []
+				lst = encHex(lst, vc << (4*i))
+				if i == step:
+					enc.encodeList(y, b, lst)
+				elif i < step:
+					enc.encodeList(x, b, lst)
+			if step == max(na,nb):
+				vc = va + vb
+				lst = []
+				lst = encHex(lst, vc)
+				enc.encodeList(y, b, lst)
+
+		# do subtask 3 in yet another different way - setup a graph
+		# then execute it
+		# start with a fixed graph; we can change it later?
+		if task == 2 and False:
+			na = 4
+			nb = 4
+			va = randint(16**na)
+			vb = randint(16**nb)
+			lst = []
+			lst = encHex(lst, va, ndigits=na)
+			lst.append('+')
+			lst = encHex(lst, vb, ndigits=nb)
+			enc.encodeList(x, b, lst)
+			step = b % 4
+			ndigits = max(na, nb)
+			# two-phase process:
+			# setup the graph, then execute it, alocating as needed.
+			vc0 = []
+			vc1 = []
+			vo = []
+			def encodeStep(enc, z, i):
+				nonlocal x, y, b, vc0, vc1, vo
+				if i == 0:
+					# setup graph for adding all digits in parallel
+					enc.encodeListPtrs(z, b, ['+','+','+','+'],\
+						[(0,0),(0,1),(0,2),(0,3)], [(0,5),(0,6),(0,7),(0,8)]) # y=1
+				if i == 1:
+					# do the calculations
+					for j in range(ndigits):
+						vc = ((va >> 4*j) & 0xf) + ((vb >> 4*j) & 0xf)
+						vc0.append(vc & 0xf)
+						vc1.append((vc >> 4) & 0xf)
+					enc.encodeListPtrs(z, b, vc0, \
+						[(1,0),(1,1),(1,2),(1,3)], [(0,0),(0,0),(0,0),(0,0)],) # y=2
+					enc.encodeListPtrs(z, b, vc1, \
+						[(1,0),(1,1),(1,2),(1,3)], [(2,0),(2,1),(2,2),(2,3)]) # y=3
+				if i == 2:
+					# ref vc0[0], vc0[1] + vc1[0], vc0[2] + vc1[1], ref vc1[2]
+					# beware the cascaded carries!
+					enc.encodeListPtrs(z, b, ['$','+','+','+','$'],\
+						[(2,0), (2,1), (2,2), (2,3), (3,3)],\
+						[(0,0), (3,0), (3,1), (3,2), (0,0)]) # y=4
+				if i == 3:
+					# results
+					vo = [vc0[0], vc0[1]+vc1[0], vc0[2]+vc1[1], vc0[3]+vc1[2], vc1[3]]
+					enc.encodeListPtrs(z, b, vo, \
+						[(4,0),(4,1),(4,2),(4,3),(4,4)], [(0,0),(5,0),(5,1),(5,2),(5,3)]) # y=5
+				# TODO: point back to the original op, (0,3)
+
+			for i in range(step):
+				encodeStep(enc, x, i)
+			encodeStep(enc, y, step) # supervised target
+
+		if task == 2:
+			na = randint(4) + 1
+			nb = randint(4) + 1
+			if validation:
+				na = 4
+				nb = 4
+			va = randint(16**na)
+			vb = randint(16**nb)
+			lst = []
+			# encode the first digit with a leading zero
+			# which can be used for subsequent additions.
+			lst = [0]
+			lst = encHex(lst, va, ndigits=na)
+			lst.append('+')
+			lst = encHex(lst, vb, ndigits=nb)
+			lst.append('=') # need to delineate end-of-number/expression
+			enc.encodeList(x, b, lst)
+			ndigits = max(na, nb)
+			numsteps = 4 + 2*(ndigits-1) # dont count the problem.
+			step = b % numsteps
+
+			# two-phase process:
+			# setup the graph, then execute it, alocating as needed.
+			vc0 = [] # list of lists
+			vc1 = []
+			vo = []
+			def encodeStep(enc, z, i):
+				nonlocal x, y, b, vc0, vc1, vo
+				if i == 0:
+					# setup graph for adding all digits in parallel
+					ops = ['+' for _ in range(ndigits)]
+					lparent = [(0,i+1) for i in range(na)]
+					lparent.extend([(0,0) for _ in range(ndigits-na)])
+					rparent = [(0,na+i+2) for i in range(nb)]
+					rparent.extend([(0,0) for _ in range(ndigits-nb)])
+					enc.encodeListPtrs(z, b, ops, lparent, rparent) # y=1
+				if i == 1:
+					# do the calculations
+					vc0_ = []
+					vc1_ = []
+					for j in range(ndigits):
+						vc = ((va >> 4*j) & 0xf) + ((vb >> 4*j) & 0xf)
+						vc0_.append(vc & 0xf)
+						vc1_.append((vc >> 4) & 0xf)
+					lparent = [(1,i) for i in range(ndigits)]
+					rparent = [(0,0) for _ in range(ndigits)]
+					enc.encodeListPtrs(z, b, vc0_, lparent, rparent) # y=2
+					rparent = [(2,i) for i in range(ndigits)]
+					enc.encodeListPtrs(z, b, vc1_, lparent, rparent) # y=3
+					vc0.append(vc0_)
+					vc1.append(vc1_)
+				if i >= 2 and i < 2 + 2*(ndigits-1):
+					# ripple carries
+					vc0_ = []
+					vc1_ = []
+					ci = (i - 2)//2
+					if i % 2 == 0:
+						ops = ['+' for _ in range(ndigits-ci-1)]
+						lparent = [(2+3*ci,i+1) for i in range(ndigits-ci-1)]
+						rparent = [(3+3*ci,i) for i in range(ndigits-ci-1)]
+						enc.encodeListPtrs(z, b, ops, lparent, rparent)
+					else: # results
+						for j in range(ndigits-ci-1):
+							vc = vc0[ci][j+1] + vc1[ci][j]
+							vc0_.append(vc & 0xf)
+							vc1_.append((vc >> 4) & 0xf)
+						lparent = [(4+3*ci,i) for i in range(ndigits-ci-1)]
+						rparent = [(0,0) for _ in range(ndigits-ci-1)]
+						enc.encodeListPtrs(z, b, vc0_, lparent, rparent)
+						rparent = [(5+3*ci,i) for i in range(ndigits-ci-1)]
+						enc.encodeListPtrs(z, b, vc1_, lparent, rparent)
+						vc0.append(vc0_)
+						vc1.append(vc1_)
+				if i == 2 + 2*(ndigits-1):
+					ops = ['$' for _ in range(ndigits+1)]
+					lparent = [(2+i*3,0) for i in range(ndigits)]
+					lparent.append((3,ndigits-1)) # original carry but this isn't right
+					rparent = [(0,0) for _ in range(ndigits+1)]
+					enc.encodeListPtrs(z, b, ops, lparent, rparent)
+				if i == 3 + 2*(ndigits-1):
+					vo = [vc0[i][0] for i in range(ndigits)]
+					vo.append(vc1[0][ndigits-1])
+					lparent = [(ndigits*3+1,i) for i in range(ndigits+1)]
+					rparent = [(0,0) for _ in range(ndigits+1)]
+					enc.encodeListPtrs(z, b, vo, lparent, rparent)
+				# TODO: fix the cascaded carries! in an elegant way.
+				# TODO: point back to the original op
+			for i in range(step):
+				encodeStep(enc, x, i)
+			encodeStep(enc, y, step) # supervised target
+
+		if task == 3: # also perfectly easy
+			na = randint(3)+1
+			shift = randint(2)+1
+			va = randint(16**na)
+			lst = []
+			lst = encHex(lst, va)
+			if shift == 1:
+				lst.append('sl1')
+				vc = va*16
+			if shift == 2:
+				lst.append('sl2')
+				vc = va*256
+			enc.encodeList(x, b, lst)
+			lst = []
+			lst = encHex(lst, vc)
+			enc.encodeList(y, b, lst)
+
+	return x, y
+
+def plotData7():
+	bs = 10
+	x, y = genData7(bs, True, True)
+	fig,axs = plt.subplots(bs,2)
+	for b in range(bs):
+		axs[b, 0].imshow(np.squeeze(x[b,:,:]))
+		axs[b, 1].imshow(np.squeeze(y[b,:,:] + 0.25*x[b,:,:]))
+		axs[b,0].set_title('X')
+		axs[b,1].set_title('Y')
+	plt.show()
+
+
+def genData8(bs, do_print=False):
+	'''
+	Multiply two 2-digit hex numbers
+	Use local allocation for intermediate variables
+	'''
+	nop = 16 # _+-*/=?() -> 012345678
+	md = nop + 16 + 32 # one-hot indicators, digits, 2D posenc
+	ntok = 80
+	nbits = 8
+
+	pos_enc = graycodePosEnc(ntok, nbits, rand_phase=True) # NOTE check random phase
+	x = np.zeros((bs, ntok, md), dtype=np.float32)
+	y = np.zeros_like(x)
+	x[:, :, -nbits*2:] = pos_enc # "horizontal"
+	x[:, :, -nbits*4:-nbits*2] = pos_enc[0,:] # "vertical"
+
+	# TODO need a better way of addressing the 'local' tokens!!!
+
+	for b in range(bs):
+		# step = randint(10)+1 # what step are we supervising?
+		step = 10 # FIXME
+		va = randint(256)
+		vb = randint(256)
+		vc = va*vb
+		# convert these all to hex.
+		va0 = va & 0xf
+		va1 = (va >> 4) & 0xf
+		vb0 = vb & 0xf
+		vb1 = (vb >> 4) & 0xf
+
+		# first encode the problem.
+		encodeList(x, ['(',va0,va1,'*',vb0,vb1,')','=','?'])
+		# expand the arguments to one-digit operations.
+		# could also pass pointers - no difference with one digit?
+		# but pointers might allow the model to understand & change structure better?
+		if step >= 1:
+			# just a copy & reformat op
+			encodeList(y, \
+				['(',va0,'*',vb0,')','+','(',va0,'*',vb1,')','sl1'])
+		if step >= 2:
+			# reduce and sum it
+			vc = va0 * vb0
+			vc0 = vc & 0xf
+			vc1 = (vc >> 4) & 0xf
+			vd = va0 * vb1
+			vd0 = vd & 0xf
+			vd1 = (vd >> 4) & 0xf
+			encodeList(y, \
+				[vc0,vc1,'+',vd0,vd1,'sl1'])
+		if step >= 3:
+			encodeList(y, [vc0,vc1,'+',0,vd0,vd1])
+		if step >= 4:
+			# add with carry
+			vc1 += vd0
+			vc2 = vd1 + (vc1 >> 4)
+			vc1 = vc1 & 0xf
+			encodeList(y, [vc0, vc1, vc2])
+		if step >= 5:
+			# copy & reformat
+			encodeList(y, \
+				['(',va1,'*',vb0,')','sl1','+','(',va1,'*',vb1,')','sl2'])
+		if step >= 6:
+			# reduce and sum
+			ve = va1 * vb0
+			ve0 = ve & 0xf
+			ve1 = (ve >> 4) & 0xf
+			vf = va1 * vb1
+			vf0 = vf & 0xf
+			vf1 = (vf >> 4) & 0xf
+			encodeList(y, \
+				[ve0,ve1,'sl1','+',vf0,vf1,'sl2'])
+		if step >= 7:
+			encodeList(y, \
+				[0,ve0,ve1,'+',0,0,vf0,vf1])
+		if step >= 8:
+			# add with carry
+			ve1 += vf0
+			ve2 = vf1 + (ve1 >> 4)
+			encodeList(y, [0, ve0, ve1, ve2])
+		if step >= 9:
+			# copy & reformat
+			encodeList(y, [vc0,vc1,vc2,'+',0,ve0,ve1,ve2])
+		if step >= 10:
+			# the answer!
+			vc1 += ve0
+			vc2 += ve1 + (vc1 >> 4)
+			vc3 = ve2 + (vc2 >> 4)
+			vc1 = vc1 & 0xf
+			vc2 = vc2 & 0xf
+			encodeList(y, [vc0,vc1,vc2,vc3])
+		if do_print:
+			print("num_tok", tok_ctr)
+
 if __name__ == '__main__':
-	# genData1(15, 19, True)
-	# genData2(15, 19, True)
-
-	# x = genData3(4, 19)
-	# print(x.shape)
-	# fig,axs = plt.subplots(2,2)
-	# for i in range(4):
-	# 	j = i // 2
-	# 	k = i % 2
-	# 	axs[j,k].imshow(np.squeeze(x[i,...]))
-	# plt.show()
-
-	plotData4()
+	parser = argparse.ArgumentParser(description='generate compositional data for training graph/hypergraph transformers')
+	parser.add_argument('-t', type=int, default=6, help='which test to run')
+	args = parser.parse_args()
+	if args.t == 3:
+		plotData3()
+	if args.t == 4:
+		plotData4()
+	if args.t == 6:
+		plotData6()
+	if args.t == 7:
+		plotData7()

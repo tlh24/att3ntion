@@ -400,6 +400,7 @@ def train_model2(num_epochs, batch_size, hidden_dim, num_heads, device='cpu', mo
 	optimizer = torch.optim.Adam(trainable_params, lr=0.001)
 	criterion = nn.CrossEntropyLoss()
 	model.printParamCount()
+	model = torch.compile(model) # mode="max-autotune"
 
 	fd_losslog = open(f'losslog_trainModel2_{attn_impl}.txt', 'w')
 
