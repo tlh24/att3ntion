@@ -840,6 +840,148 @@ __global__ void Aq_tiled_softmax(
     }
 }
 
+__global__ void Yq_scatter_smash(
+	const float* __restrict__ Q,
+	const float* __restrict__ R,
+	const float* __restrict__ S,
+	const float* __restrict__ Vr_2,
+	const float* __restrict__ Vs_2,
+	const float* __restrict__ m_j_in, const float* __restrict__ l_j_in,
+	const float* __restrict__ m_k_in, const float* __restrict__ l_k_in,
+	float* __restrict__ Y_q_,
+	int B, int H, int I, int J, int K, int D, float scale
+){
+	// Q is [B, H, I, D] R is [B, H, J, D] S is [B, H, K, D]
+	// launcher must assert i == j == k
+	// D % 32 == 0
+	// blockDim.x >= TILE*TILE
+	// blockDim.x % TILE*TILE == 0
+	// blockDim.x <= TILE*D
+	//      (otherwise, we need to do a reduction on write)
+	const int b = blockIdx.z;
+	const int h = blockIdx.y;
+
+	// thread indicies changes based on what step we're doing.
+	const int tid = threadIdx.x;
+	const int tpb = blockDim.x; // threads per block
+
+	// --- Pointers to Global Memory ---
+	int64_t bh_offset = (int64_t)(b * h * I * D)
+	const int64_t mj_bh_offset = (int64_t)(b * h * I);
+	const int64_t mk_bh_offset = mj_bh_offset;
+	const int i_start = blockIdx.x * TILE;
+
+	// shared memory
+	extern __shared__ float smem[];
+	float* q_tile = (float*)smem;
+	float* r_tile = q_tile + TILE * D;
+	float* s_tile = r_tile + TILE * D;
+	float* vr_tile = s_tile + TILE * D;
+	float* vs_tile = vr_tile + TILE * D;
+	float* attn_tile = vs_tile + TILE * D;
+
+	// m=max of row, l= sum of exps
+	float* mj_tile = attn_tile + TILE * TILE * TILE;
+	float* lj_tile = mj_tile + TILE;
+	float* mk_tile = lj_tile + TILE;
+	float* lk_tile = mk_tile + TILE;
+	float* yq_o = lk_tile + TILE ; // length load_iters
+
+	// cooperative load Q, R, S
+	int i_load = tid / D; // for i, j, k: e.g. 0 .. 15
+	int d_load = tid % D;
+	int load_iters = (TILE * D) / tpb;
+	// load q tile.  This is fixed for the life of the thread.
+	// note these loads are all cooperative across the block.
+	for( int n = 0; n < load_iters; n++ ){
+		if( i_start + n*TILE + i_load < I ){
+			q_tile[(n*TILE + i_load)*D + d_load] =
+				Q[bh_offset + (i_start + n*TILE + i_load)*D + d_load];
+		}
+	}
+	// each thread writes only one entry in yq.
+	float yq_o = 0.f;
+	// iterate over j tiles.
+	for( int jt = 0; jt < J; jt += TILE){
+		// load r_tile
+		for( int n = 0; n < load_iters; n++ ){
+			if( jt + n*TILE + i_load < J ){
+				r_tile[(n*TILE + i_load)*D + d_load] =
+					R[bh_offset + (jt + n*TILE + i_load)*D + d_load];
+			}
+		}
+		// load vr_tile
+		for( int n = 0; n < load_iters; n++ ){
+			if( jt + n*TILE + i_load < J ){
+				vr_tile[(n*TILE + i_load)*D + d_load] =
+				VR[bh_offset + (jt + n*TILE + i_load)*D + d_load];
+			}
+		}
+		// iterate over the k tiles
+		for( int kt = 0; kt < K; kt += TILE){
+			// load s_tile
+			for( int n = 0; n < load_iters; n++ ){
+				if( kt + n*TILE + i_load < K ){
+					s_tile[(n*TILE + i_load)*D + d_load] =
+						S[bh_offset + (jt + n*TILE + i_load)*D + d_load];
+				}
+			}
+			__syncthreads();
+
+			// now, calculate the attention block
+			attn_iters = (TILE*TILE*TILE) / tpb;
+			float f = 0.f;
+			for( int n = 0; n < attn_iters; n++){
+				int tid_n = tid + n*tpb;
+				int ia = tid_n / (TILE*TILE);
+				int ja = (tid_n / TILE) % TILE;
+				int ka = tid_n % TILE;
+				for(int da = 0; da < D; da++){
+					a = q_tile[(ia*D + da] * r_tile[ja*D + da] * s_tile[ka*D + da];
+					f += a*a;
+					// TODO: online softmax!
+				}
+				attn_tile[tid_n] = f;
+			}
+
+			// load vs_tile
+			for( int n = 0; n < load_iters; n++ ){
+				if( jt + n*TILE + i_load < J ){
+					vs_tile[(n*TILE + i_load)*D + d_load] =
+					Vs[bh_offset + (jt + n*TILE + i_load)*D + d_load];
+				}
+			}
+			__syncthreads();
+
+			// iterate over yq
+			yq_iters = load_iters;
+			for( int n=0; n < yq_iters; n++){
+				int tid_n = tid + n*tpb;
+				if( tid_n < TILE*D ){
+					dy = tid_n % D;
+					iy = tid_n / D;
+					for( int jy = 0; jy < TILE; jy++){
+						for( int ky = 0; ky < TILE; ky++){
+							float attn =
+							yq_o[n] += attn_tile[iy*TILE*TILE + jy*TILE + ky]
+									* vr_tile[jy*D + dy]
+									* vs_tile[ky*D + dy];
+						}
+					}
+				}
+			} // end yq_iters
+		} // end k tiles
+	} // end j tiles
+	for( int n=0; n < yq_iters; n++){
+		int tid_n = tid + n*tpb;
+		if( tid_n < TILE*D ){
+			d_yout = tid % D; //these are the same as d_load, think?!
+			i_yout = tid / D;
+			Y_q_[bh_offset + (i_start + n*TILE + i_yout)*D + d_yout] =
+					yq_o[n];
+		}
+	}
+}
 __global__ void Yq_scatter_flash(
     const float* __restrict__ Q, const float* __restrict__ R, const float* __restrict__ S,
     const float* __restrict__ Vr_2, const float* __restrict__ Vs_2,

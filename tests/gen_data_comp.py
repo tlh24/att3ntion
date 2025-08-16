@@ -161,7 +161,7 @@ def graycodePosEnc(ntok, nbits, rand_phase=False):
 			pos_enc[:, 2*i+1] = np.sin(indx / period + phase_offset) < 0
 	return pos_enc
 
-def genData3(bs, do_print=False):
+def genData3(bs, do_print=False, validation=False):
 	'''
 	Task 3: from a list of 8 integers,
 	compute the op of two of them based on *pointers*
@@ -391,7 +391,7 @@ class ExpressionGeneratorDepth:
 
 		return Expression(operator=op, left=left_child, right=right_child)
 
-def genData4(bs, do_print=False):
+def genData4(bs, do_print=False, validation=False):
 	'''
 	Task 4: from random arithmetic expressions,
 	generate parse trees & evaluate them

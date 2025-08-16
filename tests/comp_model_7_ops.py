@@ -243,15 +243,20 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	dataset_v = TensorDataset(torch.tensor(x_v), torch.tensor(y_v))
 	loader_v = DataLoader(dataset_v, batch_size=batch_size, shuffle=True)
 
+	input_dim = x.shape[2]
+
 	if attn_impl == "hypergraph":
 		n_layers = 3
 	else:
 		n_layers = 6
-
-	input_dim = x.shape[2]
 	n_recurse = 1
+
 	if task == 4:
 		n_recurse = 4
+		if attn_impl == "hypergraph":
+			n_layers = 2
+		else:
+			n_layers = 4
 
 	model = SimpleCompModel(input_dim, hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse).to(device)
 	if save_model:
