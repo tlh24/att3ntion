@@ -894,15 +894,18 @@ __global__ void Yq_scatter_smash(
 	float* yq_o = lk_tile + TILE ; // length load_iters
 
 	// cooperative load Q, size [TILE, D]
-	int i_load = tid / D; // i, j, or k: 0 .. 15
-	int d_load = tid % D; // if tpb == 256, '', load_iters = 2
-	int load_iters = (TILE * D) / tpb; //if tpb=512, D=32: load_iters = 1
+	int i_load = tid / D; // i, j, or k: tpb 512, 0..15; tpb 256 0..7
+	int d_load = tid % D; // if tpb = 256, '', load_iters = 2
+	// int load_iters = (TILE * D) / tpb; //if tpb=512, D=32: load_iters = 1
+	// int load_step = TILE / load_iters; // if tpb=256, load_step=8
+	// load_step = TILE * tpb / (TILE * D) = tpb / D
+	load_step = tpb / D;
 	// Q is fixed for the life of the thread.
 	// note these loads are all cooperative across the block.
-	for( int n = 0; n < load_iters; n++ ){
-		if( i_start + n*TILE + i_load < I ){
-			q_tile[(n*TILE + i_load)*D + d_load] =
-				Q[bh_offset + (i_start + n*TILE + i_load)*D + d_load];
+	for( int n = 0; n < TILE; n += load_step ){
+		if( i_start + n + i_load < I ){
+			q_tile[(n + i_load)*D + d_load] =
+				Q[bh_offset + (i_start + n + i_load)*D + d_load];
 		}
 	}
 
@@ -910,9 +913,9 @@ __global__ void Yq_scatter_smash(
 	for( int jt = 0; jt < J; jt += TILE){
 		// load r_tile
 		for( int n = 0; n < load_iters; n++ ){
-			if( jt + n*TILE + i_load < J ){
-				r_tile[(n*TILE + i_load)*D + d_load] =
-					R[bh_offset + (jt + n*TILE + i_load)*D + d_load];
+			if( jt + n*load_step + i_load < J ){
+				r_tile[(n*load_step + i_load)*D + d_load] =
+					R[bh_offset + (jt + n*load_step + i_load)*D + d_load];
 			}
 		}
 		// load vr_tile
