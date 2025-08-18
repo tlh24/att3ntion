@@ -852,16 +852,22 @@ __global__ void Yq_scatter_smash(
 	int B, int H, int I, int J, int K, int D, float scale
 ){
 	// Q is [B, H, I, D] R is [B, H, J, D] S is [B, H, K, D]
-	// launcher must assert i == j == k
-	// D % 32 == 0
-	// blockDim.x >= TILE*TILE
-	// blockDim.x % TILE*TILE == 0
-	// blockDim.x <= TILE*D
+	// launcher must assert i == j == k,
+	// D % 32 == 0,
+	// blockDim.x >= TILE*TILE,
+	// blockDim.x % TILE*TILE == 0,
+	// blockDim.x <= TILE*D --
 	//      (otherwise, we need to do a reduction on write)
 	const int b = blockIdx.z;
 	const int h = blockIdx.y;
+	const int i_start = blockIdx.x * TILE;
+	// computation has no dependencies across the i index
+	// but we need to parallelize it to reduce the number
+	// of redundant dram R, S, Vr_2, Vs_2 loads
+	// (which don't depend on i)
 
 	// thread indicies changes based on what step we're doing.
+	// 1-D thread block:
 	const int tid = threadIdx.x;
 	const int tpb = blockDim.x; // threads per block
 
@@ -869,7 +875,6 @@ __global__ void Yq_scatter_smash(
 	int64_t bh_offset = (int64_t)(b * h * I * D)
 	const int64_t mj_bh_offset = (int64_t)(b * h * I);
 	const int64_t mk_bh_offset = mj_bh_offset;
-	const int i_start = blockIdx.x * TILE;
 
 	// shared memory
 	extern __shared__ float smem[];
@@ -880,18 +885,19 @@ __global__ void Yq_scatter_smash(
 	float* vs_tile = vr_tile + TILE * D;
 	float* attn_tile = vs_tile + TILE * D;
 
-	// m=max of row, l= sum of exps
+	// m = max of row, l = sum of exps
 	float* mj_tile = attn_tile + TILE * TILE * TILE;
 	float* lj_tile = mj_tile + TILE;
 	float* mk_tile = lj_tile + TILE;
 	float* lk_tile = mk_tile + TILE;
+	// each thread writes load_iters entries in yq.
 	float* yq_o = lk_tile + TILE ; // length load_iters
 
-	// cooperative load Q, R, S
-	int i_load = tid / D; // for i, j, k: e.g. 0 .. 15
-	int d_load = tid % D;
-	int load_iters = (TILE * D) / tpb;
-	// load q tile.  This is fixed for the life of the thread.
+	// cooperative load Q, size [TILE, D]
+	int i_load = tid / D; // i, j, or k: 0 .. 15
+	int d_load = tid % D; // if tpb == 256, '', load_iters = 2
+	int load_iters = (TILE * D) / tpb; //if tpb=512, D=32: load_iters = 1
+	// Q is fixed for the life of the thread.
 	// note these loads are all cooperative across the block.
 	for( int n = 0; n < load_iters; n++ ){
 		if( i_start + n*TILE + i_load < I ){
@@ -899,8 +905,7 @@ __global__ void Yq_scatter_smash(
 				Q[bh_offset + (i_start + n*TILE + i_load)*D + d_load];
 		}
 	}
-	// each thread writes only one entry in yq.
-	float yq_o = 0.f;
+
 	// iterate over j tiles.
 	for( int jt = 0; jt < J; jt += TILE){
 		// load r_tile
