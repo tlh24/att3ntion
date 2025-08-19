@@ -854,8 +854,8 @@ __global__ void Yq_scatter_smash(
 	// Q is [B, H, I, D] R is [B, H, J, D] S is [B, H, K, D]
 	// launcher must assert i == j == k,
 	// D % 32 == 0,
-	// blockDim.x >= TILE*TILE,
 	// blockDim.x % TILE*TILE == 0,
+	//			(for error bounds checking for attn accum)
 	// blockDim.x <= TILE*D --
 	//      (otherwise, we need to do a reduction on write)
 	const int b = blockIdx.z;
@@ -885,7 +885,7 @@ __global__ void Yq_scatter_smash(
 	float* vs_tile = vr_tile + TILE * D;
 	float* attn_tile = vs_tile + TILE * D;
 
-	// m = max of row, l = sum of exps
+	// m = max of row, l = 1 / sum of exps
 	float* mj_tile = attn_tile + TILE * TILE * TILE;
 	float* lj_tile = mj_tile + TILE;
 	float* mk_tile = lj_tile + TILE;
@@ -896,10 +896,8 @@ __global__ void Yq_scatter_smash(
 	// cooperative load Q, size [TILE, D]
 	int i_load = tid / D; // i, j, or k: tpb 512, 0..15; tpb 256 0..7
 	int d_load = tid % D; // if tpb = 256, '', load_iters = 2
-	// int load_iters = (TILE * D) / tpb; //if tpb=512, D=32: load_iters = 1
-	// int load_step = TILE / load_iters; // if tpb=256, load_step=8
-	// load_step = TILE * tpb / (TILE * D) = tpb / D
-	load_step = tpb / D;
+	int load_iters = tpb / (TILE * D);
+	int load_step = tpb / D; // if tpb=256, load_step=8
 	// Q is fixed for the life of the thread.
 	// note these loads are all cooperative across the block.
 	for( int n = 0; n < TILE; n += load_step ){
@@ -912,27 +910,37 @@ __global__ void Yq_scatter_smash(
 	// iterate over j tiles.
 	for( int jt = 0; jt < J; jt += TILE){
 		// load r_tile
-		for( int n = 0; n < load_iters; n++ ){
-			if( jt + n*load_step + i_load < J ){
-				r_tile[(n*load_step + i_load)*D + d_load] =
-					R[bh_offset + (jt + n*load_step + i_load)*D + d_load];
+		for( int n = 0; n < TILE; n += load_step ){
+			if( jt + n + i_load < J ){
+				r_tile[(n + i_load)*D + d_load] =
+					R[bh_offset + (jt + n + i_load)*D + d_load];
 			}
 		}
 		// load vr_tile
-		for( int n = 0; n < load_iters; n++ ){
-			if( jt + n*TILE + i_load < J ){
-				vr_tile[(n*TILE + i_load)*D + d_load] =
-				VR[bh_offset + (jt + n*TILE + i_load)*D + d_load];
+		for( int n = 0; n < TILE; n += load_step ){
+			if( jt + n + i_load < J ){
+				vr_tile[(n + i_load)*D + d_load] =
+					V_r2[bh_offset + (jt + n + i_load)*D + d_load];
 			}
+		}
+		// load mj_tile, lj_tile
+		if( i_load == 0){ //thread divergence but ok
+			mj_tile[d_load] = m_j_in[mj_bh_offset + jt + d_load];
+			lj_tile[d_load] = 1.f / l_j_in[mj_bh_offset + jt + d_load];
 		}
 		// iterate over the k tiles
 		for( int kt = 0; kt < K; kt += TILE){
 			// load s_tile
-			for( int n = 0; n < load_iters; n++ ){
-				if( kt + n*TILE + i_load < K ){
-					s_tile[(n*TILE + i_load)*D + d_load] =
-						S[bh_offset + (jt + n*TILE + i_load)*D + d_load];
+			for( int n = 0; n < TILE; n += load_step ){
+				if( kt + n + i_load < K ){
+					s_tile[(n + i_load)*D + d_load] =
+						S[bh_offset + (kt + n + i_load)*D + d_load];
 				}
+			}
+			// load mk_tile, lk_tile
+			if( i_load == 0){ //thread divergence but ok
+				mk_tile[d_load] = m_j_in[mk_bh_offset + kt + d_load];
+				lk_tile[d_load] = 1.0f / l_j_in[mk_bh_offset + kt + d_load];
 			}
 			__syncthreads();
 
@@ -946,48 +954,117 @@ __global__ void Yq_scatter_smash(
 				int ka = tid_n % TILE;
 				for(int da = 0; da < D; da++){
 					a = q_tile[(ia*D + da] * r_tile[ja*D + da] * s_tile[ka*D + da];
-					f += a*a;
-					// TODO: online softmax!
+					f += a;
 				}
-				attn_tile[tid_n] = f;
+				float logit = a * scale;
+				float ar = expf(logit - mj_tile[jt]) * lj_tile[jt];
+				float as = expf(logit - mk_tile[kt]) * lk_tile[kt];
+				attn_tile[tid_n] = ar * as;
 			}
 
 			// load vs_tile
-			for( int n = 0; n < load_iters; n++ ){
-				if( jt + n*TILE + i_load < J ){
-					vs_tile[(n*TILE + i_load)*D + d_load] =
-					Vs[bh_offset + (jt + n*TILE + i_load)*D + d_load];
+			for( int n = 0; n < TILE; n += load_step ){
+				if( kt + n + i_load < K ){
+					vs_tile[(n + i_load)*D + d_load] =
+					V_s2[bh_offset + (kt + n + i_load)*D + d_load];
 				}
 			}
 			__syncthreads();
 
 			// iterate over yq
-			yq_iters = load_iters;
-			for( int n=0; n < yq_iters; n++){
+			for( int n=0; n < load_iters; n++){
 				int tid_n = tid + n*tpb;
+				float f = 0.f;
 				if( tid_n < TILE*D ){
 					dy = tid_n % D;
 					iy = tid_n / D;
 					for( int jy = 0; jy < TILE; jy++){
 						for( int ky = 0; ky < TILE; ky++){
-							float attn =
-							yq_o[n] += attn_tile[iy*TILE*TILE + jy*TILE + ky]
+							f += attn_tile[iy*TILE*TILE + jy*TILE + ky]
 									* vr_tile[jy*D + dy]
 									* vs_tile[ky*D + dy];
 						}
 					}
 				}
+				yq_o[n] = f;
 			} // end yq_iters
 		} // end k tiles
 	} // end j tiles
-	for( int n=0; n < yq_iters; n++){
+	for( int n=0; n < TILE; n += load_step){
 		int tid_n = tid + n*tpb;
-		if( tid_n < TILE*D ){
-			d_yout = tid % D; //these are the same as d_load, think?!
-			i_yout = tid / D;
-			Y_q_[bh_offset + (i_start + n*TILE + i_yout)*D + d_yout] =
-					yq_o[n];
+		if( i_start + n + i_load < I){
+			Y_q_[bh_offset + (i_start + n + i_load)*D + d_load] =
+					yq_o[n/load_step];
 		}
+	}
+}
+void Yq_scatter_smash_launcher(
+	const at::Tensor& Q, const at::Tensor& R, const at::Tensor& S,
+	const at::Tensor& Vr_2, const at::Tensor& Vs_2,
+	at::Tensor& Y_q_, float scale
+){
+	const auto B = Q.size(0);
+	const auto H = Q.size(1);
+	const auto I = Q.size(2);
+	const auto J = R.size(2);
+	const auto K = S.size(2);
+	const auto D = Q.size(3);
+	auto opts = Q.options();
+
+	auto m_j = torch::zeros({B, H, J}, opts);
+	auto l_j = torch::zeros({B, H, J}, opts);
+	auto m_k = torch::zeros({B, H, K}, opts);
+	auto l_k = torch::zeros({B, H, K}, opts);
+
+	// Zero the output tensor for atomic accumulation
+	Y_q_.zero_();
+
+	const int stats_threads = 256;
+	// TODO: lots of flops,
+	// these should be computed *once* in the gather kernel.
+	{ // Ar stats
+		dim3 grid(J, B * H);
+		dim3 block(stats_threads);
+		size_t smem_size = sizeof(float) * (D + TILE_I*D + TILE_K*D + TILE_I*TILE_K + stats_threads);
+		Ar_tiled_softmax<<<grid, block, smem_size>>>(
+			Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
+			m_j.data_ptr<float>(), l_j.data_ptr<float>(),
+			B, H, I, J, K, D, scale);
+	}
+	{ // As stats
+		dim3 grid(K, B * H);
+		dim3 block(stats_threads);
+		size_t smem_size = sizeof(float) * (D + TILE_I*D + TILE_J*D + TILE_I*TILE_J + stats_threads);
+		As_tiled_softmax<<<grid, block, smem_size>>>(
+			Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
+			m_k.data_ptr<float>(), l_k.data_ptr<float>(),
+			B, H, I, J, K, D, scale);
+	}
+	{
+		const int TPB = 256; // threads per block. or 512
+
+		TORCH_CHECK(D % 32 == 0, "D must be a multiple of 32");
+		TORCH_CHECK(TPB % (TILE*TILE) == 0, "Threads per block must be a multiple of Tile^2");
+		TORCH_CHECK(TPB <= TILE*D, "Threads per block must be <= Tile*D");
+
+		dim3 grid(B, H, (I + TILE - 1) / TILE);
+
+		size_t smem_size = sizeof(float) * (
+			TILE * D * 5 + // Q, R, S, Vr, Vs
+			TILE*TILE*TILE + // attn
+			TILE * 4 + // mj, lj, mk, lk
+			(TILE*D)/TPB ); // yq_out
+
+		Yq_scatter_smash<<<grid, TPB, smem_size>>>(
+			Q.data_ptr<float>(),
+			R.data_ptr<float>(),
+			S.data_ptr<float>(),
+			Vr_2.data_ptr<float>(),
+			Vs_2.data_ptr<float>(),
+			m_j.data_ptr<float>(), l_j.data_ptr<float>(),
+			m_k.data_ptr<float>(), l_k.data_ptr<float>(),
+			Y_q_.data_ptr<float>(),
+			B, H, I, J, K, D, scale );
 	}
 }
 __global__ void Yq_scatter_flash(
@@ -1035,7 +1112,7 @@ __global__ void Yq_scatter_flash(
     float* vr_tile = s_tile + TILE_K * D;
     float* vs_tile = vr_tile + TILE_J * D;
 
-    // m=max of row, l= sum of exps
+    // m = max of row, l = sum of exps
     float* mj_tile = vs_tile + TILE_K * D;
     float* lj_tile = mj_tile + TILE_J;
     float* mk_tile = lj_tile + TILE_J;
