@@ -854,10 +854,11 @@ __global__ void Yq_scatter_smash(
 	// Q is [B, H, I, D] R is [B, H, J, D] S is [B, H, K, D]
 	// launcher must assert i == j == k,
 	// D % 32 == 0,
-	// blockDim.x % TILE*TILE == 0,
-	//			(for error bounds checking for attn accum)
-	// blockDim.x <= TILE*D --
-	//      (otherwise, we need to do a reduction on write)
+	// blockDim.x >= TILE,
+	// blockdim.x <= TILE^3
+	// TILE^3 % blockDim.x == 0,
+	//			(for iter bounds checking for attn accum)
+	//
 	const int b = blockIdx.z;
 	const int h = blockIdx.y;
 	const int i_start = blockIdx.x * TILE;
@@ -866,7 +867,7 @@ __global__ void Yq_scatter_smash(
 	// of redundant dram R, S, Vr_2, Vs_2 loads
 	// (which don't depend on i)
 
-	// thread indicies changes based on what step we're doing.
+	// thread indices change based on what step we're doing.
 	// 1-D thread block:
 	const int tid = threadIdx.x;
 	const int tpb = blockDim.x; // threads per block
@@ -891,15 +892,21 @@ __global__ void Yq_scatter_smash(
 	float* mk_tile = lj_tile + TILE;
 	float* lk_tile = mk_tile + TILE;
 	// each thread writes load_iters entries in yq.
-	float* yq_o = lk_tile + TILE ; // length load_iters
+	float yq_accum[8] ; // local, not shared!
 
 	// cooperative load Q, size [TILE, D]
-	int i_load = tid / D; // i, j, or k: tpb 512, 0..15; tpb 256 0..7
+	int i_load = tid / D; // i, j, or k: tpb=512, 0..15; tpb=256 0..7
 	int d_load = tid % D; // if tpb = 256, '', load_iters = 2
-	int load_iters = tpb / (TILE * D);
+	int load_iters = (TILE * D) / tpb;
 	int load_step = tpb / D; // if tpb=256, load_step=8
+
+	for(int n = 0; n < load_iters; n++){
+		yq_accum[n] = 0.f;
+	}
+
 	// Q is fixed for the life of the thread.
-	// note these loads are all cooperative across the block.
+	// note these loads are cooperative & contiguous across the block.
+	// if tpb > D*TILE, many warps will be noop here.
 	for( int n = 0; n < TILE; n += load_step ){
 		if( i_start + n + i_load < I ){
 			q_tile[(n + i_load)*D + d_load] =
@@ -924,9 +931,10 @@ __global__ void Yq_scatter_smash(
 			}
 		}
 		// load mj_tile, lj_tile
-		if( i_load == 0){ //thread divergence but ok
-			mj_tile[d_load] = m_j_in[mj_bh_offset + jt + d_load];
-			lj_tile[d_load] = 1.f / l_j_in[mj_bh_offset + jt + d_load];
+		if( tid < TILE && jt + tid < J){
+			// block divergence but ok
+			mj_tile[tid] = m_j_in[mj_bh_offset + jt + tid];
+			lj_tile[tid] = 1.f / l_j_in[mj_bh_offset + jt + tid];
 		}
 		// iterate over the k tiles
 		for( int kt = 0; kt < K; kt += TILE){
@@ -938,27 +946,27 @@ __global__ void Yq_scatter_smash(
 				}
 			}
 			// load mk_tile, lk_tile
-			if( i_load == 0){ //thread divergence but ok
-				mk_tile[d_load] = m_j_in[mk_bh_offset + kt + d_load];
-				lk_tile[d_load] = 1.0f / l_j_in[mk_bh_offset + kt + d_load];
+			if( tid < TILE && kt + tid < K){
+				mk_tile[tid] = m_j_in[mk_bh_offset + kt + tid];
+				lk_tile[tid] = 1.f / l_j_in[mk_bh_offset + kt + tid];
 			}
 			__syncthreads();
 
-			// now, calculate the attention block
+			// calculate the attention block
 			attn_iters = (TILE*TILE*TILE) / tpb;
-			float f = 0.f;
-			for( int n = 0; n < attn_iters; n++){
+			for( int n = 0; n < attn_iters; n++ ){
 				int tid_n = tid + n*tpb;
 				int ia = tid_n / (TILE*TILE);
 				int ja = (tid_n / TILE) % TILE;
 				int ka = tid_n % TILE;
+				float f = 0.f;
 				for(int da = 0; da < D; da++){
 					a = q_tile[(ia*D + da] * r_tile[ja*D + da] * s_tile[ka*D + da];
 					f += a;
 				}
 				float logit = a * scale;
-				float ar = expf(logit - mj_tile[jt]) * lj_tile[jt];
-				float as = expf(logit - mk_tile[kt]) * lk_tile[kt];
+				float ar = expf(logit - mj_tile[ja]) * lj_tile[ja];
+				float as = expf(logit - mk_tile[ka]) * lk_tile[ka];
 				attn_tile[tid_n] = ar * as;
 			}
 
@@ -976,7 +984,7 @@ __global__ void Yq_scatter_smash(
 				int tid_n = tid + n*tpb;
 				float f = 0.f;
 				if( tid_n < TILE*D ){
-					dy = tid_n % D;
+					dy = tid_n % D; // = d_load
 					iy = tid_n / D;
 					for( int jy = 0; jy < TILE; jy++){
 						for( int ky = 0; ky < TILE; ky++){
@@ -986,7 +994,7 @@ __global__ void Yq_scatter_smash(
 						}
 					}
 				}
-				yq_o[n] = f;
+				yq_accum[n] += f;
 			} // end yq_iters
 		} // end k tiles
 	} // end j tiles
@@ -994,7 +1002,7 @@ __global__ void Yq_scatter_smash(
 		int tid_n = tid + n*tpb;
 		if( i_start + n + i_load < I){
 			Y_q_[bh_offset + (i_start + n + i_load)*D + d_load] =
-					yq_o[n/load_step];
+					yq_accum[n/load_step];
 		}
 	}
 }
@@ -1045,7 +1053,7 @@ void Yq_scatter_smash_launcher(
 
 		TORCH_CHECK(D % 32 == 0, "D must be a multiple of 32");
 		TORCH_CHECK(TPB % (TILE*TILE) == 0, "Threads per block must be a multiple of Tile^2");
-		TORCH_CHECK(TPB <= TILE*D, "Threads per block must be <= Tile*D");
+		// TORCH_CHECK(TPB <= TILE*D, "Threads per block must be <= Tile*D");
 
 		dim3 grid(B, H, (I + TILE - 1) / TILE);
 
