@@ -8,7 +8,7 @@
 #define TILE_J 16
 #define TILE_K 16
 #define TILE_I 16
-
+#define TILE 16
 
 #define TILE_I_SPECIAL 4
 #define TILE_J_SPECIAL 4
@@ -866,6 +866,7 @@ __global__ void Yq_scatter_smash(
 	// but we need to parallelize it to reduce the number
 	// of redundant dram R, S, Vr_2, Vs_2 loads
 	// (which don't depend on i)
+	// otherwise we'd reload them for each i!
 
 	// thread indices change based on what step we're doing.
 	// 1-D thread block:
@@ -873,7 +874,7 @@ __global__ void Yq_scatter_smash(
 	const int tpb = blockDim.x; // threads per block
 
 	// --- Pointers to Global Memory ---
-	int64_t bh_offset = (int64_t)(b * h * I * D)
+	int64_t bh_offset = (int64_t)(b * h * I * D);
 	const int64_t mj_bh_offset = (int64_t)(b * h * I);
 	const int64_t mk_bh_offset = mj_bh_offset;
 
@@ -892,17 +893,22 @@ __global__ void Yq_scatter_smash(
 	float* mk_tile = lj_tile + TILE;
 	float* lk_tile = mk_tile + TILE;
 	// each thread writes load_iters entries in yq.
-	float yq_accum[8] ; // local, not shared!
+	float yq_acc0, yq_acc1, yq_acc2, yq_acc3 ; // local, not shared!
+	float yq_acc4, yq_acc5, yq_acc6, yq_acc7 ;
+	yq_acc0 = 0.f; // can't nvcc figure this out??
+	yq_acc1 = 0.f;
+	yq_acc2 = 0.f;
+	yq_acc3 = 0.f;
+	yq_acc4 = 0.f;
+	yq_acc5 = 0.f;
+	yq_acc6 = 0.f;
+	yq_acc7 = 0.f;
 
 	// cooperative load Q, size [TILE, D]
 	int i_load = tid / D; // i, j, or k: tpb=512, 0..15; tpb=256 0..7
 	int d_load = tid % D; // if tpb = 256, '', load_iters = 2
 	int load_iters = (TILE * D) / tpb;
 	int load_step = tpb / D; // if tpb=256, load_step=8
-
-	for(int n = 0; n < load_iters; n++){
-		yq_accum[n] = 0.f;
-	}
 
 	// Q is fixed for the life of the thread.
 	// note these loads are cooperative & contiguous across the block.
@@ -927,7 +933,7 @@ __global__ void Yq_scatter_smash(
 		for( int n = 0; n < TILE; n += load_step ){
 			if( jt + n + i_load < J ){
 				vr_tile[(n + i_load)*D + d_load] =
-					V_r2[bh_offset + (jt + n + i_load)*D + d_load];
+					Vr_2[bh_offset + (jt + n + i_load)*D + d_load];
 			}
 		}
 		// load mj_tile, lj_tile
@@ -953,7 +959,7 @@ __global__ void Yq_scatter_smash(
 			__syncthreads();
 
 			// calculate the attention block
-			attn_iters = (TILE*TILE*TILE) / tpb;
+			int attn_iters = (TILE*TILE*TILE) / tpb;
 			for( int n = 0; n < attn_iters; n++ ){
 				int tid_n = tid + n*tpb;
 				int ia = tid_n / (TILE*TILE);
@@ -961,10 +967,12 @@ __global__ void Yq_scatter_smash(
 				int ka = tid_n % TILE;
 				float f = 0.f;
 				for(int da = 0; da < D; da++){
-					a = q_tile[(ia*D + da] * r_tile[ja*D + da] * s_tile[ka*D + da];
-					f += a;
+					// really should move q and r to registers
+					// this would require n being the fastest index.
+					// (each thread still computes attn_iters scores)
+					f += q_tile[ia*D + da] * r_tile[ja*D + da] * s_tile[ka*D + da];
 				}
-				float logit = a * scale;
+				float logit = f * scale;
 				float ar = expf(logit - mj_tile[ja]) * lj_tile[ja];
 				float as = expf(logit - mk_tile[ka]) * lk_tile[ka];
 				attn_tile[tid_n] = ar * as;
@@ -974,7 +982,7 @@ __global__ void Yq_scatter_smash(
 			for( int n = 0; n < TILE; n += load_step ){
 				if( kt + n + i_load < K ){
 					vs_tile[(n + i_load)*D + d_load] =
-					V_s2[bh_offset + (kt + n + i_load)*D + d_load];
+					Vs_2[bh_offset + (kt + n + i_load)*D + d_load];
 				}
 			}
 			__syncthreads();
@@ -984,8 +992,8 @@ __global__ void Yq_scatter_smash(
 				int tid_n = tid + n*tpb;
 				float f = 0.f;
 				if( tid_n < TILE*D ){
-					dy = tid_n % D; // = d_load
-					iy = tid_n / D;
+					int dy = tid_n % D; // = d_load
+					int iy = tid_n / D;
 					for( int jy = 0; jy < TILE; jy++){
 						for( int ky = 0; ky < TILE; ky++){
 							f += attn_tile[iy*TILE*TILE + jy*TILE + ky]
@@ -994,15 +1002,49 @@ __global__ void Yq_scatter_smash(
 						}
 					}
 				}
-				yq_accum[n] += f;
+				switch(n){
+					case 0:
+						yq_acc0 += f;
+					case 1:
+						yq_acc1 += f;
+					case 2:
+						yq_acc2 += f;
+					case 3:
+						yq_acc3 += f;
+					case 4:
+						yq_acc4 += f;
+					case 5:
+						yq_acc5 += f;
+					case 6:
+						yq_acc6 += f;
+					case 7:
+						yq_acc7 += f;
+				}
 			} // end yq_iters
 		} // end k tiles
 	} // end j tiles
 	for( int n=0; n < TILE; n += load_step){
-		int tid_n = tid + n*tpb;
 		if( i_start + n + i_load < I){
-			Y_q_[bh_offset + (i_start + n + i_load)*D + d_load] =
-					yq_accum[n/load_step];
+			float f = 0.f;
+			switch(n){
+				case 0:
+					f = yq_acc0;
+				case 1:
+					f = yq_acc1;
+				case 2:
+					f = yq_acc2;
+				case 3:
+					f = yq_acc3;
+				case 4:
+					f = yq_acc4;
+				case 5:
+					f = yq_acc5;
+				case 6:
+					f = yq_acc6;
+				case 7:
+					f = yq_acc7;
+			}
+			Y_q_[bh_offset + (i_start + n + i_load)*D + d_load] = f;
 		}
 	}
 }
@@ -1049,19 +1091,20 @@ void Yq_scatter_smash_launcher(
 			B, H, I, J, K, D, scale);
 	}
 	{
-		const int TPB = 256; // threads per block. or 512
+		const int TPB = 256; // threads per block. 256, 512 or 1024
 
 		TORCH_CHECK(D % 32 == 0, "D must be a multiple of 32");
 		TORCH_CHECK(TPB % (TILE*TILE) == 0, "Threads per block must be a multiple of Tile^2");
-		// TORCH_CHECK(TPB <= TILE*D, "Threads per block must be <= Tile*D");
+		TORCH_CHECK(I == J, "Kernel only implemented for Q, R, S same size");
+		TORCH_CHECK(K == J, "Kernel only implemented for Q, R, S same size");
+		TORCH_CHECK((TILE*D) / TPB <= 8, "Maximum 8 loads per thread - D is too large");
 
 		dim3 grid(B, H, (I + TILE - 1) / TILE);
 
 		size_t smem_size = sizeof(float) * (
 			TILE * D * 5 + // Q, R, S, Vr, Vs
 			TILE*TILE*TILE + // attn
-			TILE * 4 + // mj, lj, mk, lk
-			(TILE*D)/TPB ); // yq_out
+			TILE * 4 ); // mj, lj, mk, lk
 
 		Yq_scatter_smash<<<grid, TPB, smem_size>>>(
 			Q.data_ptr<float>(),
@@ -1830,7 +1873,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     // Ys_scatter_flash_launcher(Q, R, S, Vq_2, Vr_2, Y_s_, scale);
 
     cudaDeviceSynchronize(); 
-    return std::make_tuple(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_);}
+    return std::make_tuple(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_);
+}
 
 
 
