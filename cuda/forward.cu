@@ -1868,7 +1868,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     // }
 
     // SCATTER 
-    Yq_scatter_flash_launcher(Q, R, S, Vr_2, Vs_2, Y_q_, scale);
+    Yq_scatter_smash_launcher(Q, R, S, Vr_2, Vs_2, Y_q_, scale);
     // Yr_scatter_flash_launcher(Q, R, S, Vq_2, Vs_2, Y_r_, scale);
     // Ys_scatter_flash_launcher(Q, R, S, Vq_2, Vr_2, Y_s_, scale);
 
