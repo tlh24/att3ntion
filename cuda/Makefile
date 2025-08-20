@@ -22,7 +22,7 @@ LDFLAGS := -L$(LIBTORCH_PATH)/lib -L$(CUDA_LIB_PATH) -Wl,-rpath,$(LIBTORCH_PATH)
 LIBS := -ltorch -ltorch_cpu -ltorch_cuda -lc10 $(CUDA_LIB_PATH)libcudart.so.12 -lpython3.13
 
 # NVCC flags
-NVCCFLAGS := -g -G -std=c++17 --compiler-options "-fPIC" -gencode arch=compute_89,code=sm_89 # was 89 for 4090
+NVCCFLAGS := -g -G -std=c++17 --compiler-options "-fPIC" -gencode arch=compute_89,code=sm_89 # was 89 for 4090, 86 for the 3090
 
 PYTHON_CFLAGS   := $(shell python3-config --cflags)
 PYTHON_LDFLAGS  := $(shell python3-config --ldflags)
@@ -50,3 +50,5 @@ clean:
 
 # to run: (e.g.)
 # LD_LIBRARY_PATH=/home/tlh24/venv/lib/python3.13/site-packages/torch/lib cuda-gdb ./test_harness
+# for python install:
+# pip install --no-build-isolation .

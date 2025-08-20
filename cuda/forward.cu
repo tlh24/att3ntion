@@ -8,7 +8,7 @@
 #define TILE_J 16
 #define TILE_K 16
 #define TILE_I 16
-#define TILE 16
+#define TILE 8
 
 #define TILE_I_SPECIAL 4
 #define TILE_J_SPECIAL 4
@@ -858,6 +858,9 @@ __global__ void Yq_scatter_smash(
 	// blockdim.x <= TILE^3
 	// TILE^3 % blockDim.x == 0,
 	//			(for iter bounds checking for attn accum)
+	// I,J,K >= 16
+	//			(again for attn)
+	// I,J,K % TILE == 0
 	//
 	const int b = blockIdx.z;
 	const int h = blockIdx.y;
@@ -874,8 +877,8 @@ __global__ void Yq_scatter_smash(
 	const int tpb = blockDim.x; // threads per block
 
 	// --- Pointers to Global Memory ---
-	int64_t bh_offset = (int64_t)(b * h * I * D);
-	const int64_t mj_bh_offset = (int64_t)(b * h * I);
+	int64_t bh_offset = (int64_t)((b*H + h) * I * D);
+	const int64_t mj_bh_offset = (int64_t)((b*H + h) * I);
 	const int64_t mk_bh_offset = mj_bh_offset;
 
 	// shared memory
@@ -907,7 +910,7 @@ __global__ void Yq_scatter_smash(
 	// cooperative load Q, size [TILE, D]
 	int i_load = tid / D; // i, j, or k: tpb=512, 0..15; tpb=256 0..7
 	int d_load = tid % D; // if tpb = 256, '', load_iters = 2
-	int load_iters = (TILE * D) / tpb;
+	int load_iters = max(1, (TILE * D) / tpb);
 	int load_step = tpb / D; // if tpb=256, load_step=8
 
 	// Q is fixed for the life of the thread.
@@ -938,7 +941,7 @@ __global__ void Yq_scatter_smash(
 		}
 		// load mj_tile, lj_tile
 		if( tid < TILE && jt + tid < J){
-			// block divergence but ok
+			// block/warp divergence but ok
 			mj_tile[tid] = m_j_in[mj_bh_offset + jt + tid];
 			lj_tile[tid] = 1.f / l_j_in[mj_bh_offset + jt + tid];
 		}
@@ -953,8 +956,8 @@ __global__ void Yq_scatter_smash(
 			}
 			// load mk_tile, lk_tile
 			if( tid < TILE && kt + tid < K){
-				mk_tile[tid] = m_j_in[mk_bh_offset + kt + tid];
-				lk_tile[tid] = 1.f / l_j_in[mk_bh_offset + kt + tid];
+				mk_tile[tid] = m_k_in[mk_bh_offset + kt + tid];
+				lk_tile[tid] = 1.f / l_k_in[mk_bh_offset + kt + tid];
 			}
 			__syncthreads();
 
@@ -1005,20 +1008,28 @@ __global__ void Yq_scatter_smash(
 				switch(n){
 					case 0:
 						yq_acc0 += f;
+						break;
 					case 1:
 						yq_acc1 += f;
+						break;
 					case 2:
 						yq_acc2 += f;
+						break;
 					case 3:
 						yq_acc3 += f;
+						break;
 					case 4:
 						yq_acc4 += f;
+						break;
 					case 5:
 						yq_acc5 += f;
+						break;
 					case 6:
 						yq_acc6 += f;
+						break;
 					case 7:
 						yq_acc7 += f;
+						break;
 				}
 			} // end yq_iters
 		} // end k tiles
@@ -1026,23 +1037,31 @@ __global__ void Yq_scatter_smash(
 	for( int n=0; n < TILE; n += load_step){
 		if( i_start + n + i_load < I){
 			float f = 0.f;
-			switch(n){
+			switch(n/load_step){
 				case 0:
 					f = yq_acc0;
+					break;
 				case 1:
 					f = yq_acc1;
+					break;
 				case 2:
 					f = yq_acc2;
+					break;
 				case 3:
 					f = yq_acc3;
+					break;
 				case 4:
 					f = yq_acc4;
+					break;
 				case 5:
 					f = yq_acc5;
+					break;
 				case 6:
 					f = yq_acc6;
+					break;
 				case 7:
 					f = yq_acc7;
+					break;
 			}
 			Y_q_[bh_offset + (i_start + n + i_load)*D + d_load] = f;
 		}
@@ -1098,8 +1117,11 @@ void Yq_scatter_smash_launcher(
 		TORCH_CHECK(I == J, "Kernel only implemented for Q, R, S same size");
 		TORCH_CHECK(K == J, "Kernel only implemented for Q, R, S same size");
 		TORCH_CHECK((TILE*D) / TPB <= 8, "Maximum 8 loads per thread - D is too large");
+		TORCH_CHECK(I >= TILE, "Need at least one tile along I,J,K");
+		TORCH_CHECK(I % TILE == 0, "I,J,K need to be a multiple of TILE");
 
-		dim3 grid(B, H, (I + TILE - 1) / TILE);
+
+		dim3 grid((I + TILE - 1) / TILE, H, B); // x, y, z
 
 		size_t smem_size = sizeof(float) * (
 			TILE * D * 5 + // Q, R, S, Vr, Vs
