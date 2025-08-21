@@ -26,12 +26,19 @@ int main() {
 	const int I = 16;
 	const int J = 16;
 	const int K = 16;
-	const int D = 64;
+	const int D = 32;
 
 	// Create random input tensors on the GPU
-	at::Tensor Q = torch::randn({B, H, I, D}, device);
-	at::Tensor R = torch::randn({B, H, J, D}, device);
-	at::Tensor S = torch::randn({B, H, K, D}, device);
+	at::Tensor Q = torch::zeros({B, H, I, D}, device);
+	at::Tensor R = torch::zeros({B, H, J, D}, device);
+	at::Tensor S = torch::zeros({B, H, K, D}, device);
+	int of = 7;
+	int tok = 0;
+	namespace F = torch::indexing;
+	Q.index_put_({0, 0, tok, F::Slice(of, of + 4)}, torch::arange(0, 4, device) * 4);
+	R.index_put_({0, 0, tok, F::Slice(of, of + 4)}, torch::arange(0, 4, device) * 4);
+	S.index_put_({0, 0, tok, F::Slice(of, of + 4)}, torch::arange(0, 4, device) * 4);
+
 	at::Tensor Vq_1 = torch::randn({B, H, J, D}, device);
 	at::Tensor Vq_2 = torch::randn({B, H, K, D}, device);
 	at::Tensor Vr_1 = torch::randn({B, H, I, D}, device);

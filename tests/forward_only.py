@@ -46,9 +46,9 @@ print(f"LD_LIBRARY_PATH before import: {os.environ.get('LD_LIBRARY_PATH')}")
 
 def generate_inputs(device):
 	"""Generates random input tensors on the specified device."""
-	Q = torch.randn(B, H, I, D, dtype=dtype, device=device) * 16
-	R = torch.randn(B, H, J, D, dtype=dtype, device=device) * 16
-	S = torch.randn(B, H, K, D, dtype=dtype, device=device) * 16
+	Q = torch.randn(B, H, I, D, dtype=dtype, device=device) * 4
+	R = torch.randn(B, H, J, D, dtype=dtype, device=device) * 4
+	S = torch.randn(B, H, K, D, dtype=dtype, device=device) * 4
 	Vq_1 = torch.randn(B, H, I, D, dtype=dtype, device=device)
 	Vq_2 = torch.randn(B, H, I, D, dtype=dtype, device=device)
 	Vr_1 = torch.randn(B, H, J, D, dtype=dtype, device=device)
@@ -59,13 +59,16 @@ def generate_inputs(device):
 		Q = torch.zeros(B, H, I, D, dtype=dtype, device=device)
 		R = torch.zeros(B, H, J, D, dtype=dtype, device=device)
 		S = torch.zeros(B, H, K, D, dtype=dtype, device=device)
-		k = 4
-		Q[0,0,:4,:k] = torch.arange(-5, -5 + k*k).reshape(k, k)
-		R[0,0,:4,:k] = torch.arange(-10, -10 + k*k).reshape(k, k)
-		S[0,0,:4,:k] = torch.arange(5, 5 + k*k).reshape(k, k)
-		# Q[0,0,2,:8] = torch.arange(0, 8) * 4
-		# R[0,0,1,:8] = torch.arange(0, 8) * 4
-		# S[0,0,0,:8] = torch.arange(0, 8) * 4
+		# k = 9
+		# Q[0,0,:k,:k] = torch.arange(-5, -5 + k*k).reshape(k, k)
+		# R[0,0,:k,:k] = torch.arange(-10, -10 + k*k).reshape(k, k)
+		# S[0,0,:k,:k] = torch.arange(5, 5 + k*k).reshape(k, k)
+		of = 0
+		tok = 10
+		l = 6
+		Q[0,0,tok,of:of+l] = torch.arange(0, l) * 4
+		R[0,0,tok,of:of+l] = torch.arange(0, l) * 4
+		S[0,0,tok,of:of+l] = torch.arange(0, l) * 4
 	dropout_rate = 0.0
 	return Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
 

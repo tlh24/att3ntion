@@ -75,65 +75,67 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim):
 	print("\nCUDA kernel run finished successfully.")
 
 
-def launch_profiler(report_filename=None):
-    """
-    Constructs and launches the ncu profiling command.
-    """
-    # --- Configuration ---
-    # You can now change these values directly in the script for a new run
-    B, H, I_dim, J_dim, K_dim, D_dim = (1, 2, 128, 128, 128, 64)
-    KERNEL_NAME = "Yq_scatter_smash"
-    
-    # Dynamically generate the report filename
-    if report_filename is None:
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_filename = f"profiling_reports/{KERNEL_NAME}_B{B}_H{H}_I{I_dim}_J{J_dim}_K{K_dim}_D{D_dim}_{timestamp}.ncu-rep"
-    else:
-        output_filename = report_filename
+def launch_profiler(dims, report_filename=None):
+	"""
+	Constructs and launches the ncu profiling command.
+	"""
+	# --- Configuration ---
+	# You can now change these values directly in the script for a new run
+	B, H, I_dim, J_dim, K_dim, D_dim = dims
+	# KERNEL_NAME = "Ar_tiled_softmax"
+	KERNEL_NAME = "Yq_scatter_smash"
 
-    # Ensure the output directory exists
-    os.makedirs(os.path.dirname(output_filename), exist_ok=True)
+	# Dynamically generate the report filename
+	if report_filename is None:
+		timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+		output_filename = f"profiling_reports/{KERNEL_NAME}_B{B}_H{H}_I{I_dim}_J{J_dim}_K{K_dim}_D{D_dim}_{timestamp}.ncu-rep"
+	else:
+		output_filename = report_filename
 
-    # Construct the ncu command
-    ncu_command = [
-        "ncu",
-        "--set", "full",
-        "-k", KERNEL_NAME,
-        "--section", "SchedulerStats",
-        "--section", "InstructionStats",
-        "--section", "MemoryWorkloadAnalysis",
-        "-o", output_filename,
-        sys.executable,  # Use the current python executable
-        __file__,       # Pass the script itself as the target
-        "--no-profile"  # Flag to tell the script not to launch ncu again
-    ]
+	# Ensure the output directory exists
+	os.makedirs(os.path.dirname(output_filename), exist_ok=True)
 
-    print(f"Executing profiling command: {' '.join(ncu_command)}")
-    # Use subprocess to run the command
-    subprocess.run(ncu_command, check=True)
-    print("\nCUDA profiling script finished successfully.")
+	# Construct the ncu command
+	ncu_command = [
+		"ncu",
+		"--set", "full",
+		"-k", KERNEL_NAME,
+		"--section", "SchedulerStats",
+		"--section", "InstructionStats",
+		"--section", "MemoryWorkloadAnalysis",
+		"-o", output_filename,
+		sys.executable,  # Use the current python executable
+		__file__,       # Pass the script itself as the target
+		"--no-profile"  # Flag to tell the script not to launch ncu again
+	]
+
+	print(f"Executing profiling command: {' '.join(ncu_command)}")
+	# Use subprocess to run the command
+	subprocess.run(ncu_command, check=True)
+	print("\nCUDA profiling script finished successfully.")
 
 
 if __name__ == '__main__':
-    try:
-        parser = argparse.ArgumentParser(description="Run CUDA profiling script.")
-        parser.add_argument("--no-profile", action="store_true",
-                            help="Run kernels directly without launching ncu profiler.")
-        parser.add_argument("--output-file", type=str, default=None,
-                            help="Specify the output filename for the ncu report.")
-        args = parser.parse_args()
+	try:
+		parser = argparse.ArgumentParser(description="Run CUDA profiling script.")
+		parser.add_argument("--no-profile", action="store_true",
+									help="Run kernels directly without launching ncu profiler.")
+		parser.add_argument("--output-file", type=str, default=None,
+									help="Specify the output filename for the ncu report.")
+		args = parser.parse_args()
 
-        # Check if we should run the kernels directly or launch the profiler
-        if args.no_profile:
-            # This branch is executed when ncu calls the script
-            B, H, I_dim, J_dim, K_dim, D_dim = (1, 2, 128, 128, 128, 64)
-            run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim)
-        else:
-            # This is the main branch that launches the profiler
-            launch_profiler(report_filename=args.output_file)
+		# Check if we should run the kernels directly or launch the profiler
+		dims = (8, 4, 128, 128, 128, 32)
+		B, H, I_dim, J_dim, K_dim, D_dim = dims
+		if args.no_profile:
+			# This branch is executed when ncu calls the script
+			run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim)
+		else:
+			# This is the main branch that launches the profiler
+			launch_profiler(dims, report_filename=args.output_file)
 
-    except ImportError:
-        print("\nImportError: Could not import 'hyper_attn_cpp_manual'.")
-        print("Please ensure the extension is compiled via 'python setup.py install' or 'develop'.")
-    except Exception as e:
-        print(f"\nAn unexpected error occurred: {e}")
+	except ImportError:
+		print("\nImportError: Could not import 'hyper_attn_cpp_manual'.")
+		print("Please ensure the extension is compiled via 'python setup.py install' or 'develop'.")
+	except Exception as e:
+		print(f"\nAn unexpected error occurred: {e}")

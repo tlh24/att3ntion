@@ -943,7 +943,7 @@ __global__ void Yq_scatter_smash(
 		if( tid < TILE && jt + tid < J){
 			// block/warp divergence but ok
 			mj_tile[tid] = m_j_in[mj_bh_offset + jt + tid];
-			lj_tile[tid] = 1.f / l_j_in[mj_bh_offset + jt + tid];
+			lj_tile[tid] = l_j_in[mj_bh_offset + jt + tid];
 		}
 		// iterate over the k tiles
 		for( int kt = 0; kt < K; kt += TILE){
@@ -957,7 +957,7 @@ __global__ void Yq_scatter_smash(
 			// load mk_tile, lk_tile
 			if( tid < TILE && kt + tid < K){
 				mk_tile[tid] = m_k_in[mk_bh_offset + kt + tid];
-				lk_tile[tid] = 1.f / l_k_in[mk_bh_offset + kt + tid];
+				lk_tile[tid] = l_k_in[mk_bh_offset + kt + tid];
 			}
 			__syncthreads();
 
@@ -997,35 +997,36 @@ __global__ void Yq_scatter_smash(
 					}
 				}
 			}
-			// // reduction time!
-			// // simple linear, not log - don't have enough smem
-			// for(int u = 1; u < 4; u++){
-			// 	if(da == u){
-			// 		#pragma unroll
-			// 		for(int i0 = 0; i0 < 4; i0++){
-			// 			#pragma unroll
-			// 			for(int i1 = 0; i1 < 4; i1++){
-			// 				#pragma unroll
-			// 				for(int i2 = 0; i2 < 4; i2++){
-			// 					attn_tile[(ia*4+i0)*TILE*TILE + (ja*4+i1)*TILE + (ka*4+i2)] = acc[i0][i1][i2];
-			// 				}
-			// 			}
-			// 		}
-			// 	}
-			// 	__syncthreads();
-			// 	if(da == 0){
-			// 		#pragma unroll
-			// 		for(int i0=0; i0 < 4; i0++){
-			// 			#pragma unroll
-			// 			for(int i1 = 0; i1 < 4; i1++){
-			// 				#pragma unroll
-			// 				for(int i2 = 0; i2 < 4; i2++){
-			// 					acc[i0][i1][i2] += attn_tile[(ia*4+i0)*TILE*TILE + (ja*4+i1)*TILE + (ka*4+i2)];
-			// 				}
-			// 			}
-			// 		}
-			// 	}
-			// }
+			// reduction time!
+			// simple linear, not log - don't have enough smem
+			for(int u = 1; u < 4; u++){
+				if(da == u){
+					#pragma unroll
+					for(int i0 = 0; i0 < 4; i0++){
+						#pragma unroll
+						for(int i1 = 0; i1 < 4; i1++){
+							#pragma unroll
+							for(int i2 = 0; i2 < 4; i2++){
+								attn_tile[(ia*4+i0)*TILE*TILE + (ja*4+i1)*TILE + (ka*4+i2)] = acc[i0][i1][i2];
+							}
+						}
+					}
+				}
+				__syncthreads();
+				if(da == 0){
+					#pragma unroll
+					for(int i0=0; i0 < 4; i0++){
+						#pragma unroll
+						for(int i1 = 0; i1 < 4; i1++){
+							#pragma unroll
+							for(int i2 = 0; i2 < 4; i2++){
+								acc[i0][i1][i2] += attn_tile[(ia*4+i0)*TILE*TILE + (ja*4+i1)*TILE + (ka*4+i2)];
+							}
+						}
+					}
+				}
+				__syncthreads();
+			}
 			if(da == 0){
 				#pragma unroll
 				for(int i0 = 0; i0 < 4; i0++){
@@ -1036,8 +1037,8 @@ __global__ void Yq_scatter_smash(
 						#pragma unroll
 						for(int i2 = 0; i2 < 4; i2++){
 							float logit = acc[i0][i1][i2] * scale;
-							float ar = expf(logit - mjt) * ljt;
-							float as = expf(logit - mk_tile[ka*4+i2]) * lk_tile[ka*4+i2];
+							float ar = expf(logit - mjt) / ljt;
+							float as = expf(logit - mk_tile[ka*4+i2]) / lk_tile[ka*4+i2];
 							attn_tile[(ia*4+i0)*TILE*TILE + (ja*4+i1)*TILE + (ka*4+i2)] = ar * as;
 						}
 					}
@@ -1081,9 +1082,11 @@ __global__ void Yq_scatter_smash(
 					int dy = tid_n % D; // = d_load
 					int iy = tid_n / D;
 					for( int jy = 0; jy < TILE; jy++){
+						float vrt = vr_tile[jy*D + dy];
 						for( int ky = 0; ky < TILE; ky++){
+							// this too can be pudhed to registers.
 							f += attn_tile[iy*TILE*TILE + jy*TILE + ky]
-									* vr_tile[jy*D + dy]
+									* vrt
 									* vs_tile[ky*D + dy];
 						}
 					}

@@ -19,7 +19,7 @@ setup(
                 'cxx': ['-O3'],
                 'nvcc': [
                     '-O3',
-                    '-gencode=arch=compute_86,code=sm_86',
+                    '-gencode=arch=compute_89,code=sm_89',
                     '-lineinfo'
                 ]
             }
