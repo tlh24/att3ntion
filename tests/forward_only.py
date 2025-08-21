@@ -5,6 +5,7 @@ import sys
 import time
 from pynvml import *
 import pdb
+import matplotlib.pyplot as plt
 
 # Import extensions (assuming they are compiled and accessible)
 # The order of imports matters for shared library loading, ensure pytorch-related ones are first if there are conflicts.
@@ -45,15 +46,26 @@ print(f"LD_LIBRARY_PATH before import: {os.environ.get('LD_LIBRARY_PATH')}")
 
 def generate_inputs(device):
 	"""Generates random input tensors on the specified device."""
-	Q = torch.randn(B, H, I, D, dtype=dtype, device=device)
-	R = torch.randn(B, H, J, D, dtype=dtype, device=device)
-	S = torch.randn(B, H, K, D, dtype=dtype, device=device)
+	Q = torch.randn(B, H, I, D, dtype=dtype, device=device) * 16
+	R = torch.randn(B, H, J, D, dtype=dtype, device=device) * 16
+	S = torch.randn(B, H, K, D, dtype=dtype, device=device) * 16
 	Vq_1 = torch.randn(B, H, I, D, dtype=dtype, device=device)
 	Vq_2 = torch.randn(B, H, I, D, dtype=dtype, device=device)
 	Vr_1 = torch.randn(B, H, J, D, dtype=dtype, device=device)
 	Vr_2 = torch.randn(B, H, J, D, dtype=dtype, device=device)
 	Vs_1 = torch.randn(B, H, K, D, dtype=dtype, device=device)
 	Vs_2 = torch.randn(B, H, K, D, dtype=dtype, device=device)
+	if False:
+		Q = torch.zeros(B, H, I, D, dtype=dtype, device=device)
+		R = torch.zeros(B, H, J, D, dtype=dtype, device=device)
+		S = torch.zeros(B, H, K, D, dtype=dtype, device=device)
+		k = 4
+		Q[0,0,:4,:k] = torch.arange(-5, -5 + k*k).reshape(k, k)
+		R[0,0,:4,:k] = torch.arange(-10, -10 + k*k).reshape(k, k)
+		S[0,0,:4,:k] = torch.arange(5, 5 + k*k).reshape(k, k)
+		# Q[0,0,2,:8] = torch.arange(0, 8) * 4
+		# R[0,0,1,:8] = torch.arange(0, 8) * 4
+		# S[0,0,0,:8] = torch.arange(0, 8) * 4
 	dropout_rate = 0.0
 	return Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
 
@@ -174,7 +186,19 @@ def run_test():
 	except Exception as e:
 		print(f"Error during CUDA forward pass: {e}")
 		sys.exit(1)
-	# pdb.set_trace()
+	x = Y_q__cuda.cpu() - Y_q__cpu
+	x = x.squeeze()
+	fig,axs = plt.subplots(1, 3)
+	im = axs[0].imshow(Y_q__cpu.squeeze())
+	plt.colorbar(im, ax=axs[0])
+	axs[0].set_title('CPU')
+	im = axs[1].imshow(Y_q__cuda.cpu().squeeze())
+	plt.colorbar(im, ax=axs[1])
+	axs[1].set_title('CUDA')
+	im = axs[2].imshow(x)
+	plt.colorbar(im, ax=axs[2])
+	axs[2].set_title('Diff')
+	plt.show()
 
 	print("\nComparing CPU and CUDA outputs...")
 	Y_q_cuda_cpu = Y_q_cuda.cpu()

@@ -51,4 +51,4 @@ clean:
 # to run: (e.g.)
 # LD_LIBRARY_PATH=/home/tlh24/venv/lib/python3.13/site-packages/torch/lib cuda-gdb ./test_harness
 # for python install:
-# pip install --no-build-isolation .
+# pip install --no-build-isolation . -v

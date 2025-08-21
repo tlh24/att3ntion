@@ -8,7 +8,7 @@
 #define TILE_J 16
 #define TILE_K 16
 #define TILE_I 16
-#define TILE 8
+#define TILE 16
 
 #define TILE_I_SPECIAL 4
 #define TILE_J_SPECIAL 4
@@ -961,25 +961,108 @@ __global__ void Yq_scatter_smash(
 			}
 			__syncthreads();
 
-			// calculate the attention block
-			int attn_iters = (TILE*TILE*TILE) / tpb;
-			for( int n = 0; n < attn_iters; n++ ){
-				int tid_n = tid + n*tpb;
-				int ia = tid_n / (TILE*TILE);
-				int ja = (tid_n / TILE) % TILE;
-				int ka = tid_n % TILE;
-				float f = 0.f;
-				for(int da = 0; da < D; da++){
-					// really should move q and r to registers
-					// this would require n being the fastest index.
-					// (each thread still computes attn_iters scores)
-					f += q_tile[ia*D + da] * r_tile[ja*D + da] * s_tile[ka*D + da];
+			// == calc attn block ==
+			float acc[4][4][4]; // must be in registers!!
+			#pragma unroll
+			for(int i0 = 0; i0 < 4; i0++){
+				#pragma unroll
+				for(int i1 = 0; i1 < 4; i1++){
+				#pragma unroll
+					for(int i2 = 0; i2 < 4; i2++){
+						acc[i0][i1][i2] = 0.f;
+					}
 				}
-				float logit = f * scale;
-				float ar = expf(logit - mj_tile[ja]) * lj_tile[ja];
-				float as = expf(logit - mk_tile[ka]) * lk_tile[ka];
-				attn_tile[tid_n] = ar * as;
 			}
+			int da = tid / (TILE*TILE*TILE/64); // 0 .. 3
+			// TODO iterate here (if needed)
+			int ia = (tid / (TILE*TILE/16)) % (TILE/4);
+			int ja = (tid / (TILE/4)) % (TILE/4);
+			int ka = tid % (TILE/4);
+			float qa[4], ra[4], sa[4];
+			for(int db = 0; db < 8; db++){ // TODO calc n_iters
+				#pragma unroll
+				for(int u = 0; u < 4; u++){
+					qa[u] = q_tile[(ia*4+u)*D + da*8 + db];
+					ra[u] = r_tile[(ja*4+u)*D + da*8 + db];
+					sa[u] = s_tile[(ka*4+u)*D + da*8 + db];
+				}
+				#pragma unroll
+				for(int i0 = 0; i0 < 4; i0++){
+					#pragma unroll
+					for(int i1 = 0; i1 < 4; i1++){
+						#pragma unroll
+						for(int i2 = 0; i2 < 4; i2++){
+							acc[i0][i1][i2] += qa[i0] * ra[i1] * sa[i2];
+						}
+					}
+				}
+			}
+			// // reduction time!
+			// // simple linear, not log - don't have enough smem
+			// for(int u = 1; u < 4; u++){
+			// 	if(da == u){
+			// 		#pragma unroll
+			// 		for(int i0 = 0; i0 < 4; i0++){
+			// 			#pragma unroll
+			// 			for(int i1 = 0; i1 < 4; i1++){
+			// 				#pragma unroll
+			// 				for(int i2 = 0; i2 < 4; i2++){
+			// 					attn_tile[(ia*4+i0)*TILE*TILE + (ja*4+i1)*TILE + (ka*4+i2)] = acc[i0][i1][i2];
+			// 				}
+			// 			}
+			// 		}
+			// 	}
+			// 	__syncthreads();
+			// 	if(da == 0){
+			// 		#pragma unroll
+			// 		for(int i0=0; i0 < 4; i0++){
+			// 			#pragma unroll
+			// 			for(int i1 = 0; i1 < 4; i1++){
+			// 				#pragma unroll
+			// 				for(int i2 = 0; i2 < 4; i2++){
+			// 					acc[i0][i1][i2] += attn_tile[(ia*4+i0)*TILE*TILE + (ja*4+i1)*TILE + (ka*4+i2)];
+			// 				}
+			// 			}
+			// 		}
+			// 	}
+			// }
+			if(da == 0){
+				#pragma unroll
+				for(int i0 = 0; i0 < 4; i0++){
+					#pragma unroll
+					for(int i1 = 0; i1 < 4; i1++){
+						float mjt = mj_tile[ja*4+i1]; //constant over innerloop
+						float ljt = lj_tile[ja*4+i1];
+						#pragma unroll
+						for(int i2 = 0; i2 < 4; i2++){
+							float logit = acc[i0][i1][i2] * scale;
+							float ar = expf(logit - mjt) * ljt;
+							float as = expf(logit - mk_tile[ka*4+i2]) * lk_tile[ka*4+i2];
+							attn_tile[(ia*4+i0)*TILE*TILE + (ja*4+i1)*TILE + (ka*4+i2)] = ar * as;
+						}
+					}
+				}
+			}
+			__syncthreads();
+			// // old attn calc
+			// int attn_iters = (TILE*TILE*TILE) / tpb; // tpb = threads per block
+			// for( int n = 0; n < attn_iters; n++ ){
+			// 	int tid_n = tid + n*tpb;
+			// 	int ia = tid_n / (TILE*TILE);
+			// 	int ja = (tid_n / TILE) % TILE;
+			// 	int ka = tid_n % TILE;
+			// 	float f = 0.f;
+			// 	for(int da = 0; da < D; da++){
+			// 		// really should move q and r to registers
+			// 		// this would require n being the fastest index.
+			// 		// (each thread still computes attn_iters scores)
+			// 		f += q_tile[ia*D + da] * r_tile[ja*D + da] * s_tile[ka*D + da];
+			// 	}
+			// 	float logit = f * scale;
+			// 	float ar = expf(logit - mj_tile[ja]) * lj_tile[ja];
+			// 	float as = expf(logit - mk_tile[ka]) * lk_tile[ka];
+			// 	attn_tile[tid_n] = ar * as;
+			// }
 
 			// load vs_tile
 			for( int n = 0; n < TILE; n += load_step ){

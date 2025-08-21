@@ -5,6 +5,7 @@ import sys
 import datetime
 import os
 import argparse
+import pdb
 
 def get_grad_output_cuda(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_):
     """
@@ -28,50 +29,50 @@ def get_grad_output_cuda(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_):
     return grad_output_combined
 
 def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim):
-    """
-    Contains the core logic for running the CUDA kernels.
-    This is what the profiler will measure.
-    """
-    if not torch.cuda.is_available():
-        print("CUDA is not available. Aborting.")
-        return
+	"""
+	Contains the core logic for running the CUDA kernels.
+	This is what the profiler will measure.
+	"""
+	if not torch.cuda.is_available():
+		print("CUDA is not available. Aborting.")
+		return
 
-    print(f"Using device: {torch.cuda.get_device_name(0)}")
-    print(f"Profiling config (B,H,I,J,K,D): ({B},{H},{I_dim},{J_dim},{K_dim},{D_dim})")
+	print(f"Using device: {torch.cuda.get_device_name(0)}")
+	print(f"Profiling config (B,H,I,J,K,D): ({B},{H},{I_dim},{J_dim},{K_dim},{D_dim})")
 
-    dropout_rate = 0.0
-    
-    # --- Tensor Initialization ---
-    Q = torch.rand(B, H, I_dim, D_dim, device='cuda', dtype=torch.float32)
-    R = torch.rand(B, H, J_dim, D_dim, device='cuda', dtype=torch.float32)
-    S = torch.rand(B, H, K_dim, D_dim, device='cuda', dtype=torch.float32)
-    Vq_1 = torch.rand(B, H, I_dim, D_dim, device='cuda', dtype=torch.float32)
-    Vq_2 = torch.rand(B, H, I_dim, D_dim, device='cuda', dtype=torch.float32)
-    Vr_1 = torch.rand(B, H, J_dim, D_dim, device='cuda', dtype=torch.float32)
-    Vr_2 = torch.rand(B, H, J_dim, D_dim, device='cuda', dtype=torch.float32)
-    Vs_1 = torch.rand(B, H, K_dim, D_dim, device='cuda', dtype=torch.float32)
-    Vs_2 = torch.rand(B, H, K_dim, D_dim, device='cuda', dtype=torch.float32)
+	dropout_rate = 0.0
 
-    # --- Execution ---
-    # Forward Pass
-    Y_q_mc, Y_r_mc, Y_s_mc, Y_q__mc, Y_r__mc, Y_s__mc = hyper_attn_cpp_manual.forward(
-        Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
-    )
+	# --- Tensor Initialization ---
+	Q = torch.rand(B, H, I_dim, D_dim, device='cuda', dtype=torch.float32)
+	R = torch.rand(B, H, J_dim, D_dim, device='cuda', dtype=torch.float32)
+	S = torch.rand(B, H, K_dim, D_dim, device='cuda', dtype=torch.float32)
+	Vq_1 = torch.rand(B, H, I_dim, D_dim, device='cuda', dtype=torch.float32)
+	Vq_2 = torch.rand(B, H, I_dim, D_dim, device='cuda', dtype=torch.float32)
+	Vr_1 = torch.rand(B, H, J_dim, D_dim, device='cuda', dtype=torch.float32)
+	Vr_2 = torch.rand(B, H, J_dim, D_dim, device='cuda', dtype=torch.float32)
+	Vs_1 = torch.rand(B, H, K_dim, D_dim, device='cuda', dtype=torch.float32)
+	Vs_2 = torch.rand(B, H, K_dim, D_dim, device='cuda', dtype=torch.float32)
 
-    # Create dummy gradient for the backward pass
-    grad_output_cuda = get_grad_output_cuda(Y_q_mc, Y_r_mc, Y_s_mc, Y_q__mc, Y_r__mc, Y_s__mc)
-    
-    # Backward Pass
-    hyper_attn_cpp_manual.backward(
-        grad_output_cuda, 
-        Q, R, S,
-        Vq_1, Vq_2,
-        Vr_1, Vr_2,
-        Vs_1, Vs_2,
-        dropout_rate
-    )
-    torch.cuda.synchronize()
-    print("\nCUDA kernel run finished successfully.")
+	# --- Execution ---
+	# Forward Pass
+	Y_q_mc, Y_r_mc, Y_s_mc, Y_q__mc, Y_r__mc, Y_s__mc = hyper_attn_cpp_manual.forward(
+		Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
+	)
+
+	# Create dummy gradient for the backward pass
+	grad_output_cuda = get_grad_output_cuda(Y_q_mc, Y_r_mc, Y_s_mc, Y_q__mc, Y_r__mc, Y_s__mc)
+
+	# Backward Pass
+	hyper_attn_cpp_manual.backward(
+		grad_output_cuda,
+		Q, R, S,
+		Vq_1, Vq_2,
+		Vr_1, Vr_2,
+		Vs_1, Vs_2,
+		dropout_rate
+	)
+	torch.cuda.synchronize()
+	print("\nCUDA kernel run finished successfully.")
 
 
 def launch_profiler(report_filename=None):
@@ -81,7 +82,7 @@ def launch_profiler(report_filename=None):
     # --- Configuration ---
     # You can now change these values directly in the script for a new run
     B, H, I_dim, J_dim, K_dim, D_dim = (1, 2, 128, 128, 128, 64)
-    KERNEL_NAME = "Yq_scatter_flash"
+    KERNEL_NAME = "Yq_scatter_smash"
     
     # Dynamically generate the report filename
     if report_filename is None:
