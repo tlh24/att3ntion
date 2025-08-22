@@ -81,7 +81,7 @@ def launch_profiler(report_filename=None):
     # --- Configuration ---
     # You can now change these values directly in the script for a new run
     B, H, I_dim, J_dim, K_dim, D_dim = (1, 2, 128, 128, 128, 64)
-    KERNEL_NAME = "Yq_scatter_flash"
+    KERNEL_NAME = "Yq_gather_flash"
     
     # Dynamically generate the report filename
     if report_filename is None:
@@ -90,8 +90,12 @@ def launch_profiler(report_filename=None):
     else:
         output_filename = report_filename
 
-    # Ensure the output directory exists
-    os.makedirs(os.path.dirname(output_filename), exist_ok=True)
+    dirpath = os.path.dirname(output_filename)
+    if dirpath == "":
+        dirpath = "profiling_reports"
+        output_filename = os.path.join(dirpath, output_filename)
+
+    os.makedirs(dirpath, exist_ok=True)
 
     # Construct the ncu command
     ncu_command = [
