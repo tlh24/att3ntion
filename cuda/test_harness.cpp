@@ -32,7 +32,7 @@ int main() {
 	at::Tensor Q = torch::zeros({B, H, I, D}, device);
 	at::Tensor R = torch::zeros({B, H, J, D}, device);
 	at::Tensor S = torch::zeros({B, H, K, D}, device);
-	int of = 7;
+	int of = 0;
 	int tok = 0;
 	namespace F = torch::indexing;
 	Q.index_put_({0, 0, tok, F::Slice(of, of + 4)}, torch::arange(0, 4, device) * 4);
@@ -42,9 +42,9 @@ int main() {
 	at::Tensor Vq_1 = torch::randn({B, H, J, D}, device);
 	at::Tensor Vq_2 = torch::randn({B, H, K, D}, device);
 	at::Tensor Vr_1 = torch::randn({B, H, I, D}, device);
-	at::Tensor Vr_2 = torch::randn({B, H, K, D}, device);
+	at::Tensor Vr_2 = torch::ones({B, H, K, D}, device);
 	at::Tensor Vs_1 = torch::randn({B, H, I, D}, device);
-	at::Tensor Vs_2 = torch::randn({B, H, J, D}, device);
+	at::Tensor Vs_2 = torch::ones({B, H, J, D}, device) * 2;
 
 	std::cout << "Input tensors created on CUDA device." << std::endl;
 

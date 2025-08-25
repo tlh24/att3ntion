@@ -46,9 +46,9 @@ print(f"LD_LIBRARY_PATH before import: {os.environ.get('LD_LIBRARY_PATH')}")
 
 def generate_inputs(device):
 	"""Generates random input tensors on the specified device."""
-	Q = torch.randn(B, H, I, D, dtype=dtype, device=device) * 4
-	R = torch.randn(B, H, J, D, dtype=dtype, device=device) * 4
-	S = torch.randn(B, H, K, D, dtype=dtype, device=device) * 4
+	Q = torch.randn(B, H, I, D, dtype=dtype, device=device) * 1
+	R = torch.randn(B, H, J, D, dtype=dtype, device=device) * 1
+	S = torch.randn(B, H, K, D, dtype=dtype, device=device) * 1
 	Vq_1 = torch.randn(B, H, I, D, dtype=dtype, device=device)
 	Vq_2 = torch.randn(B, H, I, D, dtype=dtype, device=device)
 	Vr_1 = torch.randn(B, H, J, D, dtype=dtype, device=device)
@@ -64,11 +64,19 @@ def generate_inputs(device):
 		# R[0,0,:k,:k] = torch.arange(-10, -10 + k*k).reshape(k, k)
 		# S[0,0,:k,:k] = torch.arange(5, 5 + k*k).reshape(k, k)
 		of = 0
-		tok = 10
-		l = 6
+		tok = 0
+		l = 4
 		Q[0,0,tok,of:of+l] = torch.arange(0, l) * 4
 		R[0,0,tok,of:of+l] = torch.arange(0, l) * 4
 		S[0,0,tok,of:of+l] = torch.arange(0, l) * 4
+	if False:
+		Vr_2 = torch.ones(B, H, J, D, dtype=dtype, device=device)
+		Vs_2 = torch.ones(B, H, J, D, dtype=dtype, device=device) * 2
+		# k = 9
+		# Vr_2[0,0,:k,:k] = torch.arange(-5, -5 + k*k).reshape(k, k)
+		# Vs_2[0,0,:k,:k] = torch.arange(-5, -5 + k*k).reshape(k, k)
+		# Vr_2[0,0,-4:,:] = torch.randn(4, D) * 100.0
+		# Vs_2[0,0,-4:,:] = torch.randn(4, D) * 100.0
 	dropout_rate = 0.0
 	return Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
 
@@ -191,7 +199,7 @@ def run_test():
 		sys.exit(1)
 	x = Y_q__cuda.cpu() - Y_q__cpu
 	x = x.squeeze()
-	fig,axs = plt.subplots(1, 3)
+	fig,axs = plt.subplots(1, 4)
 	im = axs[0].imshow(Y_q__cpu.squeeze())
 	plt.colorbar(im, ax=axs[0])
 	axs[0].set_title('CPU')
@@ -201,6 +209,11 @@ def run_test():
 	im = axs[2].imshow(x)
 	plt.colorbar(im, ax=axs[2])
 	axs[2].set_title('Diff')
+	x = Y_q__cuda.cpu() / Y_q__cpu
+	x = x.squeeze()
+	im = axs[3].imshow(x)
+	plt.colorbar(im, ax=axs[3])
+	axs[3].set_title('Ratio')
 	plt.show()
 
 	print("\nComparing CPU and CUDA outputs...")
