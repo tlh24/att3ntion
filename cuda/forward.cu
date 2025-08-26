@@ -840,7 +840,9 @@ __global__ void Aq_tiled_softmax(
     }
 }
 
-__global__ void Yq_scatter_smash(
+__global__ void
+__launch_bounds__(256, 2) // make sure we can get 2 thread blocks per SM
+Yq_scatter_smash(
 	const float* __restrict__ Q,
 	const float* __restrict__ R,
 	const float* __restrict__ S,
@@ -879,7 +881,6 @@ __global__ void Yq_scatter_smash(
 	// --- Pointers to Global Memory ---
 	int64_t bh_offset = (int64_t)((b*H + h) * I * D);
 	const int64_t mj_bh_offset = (int64_t)((b*H + h) * I);
-	const int64_t mk_bh_offset = mj_bh_offset;
 
 	// shared memory
 	extern __shared__ float smem[];
@@ -908,15 +909,15 @@ __global__ void Yq_scatter_smash(
 	yq_acc7 = 0.f;
 
 	// cooperative load Q, size [TILE, D]
-	int i_load = tid / D; // i, j, or k: tpb=512, 0..15; tpb=256 0..7
-	int d_load = tid % D; // if tpb = 256, '', load_iters = 2
-	int load_iters = max(1, (TILE * D) / tpb);
-	int load_step = tpb / D; // if tpb=256, load_step=8
+	unsigned short i_load = tid / D; // i, j, or k: tpb=512, 0..15; tpb=256 0..7
+	unsigned short d_load = tid % D; // if tpb = 256, '', load_iters = 2
+	unsigned short load_iters = max(1, (TILE * D) / tpb);
+	unsigned short load_step = tpb / D; // if tpb=256, load_step=8
 
 	// Q is fixed for the life of the thread.
 	// note these loads are cooperative & contiguous across the block.
 	// if tpb > D*TILE, many warps will be noop here.
-	for( int n = 0; n < TILE; n += load_step ){
+	for( unsigned short n = 0; n < TILE; n += load_step ){
 		if( i_start + n + i_load < I ){
 			q_tile[(n + i_load)*D + d_load] =
 				Q[bh_offset + (i_start + n + i_load)*D + d_load];
@@ -924,16 +925,16 @@ __global__ void Yq_scatter_smash(
 	}
 
 	// iterate over j tiles.
-	for( int jt = 0; jt < J; jt += TILE){
+	for( unsigned short jt = 0; jt < J; jt += TILE){
 		// load r_tile
-		for( int n = 0; n < TILE; n += load_step ){
+		for( unsigned short n = 0; n < TILE; n += load_step ){
 			if( jt + n + i_load < J ){
 				r_tile[(n + i_load)*D + d_load] =
 					R[bh_offset + (jt + n + i_load)*D + d_load];
 			}
 		}
 		// load vr_tile
-		for( int n = 0; n < TILE; n += load_step ){
+		for( unsigned short n = 0; n < TILE; n += load_step ){
 			if( jt + n + i_load < J ){
 				vr_tile[(n + i_load)*D + d_load] =
 					Vr_2[bh_offset + (jt + n + i_load)*D + d_load];
@@ -946,9 +947,9 @@ __global__ void Yq_scatter_smash(
 			lj_tile[tid] = 1.f / l_j_in[mj_bh_offset + jt + tid];
 		}
 		// iterate over the k tiles
-		for( int kt = 0; kt < K; kt += TILE){
+		for( unsigned short kt = 0; kt < K; kt += TILE){
 			// load s_tile
-			for( int n = 0; n < TILE; n += load_step ){
+			for( unsigned short n = 0; n < TILE; n += load_step ){
 				if( kt + n + i_load < K ){
 					s_tile[(n + i_load)*D + d_load] =
 						S[bh_offset + (kt + n + i_load)*D + d_load];
@@ -956,8 +957,8 @@ __global__ void Yq_scatter_smash(
 			}
 			// load mk_tile, lk_tile
 			if( tid < TILE && kt + tid < K){
-				mk_tile[tid] = m_k_in[mk_bh_offset + kt + tid];
-				lk_tile[tid] = 1.f / l_k_in[mk_bh_offset + kt + tid];
+				mk_tile[tid] = m_k_in[mj_bh_offset + kt + tid];
+				lk_tile[tid] = 1.f / l_k_in[mj_bh_offset + kt + tid];
 			}
 			__syncthreads();
 
@@ -973,13 +974,13 @@ __global__ void Yq_scatter_smash(
 					}
 				}
 			}
-			int da = tid / (TILE*TILE*TILE/64); // 0 .. 3
+			unsigned short da = tid / (TILE*TILE*TILE/64); // 0 .. 3
 			// TODO iterate here (if needed)
-			int ia = (tid / (TILE*TILE/16)) % (TILE/4);
-			int ja = (tid / (TILE/4)) % (TILE/4);
-			int ka = tid % (TILE/4);
+			unsigned short ia = (tid / (TILE*TILE/16)) % (TILE/4);
+			unsigned short ja = (tid / (TILE/4)) % (TILE/4);
+			unsigned short ka = tid % (TILE/4);
 			float qa[4], ra[4], sa[4];
-			for(int db = 0; db < 8; db++){ // TODO calc n_iters
+			for(unsigned short db = 0; db < 8; db++){ // TODO calc n_iters
 				#pragma unroll
 				for(int u = 0; u < 4; u++){
 					qa[u] = q_tile[(ia*4+u)*D + da*8 + db];
@@ -999,7 +1000,7 @@ __global__ void Yq_scatter_smash(
 			}
 			// reduction time!
 			// simple linear, not log - don't have enough smem
-			for(int u = 1; u < 4; u++){
+			for(unsigned char u = 1; u < 4; u++){
 				if(da == u){
 					#pragma unroll
 					for(int i0 = 0; i0 < 4; i0++){
@@ -1075,15 +1076,15 @@ __global__ void Yq_scatter_smash(
 			__syncthreads();
 
 			// iterate over yq
-			for( int n=0; n < load_iters; n++){
-				int tid_n = tid + n*tpb;
+			for( unsigned short n=0; n < load_iters; n++){
+				unsigned short tid_n = tid + n*tpb;
 				float f = 0.f;
 				if( tid_n < TILE*D ){
-					int dy = tid_n % D; // = d_load
-					int iy = tid_n / D;
-					for( int jy = 0; jy < TILE; jy++){
+					unsigned short dy = tid_n % D; // = d_load
+					unsigned short iy = tid_n / D;
+					for( unsigned short jy = 0; jy < TILE; jy++){
 						float vrt = vr_tile[jy*D + dy];
-						for( int ky = 0; ky < TILE; ky++){
+						for( unsigned short ky = 0; ky < TILE; ky++){
 							// this too can be pushed to registers.
 							f += attn_tile[iy*TILE*TILE + jy*TILE + ky]
 									* vrt
@@ -1120,7 +1121,7 @@ __global__ void Yq_scatter_smash(
 			} // end yq_iters
 		} // end k tiles
 	} // end j tiles
-	for( int n=0; n < TILE; n += load_step){
+	for( unsigned short n=0; n < TILE; n += load_step){
 		if( i_start + n + i_load < I){
 			float f = 0.f;
 			switch(n/load_step){
