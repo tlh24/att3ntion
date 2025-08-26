@@ -1000,6 +1000,10 @@ Yq_scatter_smash(
 			}
 			// reduction time!
 			// simple linear, not log - don't have enough smem
+			// idea: what if we used the s_tile memory for redution?
+			// (need to get the full attn logits of course..)
+			// also, think that we can get by with smaller tiles,
+			// and faster loads from smem, e.g. each warp loads a full 32?
 			for(unsigned char u = 1; u < 4; u++){
 				if(da == u){
 					#pragma unroll
