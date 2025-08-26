@@ -919,7 +919,7 @@ Yq_scatter_smash(
 	// if tpb > D*TILE, many warps will be noop here.
 	for( unsigned short n = 0; n < TILE; n += load_step ){
 		if( i_start + n + i_load < I ){
-			q_tile[d_load*TILE + n + i_load] =
+			q_tile[(n + i_load)*D + d_load] =
 				Q[bh_offset + (i_start + n + i_load)*D + d_load];
 		}
 	}
@@ -929,10 +929,7 @@ Yq_scatter_smash(
 		// load r_tile
 		for( unsigned short n = 0; n < TILE; n += load_step ){
 			if( jt + n + i_load < J ){
-				// r_tile[(n + i_load)*D + d_load] =
-				// 	R[bh_offset + (jt + n + i_load)*D + d_load];
-				// transpose q,r,s tile
-				r_tile[d_load*TILE + n + i_load] =
+				r_tile[(n + i_load)*D + d_load] =
 					R[bh_offset + (jt + n + i_load)*D + d_load];
 			}
 		}
@@ -986,9 +983,8 @@ Yq_scatter_smash(
 			for(unsigned short db = 0; db < 8; db++){ // TODO calc n_iters
 				#pragma unroll
 				for(int u = 0; u < 4; u++){
-					// for coalesced access, these should be transposed.
-					qa[u] = q_tile[(ia*4+u) + da*8*TILE + db*TILE];
-					ra[u] = r_tile[(ja*4+u) + da*8*TILE + db*TILE];
+					qa[u] = q_tile[(ia*4+u)*D + da*8 + db];
+					ra[u] = r_tile[(ja*4+u)*D + da*8 + db];
 					sa[u] = s_tile[(ka*4+u)*D + da*8 + db];
 				}
 				#pragma unroll
