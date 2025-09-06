@@ -163,12 +163,12 @@ def graycodePosEnc(ntok, nbits, rand_phase=False):
 
 def genData3(bs, do_print=False, validation=False):
 	'''
-	Task 3: from a list of 8 integers,
+	Task 3: from a list of ntok integers,
 	compute the op of two of them based on *pointers*
 	rather than positional arguments.
 	This ought to be easy.
 	'''
-	ntok = 16
+	ntok = 24
 	nbits = 4
 	md = 64 - (5 + (nbits*2)*3) # 35
 
@@ -403,10 +403,10 @@ def genData4(bs, do_print=False, validation=False):
 	rng = np.random.default_rng()
 	x = np.zeros((bs, ntok, md + 5 + 8*3), dtype=np.float32)
 	y = np.zeros_like(x)
-	exp_gen = ExpressionGeneratorDepth(4, 7) # NOTE!!!
+	exp_gen = ExpressionGeneratorDepth(5, 7) # NOTE!!!
 	for b in range(bs):
 		pos_enc = graycodePosEnc(ntok, nbits, rand_phase=True)
-		tries = 10
+		tries = 16
 		cnt = 0
 		while tries > 0:
 			# could do a much better packing alg ..meh
@@ -1066,6 +1066,22 @@ def genData8(bs, do_print=False):
 			encodeList(y, [vc0,vc1,vc2,vc3])
 		if do_print:
 			print("num_tok", tok_ctr)
+
+# genData9(bs, do_print=False):
+# 	''' replicate http://arxiv.org/abs/2505.20896
+# 	'''
+# 	md = 8 + 16 + 8 # one-hot indicators, digits, pointer, [posenc]
+# 	ntok = 24
+# 	nbits = 8
+#
+# 	pos_enc = graycodePosEnc(ntok, nbits, rand_phase=False)
+# 	x = np.zeros((bs, ntok, md + nbits*2), dtype=np.float32)
+# 	y = np.zeros_like(x)
+# 	x[:, :, -nbits*2:] = pos_enc
+# 	y[:, :, -nbits*2:] = pos_enc # this will be overwritten
+#
+# 	for b in range(bs):
+
 
 if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='generate compositional data for training graph/hypergraph transformers')

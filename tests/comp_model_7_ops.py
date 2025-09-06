@@ -79,17 +79,14 @@ class SimpleCompModel(nn.Module):
 		self.gelu = QuickGELU()
 		
 	def forward(self, x, b):
-		skip = b % (self.n_recurse)
+		# skip = b % (self.n_recurse)
+		skip = 0
 		if skip > 0:
 			with torch.no_grad():
 				x = self.embedding_proj(x)
 		else:
 			x = self.embedding_proj(x)
 		for r in range(self.n_recurse):
-			'''allocation module:
-			each token has access to one extra token per
-			full pass through the network.
-			'''
 			if r < skip:
 				with torch.no_grad():
 					for layer_block in self.repeated_layers:
@@ -227,15 +224,17 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	
 	print(f"Using device: {device}")
 	
+	nsmaples = 1000
 	if task == 3:
 		gen_func = genData3
 	if task == 4:
 		gen_func = genData4
 	if task == 7:
 		gen_func = genData7
+		nsamples = 6000
 
-	x, y = gen_func(batch_size * 1000, do_print=False)
-	x_v, y_v = gen_func(batch_size * 1000, do_print=False, validation=True)
+	x, y = gen_func(batch_size * nsamples, do_print=False)
+	x_v, y_v = gen_func(batch_size * nsamples, do_print=False, validation=True)
 
 	dataset = TensorDataset(torch.tensor(x), torch.tensor(y))
 	train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -252,7 +251,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	n_recurse = 1
 
 	if task == 4:
-		n_recurse = 4
+		n_recurse = 5
 		if attn_impl == "hypergraph":
 			n_layers = 2
 		else:
@@ -269,8 +268,8 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	weight_decay = 1e-2 # karpathy 1e-1, default 1e-2
 	beta1 = 0.9 # default 0.9, both.
 	beta2 = 0.95 # karpathy 0.95, default 0.999
-	optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), 'cuda')
-	# optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, amsgrad=True)
+	# optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), 'cuda')
+	optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, amsgrad=True)
 	model.printParamCount()
 	model = torch.compile(model) # mode="max-autotune"
 
@@ -278,8 +277,8 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	print(f"Bfloat16 supported: {bf16_supported}")
 	print("--- Running with Automatic Mixed Precision ---")
 
-
-	fd_losslog = open(f'losslog_{attn_impl}_t{task}_{log_name}_r{replicate}.txt', 'w')
+	nam = {"hypergraph":"hg","graph":"g"}.get(attn_impl)
+	fd_losslog = open(f'losslog_{nam}_t{task}_{log_name}_r{replicate}.txt', 'w')
 
 	print("\ntrain_model1 started...")
 	uu = 0
@@ -421,8 +420,6 @@ if __name__ == '__main__':
 	parser.add_argument('--task', type=int, help="what task to run the model on", required=True)
 	parser.add_argument('--repl', type=int, default=1, help="what replicate this is",)
 	args = parser.parse_args()
-
-	# print("Task 7: This script tests the graph and hypergraph transformer on a one-digit multiply task, multi-digit add, and shift tasks.")
 	
 	model = trainModel(
 		num_epochs=args.epochs,
