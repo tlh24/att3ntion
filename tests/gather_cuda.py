@@ -163,24 +163,40 @@ def run_test():
     yr_close = torch.allclose(Y_r_m_cpu, Y_r_r_cpu, rtol=rtol, atol=atol)
     ys_close = torch.allclose(Y_s_m_cpu, Y_s_r_cpu, rtol=rtol, atol=atol)
 
+    # Compute max differences if available, else "N/A"
+    try:
+        yq_diff = (Y_q_m_cpu - Y_q_r_cpu).abs().max().item()
+    except Exception:
+        yq_diff = "N/A"
+    try:
+        yr_diff = (Y_r_m_cpu - Y_r_r_cpu).abs().max().item()
+    except Exception:
+        yr_diff = "N/A"
+    try:
+        ys_diff = (Y_s_m_cpu - Y_s_r_cpu).abs().max().item()
+    except Exception:
+        ys_diff = "N/A"
+
     forward_results = [
-        ["Y_q", "PASS" if yq_close else "FAIL", (Y_q_m_cpu - Y_q_r_cpu).abs().max().item() if not yq_close else 0],
-        ["Y_r", "PASS" if yr_close else "FAIL", (Y_r_m_cpu - Y_r_r_cpu).abs().max().item() if not yr_close else 0],
-        ["Y_s", "PASS" if ys_close else "FAIL", (Y_s_m_cpu - Y_s_r_cpu).abs().max().item() if not ys_close else 0],
+        ["Y_q", "PASS" if yq_close else "FAIL", yq_diff],
+        ["Y_r", "PASS" if yr_close else "FAIL", yr_diff],
+        ["Y_s", "PASS" if ys_close else "FAIL", ys_diff],
         ["Y_q_", "SKIPPED", "N/A"],
         ["Y_r_", "SKIPPED", "N/A"],
         ["Y_s_", "SKIPPED", "N/A"],
     ]
 
+    # Require all three gathers to match
     all_passed = yq_close and yr_close and ys_close
 
+    print("\nForward Pass Results:")
+    print_table(["Output", "Status", "Max Diff"], forward_results)
+
     if not all_passed:
-        print("\nForward Pass Results:")
-        print_table(["Output", "Status", "Max Diff"], forward_results)
         print("\n*** Gather Equivalence Test Failed! ***")
         return False
     else:
-        print("\nGather-only Equivalence Test Passed.")
+        print("\nGather Equivalence Test Passed.")
         return True
 
 
@@ -205,7 +221,7 @@ def benchmark():
     dropout_rate = 0.0
 
     print("\n" + "=" * 80)
-    print("PERFORMANCE BENCHMARKS (FORWARD PASS, YQ GATHER ONLY)")
+    print("PERFORMANCE BENCHMARKS (FORWARD PASS, Yq/Yr/Ys GATHER)")
     print("=" * 80)
 
     print("\n--- Custom CUDA & PyTorch C++ Reference Benchmarks ---")
@@ -329,14 +345,14 @@ if __name__ == '__main__':
     nvmlInit()
     
     print("=" * 60)
-    print("CUDA EQUIVALENCE TESTING (Yq_GATHER FORWARD ONLY)")
+    print("CUDA EQUIVALENCE TESTING (Yq/Yr/Ys GATHER FORWARD)")
     print("=" * 60)
     
     forward_passed = run_test()
     
     if forward_passed:
         print("\n" + "=" * 60)
-        print("ALL Yq_GATHER EQUIVALENCE TESTS PASSED! Proceeding with benchmarks...")
+        print("ALL GATHER EQUIVALENCE TESTS (Yq/Yr/Ys) PASSED! Proceeding with benchmarks...")
         print("=" * 60)
         if torch.cuda.is_available():
             print(f"CUDA Device: {torch.cuda.get_device_name(0)}")
@@ -345,7 +361,7 @@ if __name__ == '__main__':
             print("CUDA not available. Skipping benchmarks.")
     else:
         print("\n" + "=" * 60)
-        print("Yq_GATHER EQUIVALENCE TESTS FAILED - SKIPPING BENCHMARKS")
+        print("GATHER EQUIVALENCE TESTS (Yq/Yr/Ys) FAILED - SKIPPING BENCHMARKS")
         print("Please fix the implementation issues before benchmarking.")
         print("=" * 60)
         sys.exit(1)
