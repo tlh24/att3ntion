@@ -124,19 +124,15 @@ class HypergraphAttention_Naive(nn.Module):
 			Y_s_ = torch.einsum('bhijk,bhid,bhijk,bhjd->bhkd', Aq, Vq_, Ar, Vr_)
 		
 		Y_q = self.gelu(Y_q) # test!
-		Y_r = self.gelu(Y_r) # is this better?
-		Y_s = self.gelu(Y_s) # doesn't seem like much.
+		Y_r = self.gelu(Y_r)
+		Y_s = self.gelu(Y_s)
 		Y_q_ = self.gelu(Y_q_)
 		Y_r_ = self.gelu(Y_r_)
 		Y_s_ = self.gelu(Y_s_)
 		y = Y_q + Y_r + Y_s + Y_q_ + Y_r_ + Y_s_
 		
-		if self.head_subspaces:
-			y = y.permute(0,2,1,3) # to bihd
-			y = y.reshape(batch_size, ntok, self.n_heads*self.d_val)
-		else:
-			# sum along the heads
-			y = y.permute(0, 2, 1, 3).sum(dim=2).squeeze()
+		# sum along the heads
+		y = y.permute(0, 2, 1, 3).sum(dim=2).squeeze()
 		# y = self.gelu(y)
 		y = self.Wo(y)
 		# residual path is external to this layer.
@@ -146,21 +142,21 @@ class HypergraphAttention_Naive(nn.Module):
 		bs, ntok, d_model = x.shape
 		f = 0.0
 		# QRS proj = [..., d_model] @ [d_model, n_heads*d_model]
-		f += 3 * bs * ntok * d_model**2 * self.n_heads*self.d_head
+		f += 3 * bs * ntok * d_model**2 * self.n_heads*d_model
 		# Value proj = [..., d_model] @ [d_model, n_heads*d_model*2]
-		f += 3 * bs * ntok * d_model**2 * self.n_heads*self.d_val*2
+		f += 3 * bs * ntok * d_model**2 * self.n_heads*d_model*2
 		# attn - '2' is from the 3-way multiply
-		f += bs * self.n_heads * ntok**3 * self.d_head * 2
+		f += bs * self.n_heads * ntok**3 * d_model * 2
 		# 3 softmaxes - 2 is from the softmax itself.
 		f += bs * self.n_heads * ntok**3 * 2 * 3
 		# gather
-		f += bs * self.n_heads * ntok**3 * self.d_val * 3
+		f += bs * self.n_heads * ntok**3 * d_model * 3
 		# scatter - 3 comes from the 4 arguments to each
-		f += bs * self.n_heads * ntok**3 * self.d_val * 3 * 3
+		f += bs * self.n_heads * ntok**3 * d_model * 3 * 3
 		# combine & Gelu
-		f += bs * self.n_heads * ntok * self.d_val * (6 + 6)
+		f += bs * self.n_heads * ntok * d_model * (6 + 6)
 		# Wo = [..., d_model] @ [d_model, d_model]
-		f += bs * self.n_heads * ntok * d_model * self.d_val
+		f += bs * self.n_heads * ntok * d_model**2
 
 		return f
 
@@ -223,6 +219,23 @@ class GraphAttention_Naive(nn.Module):
 		y = self.Wo(y)
 		# residual path is external to this layer.
 		return y
+
+	def calcFlops(self, x):
+		bs, ntok, d_model = x.shape
+		f = 0.0
+		# QKV projection
+		f += 3 * bs * ntok * d_model**2 * self.n_heads*d_model
+		# attention
+		f += bs * self.n_heads * ntok**2 * d_model
+		# softmax
+		f += bs * self.n_heads * ntok**2 * 2
+		# V projection
+		f += bs * self.n_heads * ntok * d_model**2 * 2
+		# sum and gelu
+		f += bs * self.n_heads * ntok * d_model * (2 + 6)
+		# Wo proj
+		f += bs * ntok * d_model**2
+		return f
 
 	def calcFlops(self, x):
 		bs, ntok, d_model = x.shape

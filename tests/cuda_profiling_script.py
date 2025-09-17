@@ -40,17 +40,18 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim):
     print(f"Profiling config (B,H,I,J,K,D): ({B},{H},{I_dim},{J_dim},{K_dim},{D_dim})")
 
     dropout_rate = 0.0
+    dtype = torch.bfloat16#torch.float32
     
     # --- Tensor Initialization ---
-    Q = torch.rand(B, H, I_dim, D_dim, device='cuda', dtype=torch.float32)
-    R = torch.rand(B, H, J_dim, D_dim, device='cuda', dtype=torch.float32)
-    S = torch.rand(B, H, K_dim, D_dim, device='cuda', dtype=torch.float32)
-    Vq_1 = torch.rand(B, H, I_dim, D_dim, device='cuda', dtype=torch.float32)
-    Vq_2 = torch.rand(B, H, I_dim, D_dim, device='cuda', dtype=torch.float32)
-    Vr_1 = torch.rand(B, H, J_dim, D_dim, device='cuda', dtype=torch.float32)
-    Vr_2 = torch.rand(B, H, J_dim, D_dim, device='cuda', dtype=torch.float32)
-    Vs_1 = torch.rand(B, H, K_dim, D_dim, device='cuda', dtype=torch.float32)
-    Vs_2 = torch.rand(B, H, K_dim, D_dim, device='cuda', dtype=torch.float32)
+    Q = torch.rand(B, H, I_dim, D_dim, device='cuda', dtype=dtype)
+    R = torch.rand(B, H, J_dim, D_dim, device='cuda', dtype=dtype)
+    S = torch.rand(B, H, K_dim, D_dim, device='cuda', dtype=dtype)
+    Vq_1 = torch.rand(B, H, I_dim, D_dim, device='cuda', dtype=dtype)
+    Vq_2 = torch.rand(B, H, I_dim, D_dim, device='cuda', dtype=dtype)
+    Vr_1 = torch.rand(B, H, J_dim, D_dim, device='cuda', dtype=dtype)
+    Vr_2 = torch.rand(B, H, J_dim, D_dim, device='cuda', dtype=dtype)
+    Vs_1 = torch.rand(B, H, K_dim, D_dim, device='cuda', dtype=dtype)
+    Vs_2 = torch.rand(B, H, K_dim, D_dim, device='cuda', dtype=dtype)
 
     # --- Execution ---
     # Forward Pass
@@ -81,7 +82,7 @@ def launch_profiler(report_filename=None):
     # --- Configuration ---
     # You can now change these values directly in the script for a new run
     B, H, I_dim, J_dim, K_dim, D_dim = (1, 2, 128, 128, 128, 64)
-    KERNEL_NAME = "Yq_scatter_flash"
+    KERNEL_NAME = "Ys_gather_flash_bf16"
     
     # Dynamically generate the report filename
     if report_filename is None:
@@ -90,8 +91,12 @@ def launch_profiler(report_filename=None):
     else:
         output_filename = report_filename
 
-    # Ensure the output directory exists
-    os.makedirs(os.path.dirname(output_filename), exist_ok=True)
+    dirpath = os.path.dirname(output_filename)
+    if dirpath == "":
+        dirpath = "profiling_reports"
+        output_filename = os.path.join(dirpath, output_filename)
+
+    os.makedirs(dirpath, exist_ok=True)
 
     # Construct the ncu command
     ncu_command = [
