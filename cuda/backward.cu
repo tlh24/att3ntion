@@ -4,6 +4,12 @@
 #include <cuda_runtime.h>
 #include "../cpp/manual_att3ntion.h"
     
+#ifndef TILE_I
+#define TILE_I 8
+#define TILE_J 8
+#define TILE_K 8
+#endif
+
 // --- Backward Pass ---
 
 __global__ void gather_grad_Vq1_kernel_optimized(
@@ -1483,6 +1489,336 @@ __global__ void grad_S_kernel(
     grad_S[idx] = scale * sum_for_grad_s;
 }
 
+
+
+/*********************************************************************
+*  grad_Vq1_tbIK_kernel_v2  (Approach B, with shared memory reduction)
+*********************************************************************/
+#ifndef T_I
+  #define T_I  8
+#endif
+#ifndef T_K
+  #define T_K  8
+#endif
+#ifndef T_J
+  #define T_J  8
+#endif
+
+__global__ void grad_Vq1_tbIK_kernel(
+    const float* __restrict__ Q,        // [B,H,N,D]
+    const float* __restrict__ R,        // [B,H,N,D]
+    const float* __restrict__ S,        // [B,H,N,D]
+    const float* __restrict__ Vs,       // [B,H,N,D]   (Vs_1 slice)
+    const float* __restrict__ Vr,       // [B,H,N,D]   (Vr_1 slice)
+    const float* __restrict__ gradY,    // [B,H,N,D]   (grad_output slice)   <-- single source
+    const float* __restrict__ m_j,      // [B,H,N]
+    const float* __restrict__ l_j,      // [B,H,N]
+    const float* __restrict__ m_k,      // [B,H,N]
+    const float* __restrict__ l_k,      // [B,H,N]
+    float*       __restrict__ gradVq,   // [B,H,N,D]   (output)
+    int  N, int D,
+    float scale )
+{
+    /* ---- decode indices ------------------------------------------------ */
+    int bh  = blockIdx.z;          // flattened (batch, head)
+    int i0  = blockIdx.x * T_I + threadIdx.x;
+    int k0  = blockIdx.y * T_K + threadIdx.y;
+    if (i0 >= N || k0 >= N) return;
+
+    const int64_t stride_BH = (int64_t)N * D;
+    const float* QBH   = Q       + bh * stride_BH;
+    const float* RBH   = R       + bh * stride_BH;
+    const float* SBH   = S       + bh * stride_BH;
+    const float* VsBH  = Vs      + bh * stride_BH;
+    const float* VrBH  = Vr      + bh * stride_BH;
+    const float* gYBH  = gradY   + bh * stride_BH;
+    const float* mJBH  = m_j     + (int64_t)bh * N;
+    const float* lJBH  = l_j     + (int64_t)bh * N;
+    const float* mKBH  = m_k     + (int64_t)bh * N;
+    const float* lKBH  = l_k     + (int64_t)bh * N;
+          float* gVqBH = gradVq  + bh * stride_BH;
+
+    /* ---- load Q[i,:]  S[k,:]  Vs[k,:] into registers ------------------- */
+    float q_vec[16];    // assumes D ≤ 16 (adjust if larger)
+    float s_vec[16], vs_vec[16];
+    #pragma unroll
+    for (int d=0; d<D; ++d){
+        q_vec[d]  = QBH[i0*D + d];
+        s_vec[d]  = SBH[k0*D + d];
+        vs_vec[d] = VsBH[k0*D + d];
+    }
+    float grad_acc[16] = {0.0f};
+
+    /* ---- loop over J in chunks ---------------------------------------- */
+    for (int jBase=0; jBase<N; jBase+=T_J){
+        __shared__ float sh_R [T_J][16];
+        __shared__ float sh_Vr[T_J][16];
+        __shared__ float sh_gY[T_J][16];
+        __shared__ float sh_mj[T_J];
+        __shared__ float sh_lj[T_J];
+
+        int lj = threadIdx.y;                       // 0 … T_K-1 (≤T_J)
+        if (lj < T_J && (jBase+lj) < N){
+            int jGlob = jBase + lj;
+            #pragma unroll
+            for (int d=threadIdx.x; d<D; d+=T_I){
+                sh_R [lj][d] = RBH [jGlob*D + d];
+                sh_Vr[lj][d] = VrBH[jGlob*D + d];
+                sh_gY[lj][d] = gYBH[jGlob*D + d];   // grad_Yr = grad_output
+            }
+            if (threadIdx.x == 0){
+                sh_mj[lj] = mJBH[jGlob];
+                sh_lj[lj] = lJBH[jGlob];
+            }
+        }
+        __syncthreads();
+
+        /* ---- iterate inside loaded j-chunk ----------------------------- */
+        for (int jOff=0; jOff<T_J && (jBase+jOff)<N; ++jOff){
+            float logits=0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                logits += q_vec[d]*sh_R[jOff][d]*s_vec[d];
+            logits *= scale;
+
+            float wj = __expf(logits - sh_mj[jOff]) / sh_lj[jOff];
+            float wk = __expf(logits - mKBH[k0])    / lKBH[k0];
+
+            #pragma unroll
+            for (int d=0; d<D; ++d){
+                grad_acc[d] += wj * sh_gY[jOff][d] * vs_vec[d]        /* Yr path */
+                              + wk * gYBH[k0*D + d]  * sh_Vr[jOff][d];/* Ys path */
+            }
+        }
+        __syncthreads();
+    }
+
+    /* ---- atomic add to global grad ------------------------------------ */
+    #pragma unroll
+    for (int d=0; d<D; ++d)
+        atomicAdd(&gVqBH[i0*D + d], grad_acc[d]);
+}
+
+// Ar = softmax_{i,k}(A)
+static __global__ void Ar_tiled_softmax(
+    const float* __restrict__ Q, const float* __restrict__ R, const float* __restrict__ S,
+    float* __restrict__ m_j_out, float* __restrict__ l_j_out,
+    int B, int H, int I, int J, int K, int D, float scale
+) {
+    // --- Grid/Block Mapping ---
+    // Each block computes the stats for a single j_idx, for a single batch/head.
+    const int j_idx = blockIdx.x;
+    const int bh_idx = blockIdx.y;
+    
+    if (j_idx >= J) return;
+
+    const int tid = threadIdx.x;
+    const int block_size = blockDim.x;
+
+    // --- Pointers ---
+    const int64_t q_bh_offset = (int64_t)bh_idx * I * D;
+    const int64_t r_bh_offset = (int64_t)bh_idx * J * D;
+    const int64_t s_bh_offset = (int64_t)bh_idx * K * D;
+
+    const float* Q_slice = Q + q_bh_offset;
+    const float* R_slice = R + r_bh_offset;
+    const float* S_slice = S + s_bh_offset;
+
+    // --- Shared Memory ---
+    extern __shared__ float smem[];
+    float* r_vec_sh = smem;                              // D
+    float* q_tile = r_vec_sh + D;                        // TILE_I * D
+    float* s_tile = q_tile + TILE_I * D;                 // TILE_K * D
+    float* p_tile = s_tile + TILE_K * D;                 // TILE_I * TILE_K (for intermediate dots)
+    float* red_buf = p_tile + TILE_I * TILE_K;           // block_size (for reduction)
+
+    // --- Load R[j] into shared memory ---
+    for(int d=tid; d<D; d+=block_size) {
+        r_vec_sh[d] = R_slice[j_idx * D + d];
+    }
+    
+    // Each thread holds a local copy of the block-wide stats
+    float m_block = -1e30f;
+    float l_block = 0.0f;
+
+    __syncthreads();
+
+    // --- Main Loop: Iterate over all i and k tiles ---
+    for (int i0 = 0; i0 < I; i0 += TILE_I) {
+        for (int k0 = 0; k0 < K; k0 += TILE_K) {
+            // Cooperatively load Q and S tiles
+            for (int idx = tid; idx < TILE_I * D; idx += block_size) {
+                int i_load = i0 + (idx/D);
+                if(i_load < I) q_tile[idx] = Q_slice[i_load * D + (idx%D)];
+            }
+            for (int idx = tid; idx < TILE_K * D; idx += block_size) {
+                int k_load = k0 + (idx/D);
+                if(k_load < K) s_tile[idx] = S_slice[k_load * D + (idx%D)];
+            }
+            __syncthreads();
+
+            // --- Compute dot products for this tile and store in p_tile ---
+            for (int flat_idx = tid; flat_idx < TILE_I * TILE_K; flat_idx += block_size) {
+                int i_tile_idx = flat_idx / TILE_K;
+                int k_tile_idx = flat_idx % TILE_K;
+                
+                float dot = 0.0f;
+                if (i0 + i_tile_idx < I && k0 + k_tile_idx < K) {
+                    const float* q_vec_sh = q_tile + i_tile_idx * D;
+                    const float* s_vec_sh = s_tile + k_tile_idx * D;
+                    for(int d=0; d<D; ++d) dot += q_vec_sh[d] * r_vec_sh[d] * s_vec_sh[d];
+                    p_tile[flat_idx] = dot * scale;
+                } else {
+                    p_tile[flat_idx] = -1e30f; // Padding
+                }
+            }
+            __syncthreads();
+
+            // --- Parallel reduction to find tile max (m_tile) ---
+            float m_tile_thread = -1e30f;
+            for (int flat_idx = tid; flat_idx < TILE_I * TILE_K; flat_idx += block_size) {
+                m_tile_thread = fmaxf(m_tile_thread, p_tile[flat_idx]);
+            }
+            red_buf[tid] = m_tile_thread;
+            __syncthreads();
+            for (int s = block_size / 2; s > 0; s >>= 1) {
+                if (tid < s) red_buf[tid] = fmaxf(red_buf[tid], red_buf[tid + s]);
+                __syncthreads();
+            }
+            float m_tile = red_buf[0];
+
+            // --- Parallel reduction to find tile sum_exp (l_tile) ---
+            float l_tile_thread = 0.0f;
+            for (int flat_idx = tid; flat_idx < TILE_I * TILE_K; flat_idx += block_size) {
+                if (p_tile[flat_idx] > -1e29f) { // Check if it's not padding
+                    l_tile_thread += expf(p_tile[flat_idx] - m_tile);
+                }
+            }
+            red_buf[tid] = l_tile_thread;
+            __syncthreads();
+            for (int s = block_size / 2; s > 0; s >>= 1) {
+                if (tid < s) red_buf[tid] += red_buf[tid + s];
+                __syncthreads();
+            }
+            float l_tile = red_buf[0];
+            
+            // --- Online update of block-wide stats (each thread updates its copy) ---
+            float m_new = fmaxf(m_block, m_tile);
+            l_block = expf(m_block - m_new) * l_block + expf(m_tile - m_new) * l_tile;
+            m_block = m_new;
+            __syncthreads(); // Sync to ensure all threads are ready for the next tile
+        }
+    }
+    
+    // --- Write final stats to global memory (only thread 0) ---
+    if (tid == 0) {
+        m_j_out[bh_idx * J + j_idx] = m_block;
+        l_j_out[bh_idx * J + j_idx] = l_block;
+    }
+}
+
+// As = softmax_{i,j}(A)
+static __global__ void As_tiled_softmax(
+    const float* __restrict__ Q, const float* __restrict__ R, const float* __restrict__ S,
+    float* __restrict__ m_k_out, float* __restrict__ l_k_out,
+    int B, int H, int I, int J, int K, int D, float scale
+) {
+    // --- Grid/Block Mapping ---
+    const int k_idx = blockIdx.x;
+    const int bh_idx = blockIdx.y;
+    if (k_idx >= K) return;
+
+    const int tid = threadIdx.x;
+    const int block_size = blockDim.x;
+
+    // --- Pointers ---
+    const int64_t q_bh_offset = (int64_t)bh_idx * I * D;
+    const int64_t r_bh_offset = (int64_t)bh_idx * J * D;
+    const int64_t s_bh_offset = (int64_t)bh_idx * K * D;
+
+    const float* Q_slice = Q + q_bh_offset;
+    const float* R_slice = R + r_bh_offset;
+    const float* S_slice = S + s_bh_offset;
+
+    // --- Shared Memory ---
+    extern __shared__ float smem[];
+    float* s_vec_sh = smem;                              // D
+    float* q_tile = s_vec_sh + D;                        // TILE_I * D
+    float* r_tile = q_tile + TILE_I * D;                 // TILE_J * D
+    float* p_tile = r_tile + TILE_J * D;                 // TILE_I * TILE_J
+    float* red_buf = p_tile + TILE_I * TILE_J;           // block_size
+
+    for(int d=tid; d<D; d+=block_size) s_vec_sh[d] = S_slice[k_idx * D + d];
+    
+    float m_block = -1e30f;
+    float l_block = 0.0f;
+    __syncthreads();
+
+    // --- Main Loop: Iterate over all i and j tiles ---
+    for (int i0 = 0; i0 < I; i0 += TILE_I) {
+        for (int j0 = 0; j0 < J; j0 += TILE_J) {
+            // Cooperatively load Q and R tiles
+            for (int idx = tid; idx < TILE_I * D; idx += block_size) {
+                int i_load = i0 + (idx/D);
+                if(i_load < I) q_tile[idx] = Q_slice[i_load * D + (idx%D)];
+            }
+            for (int idx = tid; idx < TILE_J * D; idx += block_size) {
+                int j_load = j0 + (idx/D);
+                if(j_load < J) r_tile[idx] = R_slice[j_load * D + (idx%D)];
+            }
+            __syncthreads();
+
+            // Compute dot products
+            for (int flat_idx = tid; flat_idx < TILE_I * TILE_J; flat_idx += block_size) {
+                int i_tile_idx = flat_idx / TILE_J;
+                int j_tile_idx = flat_idx % TILE_J;
+                float dot = 0.0f;
+                if (i0 + i_tile_idx < I && j0 + j_tile_idx < J) {
+                    const float* q_vec_sh = q_tile + i_tile_idx * D;
+                    const float* r_vec_sh = r_tile + j_tile_idx * D;
+                    for(int d=0; d<D; ++d) dot += q_vec_sh[d] * r_vec_sh[d] * s_vec_sh[d];
+                    p_tile[flat_idx] = dot * scale;
+                } else {
+                    p_tile[flat_idx] = -1e30f;
+                }
+            }
+            __syncthreads();
+
+            // Find tile max (m_tile)
+            float m_tile_thread = -1e30f;
+            for (int i = tid; i < TILE_I*TILE_J; i+=block_size) m_tile_thread = fmaxf(m_tile_thread, p_tile[i]);
+            red_buf[tid] = m_tile_thread;
+            __syncthreads();
+            for (int s=block_size/2; s>0; s>>=1) if (tid<s) red_buf[tid] = fmaxf(red_buf[tid], red_buf[tid+s]);
+            __syncthreads();
+            float m_tile = red_buf[0];
+
+            // Find tile sum_exp (l_tile)
+            float l_tile_thread = 0.0f;
+            for (int i = tid; i < TILE_I*TILE_J; i+=block_size) {
+                if(p_tile[i] > -1e29f) l_tile_thread += expf(p_tile[i] - m_tile);
+            }
+            red_buf[tid] = l_tile_thread;
+            __syncthreads();
+            for (int s=block_size/2; s>0; s>>=1) if (tid<s) red_buf[tid] += red_buf[tid+s];
+            __syncthreads();
+            float l_tile = red_buf[0];
+
+            // Online update
+            float m_new = fmaxf(m_block, m_tile);
+            l_block = expf(m_block - m_new) * l_block + expf(m_tile - m_new) * l_tile;
+            m_block = m_new;
+            __syncthreads();
+        }
+    }
+    
+    if (tid == 0) {
+        m_k_out[bh_idx * K + k_idx] = m_block;
+        l_k_out[bh_idx * K + k_idx] = l_block;
+    }
+}
+
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
           torch::Tensor, torch::Tensor,
           torch::Tensor, torch::Tensor,
@@ -1521,17 +1857,86 @@ backward_cuda(
   auto grad_Vr_2 = torch::zeros_like(Vr_2);
   auto grad_Vs_1 = torch::zeros_like(Vs_1);
   auto grad_Vs_2 = torch::zeros_like(Vs_2);
+  
 
   // 2) extract dims + scale
   const int B = Q.size(0);
   const int H = Q.size(1);
+  const int N = Q.size(2);    
   const int I = Q.size(2); 
   const int J = R.size(2); 
   const int K = S.size(2); 
   const int D = Q.size(3);
   const int N_grad = grad_output.size(2); 
-
   const float scale = 1.0f / sqrtf((float)D);
+
+
+  // ---- allocate stats tensors (needs B,H,N known) -------------------
+  auto optionsBH = Q.options();
+  auto m_j = torch::empty({B, H, N}, optionsBH);
+  auto l_j = torch::empty({B, H, N}, optionsBH);
+  auto m_k = torch::empty({B, H, N}, optionsBH);
+  auto l_k = torch::empty({B, H, N}, optionsBH);
+    
+  //--------------------------------------------------------------
+  // grid :  (J , B*H)   each block handles one   j   for one (b,h)
+  // block:  256 threads  (pure reduction inside the plane)
+  //--------------------------------------------------------------
+  constexpr int block_threads = 256;
+  const size_t shmem_bytes_Ar =
+        (D                                  /* r_vec */
+        + TILE_I*D + TILE_K*D               /* q_tile + s_tile */
+        + TILE_I*TILE_K                     /* p_tile */
+        + block_threads) * sizeof(float);   /* red_buf */
+
+  const dim3 arBlocks(J, B*H);       // (j , bh)
+  const dim3 arThreads(block_threads);
+
+  Ar_tiled_softmax<<<arBlocks, arThreads, shmem_bytes_Ar, at::cuda::getCurrentCUDAStream()>>>(
+        Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
+        m_j.data_ptr<float>(), l_j.data_ptr<float>(),
+        B, H, N, J /*=N*/, K /*=N*/, D, scale);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    fprintf(stderr, "CUDA error in Ar_tiled_softmax: %s\n", cudaGetErrorString(err));
+  }
+
+  const size_t shmem_bytes_As =
+  (D                                  /* s_vec */
++ TILE_I*D + TILE_J*D               /* q_tile + r_tile */
++ TILE_I*TILE_J                     /* p_tile */
++ block_threads) * sizeof(float);   /* red_buf */
+
+dim3 asBlocks(K, B*H);       // (k , bh)
+dim3 asThreads(block_threads);
+
+As_tiled_softmax<<<asBlocks, asThreads, shmem_bytes_As, at::cuda::getCurrentCUDAStream()>>>(
+Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
+m_k.data_ptr<float>(), l_k.data_ptr<float>(),
+B, H, N, J/*=N*/, K, D, scale);
+err = cudaGetLastError();
+if (err != cudaSuccess) {
+    fprintf(stderr, "CUDA error in As_tiled_softmax: %s\n", cudaGetErrorString(err));
+}
+
+  /* ---------------- grad_Vq1 fast kernel (Approach B) ---------------- */
+  constexpr int TI = T_I;
+  constexpr int TK = T_K;
+  dim3 blockDim(TI, TK);                         // threads : (i,k)
+  dim3 gridDim((N+TI-1)/TI, (N+TK-1)/TK, B*H);   // blocks  : (i-tiles, k-tiles, bh)
+
+  size_t shmem_bytes = T_J * D * 3 * sizeof(float); // R  + Vr + gradY
+
+  grad_Vq1_tbIK_kernel<<<gridDim, blockDim, shmem_bytes,
+  at::cuda::getCurrentCUDAStream()>>>(
+Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
+Vs_1.data_ptr<float>(), Vr_1.data_ptr<float>(),
+grad_output.data_ptr<float>(),
+m_j.data_ptr<float>(), l_j.data_ptr<float>(),
+m_k.data_ptr<float>(), l_k.data_ptr<float>(),
+grad_Vq_1.data_ptr<float>(),
+N, D, scale);
+
   const int threads = 256; 
 
   // 3) Compute grad_A tensor on GPU by processing slice by slice - materializes on GPU 

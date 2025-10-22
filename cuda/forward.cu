@@ -1075,7 +1075,7 @@ void Ys_gather_flash_bf16(
 // SCATTER KERNELS
 
 // Aq = softmax_{j,k}(A)
-__global__ void Aq_tiled_softmax(
+static __global__ void Aq_tiled_softmax(
     const float* __restrict__ Q, const float* __restrict__ R, const float* __restrict__ S,
     float* __restrict__ m_i_out, float* __restrict__ l_i_out,
     int B, int H, int I, int J, int K, int D, float scale
@@ -1193,7 +1193,7 @@ __global__ void Aq_tiled_softmax(
 }
 
 // Ar = softmax_{i,k}(A)
-__global__ void Ar_tiled_softmax(
+static __global__ void Ar_tiled_softmax(
     const float* __restrict__ Q, const float* __restrict__ R, const float* __restrict__ S,
     float* __restrict__ m_j_out, float* __restrict__ l_j_out,
     int B, int H, int I, int J, int K, int D, float scale
@@ -1311,7 +1311,7 @@ __global__ void Ar_tiled_softmax(
 }
 
 // As = softmax_{i,j}(A)
-__global__ void As_tiled_softmax(
+static __global__ void As_tiled_softmax(
     const float* __restrict__ Q, const float* __restrict__ R, const float* __restrict__ S,
     float* __restrict__ m_k_out, float* __restrict__ l_k_out,
     int B, int H, int I, int J, int K, int D, float scale
@@ -2213,9 +2213,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     }
 
     // SCATTER 
-    // Yq_scatter_flash_launcher(Q, R, S, Vr_2, Vs_2, Y_q_, scale);
-    // Yr_scatter_flash_launcher(Q, R, S, Vq_2, Vs_2, Y_r_, scale);
-    // Ys_scatter_flash_launcher(Q, R, S, Vq_2, Vr_2, Y_s_, scale);
+    Yq_scatter_flash_launcher(Q, R, S, Vr_2, Vs_2, Y_q_, scale);
+    Yr_scatter_flash_launcher(Q, R, S, Vq_2, Vs_2, Y_r_, scale);
+    Ys_scatter_flash_launcher(Q, R, S, Vq_2, Vr_2, Y_s_, scale);
 
     cudaDeviceSynchronize(); 
     return std::make_tuple(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_);}
