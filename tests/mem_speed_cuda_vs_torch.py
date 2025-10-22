@@ -3,13 +3,13 @@ import os
 import sys
 import time # Add this import
 from pynvml import * # Add this import
-from self_attn_pytorch import SelfAttention # Add this import
+
 
 # Import extensions (assuming they are compiled and accessible)
 # The order of imports matters for shared library loading, ensure pytorch-related ones are first if there are conflicts.
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, parent_dir)
-
+from self_attn_pytorch import SelfAttention # Add this import
 try:
     import hyper_attn_cpp_manual as manual_att3ntion
     import hyper_attn_cpp_reference # Add this import

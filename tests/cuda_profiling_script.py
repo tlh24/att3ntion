@@ -40,7 +40,7 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim):
     print(f"Profiling config (B,H,I,J,K,D): ({B},{H},{I_dim},{J_dim},{K_dim},{D_dim})")
 
     dropout_rate = 0.0
-    dtype = torch.bfloat16#torch.float32
+    dtype = torch.float32
     
     # --- Tensor Initialization ---
     Q = torch.rand(B, H, I_dim, D_dim, device='cuda', dtype=dtype)
@@ -82,7 +82,7 @@ def launch_profiler(report_filename=None):
     # --- Configuration ---
     # You can now change these values directly in the script for a new run
     B, H, I_dim, J_dim, K_dim, D_dim = (1, 2, 128, 128, 128, 64)
-    KERNEL_NAME = "Ys_gather_flash_bf16"
+    KERNEL_NAME = "grad_Vq1_tbIK_kernel"
     
     # Dynamically generate the report filename
     if report_filename is None:

@@ -499,15 +499,17 @@ void compute_grad_Vq_1(
     int J = R.size(2);
     int K = S.size(2);
     int D = Q.size(3);
-    float scale = 1.0f / std::sqrt(static_cast<float>(D));
+    float scale = 1.0f / std::sqrt(static_cast<float>(D)); // TODO: pass this in as an argument from the interface
 
     // Vq_1 contributes to both Y_r and Y_s in the forward pass
 
-    // 1. Contribution from Y_r (gather to position j)
-    // Y_r = compute_Y_gather(Q, R, S, Vq_1, Vs_1, 1)
+
     for (int b = 0; b < B; b++) {
         for (int h = 0; h < H; h++) {
+            // 1. Contribution from Y_r (gather to position j)
+            // Y_r = compute_Y_gather(Q, R, S, Vq_1, Vs_1, 1)
             for (int j = 0; j < J; j++) {
+                
                 // We need the attention weights Ar_j for fixed j
                 // (softmax over i,k dimensions for this fixed j)
                 std::vector<float> Ar_j_values(I * K); // Will store the attention weights
