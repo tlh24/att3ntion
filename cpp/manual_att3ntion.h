@@ -13,7 +13,9 @@ forward_cuda(
     double dropout_rate);
 
 // Declaration for the CUDA backward pass
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> 
+std::tuple<at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor, at::Tensor, at::Tensor>
 backward_cuda(
     at::Tensor grad_output,
     at::Tensor Q, at::Tensor R, at::Tensor S,

@@ -1471,7 +1471,11 @@ torch::Tensor compute_grad_S_single(
 }
 
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> backward_cpu(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
+          torch::Tensor, torch::Tensor,
+          torch::Tensor, torch::Tensor,
+          torch::Tensor, torch::Tensor>
+backward_cpu(
     torch::Tensor grad_output,
     torch::Tensor Q,
     torch::Tensor R,
@@ -1574,8 +1578,8 @@ auto backward(
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward", &forward,
-          "Hypergraph Attention forward (returns sum of all Y tensors)",
+    m.def("forward", &forward_cuda,
+          "Hypergraph Attention forward (returns Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_)",
           py::arg("Q"),
           py::arg("R"),
           py::arg("S"),
