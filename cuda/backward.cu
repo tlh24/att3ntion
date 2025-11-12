@@ -1848,6 +1848,114 @@ __global__ void grad_Vq2_tbIK_kernel(
         atomicAdd(&gVqBH[i0*D + d], grad_acc[d]);
 }
 
+__global__ void grad_Vr2_tbIK_kernel(
+    const float* __restrict__ Q,      // [B,H,N,D]
+    const float* __restrict__ R,      // [B,H,N,D]
+    const float* __restrict__ S,      // [B,H,N,D]
+    const float* __restrict__ Vq2,    // [B,H,N,D]
+    const float* __restrict__ Vs2,    // [B,H,N,D]
+    const float* __restrict__ gradY,  // [B,H,N,D]
+    const float* __restrict__ m_i,    // [B,H,N]
+    const float* __restrict__ l_i,    // [B,H,N]
+    const float* __restrict__ m_j,    // [B,H,N]
+    const float* __restrict__ l_j,    // [B,H,N]
+    const float* __restrict__ m_k,    // [B,H,N]
+    const float* __restrict__ l_k,    // [B,H,N]
+    float*       __restrict__ gradVr, // [B,H,N,D]
+    int N, int D, float scale)
+{
+    const int j0 = blockIdx.x * T_I + threadIdx.x;
+    const int k0 = blockIdx.y * T_K + threadIdx.y;
+    const int bh = blockIdx.z;
+    if (j0 >= N || k0 >= N) return;
+
+    const int64_t stride_BH = (int64_t)N * D;
+    const float* QBH   = Q     + (int64_t)bh * stride_BH;
+    const float* RBH   = R     + (int64_t)bh * stride_BH;
+    const float* SBH   = S     + (int64_t)bh * stride_BH;
+    const float* Vq2BH = Vq2   + (int64_t)bh * stride_BH;
+    const float* Vs2BH = Vs2   + (int64_t)bh * stride_BH;
+    const float* gYBH  = gradY + (int64_t)bh * stride_BH;
+    const float* m_iBH = m_i   + (int64_t)bh * N;
+    const float* l_iBH = l_i   + (int64_t)bh * N;
+    const float* m_jBH = m_j   + (int64_t)bh * N;
+    const float* l_jBH = l_j   + (int64_t)bh * N;
+    const float* m_kBH = m_k   + (int64_t)bh * N;
+    const float* l_kBH = l_k   + (int64_t)bh * N;
+          float* gVrBH = gradVr+ (int64_t)bh * stride_BH;
+
+    float r_vec[MAX_D_REG];
+    float s_vec[MAX_D_REG];
+    float vs2_vec[MAX_D_REG];
+    float gy_k_vec[MAX_D_REG];
+    #pragma unroll
+    for (int d=0; d<D; ++d){
+        r_vec[d]    = RBH[j0*D + d];
+        s_vec[d]    = SBH[k0*D + d];
+        vs2_vec[d]  = Vs2BH[k0*D + d];
+        gy_k_vec[d] = gYBH[k0*D + d];
+    }
+
+    float grad_acc[MAX_D_REG] = {0.0f};
+    const float coeff_j = __expf(-m_jBH[j0]) / l_jBH[j0];
+    const float coeff_k = __expf(-m_kBH[k0]) / l_kBH[k0];
+
+    extern __shared__ float shmem[];
+    float* sh_Q   = shmem;                    // T_J * D
+    float* sh_Vq2 = sh_Q   + T_J * D;         // T_J * D
+    float* sh_gYq = sh_Vq2 + T_J * D;         // T_J * D
+    float* sh_mi  = (float*)(sh_gYq + T_J * D); // T_J
+    float* sh_li  = sh_mi + T_J;              // T_J
+
+    for (int iBase=0; iBase < N; iBase+=T_J){
+        const int li = threadIdx.y;
+        if (li < T_J && (iBase + li) < N){
+            const int iGlob = iBase + li;
+            for (int d=threadIdx.x; d<D; d+=T_I){
+                sh_Q  [li*D + d] = QBH [iGlob*D + d];
+                sh_Vq2[li*D + d] = Vq2BH[iGlob*D + d];
+                sh_gYq[li*D + d] = gYBH [iGlob*D + d];
+            }
+            if (threadIdx.x == 0){
+                sh_mi[li] = m_iBH[iGlob];
+                sh_li[li] = l_iBH[iGlob];
+            }
+        }
+        __syncthreads();
+
+        for (int iOff=0; iOff<T_J && (iBase+iOff)<N; ++iOff){
+            float dot = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                dot += sh_Q[iOff*D + d] * r_vec[d] * s_vec[d];
+            float logits = dot * scale;
+            float exp_logits = __expf(logits);
+
+            float coeff_i = __expf(-sh_mi[iOff]) / sh_li[iOff];
+            float w_aq = exp_logits * coeff_i;
+            float w_ar = exp_logits * coeff_j;
+            float w_as = exp_logits * coeff_k;
+
+            float w1 = w_ar * w_as;
+            float w2 = w_aq * w_ar;
+
+            const float* dy_q_vec = &sh_gYq[iOff*D];
+            const float* vq2_vec  = &sh_Vq2[iOff*D];
+
+            #pragma unroll
+            for (int d=0; d<D; ++d){
+                grad_acc[d] += w1 * dy_q_vec[d] * vs2_vec[d]
+                              + w2 * gy_k_vec[d] * vq2_vec[d];
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int d=0; d<D; ++d)
+        atomicAdd(&gVrBH[j0*D + d], grad_acc[d]);
+}
+
 // ======================= end kernel =====================================
 // ... existing code ...
 // After grad_Vq1 launch, insert launch for new scatter kernel
@@ -2956,7 +3064,29 @@ N, D, scale);
 }
 
   // ============================================================================
-  // 10. COMPUTE REMAINING V GRADIENTS (grad_Vr_2, grad_Vs_2)
+  // 10. COMPUTE grad_Vr_2 (SCATTER-STYLE KERNEL)
+  // ============================================================================
+  {
+  constexpr int TI = T_I;
+  constexpr int TK = T_K;
+    dim3 blockDim(TI, TK);
+    dim3 gridDim((N+TI-1)/TI, (N+TK-1)/TK, B*H);
+    size_t shmem_bytes_vr2 = T_J * D * 3 * sizeof(float) + T_J * 2 * sizeof(float);
+
+  grad_Vr2_tbIK_kernel<<<gridDim, blockDim, shmem_bytes_vr2,
+  at::cuda::getCurrentCUDAStream()>>>(
+Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
+Vq_2.data_ptr<float>(), Vs_2.data_ptr<float>(),
+grad_output.data_ptr<float>(),
+m_i.data_ptr<float>(), l_i.data_ptr<float>(),
+m_j.data_ptr<float>(), l_j.data_ptr<float>(),
+m_k.data_ptr<float>(), l_k.data_ptr<float>(),
+grad_Vr_2.data_ptr<float>(),
+N, D, scale);
+  }
+
+  // ============================================================================
+  // 11. COMPUTE REMAINING V GRADIENTS (grad_Vs_2)
   //    Using slice-by-slice approach with A materialization
   // ============================================================================
   const int threads = 256; 
@@ -2982,22 +3112,6 @@ N, D, scale);
           torch::Tensor Aq_slice_gpu = compute_Aq_slice_cuda_wrapper(A_slice_gpu);
           torch::Tensor Ar_slice_gpu = compute_Ar_slice_cuda_wrapper(A_slice_gpu);
           torch::Tensor As_slice_gpu = compute_As_slice_cuda_wrapper(A_slice_gpu);
-
-      // --- Compute grad_Vr_2 (scatter-style) ---
-          {
-              auto gradVr2_slice = grad_Vr_2.select(0, b).select(0, h);
-              const int64_t N_kernel = (int64_t)J * D;
-              const dim3 blocks((N_kernel + threads - 1) / threads);
-              scatter_grad_Vr2_kernel_optimized<<<blocks, threads>>>(
-                  grad_output_slice_gpu.data_ptr<float>(),
-            Aq_slice_gpu.data_ptr<float>(),
-            Ar_slice_gpu.data_ptr<float>(),
-            As_slice_gpu.data_ptr<float>(),
-            Vq_2_slice_gpu.data_ptr<float>(),
-            Vs_2_slice_gpu.data_ptr<float>(),
-                  gradVr2_slice.data_ptr<float>(),
-            I, J, K, D, N_grad);
-          }
 
       // --- Compute grad_Vs_2 (scatter-style) ---
           {
@@ -3043,7 +3157,7 @@ N, D, scale);
   }
 
   // ============================================================================
-  // 11. COMPUTE grad_Q, grad_R, grad_S FROM grad_A
+  // 12. COMPUTE grad_Q, grad_R, grad_S FROM grad_A
   // ============================================================================
   // COMMENTED OUT: Returning zeros for grad_Q, grad_R, grad_S to allow kernel rewrite
   //
@@ -3081,7 +3195,7 @@ N, D, scale);
   // }
 
   // ============================================================================
-  // 12. SYNCHRONIZE AND RETURN GRADIENTS
+  // 13. SYNCHRONIZE AND RETURN GRADIENTS
   // ============================================================================
 
   cudaDeviceSynchronize(); 
