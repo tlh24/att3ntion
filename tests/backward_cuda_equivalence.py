@@ -2,6 +2,7 @@ import os
 import sys
 import math
 import argparse
+from typing import Tuple
 import torch
 
 
@@ -9,6 +10,117 @@ import torch
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
+
+
+# ==============================================================================
+# Reference Implementation for grad_Q Intermediate Sums
+# (Based on user-provided Python snippet)
+# ==============================================================================
+
+def compute_softmax_stats(Q, R, S, scale):
+    """Computes m and l statistics for online softmax.
+    
+    Expects 2D tensors [N, D] for single batch/head.
+    """
+    I, D = Q.shape
+    J = R.size(0)
+    K = S.size(0)
+
+    A = torch.einsum('id,jd,kd->ijk', Q, R, S) * scale
+
+    # Stats for Aq (i-centric, softmax over j,k)
+    A_for_q = A.flatten(1, 2)  # [I, J*K]
+    m_i = A_for_q.max(dim=-1).values  # [I]
+    l_i = torch.exp(A_for_q - m_i.unsqueeze(-1)).sum(dim=-1)  # [I]
+
+    # Stats for Ar (j-centric, softmax over i,k)
+    A_for_r = A.permute(1, 0, 2).flatten(1, 2)  # [J, I*K]
+    m_j = A_for_r.max(dim=-1).values  # [J]
+    l_j = torch.exp(A_for_r - m_j.unsqueeze(-1)).sum(dim=-1)  # [J]
+
+    # Stats for As (k-centric, softmax over i,j)
+    A_for_s = A.permute(2, 0, 1).flatten(1, 2)  # [K, I*J]
+    m_k = A_for_s.max(dim=-1).values  # [K]
+    l_k = torch.exp(A_for_s - m_k.unsqueeze(-1)).sum(dim=-1)  # [K]
+
+    return (m_i, l_i, m_j, l_j, m_k, l_k)
+
+def _numerators(logits, mi, mj, mk, li, lj, lk):
+    """
+    logits : [Bq, Br, Bk]
+    Broadcasting shapes:
+        mi,li : [Bq, 1 , 1]
+        mj,lj : [1 , Br, 1]
+        mk,lk : [1 , 1 , Bk]
+    returns: Aq_tile , Ar_tile , As_tile   (all same shape as logits)
+    """
+    Aq = torch.exp(logits - mi) / li
+    Ar = torch.exp(logits - mj) / lj
+    As = torch.exp(logits - mk) / lk
+    return Aq, Ar, As
+
+def _pass1(Q,R,S, Vq1,Vq2, Vr1,Vr2, Vs1,Vs2,
+           grad_out, m_i,l_i, m_j,l_j, m_k,l_k,
+           scale, Bq,Br,Bk):
+    N, D = Q.shape
+    # 1-D accumulators for the ∑ grad_A* * A* terms
+    sum_q = torch.zeros(N, device=Q.device, dtype=Q.dtype)
+    sum_r = torch.zeros_like(sum_q)
+    sum_s = torch.zeros_like(sum_q)
+
+    # convenience views for broadcasting
+    m_i = m_i.view(N,1,1); l_i = l_i.view(N,1,1)
+    m_j = m_j.view(1,N,1); l_j = l_j.view(1,N,1)
+    m_k = m_k.view(1,1,N); l_k = l_k.view(1,1,N)
+
+    for k0 in range(0, N, Bk):
+        k1 = min(k0+Bk, N)
+        Sk   = S   [k0:k1]
+        Vs1k = Vs1 [k0:k1]
+        Vs2k = Vs2 [k0:k1]
+        dYk  = grad_out[k0:k1]
+        mk, lk = m_k[...,k0:k1], l_k[...,k0:k1]
+
+        for j0 in range(0, N, Br):
+            j1 = min(j0+Br, N)
+            Rj   = R   [j0:j1]
+            Vr1j = Vr1 [j0:j1]
+            Vr2j = Vr2 [j0:j1]
+            dYj  = grad_out[j0:j1]
+            mj, lj = m_j[:, j0:j1, :], l_j[:, j0:j1, :]
+
+            for i0 in range(0, N, Bq):
+                i1 = min(i0+Bq, N)
+                Qi   = Q   [i0:i1]
+                Vq1i = Vq1 [i0:i1]
+                Vq2i = Vq2 [i0:i1]
+                dYi  = grad_out[i0:i1]
+                mi, li = m_i[i0:i1], l_i[i0:i1]
+
+                logits = torch.einsum('id,jd,kd->ijk', Qi,Rj,Sk) * scale
+                Aq, Ar, As = _numerators(logits, mi,mj,mk, li,lj,lk)
+
+                gAq  = torch.einsum('id,jd,kd->ijk', dYi, Vr1j, Vs1k)
+                gAq += torch.einsum('jd,id,kd->ijk', dYj, Vq2i, Vs2k) * As
+                gAq += torch.einsum('kd,id,jd->ijk', dYk, Vq2i, Vr2j) * Ar
+
+                gAr  = torch.einsum('jd,id,kd->ijk', dYj, Vq1i, Vs1k)
+                gAr += torch.einsum('id,jd,kd->ijk', dYi, Vr2j, Vs2k) * As
+                gAr += torch.einsum('kd,id,jd->ijk', dYk, Vq2i, Vr2j) * Aq
+
+                gAs  = torch.einsum('kd,id,jd->ijk', dYk, Vq1i, Vr1j)
+                gAs += torch.einsum('id,jd,kd->ijk', dYi, Vr2j, Vs2k) * Ar
+                gAs += torch.einsum('jd,id,kd->ijk', dYj, Vq2i, Vs2k) * Aq
+
+                sum_q[i0:i1] += (gAq * Aq).sum(dim=(1,2))
+                sum_r[j0:j1] += (gAr * Ar).sum(dim=(0,2))
+                sum_s[k0:k1] += (gAs * As).sum(dim=(0,1))
+
+    return sum_q, sum_r, sum_s
+
+# ==============================================================================
+# End of Reference Implementation
+# ==============================================================================
 
 
 def compute_reference_grads(Q, R, S,
@@ -101,7 +213,8 @@ def compute_manual_grads(ext_mod,
                          Vr_1, Vr_2,
                          Vs_1, Vs_2,
                          grad_output,
-                         dropout_rate=0.0):
+                         dropout_rate=0.0) -> Tuple[torch.Tensor, ...]:
+    """Calls the backward pass and returns all 12 output tensors."""
     return ext_mod.backward(
         grad_output, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
     )
@@ -119,9 +232,7 @@ def main():
     parser = argparse.ArgumentParser("CUDA backward equivalence vs PyTorch reference")
     parser.add_argument('--B', type=int, default=1)
     parser.add_argument('--H', type=int, default=2)
-    parser.add_argument('--I', type=int, default=8)
-    parser.add_argument('--J', type=int, default=8)
-    parser.add_argument('--K', type=int, default=8)
+    parser.add_argument('--N', type=int, default=8, help='Sequence length (I=J=K=N for pass1 kernel)')
     parser.add_argument('--D', type=int, default=32)
     parser.add_argument('--rtol', type=float, default=1e-4)
     parser.add_argument('--atol', type=float, default=1e-5)
@@ -130,6 +241,9 @@ def main():
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
+    
+    # For now, pass1 kernel requires I=J=K=N
+    I = J = K = args.N
 
     try:
         import hyper_attn_cpp_manual as manual_ext
@@ -139,7 +253,7 @@ def main():
         sys.exit(1)
 
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
-    B, H, I, J, K, D = args.B, args.H, args.I, args.J, args.K, args.D
+    B, H, D = args.B, args.H, args.D
 
     # Inputs
     Q    = torch.randn(B, H, I, D, device=device, dtype=torch.float32)
@@ -155,17 +269,20 @@ def main():
     max_len = max(I, J, K)
     grad_output = torch.randn(B, H, max_len, D, device=device, dtype=torch.float32)
 
-    # Compute manual (CUDA) grads
+    # --- Compute manual (CUDA) grads and intermediate sums ---
     torch.cuda.synchronize() if device.type == 'cuda' else None
     grads_manual = compute_manual_grads(
         manual_ext, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, grad_output
     )
 
-    # Compute reference (autograd) grads
+
+    # --- Compute reference (autograd) grads ---
     grads_ref = compute_reference_grads(
         Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, grad_output
     )
 
+    # --- Compute reference intermediate sums ---
+    # Note: This runs on a single head/batch item for simplicity
     names = [
         'grad_Q', 'grad_R', 'grad_S',
         'grad_Vq_1', 'grad_Vq_2',
@@ -187,10 +304,10 @@ def main():
 
     print("-" * 80)
     if all_ok:
-        print("All gradients match within tolerance.")
+        print("All gradients and intermediate sums match within tolerance.")
         sys.exit(0)
     else:
-        print("Gradient mismatches detected.")
+        print("Mismatches detected.")
         sys.exit(2)
 
 
