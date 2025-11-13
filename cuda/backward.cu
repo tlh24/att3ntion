@@ -5,10 +5,14 @@
 #include "../cpp/manual_att3ntion.h"
 #include <tuple>
     
-// TODO: move these to a config file? 
+// Tunable tile sizes (shared defaults; override per build if needed)
 #ifndef TILE_I
 #define TILE_I 8
+#endif
+#ifndef TILE_J
 #define TILE_J 8
+#endif
+#ifndef TILE_K
 #define TILE_K 8
 #endif
 
@@ -16,14 +20,15 @@
 #define MAX_D_REG 64
 #endif
 
+// Gather/scatter kernels reuse these aliases so callers can override independently.
 #ifndef T_I
-  #define T_I  8
-#endif
-#ifndef T_K
-  #define T_K  8
+#define T_I TILE_I
 #endif
 #ifndef T_J
-  #define T_J  8
+#define T_J TILE_J
+#endif
+#ifndef T_K
+#define T_K TILE_K
 #endif
 
 // ==================== softmax stats ====================== (TODO: optimize)
@@ -2141,7 +2146,7 @@ backward_cuda(torch::Tensor grad_output,
     constexpr int tileJ = 16;      // independent knob for J streaming
 
     TORCH_CHECK(D <= MAX_D_REG,
-                "grad_Q_tbIK_kernel requires D <= ",
+                "grad_Q_kernel requires D <= ",
                 MAX_D_REG,
                 ", but got D = ",
                 D);
@@ -2181,7 +2186,7 @@ backward_cuda(torch::Tensor grad_output,
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-      fprintf(stderr, "CUDA error in grad_Q_tbIK launch: %s\n", cudaGetErrorString(err));
+      fprintf(stderr, "CUDA error in grad_Q_kernel launch: %s\n", cudaGetErrorString(err));
     }
   }
 
@@ -2192,7 +2197,7 @@ backward_cuda(torch::Tensor grad_output,
     constexpr int tileI = 16;      // independent knob for I streaming
 
     TORCH_CHECK(D <= MAX_D_REG,
-                "grad_R_tbJK_kernel requires D <= ",
+                "grad_R_kernel requires D <= ",
                 MAX_D_REG,
                 ", but got D = ",
                 D);
@@ -2231,7 +2236,7 @@ backward_cuda(torch::Tensor grad_output,
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-      fprintf(stderr, "CUDA error in grad_R_tbJK launch: %s\n", cudaGetErrorString(err));
+      fprintf(stderr, "CUDA error in grad_R_kernel launch: %s\n", cudaGetErrorString(err));
     }
   }
 
@@ -2242,7 +2247,7 @@ backward_cuda(torch::Tensor grad_output,
     constexpr int tileJ = 16;      // stream over J independently
 
     TORCH_CHECK(D <= MAX_D_REG,
-                "grad_S_tbKI_kernel requires D <= ",
+                "grad_S_kernel requires D <= ",
                 MAX_D_REG,
                 ", but got D = ",
                 D);
@@ -2281,7 +2286,7 @@ backward_cuda(torch::Tensor grad_output,
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-      fprintf(stderr, "CUDA error in grad_S_tbKI launch: %s\n", cudaGetErrorString(err));
+      fprintf(stderr, "CUDA error in grad_S_kernel launch: %s\n", cudaGetErrorString(err));
     }
   }
 

@@ -5,17 +5,16 @@
 #include "../cpp/manual_att3ntion.h"
 #include <cuda_bf16.h>
 
-// -- Forward Pass --
 #define TILE_J 16
 #define TILE_K 16
 #define TILE_I 16
 
-
+// TODO: add comment for why these are special
 #define TILE_I_SPECIAL 4
 #define TILE_J_SPECIAL 4
 #define TILE_K_SPECIAL 4
 
-// GATHER KERNELS
+// ===================== gather kernels ======================
 
 extern "C" __global__
 void Yq_gather_flash(
@@ -1072,7 +1071,7 @@ void Ys_gather_flash_bf16(
     }
 }
 
-// SCATTER KERNELS
+// ===================== softmax stats kernels ======================
 
 // Aq = softmax_{j,k}(A)
 static __global__ void Aq_tiled_softmax(
@@ -1410,6 +1409,8 @@ static __global__ void As_tiled_softmax(
         l_k_out[bh_idx * K + k_idx] = l_block;
     }
 }
+
+// ===================== scatter kernels ======================
 
 __global__ void Yq_scatter_flash(
     const float* __restrict__ Q, const float* __restrict__ R, const float* __restrict__ S,
