@@ -5,6 +5,7 @@
 #include "../cpp/manual_att3ntion.h"
 #include <tuple>
     
+// TODO: move these to a config file? 
 #ifndef TILE_I
 #define TILE_I 8
 #define TILE_J 8
@@ -25,7 +26,7 @@
   #define T_J  8
 #endif
 
-// ==================== softmax stats ======================
+// ==================== softmax stats ====================== (TODO: optimize)
 
 
 // Ar = softmax_{i,k}(A)
@@ -366,9 +367,9 @@ static __global__ void As_tiled_softmax(
     }
 }
 
-// ===================== gather-grad ======================
+// ===================== gather-grad Vq1, Vr1, Vs1 ======================
 
-__global__ void grad_Vq1_tbIK_kernel(
+__global__ void grad_gather_Vq_kernel(
     const float* __restrict__ Q,        // [B,H,N,D]
     const float* __restrict__ R,        // [B,H,N,D]
     const float* __restrict__ S,        // [B,H,N,D]
@@ -463,7 +464,7 @@ __global__ void grad_Vq1_tbIK_kernel(
         atomicAdd(&gVqBH[i0*D + d], grad_acc[d]);
 }
 
-__global__ void grad_Vr1_tbIK_kernel(
+__global__ void grad_gather_Vr_kernel(
     const float* __restrict__ Q,        // [B,H,N,D]
     const float* __restrict__ R,        // [B,H,N,D]
     const float* __restrict__ S,        // [B,H,N,D]
@@ -560,7 +561,7 @@ __global__ void grad_Vr1_tbIK_kernel(
         atomicAdd(&gVrBH[j0*D + d], grad_acc[d]);
 }
 
-__global__ void grad_Vs1_tbIK_kernel(
+__global__ void grad_gather_Vs_kernel(
     const float* __restrict__ Q,        // [B,H,N,D]
     const float* __restrict__ R,        // [B,H,N,D]
     const float* __restrict__ S,        // [B,H,N,D]
@@ -657,10 +658,10 @@ __global__ void grad_Vs1_tbIK_kernel(
         atomicAdd(&gVsBH[k0*D + d], grad_acc[d]);
 }
 
-// ===================== scatter-grad ======================
+// ===================== scatter-grad Vq2, Vr2, Vs2 ======================
 
 
-__global__ void grad_Vq2_tbIK_kernel(
+__global__ void grad_scatter_Vq_kernel(
     const float* __restrict__ Q,      // [B,H,N,D]
     const float* __restrict__ R,      // [B,H,N,D]
     const float* __restrict__ S,      // [B,H,N,D]
@@ -779,7 +780,7 @@ __global__ void grad_Vq2_tbIK_kernel(
         atomicAdd(&gVqBH[i0*D + d], grad_acc[d]);
 }
 
-__global__ void grad_Vr2_tbIK_kernel(
+__global__ void grad_scatter_Vr_kernel(
     const float* __restrict__ Q,      // [B,H,N,D]
     const float* __restrict__ R,      // [B,H,N,D]
     const float* __restrict__ S,      // [B,H,N,D]
@@ -887,7 +888,7 @@ __global__ void grad_Vr2_tbIK_kernel(
         atomicAdd(&gVrBH[j0*D + d], grad_acc[d]);
 }
 
-__global__ void grad_Vs2_tbIK_kernel(
+__global__ void grad_scatter_Vs_kernel(
     const float* __restrict__ Q,      // [B,H,N,D]
     const float* __restrict__ R,      // [B,H,N,D]
     const float* __restrict__ S,      // [B,H,N,D]
@@ -996,15 +997,8 @@ __global__ void grad_Vs2_tbIK_kernel(
         atomicAdd(&gVsBH[k0*D + d], grad_acc[d]);
 }
 
+// ===================== precompute Jacobian corrections + helpers ==================
 
-
-// ============================================================================
-// KERNEL IMPLEMENTATION: Tiled grad_Q (Pass 1)
-//
-// This section contains the CUDA kernel and C++ wrapper for the first pass
-// of the flash-attention-style gradient computation for Q. It computes the
-// intermediate reduction arrays `sum_q`, `sum_r`, and `sum_s`.
-// ============================================================================
 
 // Helper for integer division rounded up
 __host__ __device__ inline int ceilDiv(int a, int b) {
@@ -1021,15 +1015,8 @@ __device__ __forceinline__ float dot3(const float* a, const float* b, const floa
     return sum;
 }
 
-//
-// --- grad_q_pass1_kernel ---
-//
-// This kernel computes the intermediate sums for the grad_Q calculation.
-// Each block processes a tile of size (Bq, Br, Bk) and atomically
-// accumulates the results into global memory.
-//
 template<int Bq, int Br, int Bk>
-__global__ void grad_q_pass1_kernel(
+__global__ void precompute_jacobian_corrections_kernel(
     // Inputs
     const float* Q,   const float* R,   const float* S,
     const float* Vq1, const float* Vq2,
@@ -1163,83 +1150,12 @@ __global__ void grad_q_pass1_kernel(
     }
 }
 
-//
-// --- grad_q_pass1_cuda_wrapper ---
-//
-// C++ wrapper to launch the grad_q_pass1_kernel. It handles tensor slicing
-// for batches and heads and allocates the output tensors.
-//
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-grad_q_pass1_cuda_wrapper(
-    torch::Tensor Q, torch::Tensor R, torch::Tensor S,
-    torch::Tensor Vq_1, torch::Tensor Vq_2,
-    torch::Tensor Vr_1, torch::Tensor Vr_2,
-    torch::Tensor Vs_1, torch::Tensor Vs_2,
-    torch::Tensor grad_output,
-    torch::Tensor m_i, torch::Tensor l_i,
-    torch::Tensor m_j, torch::Tensor l_j,
-    torch::Tensor m_k, torch::Tensor l_k,
-    float scale
-) {
-    const int B = Q.size(0);
-    const int H = Q.size(1);
-    const int N = Q.size(2);
-    const int D = Q.size(3);
 
-    auto sum_q = torch::zeros({B, H, N}, Q.options());
-    auto sum_r = torch::zeros({B, H, N}, Q.options());
-    auto sum_s = torch::zeros({B, H, N}, Q.options());
 
-    constexpr int Bq = 8;
-    constexpr int Br = 8;
-    constexpr int Bk = 8;
+// ===================== grad Q, R, S ====================== (TODO: optimize)
 
-    dim3 grid(ceilDiv(N, Bq), ceilDiv(N, Br), ceilDiv(N, Bk));
-    dim3 threads(Bq, Br, Bk);
-
-    const size_t shmem_bytes = (4*Bq + 4*Br + 4*Bk) * D * sizeof(float);
-
-    for (int b = 0; b < B; ++b) {
-        for (int h = 0; h < H; ++h) {
-            grad_q_pass1_kernel<Bq, Br, Bk><<<grid, threads, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
-                Q.select(0,b).select(0,h).data_ptr<float>(),
-                R.select(0,b).select(0,h).data_ptr<float>(),
-                S.select(0,b).select(0,h).data_ptr<float>(),
-                Vq_1.select(0,b).select(0,h).data_ptr<float>(),
-                Vq_2.select(0,b).select(0,h).data_ptr<float>(),
-                Vr_1.select(0,b).select(0,h).data_ptr<float>(),
-                Vr_2.select(0,b).select(0,h).data_ptr<float>(),
-                Vs_1.select(0,b).select(0,h).data_ptr<float>(),
-                Vs_2.select(0,b).select(0,h).data_ptr<float>(),
-                grad_output.select(0,b).select(0,h).data_ptr<float>(),
-                m_i.select(0,b).select(0,h).data_ptr<float>(),
-                l_i.select(0,b).select(0,h).data_ptr<float>(),
-                m_j.select(0,b).select(0,h).data_ptr<float>(),
-                l_j.select(0,b).select(0,h).data_ptr<float>(),
-                m_k.select(0,b).select(0,h).data_ptr<float>(),
-                l_k.select(0,b).select(0,h).data_ptr<float>(),
-                sum_q.select(0,b).select(0,h).data_ptr<float>(),
-                sum_r.select(0,b).select(0,h).data_ptr<float>(),
-                sum_s.select(0,b).select(0,h).data_ptr<float>(),
-                N, D, scale
-            );
-        }
-    }
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-      fprintf(stderr, "CUDA error in grad_q_pass1: %s\n", cudaGetErrorString(err));
-    }
-
-  return std::make_tuple(sum_q, sum_r, sum_s);
-}
-
-// ==========================================================================
-//  grad_Q_pass2_tbIK_kernel  –  second pass of flash-style backward
-//  Thread-block geometry:     (i , k) tile   [blockDim = (tileI , tileK)]
-// ==========================================================================
 template<int BLOCK_I, int BLOCK_J, int BLOCK_K, int REG_CAP = MAX_D_REG>
-__global__ void grad_Q_pass2_tbIK_kernel(
+__global__ void grad_Q_kernel(
     /* ---- operands ---------------------------------------------------- */
     const float* __restrict__ Q,   // [B,H,N,D]
     const float* __restrict__ R,   // [B,H,N,D]
@@ -1435,13 +1351,8 @@ __global__ void grad_Q_pass2_tbIK_kernel(
         atomicAdd(&gQbh[i0*D + d], scale * grad_acc[d]);
 }
 
-
-// ==========================================================================
-//  grad_R_pass2_tbJK_kernel  –  second pass of flash-style backward (grad R)
-//  Thread-block geometry:     (j , k) tile   [blockDim = (tileJ , tileK)]
-// ==========================================================================
 template<int BLOCK_J, int BLOCK_I, int BLOCK_K, int REG_CAP = MAX_D_REG>
-__global__ void grad_R_pass2_tbJK_kernel(
+__global__ void grad_R_kernel(
     /* ---- operands ---------------------------------------------------- */
     const float* __restrict__ Q,   // [B,H,N,D]
     const float* __restrict__ R,   // [B,H,N,D]
@@ -1650,13 +1561,8 @@ __global__ void grad_R_pass2_tbJK_kernel(
         atomicAdd(&gRbh[j0*D + d], scale * grad_acc[d]);
 }
 
-
-// ==========================================================================
-//  grad_S_pass2_tbKI_kernel  –  second pass of flash-style backward (grad S)
-//  Thread-block geometry:     (k , i) tile   [blockDim = (tileK , tileI)]
-// ==========================================================================
 template<int BLOCK_K, int BLOCK_J, int BLOCK_I, int REG_CAP = MAX_D_REG>
-__global__ void grad_S_pass2_tbKI_kernel(
+__global__ void grad_S_kernel(
     /* ---- operands ---------------------------------------------------- */
     const float* __restrict__ Q,   // [B,H,N,D]
     const float* __restrict__ R,   // [B,H,N,D]
@@ -1881,6 +1787,7 @@ backward_cuda(torch::Tensor grad_output,
               torch::Tensor Vs_1,
               torch::Tensor Vs_2,
               double dropout_rate) {
+                
   // ============================================================================
   // 1. ENSURE ALL TENSORS ARE CONTIGUOUS
   // ============================================================================
@@ -1933,7 +1840,7 @@ backward_cuda(torch::Tensor grad_output,
   auto sum_s = torch::zeros({B, H, N}, optionsBH);
 
   // ============================================================================
-  // 4. COMPUTE SOFTMAX STATISTICS: Aq (i-centric), Ar (j-centric), As (k-centric)
+  // 4. PRECOMPUTE SOFTMAX STATISTICS   
   // ============================================================================
   constexpr int block_threads = 256;
 
@@ -2010,210 +1917,7 @@ backward_cuda(torch::Tensor grad_output,
   }
 
   // ============================================================================
-  // 5. COMPUTE grad_Q, R, S
-  // ============================================================================
-  {
-    // --- Pass 1: accumulate normalization sums ---
-    constexpr int Bq = 8;
-    constexpr int Br = 8;
-    constexpr int Bk = 8;
-
-    dim3 grid(ceilDiv(N, Bq), ceilDiv(N, Br), ceilDiv(N, Bk));
-    dim3 threads(Bq, Br, Bk);
-
-    const size_t shmem_bytes =
-        (Bq * D + Br * D + Bk * D +   // Q, R, S
-         Bq * D + Bq * D +            // Vq1, Vq2
-         Br * D + Br * D +            // Vr1, Vr2
-         Bk * D + Bk * D +            // Vs1, Vs2
-         Bq * D + Br * D + Bk * D)    // dY
-        * sizeof(float);
-
-    for (int b = 0; b < B; ++b) {
-      for (int h = 0; h < H; ++h) {
-        grad_q_pass1_kernel<Bq, Br, Bk><<<grid, threads, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
-            Q.select(0, b).select(0, h).data_ptr<float>(),
-            R.select(0, b).select(0, h).data_ptr<float>(),
-            S.select(0, b).select(0, h).data_ptr<float>(),
-            Vq_1.select(0, b).select(0, h).data_ptr<float>(),
-            Vq_2.select(0, b).select(0, h).data_ptr<float>(),
-            Vr_1.select(0, b).select(0, h).data_ptr<float>(),
-            Vr_2.select(0, b).select(0, h).data_ptr<float>(),
-            Vs_1.select(0, b).select(0, h).data_ptr<float>(),
-            Vs_2.select(0, b).select(0, h).data_ptr<float>(),
-            grad_output.select(0, b).select(0, h).data_ptr<float>(),
-            m_i.select(0, b).select(0, h).data_ptr<float>(),
-            l_i.select(0, b).select(0, h).data_ptr<float>(),
-            m_j.select(0, b).select(0, h).data_ptr<float>(),
-            l_j.select(0, b).select(0, h).data_ptr<float>(),
-            m_k.select(0, b).select(0, h).data_ptr<float>(),
-            l_k.select(0, b).select(0, h).data_ptr<float>(),
-            sum_q.select(0, b).select(0, h).data_ptr<float>(),
-            sum_r.select(0, b).select(0, h).data_ptr<float>(),
-            sum_s.select(0, b).select(0, h).data_ptr<float>(),
-            N, D, scale);
-      }
-    }
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-      fprintf(stderr, "CUDA error in grad_q_pass1 launch: %s\n", cudaGetErrorString(err));
-    }
-  }
-
-  {
-    // --- Pass 2: finalize grad_Q ---
-    constexpr int tileI = TILE_I;  // reuse existing macro defaults (8)
-    constexpr int tileK = TILE_K;
-    constexpr int tileJ = 16;      // independent knob for J streaming
-
-    TORCH_CHECK(D <= MAX_D_REG,
-                "grad_Q_pass2_tbIK_kernel requires D <= ",
-                MAX_D_REG,
-                ", but got D = ",
-                D);
-
-    dim3 block_dim(tileI, tileK);
-    dim3 grid_dim((N + tileI - 1) / tileI,
-                  (N + tileK - 1) / tileK,
-                  B * H);
-
-    const size_t shmem_bytes =
-        4 * tileJ * D * sizeof(float) +  // R, Vr1, Vr2, gYj
-        3 * tileJ * sizeof(float);       // mj, lj, sum_r
-
-    grad_Q_pass2_tbIK_kernel<tileI, tileJ, tileK>
-        <<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
-            Q.data_ptr<float>(),
-            R.data_ptr<float>(),
-            S.data_ptr<float>(),
-            Vq_1.data_ptr<float>(),
-            Vq_2.data_ptr<float>(),
-            Vr_1.data_ptr<float>(),
-            Vr_2.data_ptr<float>(),
-            Vs_1.data_ptr<float>(),
-            Vs_2.data_ptr<float>(),
-            grad_output.data_ptr<float>(),
-            m_i.data_ptr<float>(),
-            l_i.data_ptr<float>(),
-            m_j.data_ptr<float>(),
-            l_j.data_ptr<float>(),
-            m_k.data_ptr<float>(),
-            l_k.data_ptr<float>(),
-            sum_q.data_ptr<float>(),
-            sum_r.data_ptr<float>(),
-            sum_s.data_ptr<float>(),
-            grad_Q.data_ptr<float>(),
-            N, D, scale);
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-      fprintf(stderr, "CUDA error in grad_Q_pass2 launch: %s\n", cudaGetErrorString(err));
-    }
-  }
-
-  {
-    // --- Pass 2: finalize grad_R ---
-    constexpr int tileJ = TILE_J;  // reuse macro defaults for target axis
-    constexpr int tileK = TILE_K;
-    constexpr int tileI = 16;      // independent knob for I streaming
-
-    TORCH_CHECK(D <= MAX_D_REG,
-                "grad_R_pass2_tbJK_kernel requires D <= ",
-                MAX_D_REG,
-                ", but got D = ",
-                D);
-
-    dim3 block_dim(tileJ, tileK);
-    dim3 grid_dim((N + tileJ - 1) / tileJ,
-                  (N + tileK - 1) / tileK,
-                  B * H);
-
-    const size_t shmem_bytes =
-        (4 * tileI * D + 3 * tileI) * sizeof(float);  // Q, Vq1, Vq2, dY + stats
-
-    grad_R_pass2_tbJK_kernel<tileJ, tileI, tileK>
-        <<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
-            Q.data_ptr<float>(),
-            R.data_ptr<float>(),
-            S.data_ptr<float>(),
-            Vq_1.data_ptr<float>(),
-            Vq_2.data_ptr<float>(),
-            Vr_1.data_ptr<float>(),
-            Vr_2.data_ptr<float>(),
-            Vs_1.data_ptr<float>(),
-            Vs_2.data_ptr<float>(),
-            grad_output.data_ptr<float>(),
-            m_i.data_ptr<float>(),
-            l_i.data_ptr<float>(),
-            m_j.data_ptr<float>(),
-            l_j.data_ptr<float>(),
-            m_k.data_ptr<float>(),
-            l_k.data_ptr<float>(),
-            sum_q.data_ptr<float>(),
-            sum_r.data_ptr<float>(),
-            sum_s.data_ptr<float>(),
-            grad_R.data_ptr<float>(),
-            N, D, scale);
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-      fprintf(stderr, "CUDA error in grad_R_pass2 launch: %s\n", cudaGetErrorString(err));
-    }
-  }
-
-  {
-    // --- Pass 2: finalize grad_S ---
-    constexpr int tileK = TILE_K;
-    constexpr int tileI = TILE_I;
-    constexpr int tileJ = 16;      // stream over J independently
-
-    TORCH_CHECK(D <= MAX_D_REG,
-                "grad_S_pass2_tbKI_kernel requires D <= ",
-                MAX_D_REG,
-                ", but got D = ",
-                D);
-
-    dim3 block_dim(tileK, tileI);
-    dim3 grid_dim((N + tileK - 1) / tileK,
-                  (N + tileI - 1) / tileI,
-                  B * H);
-
-    const size_t shmem_bytes =
-        4 * tileJ * D * sizeof(float) + 3 * tileJ * sizeof(float);
-
-    grad_S_pass2_tbKI_kernel<tileK, tileJ, tileI>
-        <<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
-            Q.data_ptr<float>(),
-            R.data_ptr<float>(),
-            S.data_ptr<float>(),
-            Vq_1.data_ptr<float>(),
-            Vq_2.data_ptr<float>(),
-            Vr_1.data_ptr<float>(),
-            Vr_2.data_ptr<float>(),
-            Vs_1.data_ptr<float>(),
-            Vs_2.data_ptr<float>(),
-            grad_output.data_ptr<float>(),
-            m_i.data_ptr<float>(),
-            l_i.data_ptr<float>(),
-            m_j.data_ptr<float>(),
-            l_j.data_ptr<float>(),
-            m_k.data_ptr<float>(),
-            l_k.data_ptr<float>(),
-            sum_q.data_ptr<float>(),
-            sum_r.data_ptr<float>(),
-            sum_s.data_ptr<float>(),
-            grad_S.data_ptr<float>(),
-            N, D, scale);
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-      fprintf(stderr, "CUDA error in grad_S_pass2 launch: %s\n", cudaGetErrorString(err));
-    }
-  }
-
-  // ============================================================================
-  // 6. COMPUTE grad_{Vq,Vr,Vs}_1 (GATHER-GRAD KERNELS)
+  // 5. COMPUTE grad_{Vq,Vr,Vs}_1 (GATHER-GRAD KERNELS)
   // ============================================================================
   {
     // --- grad_Vq_1 ---
@@ -2224,7 +1928,7 @@ backward_cuda(torch::Tensor grad_output,
     dim3 grid_dim((N + TI - 1) / TI, (N + TK - 1) / TK, B * H);
     size_t shmem_bytes = T_J * D * 3 * sizeof(float);  // R + Vr + gradY
 
-    grad_Vq1_tbIK_kernel<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+    grad_gather_Vq_kernel<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
         Q.data_ptr<float>(),
         R.data_ptr<float>(),
         S.data_ptr<float>(),
@@ -2249,7 +1953,7 @@ backward_cuda(torch::Tensor grad_output,
     size_t shmem_bytes =
         T_J * D * 3 * sizeof(float) + T_J * 2 * sizeof(float);  // Q + Vq + gradY + mi/li
 
-    grad_Vr1_tbIK_kernel<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+    grad_gather_Vr_kernel<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
         Q.data_ptr<float>(),
         R.data_ptr<float>(),
         S.data_ptr<float>(),
@@ -2274,7 +1978,7 @@ backward_cuda(torch::Tensor grad_output,
     size_t shmem_bytes =
         T_J * D * 3 * sizeof(float) + T_J * 2 * sizeof(float);  // R + Vr + gradY + mj/lj
 
-    grad_Vs1_tbIK_kernel<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+    grad_gather_Vs_kernel<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
         Q.data_ptr<float>(),
         R.data_ptr<float>(),
         S.data_ptr<float>(),
@@ -2290,7 +1994,7 @@ backward_cuda(torch::Tensor grad_output,
   }
 
   // ============================================================================
-  // 7. COMPUTE grad_{Vq,Vr,Vs}_2 (SCATTER-GRAD KERNELS)
+  // 6. COMPUTE grad_{Vq,Vr,Vs}_2 (SCATTER-GRAD KERNELS)
   // ============================================================================
   {
     // --- grad_Vq_2 ---
@@ -2302,7 +2006,7 @@ backward_cuda(torch::Tensor grad_output,
     size_t shmem_bytes =
         T_J * D * 3 * sizeof(float) + T_J * 2 * sizeof(float);
 
-    grad_Vq2_tbIK_kernel<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+    grad_scatter_Vq_kernel<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
         Q.data_ptr<float>(),
         R.data_ptr<float>(),
         S.data_ptr<float>(),
@@ -2329,7 +2033,7 @@ backward_cuda(torch::Tensor grad_output,
     size_t shmem_bytes =
         T_J * D * 3 * sizeof(float) + T_J * 2 * sizeof(float);
 
-    grad_Vr2_tbIK_kernel<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+    grad_scatter_Vr_kernel<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
         Q.data_ptr<float>(),
         R.data_ptr<float>(),
         S.data_ptr<float>(),
@@ -2356,7 +2060,7 @@ backward_cuda(torch::Tensor grad_output,
     size_t shmem_bytes =
         T_J * D * 3 * sizeof(float) + T_J * 2 * sizeof(float);
 
-    grad_Vs2_tbIK_kernel<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+    grad_scatter_Vs_kernel<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
         Q.data_ptr<float>(),
         R.data_ptr<float>(),
         S.data_ptr<float>(),
@@ -2373,9 +2077,214 @@ backward_cuda(torch::Tensor grad_output,
         N, D, scale);
   }
 
+
+  // ===========================================================================
+  // 7. PRECOMPUTE JACOBIAN CORRECTIONS for grad_Q, R, S
   // ============================================================================
-  // 8. FINALIZE
-  // ============================================================================
+  {
+    // --- Correction sums shared by grad_Q/grad_R/grad_S ---
+    constexpr int Bq = 8;
+    constexpr int Br = 8;
+    constexpr int Bk = 8;
+
+    dim3 grid(ceilDiv(N, Bq), ceilDiv(N, Br), ceilDiv(N, Bk));
+    dim3 threads(Bq, Br, Bk);
+
+    const size_t shmem_bytes =
+        (Bq * D + Br * D + Bk * D +   // Q, R, S
+         Bq * D + Bq * D +            // Vq1, Vq2
+         Br * D + Br * D +            // Vr1, Vr2
+         Bk * D + Bk * D +            // Vs1, Vs2
+         Bq * D + Br * D + Bk * D)    // dY
+        * sizeof(float);
+
+    for (int b = 0; b < B; ++b) {
+      for (int h = 0; h < H; ++h) {
+        precompute_jacobian_corrections_kernel<Bq, Br, Bk><<<grid, threads, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+            Q.select(0, b).select(0, h).data_ptr<float>(),
+            R.select(0, b).select(0, h).data_ptr<float>(),
+            S.select(0, b).select(0, h).data_ptr<float>(),
+            Vq_1.select(0, b).select(0, h).data_ptr<float>(),
+            Vq_2.select(0, b).select(0, h).data_ptr<float>(),
+            Vr_1.select(0, b).select(0, h).data_ptr<float>(),
+            Vr_2.select(0, b).select(0, h).data_ptr<float>(),
+            Vs_1.select(0, b).select(0, h).data_ptr<float>(),
+            Vs_2.select(0, b).select(0, h).data_ptr<float>(),
+            grad_output.select(0, b).select(0, h).data_ptr<float>(),
+            m_i.select(0, b).select(0, h).data_ptr<float>(),
+            l_i.select(0, b).select(0, h).data_ptr<float>(),
+            m_j.select(0, b).select(0, h).data_ptr<float>(),
+            l_j.select(0, b).select(0, h).data_ptr<float>(),
+            m_k.select(0, b).select(0, h).data_ptr<float>(),
+            l_k.select(0, b).select(0, h).data_ptr<float>(),
+            sum_q.select(0, b).select(0, h).data_ptr<float>(),
+            sum_r.select(0, b).select(0, h).data_ptr<float>(),
+            sum_s.select(0, b).select(0, h).data_ptr<float>(),
+            N, D, scale);
+      }
+    }
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      fprintf(stderr, "CUDA error in precompute_jacobian_corrections launch: %s\n", cudaGetErrorString(err));
+    }
+  }
+
+  // ===========================================================================
+  // 8. COMPUTE grad_Q, R, S
+  // ============================================================================   
+
+  {
+    // --- grad_Q accumulation ---
+    constexpr int tileI = TILE_I;  // reuse existing macro defaults (8)
+    constexpr int tileK = TILE_K;
+    constexpr int tileJ = 16;      // independent knob for J streaming
+
+    TORCH_CHECK(D <= MAX_D_REG,
+                "grad_Q_tbIK_kernel requires D <= ",
+                MAX_D_REG,
+                ", but got D = ",
+                D);
+
+    dim3 block_dim(tileI, tileK);
+    dim3 grid_dim((N + tileI - 1) / tileI,
+                  (N + tileK - 1) / tileK,
+                  B * H);
+
+    const size_t shmem_bytes =
+        4 * tileJ * D * sizeof(float) +  // R, Vr1, Vr2, gYj
+        3 * tileJ * sizeof(float);       // mj, lj, sum_r
+
+    grad_Q_kernel<tileI, tileJ, tileK>
+        <<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+            Q.data_ptr<float>(),
+            R.data_ptr<float>(),
+            S.data_ptr<float>(),
+            Vq_1.data_ptr<float>(),
+            Vq_2.data_ptr<float>(),
+            Vr_1.data_ptr<float>(),
+            Vr_2.data_ptr<float>(),
+            Vs_1.data_ptr<float>(),
+            Vs_2.data_ptr<float>(),
+            grad_output.data_ptr<float>(),
+            m_i.data_ptr<float>(),
+            l_i.data_ptr<float>(),
+            m_j.data_ptr<float>(),
+            l_j.data_ptr<float>(),
+            m_k.data_ptr<float>(),
+            l_k.data_ptr<float>(),
+            sum_q.data_ptr<float>(),
+            sum_r.data_ptr<float>(),
+            sum_s.data_ptr<float>(),
+            grad_Q.data_ptr<float>(),
+            N, D, scale);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      fprintf(stderr, "CUDA error in grad_Q_tbIK launch: %s\n", cudaGetErrorString(err));
+    }
+  }
+
+  {
+    // --- grad_R accumulation ---
+    constexpr int tileJ = TILE_J;  // reuse macro defaults for target axis
+    constexpr int tileK = TILE_K;
+    constexpr int tileI = 16;      // independent knob for I streaming
+
+    TORCH_CHECK(D <= MAX_D_REG,
+                "grad_R_tbJK_kernel requires D <= ",
+                MAX_D_REG,
+                ", but got D = ",
+                D);
+
+    dim3 block_dim(tileJ, tileK);
+    dim3 grid_dim((N + tileJ - 1) / tileJ,
+                  (N + tileK - 1) / tileK,
+                  B * H);
+
+    const size_t shmem_bytes =
+        (4 * tileI * D + 3 * tileI) * sizeof(float);  // Q, Vq1, Vq2, dY + stats
+
+    grad_R_kernel<tileJ, tileI, tileK>
+        <<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+            Q.data_ptr<float>(),
+            R.data_ptr<float>(),
+            S.data_ptr<float>(),
+            Vq_1.data_ptr<float>(),
+            Vq_2.data_ptr<float>(),
+            Vr_1.data_ptr<float>(),
+            Vr_2.data_ptr<float>(),
+            Vs_1.data_ptr<float>(),
+            Vs_2.data_ptr<float>(),
+            grad_output.data_ptr<float>(),
+            m_i.data_ptr<float>(),
+            l_i.data_ptr<float>(),
+            m_j.data_ptr<float>(),
+            l_j.data_ptr<float>(),
+            m_k.data_ptr<float>(),
+            l_k.data_ptr<float>(),
+            sum_q.data_ptr<float>(),
+            sum_r.data_ptr<float>(),
+            sum_s.data_ptr<float>(),
+            grad_R.data_ptr<float>(),
+            N, D, scale);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      fprintf(stderr, "CUDA error in grad_R_tbJK launch: %s\n", cudaGetErrorString(err));
+    }
+  }
+
+  {
+    // --- grad_S accumulation ---
+    constexpr int tileK = TILE_K;
+    constexpr int tileI = TILE_I;
+    constexpr int tileJ = 16;      // stream over J independently
+
+    TORCH_CHECK(D <= MAX_D_REG,
+                "grad_S_tbKI_kernel requires D <= ",
+                MAX_D_REG,
+                ", but got D = ",
+                D);
+
+    dim3 block_dim(tileK, tileI);
+    dim3 grid_dim((N + tileK - 1) / tileK,
+                  (N + tileI - 1) / tileI,
+                  B * H);
+
+    const size_t shmem_bytes =
+        4 * tileJ * D * sizeof(float) + 3 * tileJ * sizeof(float);
+
+    grad_S_kernel<tileK, tileJ, tileI>
+        <<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+            Q.data_ptr<float>(),
+            R.data_ptr<float>(),
+            S.data_ptr<float>(),
+            Vq_1.data_ptr<float>(),
+            Vq_2.data_ptr<float>(),
+            Vr_1.data_ptr<float>(),
+            Vr_2.data_ptr<float>(),
+            Vs_1.data_ptr<float>(),
+            Vs_2.data_ptr<float>(),
+            grad_output.data_ptr<float>(),
+            m_i.data_ptr<float>(),
+            l_i.data_ptr<float>(),
+            m_j.data_ptr<float>(),
+            l_j.data_ptr<float>(),
+            m_k.data_ptr<float>(),
+            l_k.data_ptr<float>(),
+            sum_q.data_ptr<float>(),
+            sum_r.data_ptr<float>(),
+            sum_s.data_ptr<float>(),
+            grad_S.data_ptr<float>(),
+            N, D, scale);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      fprintf(stderr, "CUDA error in grad_S_tbKI launch: %s\n", cudaGetErrorString(err));
+    }
+  }
+
   cudaDeviceSynchronize();
 
   return std::make_tuple(
