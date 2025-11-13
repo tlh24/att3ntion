@@ -123,69 +123,56 @@ def _pass1(Q,R,S, Vq1,Vq2, Vr1,Vr2, Vs1,Vs2,
 # ==============================================================================
 
 
+try:
+    import hyper_attn_cpp_reference as baseline_ext
+except ImportError:
+    baseline_ext = None
+
+
 def compute_reference_grads(Q, R, S,
                             Vq_1, Vq_2,
                             Vr_1, Vr_2,
                             Vs_1, Vs_2,
                             grad_output):
-    """Compute ground-truth grads using PyTorch autograd.
+    """Compute reference gradients via the Torch-only C++ extension.
 
-    This mirrors the math used by the CUDA extension:
-      - A = einsum('bhid,bhjd,bhkd->bhijk', Q, R, S) / sqrt(D)
-      - Aq = softmax over (j,k)
-      - Ar = softmax over (i,k)
-      - As = softmax over (i,j)
-      - Gather Y: Y_q, Y_r, Y_s
-      - Scatter Y: Y_q_, Y_r_, Y_s_ using elementwise products of A* A*
-
-    The scalar loss is the dot of each Y_* with grad_output sliced to the
-    appropriate sequence length for that output.
+    We call `hyper_attn_cpp_reference.forward`, then back-propagate a synthetic
+    loss identical to the one used for the CUDA kernel so the two gradient sets
+    are directly comparable.
     """
+
+    if baseline_ext is None:
+        raise RuntimeError("hyper_attn_cpp_reference is not available; build the extension first (python setup.py develop)")
+
     B, H, I, D = Q.shape
     J = R.size(2)
     K = S.size(2)
 
-    # Clone and enable grad on reference tensors to avoid polluting inputs
-    Q_ref   = Q.detach().clone().requires_grad_(True)
-    R_ref   = R.detach().clone().requires_grad_(True)
-    S_ref   = S.detach().clone().requires_grad_(True)
-    Vq1_ref = Vq_1.detach().clone().requires_grad_(True)
-    Vq2_ref = Vq_2.detach().clone().requires_grad_(True)
-    Vr1_ref = Vr_1.detach().clone().requires_grad_(True)
-    Vr2_ref = Vr_2.detach().clone().requires_grad_(True)
-    Vs1_ref = Vs_1.detach().clone().requires_grad_(True)
-    Vs2_ref = Vs_2.detach().clone().requires_grad_(True)
+    # Clone tensors and enable grad
+    tensors = [Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2]
+    tensors = [t.detach().clone().requires_grad_(True) for t in tensors]
+    (Q_ref, R_ref, S_ref,
+     Vq1_ref, Vq2_ref,
+     Vr1_ref, Vr2_ref,
+     Vs1_ref, Vs2_ref) = tensors
 
-    scale = 1.0 / math.sqrt(float(D))
-    A = torch.einsum('bhid,bhjd,bhkd->bhijk', Q_ref, R_ref, S_ref) * scale
+    # Forward pass through reference extension; returns 6 tensors
+    outputs = baseline_ext.forward(
+        Q_ref, R_ref, S_ref,
+        Vq1_ref, Vq2_ref,
+        Vr1_ref, Vr2_ref,
+        Vs1_ref, Vs2_ref
+    )
 
-    # Aq: softmax over (j,k)
-    Aq = torch.softmax(A.flatten(3, 4), dim=-1).reshape_as(A)
+    if not (isinstance(outputs, tuple) and len(outputs) == 6):
+        raise ValueError("Expected 6-tensor output from reference extension")
 
-    # Ar: softmax over (i,k)
-    A_r = A.permute(0, 1, 3, 2, 4)                          # [B,H,J,I,K]
-    Ar = torch.softmax(A_r.flatten(3, 4), dim=-1).reshape_as(A_r)
-    Ar = Ar.permute(0, 1, 3, 2, 4)                           # [B,H,I,J,K]
+    Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_ = outputs
 
-    # As: softmax over (i,j)
-    A_s = A.permute(0, 1, 4, 2, 3)                           # [B,H,K,I,J]
-    As = torch.softmax(A_s.flatten(3, 4), dim=-1).reshape_as(A_s)
-    As = As.permute(0, 1, 3, 4, 2)                           # [B,H,I,J,K]
-
-    # Gather outputs
-    Y_q  = torch.einsum('bhijk,bhjd,bhkd->bhid', Aq, Vr1_ref, Vs1_ref)
-    Y_r  = torch.einsum('bhijk,bhid,bhkd->bhjd', Ar, Vq1_ref, Vs1_ref)
-    Y_s  = torch.einsum('bhijk,bhid,bhjd->bhkd', As, Vq1_ref, Vr1_ref)
-
-    # Scatter outputs (elementwise products of attention maps)
-    Y_q_ = torch.einsum('bhijk,bhjd,bhkd->bhid', Ar * As, Vr2_ref, Vs2_ref)
-    Y_r_ = torch.einsum('bhijk,bhid,bhkd->bhjd', Aq * As, Vq2_ref, Vs2_ref)
-    Y_s_ = torch.einsum('bhijk,bhid,bhjd->bhkd', Aq * Ar, Vq2_ref, Vr2_ref)
-
-    # Slice grad_output to each output's length
-    T_i = grad_output[:, :, :I, :]  # for Y_q, Y_q_
-    T_j = grad_output[:, :, :J, :]  # for Y_r, Y_r_
-    T_k = grad_output[:, :, :K, :]  # for Y_s, Y_s_
+    # Synthetic loss identical to CUDA path
+    T_i = grad_output[:, :, :I, :]
+    T_j = grad_output[:, :, :J, :]
+    T_k = grad_output[:, :, :K, :]
 
     loss = (
         (Y_q  * T_i).sum() +
@@ -269,20 +256,21 @@ def main():
     max_len = max(I, J, K)
     grad_output = torch.randn(B, H, max_len, D, device=device, dtype=torch.float32)
 
-    # --- Compute manual (CUDA) grads and intermediate sums ---
+    # --- Compute manual (CUDA) grads ---
     torch.cuda.synchronize() if device.type == 'cuda' else None
     grads_manual = compute_manual_grads(
         manual_ext, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, grad_output
     )
-
 
     # --- Compute reference (autograd) grads ---
     grads_ref = compute_reference_grads(
         Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, grad_output
     )
 
-    # --- Compute reference intermediate sums ---
-    # Note: This runs on a single head/batch item for simplicity
+    # NOTE: intermediate softmax-statistics sums were removed from the CUDA
+    # kernel.  Skip the previous comparison block that referenced
+    # sum_q_manual / sum_q_ref etc.
+
     names = [
         'grad_Q', 'grad_R', 'grad_S',
         'grad_Vq_1', 'grad_Vq_2',
