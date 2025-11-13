@@ -82,7 +82,7 @@ def launch_profiler(report_filename=None):
     # --- Configuration ---
     # You can now change these values directly in the script for a new run
     B, H, I_dim, J_dim, K_dim, D_dim = (1, 2, 128, 128, 128, 64)
-    KERNEL_NAME = "grad_Vq1_tbIK_kernel"
+    KERNEL_NAME = "grad_Q_kernel"
     
     # Dynamically generate the report filename
     if report_filename is None:
