@@ -4,7 +4,10 @@
 #include <cuda_runtime.h>
 #include "../cpp/manual_att3ntion.h"
 #include <tuple>
-    
+
+constexpr float EXP_CLIP = 80.0f;   // safe range for expf in FP32
+constexpr float DENOM_EPS = 1e-6f;  // avoid divide-by-zero
+
 // Tunable tile sizes (shared defaults; override per build if needed)
 #ifndef TILE_I
 #define TILE_I 8
@@ -716,8 +719,11 @@ __global__ void grad_scatter_Vq_kernel(
     float grad_acc[MAX_D_REG] = {0.0f};
 
     // coefficients depending only on i or k  ----------------------------
-    const float coeff_i = __expf(-m_iBH[i0]) / l_iBH[i0];
-    const float coeff_k = __expf(-m_kBH[k0]) / l_kBH[k0];
+    constexpr float EXP_CLIP = 80.0f;   // safe range for expf
+    constexpr float DENOM_EPS = 1e-6f;
+
+    const float coeff_i = __expf(fminf(-m_iBH[i0], EXP_CLIP)) / fmaxf(l_iBH[i0], DENOM_EPS);
+    const float coeff_k = __expf(fminf(-m_kBH[k0], EXP_CLIP)) / fmaxf(l_kBH[k0], DENOM_EPS);
 
     // ---- shared memory tiles for (j) ----------------------------------
     extern __shared__ float shmem[];
@@ -753,11 +759,12 @@ __global__ void grad_scatter_Vq_kernel(
             for (int d=0; d<D; ++d)
                 dot += q_vec[d] * sh_R[jOff*D + d] * s_vec[d];
             float logits = dot * scale;
-            float exp_logits = __expf(logits);
+            float exp_logits = __expf(fminf(logits, EXP_CLIP));
 
             // softmax numerators
             float w_aq   = exp_logits * coeff_i;                    // Aq numerator (omit /li factor later?) Actually Aq=exp(logits-m_i)/l_i = exp_logits*coeff_i
-            float w_ar   = exp_logits * (__expf(-sh_mj[jOff]) / sh_lj[jOff]);
+            float w_ar   = exp_logits * (__expf(fminf(-sh_mj[jOff], EXP_CLIP)) /
+                                         fmaxf(sh_lj[jOff], DENOM_EPS));
             float w_as   = exp_logits * coeff_k;
 
             // term 1: Aq*As
@@ -783,6 +790,15 @@ __global__ void grad_scatter_Vq_kernel(
     #pragma unroll
     for (int d=0; d<D; ++d)
         atomicAdd(&gVqBH[i0*D + d], grad_acc[d]);
+
+    // ===== DEBUG: detect non-finite denominators or coefficients =====
+    if (!isfinite(coeff_i) || !isfinite(coeff_k) || !isfinite(l_iBH[i0]) || !isfinite(l_kBH[k0])) {
+        // Only one thread per threadblock should print to avoid clutter
+        if (threadIdx.x == 0 && threadIdx.y == 0) {
+            printf("[grad_scatter_Vq_kernel] BH=%d i=%d k=%d  coeff_i=%e  coeff_k=%e  l_i=%e  l_k=%e\n",
+                   bh, i0, k0, coeff_i, coeff_k, l_iBH[i0], l_kBH[k0]);
+        }
+    }
 }
 
 __global__ void grad_scatter_Vr_kernel(
@@ -866,7 +882,7 @@ __global__ void grad_scatter_Vr_kernel(
             for (int d=0; d<D; ++d)
                 dot += sh_Q[iOff*D + d] * r_vec[d] * s_vec[d];
             float logits = dot * scale;
-            float exp_logits = __expf(logits);
+            float exp_logits = __expf(fminf(logits, EXP_CLIP));
 
             float coeff_i = __expf(-sh_mi[iOff]) / sh_li[iOff];
             float w_aq = exp_logits * coeff_i;
@@ -935,8 +951,8 @@ __global__ void grad_scatter_Vs_kernel(
     float gy_i_vec[MAX_D_REG];
     #pragma unroll
     for (int d=0; d<D; ++d){
-        q_vec[d]    = QBH [i0*D + d];
-        s_vec[d]    = SBH [k0*D + d];
+        q_vec[d]    = QBH[i0*D + d];
+        s_vec[d]    = SBH[k0*D + d];
         vq2_vec[d]  = Vq2BH[i0*D + d];
         gy_i_vec[d] = gYBH [i0*D + d];
     }
@@ -975,7 +991,7 @@ __global__ void grad_scatter_Vs_kernel(
             for (int d=0; d<D; ++d)
                 dot += q_vec[d] * sh_R[jOff*D + d] * s_vec[d];
             float logits = dot * scale;
-            float exp_logits = __expf(logits);
+            float exp_logits = __expf(fminf(logits, EXP_CLIP));
 
             float coeff_j = __expf(-sh_mj[jOff]) / sh_lj[jOff];
             float w_aq = exp_logits * coeff_i;
@@ -2026,6 +2042,12 @@ backward_cuda(torch::Tensor grad_output,
         l_k.data_ptr<float>(),
         grad_Vq_2.data_ptr<float>(),
         N, D, scale);
+
+    AT_CUDA_CHECK(cudaGetLastError());
+    AT_CUDA_CHECK(cudaDeviceSynchronize());
+    TORCH_CHECK(
+        grad_Vq_2.isfinite().all().item<bool>(),
+        "grad_Vq_2 contains non-finite values after grad_scatter_Vq_kernel");
   }
 
   {
@@ -2188,6 +2210,11 @@ backward_cuda(torch::Tensor grad_output,
     if (err != cudaSuccess) {
       fprintf(stderr, "CUDA error in grad_Q_kernel launch: %s\n", cudaGetErrorString(err));
     }
+
+    AT_CUDA_CHECK(cudaDeviceSynchronize());
+    TORCH_CHECK(
+        grad_Vq_2.isfinite().all().item<bool>(),
+        "grad_Vq_2 contains non-finite values after grad_Q_kernel");
   }
 
   {
@@ -2238,6 +2265,11 @@ backward_cuda(torch::Tensor grad_output,
     if (err != cudaSuccess) {
       fprintf(stderr, "CUDA error in grad_R_kernel launch: %s\n", cudaGetErrorString(err));
     }
+
+    AT_CUDA_CHECK(cudaDeviceSynchronize());
+    TORCH_CHECK(
+        grad_Vq_2.isfinite().all().item<bool>(),
+        "grad_Vq_2 contains non-finite values after grad_R_kernel");
   }
 
   {
@@ -2288,6 +2320,11 @@ backward_cuda(torch::Tensor grad_output,
     if (err != cudaSuccess) {
       fprintf(stderr, "CUDA error in grad_S_kernel launch: %s\n", cudaGetErrorString(err));
     }
+
+    AT_CUDA_CHECK(cudaDeviceSynchronize());
+    TORCH_CHECK(
+        grad_Vq_2.isfinite().all().item<bool>(),
+        "grad_Vq_2 contains non-finite values after grad_S_kernel");
   }
 
   cudaDeviceSynchronize();
