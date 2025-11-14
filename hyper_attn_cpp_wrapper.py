@@ -72,6 +72,17 @@ class HyperAttentionAutograd(Function):
 
         grad_Q, grad_R, grad_S, grad_Vq_1, grad_Vq_2, grad_Vr_1, grad_Vr_2, grad_Vs_1, grad_Vs_2 = grad_tuple
 
+        debug_names = [
+            "grad_Q", "grad_R", "grad_S",
+            "grad_Vq_1", "grad_Vq_2",
+            "grad_Vr_1", "grad_Vr_2",
+            "grad_Vs_1", "grad_Vs_2",
+        ]
+        for name, tensor in zip(debug_names, grad_tuple):
+            if tensor is not None and tensor.is_floating_point():
+                if not torch.isfinite(tensor).all():
+                    raise RuntimeError(f"{name} contains non-finite values")
+
         return (
             grad_Q,
             grad_R,
@@ -98,9 +109,12 @@ class HypergraphAttentionCPP(nn.Module):
 
         torch.manual_seed(42)
         
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
+
         self.d_model = d_model
         self.n_heads = n_heads
-        self.head_dim = d_model
+        self.head_dim = d_model // n_heads
         
         self.Wq = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
         self.Wr = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
