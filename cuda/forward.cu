@@ -2,6 +2,7 @@
 #include <ATen/cuda/CUDAContext.h>      
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <stdio.h>
 #include "../cpp/manual_att3ntion.h"
 #include <cuda_bf16.h>
 
@@ -128,6 +129,7 @@ void Yq_gather_flash(
                 __syncthreads();
             }
             m_ij = red_buf[0];
+            __syncthreads(); // Ensure all threads have read m_ij before red_buf is reused for sum
 
             // --- Compute Softmax Numerator (p_ij) and Denominator (l_ij) for the tile ---
             float l_ij = 0.0f;
@@ -149,6 +151,7 @@ void Yq_gather_flash(
                 __syncthreads();
             }
             l_ij = red_buf[0];
+            __syncthreads(); // Ensure all threads have read l_ij before red_buf is reused
             
             // --- Update Online Softmax State (Done by thread 0) ---
             float m_i_old, l_i_old, m_new, alpha, beta, l_new;
@@ -176,22 +179,16 @@ void Yq_gather_flash(
 
             // --- Update Output Vector O ---
             // Each thread updates its portion of O in shared memory
-            // Each thread updates its portion of O in shared memory
             for(int d = tid; d < D; d += block_size) {
                 float new_o_d = 0.0f;
-                // Accumulate new value contribution from the tile. Unroll accumulation.
-                float o_accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                // Accumulate new value contribution from the tile
                 for (int jt = 0; jt < TILE_J; ++jt) {
-                    if (j0+jt >= J) continue;
-                    for (int kt = 0; kt < TILE_K; kt+=4) { // Unroll innermost loop
-                        if (k0+kt >= K) continue;
-                        o_accum[0] += p_tile[jt*TILE_K+kt+0] * v1_tile[jt*D+d] * v2_tile[(kt+0)*D+d];
-                        o_accum[1] += p_tile[jt*TILE_K+kt+1] * v1_tile[jt*D+d] * v2_tile[(kt+1)*D+d];
-                        o_accum[2] += p_tile[jt*TILE_K+kt+2] * v1_tile[jt*D+d] * v2_tile[(kt+2)*D+d];
-                        o_accum[3] += p_tile[jt*TILE_K+kt+3] * v1_tile[jt*D+d] * v2_tile[(kt+3)*D+d];
+                    if (j0 + jt >= J) continue;
+                    for (int kt = 0; kt < TILE_K; ++kt) {
+                        if (k0 + kt >= K) continue;
+                        new_o_d += p_tile[jt*TILE_K + kt] * v1_tile[jt*D + d] * v2_tile[kt*D + d];
                     }
                 }
-                new_o_d = o_accum[0] + o_accum[1] + o_accum[2] + o_accum[3];
                 
                 // Rescale old O value and add new contribution
                 if (l_new > 1e-20f) {
