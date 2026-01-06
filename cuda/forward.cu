@@ -1169,6 +1169,7 @@ static __global__ void Aq_tiled_softmax(
                 __syncthreads();
             }
             float m_tile = red_buf[0];
+            __syncthreads(); // Ensure all threads read m_tile before red_buf is reused
 
             // --- Parallel reduction to find tile sum_exp (l_tile) ---
             float l_tile_thread = 0.0f;
@@ -1287,6 +1288,7 @@ static __global__ void Ar_tiled_softmax(
                 __syncthreads();
             }
             float m_tile = red_buf[0];
+            __syncthreads(); // Ensure all threads read m_tile before red_buf is reused
 
             // --- Parallel reduction to find tile sum_exp (l_tile) ---
             float l_tile_thread = 0.0f;
@@ -1385,24 +1387,29 @@ static __global__ void As_tiled_softmax(
             }
             __syncthreads();
 
-            // Find tile max (m_tile)
+            // Find tile max (m_tile) with proper sync in reduction
             float m_tile_thread = -1e30f;
             for (int i = tid; i < TILE_I*TILE_J; i+=block_size) m_tile_thread = fmaxf(m_tile_thread, p_tile[i]);
             red_buf[tid] = m_tile_thread;
             __syncthreads();
-            for (int s=block_size/2; s>0; s>>=1) if (tid<s) red_buf[tid] = fmaxf(red_buf[tid], red_buf[tid+s]);
-            __syncthreads();
+            for (int s=block_size/2; s>0; s>>=1) {
+                if (tid<s) red_buf[tid] = fmaxf(red_buf[tid], red_buf[tid+s]);
+                __syncthreads();
+            }
             float m_tile = red_buf[0];
+            __syncthreads(); // Ensure all threads read m_tile before red_buf is reused
 
-            // Find tile sum_exp (l_tile)
+            // Find tile sum_exp (l_tile) with proper sync in reduction
             float l_tile_thread = 0.0f;
             for (int i = tid; i < TILE_I*TILE_J; i+=block_size) {
                 if(p_tile[i] > -1e29f) l_tile_thread += expf(p_tile[i] - m_tile);
             }
             red_buf[tid] = l_tile_thread;
             __syncthreads();
-            for (int s=block_size/2; s>0; s>>=1) if (tid<s) red_buf[tid] += red_buf[tid+s];
-            __syncthreads();
+            for (int s=block_size/2; s>0; s>>=1) {
+                if (tid<s) red_buf[tid] += red_buf[tid+s];
+                __syncthreads();
+            }
             float l_tile = red_buf[0];
 
             // Online update
@@ -1445,7 +1452,9 @@ __global__ void Yq_scatter_flash(
 
     const int i_idx = i_start + thread_i_idx; // global index of curr thread's I
 
-    if (i_idx >= I || j_start >= J) return; // check bounds
+    // NOTE: We cannot return early here because all threads must participate
+    // in __syncthreads(). Instead, we use this flag to skip computation/writes.
+    const bool valid_thread = (i_idx < I) && (j_start < J);
 
     // --- Pointers to Global Memory ---
     const int64_t q_bh_offset = (int64_t)bh_idx * I * D;
@@ -1479,6 +1488,7 @@ __global__ void Yq_scatter_flash(
     int flat_thread_id_2d = threadIdx.y * blockDim.x + threadIdx.x; 
     int threads_per_block = blockDim.x * blockDim.y; // tile I * D
     
+    // Initialize o_tile (all threads, even invalid ones, to avoid uninitialized smem)
     o_tile[thread_i_idx * D + thread_d_idx] = 0.0f;
 
     // --- Load Q tile to smem (strided/coalesced layout)---
@@ -1510,6 +1520,7 @@ __global__ void Yq_scatter_flash(
              lj_tile[j_load] = l_j_in[mj_bh_offset + j_start + j_load];
         }
     }
+    __syncthreads(); // Ensure all J-related tiles are loaded before computation
 
     for (int k0 = 0; k0 < K; k0 += TILE_K) { // for each S of length tile K
         // --- Cooperative loading for k-related tiles ---
@@ -1568,20 +1579,24 @@ __global__ void Yq_scatter_flash(
                 float combined_attn_val = ar_val * as_val; 
                 
                 // --- Step 2.3: Parallel Vector Update ---
-                // NO __syncthreads() is needed here. The barrier stall is GONE.
                 const float* vr_vec = vr_tile + j_tile_idx * D;
                 const float* vs_vec = vs_tile + k_tile_idx * D;
 
                 o_tile[thread_i_idx * D + thread_d_idx] += combined_attn_val * vr_vec[thread_d_idx] * vs_vec[thread_d_idx];
+                
+                // Sync before next iteration writes to reduction_smem
+                __syncthreads();
             }
         }
         __syncthreads(); // Sync after all j,k tiles are processed for this k0-block, before loading the next tile of K block.
     }
     
     // --- Write final result to global memory ---
-    // Use atomicAdd to safely accumulate results
-    float final_val = o_tile[thread_i_idx * D + thread_d_idx];
-    if (i_idx < I && thread_d_idx < D) atomicAdd(&Y_q_[yq_bh_offset + i_idx * D + thread_d_idx], final_val);
+    // Use atomicAdd to safely accumulate results. Only valid threads write.
+    if (valid_thread) {
+        float final_val = o_tile[thread_i_idx * D + thread_d_idx];
+        atomicAdd(&Y_q_[yq_bh_offset + i_idx * D + thread_d_idx], final_val);
+    }
 }
 
 void Yq_scatter_flash_launcher(
@@ -1635,10 +1650,11 @@ void Yq_scatter_flash_launcher(
         );
         dim3 block(D, TILE_I_SPECIAL);
         size_t smem_size = sizeof(float) * (
-            TILE_I_SPECIAL*D + TILE_J*D + TILE_K*D + 
-            TILE_J*D + TILE_K*D +             
-            TILE_J + TILE_J + TILE_K + TILE_K +
-            TILE_I_SPECIAL*D // Add memory for the o_tile accumulator
+            TILE_I_SPECIAL*D + TILE_J*D + TILE_K*D + // q_tile, r_tile, s_tile
+            TILE_J*D + TILE_K*D +                    // vr_tile, vs_tile
+            TILE_J + TILE_J + TILE_K + TILE_K +      // mj_tile, lj_tile, mk_tile, lk_tile
+            TILE_I_SPECIAL*D +                       // o_tile accumulator
+            TILE_I_SPECIAL*D                         // reduction_smem for dot product
         );
         Yq_scatter_flash<<<grid, block, smem_size>>>(
             Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
@@ -1673,8 +1689,8 @@ __global__ void Yr_scatter_flash(
 
     const int i0 = i_tile_idx_grid * TILE_I;
 
-    // Early exit for blocks outside the valid problem space
-    if (j_idx >= J || i0 >= I) return;
+    // NOTE: We cannot return early because all threads must participate in __syncthreads().
+    const bool valid_thread = (j_idx < J) && (i0 < I);
 
     // --- Pointers ---
     const int64_t q_bh_offset = (int64_t)bh_idx * I * D;
@@ -1802,8 +1818,10 @@ __global__ void Yr_scatter_flash(
     }
     
     // --- Write final result to global memory ---
-    float final_val = o_tile[j_local_idx * D + d_idx];
-    if (d_idx < D) atomicAdd(&Y_r_[yr_bh_offset + j_idx * D + d_idx], final_val);
+    if (valid_thread && d_idx < D) {
+        float final_val = o_tile[j_local_idx * D + d_idx];
+        atomicAdd(&Y_r_[yr_bh_offset + j_idx * D + d_idx], final_val);
+    }
 }
 
 void Yr_scatter_flash_launcher(
@@ -1892,8 +1910,8 @@ __global__ void Ys_scatter_flash(
 
     const int i0 = i_tile_idx_grid * TILE_I;
 
-    // Early exit for blocks outside the valid problem space
-    if (k_idx >= K || i0 >= I) return;
+    // NOTE: We cannot return early because all threads must participate in __syncthreads().
+    const bool valid_thread = (k_idx < K) && (i0 < I);
 
     // --- Pointers ---
     const int64_t q_bh_offset = (int64_t)bh_idx * I * D;
@@ -2018,8 +2036,10 @@ __global__ void Ys_scatter_flash(
     }
     
     // --- Write final result to global memory ---
-    float final_val = o_tile[k_local_idx * D + d_idx];
-    if (d_idx < D) atomicAdd(&Y_s_[ys_bh_offset + k_idx * D + d_idx], final_val);
+    if (valid_thread && d_idx < D) {
+        float final_val = o_tile[k_local_idx * D + d_idx];
+        atomicAdd(&Y_s_[ys_bh_offset + k_idx * D + d_idx], final_val);
+    }
 }
 
 
