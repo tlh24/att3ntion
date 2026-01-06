@@ -79,6 +79,9 @@ static __global__ void Ar_tiled_softmax(
     float m_block = -1e30f;
     float l_block = 0.0f;
 
+    // numerical stability constant
+    constexpr float EXP_CLIP = 80.0f;   // safe range for expf
+
     __syncthreads();
 
     // --- Main Loop: Iterate over all i and k tiles ---
@@ -124,12 +127,13 @@ static __global__ void Ar_tiled_softmax(
                 __syncthreads();
             }
             float m_tile = red_buf[0];
+            __syncthreads(); // CRITICAL: Ensure all threads read m_tile before red_buf is reused
 
             // --- Parallel reduction to find tile sum_exp (l_tile) ---
             float l_tile_thread = 0.0f;
             for (int flat_idx = tid; flat_idx < TILE_I * TILE_K; flat_idx += block_size) {
                 if (p_tile[flat_idx] > -1e29f) { // Check if it's not padding
-                    l_tile_thread += expf(p_tile[flat_idx] - m_tile);
+                    l_tile_thread += expf(fminf(p_tile[flat_idx] - m_tile, EXP_CLIP));
                 }
             }
             red_buf[tid] = l_tile_thread;
@@ -142,7 +146,7 @@ static __global__ void Ar_tiled_softmax(
             
             // --- Online update of block-wide stats (each thread updates its copy) ---
             float m_new = fmaxf(m_block, m_tile);
-            l_block = expf(m_block - m_new) * l_block + expf(m_tile - m_new) * l_tile;
+            l_block = expf(fminf(m_block - m_new, EXP_CLIP)) * l_block + expf(fminf(m_tile - m_new, EXP_CLIP)) * l_tile;
             m_block = m_new;
             __syncthreads(); // Sync to ensure all threads are ready for the next tile
         }
@@ -198,6 +202,9 @@ static __global__ void Aq_tiled_softmax(
     float m_block = -1e30f;
     float l_block = 0.0f;
 
+    // numerical stability constant
+    constexpr float EXP_CLIP = 80.0f;   // safe range for expf
+
     __syncthreads();
 
     // --- Main Loop: Iterate over all j and k tiles ---
@@ -243,12 +250,13 @@ static __global__ void Aq_tiled_softmax(
                 __syncthreads();
             }
             float m_tile = red_buf[0];
+            __syncthreads(); // CRITICAL: Ensure all threads read m_tile before red_buf is reused
 
             // --- Parallel reduction to find tile sum_exp (l_tile) ---
             float l_tile_thread = 0.0f;
             for (int flat_idx = tid; flat_idx < TILE_J * TILE_K; flat_idx += block_size) {
                 if (p_tile[flat_idx] > -1e29f) { // Check if it's not padding
-                    l_tile_thread += expf(p_tile[flat_idx] - m_tile);
+                    l_tile_thread += expf(fminf(p_tile[flat_idx] - m_tile, EXP_CLIP));
                 }
             }
             red_buf[tid] = l_tile_thread;
@@ -261,7 +269,7 @@ static __global__ void Aq_tiled_softmax(
             
             // --- Online update of block-wide stats (each thread updates its copy) ---
             float m_new = fmaxf(m_block, m_tile);
-            l_block = expf(m_block - m_new) * l_block + expf(m_tile - m_new) * l_tile;
+            l_block = expf(fminf(m_block - m_new, EXP_CLIP)) * l_block + expf(fminf(m_tile - m_new, EXP_CLIP)) * l_tile;
             m_block = m_new;
             __syncthreads(); 
         }
@@ -309,6 +317,10 @@ static __global__ void As_tiled_softmax(
     
     float m_block = -1e30f;
     float l_block = 0.0f;
+
+    // numerical stability constant
+    constexpr float EXP_CLIP = 80.0f;   // safe range for expf
+
     __syncthreads();
 
     // --- Main Loop: Iterate over all i and j tiles ---
@@ -341,29 +353,34 @@ static __global__ void As_tiled_softmax(
             }
             __syncthreads();
 
-            // Find tile max (m_tile)
+            // Find tile max (m_tile) - with proper sync in reduction
             float m_tile_thread = -1e30f;
             for (int i = tid; i < TILE_I*TILE_J; i+=block_size) m_tile_thread = fmaxf(m_tile_thread, p_tile[i]);
             red_buf[tid] = m_tile_thread;
             __syncthreads();
-            for (int s=block_size/2; s>0; s>>=1) if (tid<s) red_buf[tid] = fmaxf(red_buf[tid], red_buf[tid+s]);
-            __syncthreads();
+            for (int s=block_size/2; s>0; s>>=1) {
+                if (tid<s) red_buf[tid] = fmaxf(red_buf[tid], red_buf[tid+s]);
+                __syncthreads(); // CRITICAL: sync inside reduction loop
+            }
             float m_tile = red_buf[0];
+            __syncthreads(); // CRITICAL: Ensure all threads read m_tile before red_buf is reused
 
-            // Find tile sum_exp (l_tile)
+            // Find tile sum_exp (l_tile) - with proper sync in reduction
             float l_tile_thread = 0.0f;
             for (int i = tid; i < TILE_I*TILE_J; i+=block_size) {
-                if(p_tile[i] > -1e29f) l_tile_thread += expf(p_tile[i] - m_tile);
+                if(p_tile[i] > -1e29f) l_tile_thread += expf(fminf(p_tile[i] - m_tile, EXP_CLIP));
             }
             red_buf[tid] = l_tile_thread;
             __syncthreads();
-            for (int s=block_size/2; s>0; s>>=1) if (tid<s) red_buf[tid] += red_buf[tid+s];
-            __syncthreads();
+            for (int s=block_size/2; s>0; s>>=1) {
+                if (tid<s) red_buf[tid] += red_buf[tid+s];
+                __syncthreads(); // CRITICAL: sync inside reduction loop
+            }
             float l_tile = red_buf[0];
 
             // Online update
             float m_new = fmaxf(m_block, m_tile);
-            l_block = expf(m_block - m_new) * l_block + expf(m_tile - m_new) * l_tile;
+            l_block = expf(fminf(m_block - m_new, EXP_CLIP)) * l_block + expf(fminf(m_tile - m_new, EXP_CLIP)) * l_tile;
             m_block = m_new;
             __syncthreads();
         }
