@@ -507,9 +507,12 @@ void Yr_gather_flash(
             }
             red_buf[tid] = m_ij;
             __syncthreads();
-            for (int s = block_size / 2; s > 0; s >>= 1) if (tid < s) red_buf[tid] = fmaxf(red_buf[tid], red_buf[tid+s]);
-            __syncthreads();
+            for (int s = block_size / 2; s > 0; s >>= 1) {
+                if (tid < s) red_buf[tid] = fmaxf(red_buf[tid], red_buf[tid+s]);
+                __syncthreads();
+            }
             m_ij = red_buf[0];
+            __syncthreads(); // Ensure all threads have read m_ij before red_buf is reused
 
             // --- Compute Softmax Numerator & Denominator ---
             float l_ij = 0.0f;
@@ -524,9 +527,12 @@ void Yr_gather_flash(
             }
             red_buf[tid] = l_ij;
             __syncthreads();
-            for (int s = block_size / 2; s > 0; s >>= 1) if (tid < s) red_buf[tid] += red_buf[tid+s];
-            __syncthreads();
+            for (int s = block_size / 2; s > 0; s >>= 1) {
+                if (tid < s) red_buf[tid] += red_buf[tid+s];
+                __syncthreads();
+            }
             l_ij = red_buf[0];
+            __syncthreads(); // Ensure all threads have read l_ij before red_buf is reused
             
             // --- Update Online Softmax State ---
             float m_i_old, l_i_old, m_new, alpha, beta, l_new;
@@ -834,9 +840,12 @@ void Ys_gather_flash(
             }
             red_buf[tid] = m_ij;
             __syncthreads();
-            for (int s = block_size / 2; s > 0; s >>= 1) if (tid < s) red_buf[tid] = fmaxf(red_buf[tid], red_buf[tid+s]);
-            __syncthreads();
+            for (int s = block_size / 2; s > 0; s >>= 1) {
+                if (tid < s) red_buf[tid] = fmaxf(red_buf[tid], red_buf[tid+s]);
+                __syncthreads();
+            }
             m_ij = red_buf[0];
+            __syncthreads(); // Ensure all threads have read m_ij before red_buf is reused
 
             // --- Compute Softmax Numerator & Denominator ---
             float l_ij = 0.0f;
@@ -851,9 +860,12 @@ void Ys_gather_flash(
             }
             red_buf[tid] = l_ij;
             __syncthreads();
-            for (int s = block_size / 2; s > 0; s >>= 1) if (tid < s) red_buf[tid] += red_buf[tid+s];
-            __syncthreads();
+            for (int s = block_size / 2; s > 0; s >>= 1) {
+                if (tid < s) red_buf[tid] += red_buf[tid+s];
+                __syncthreads();
+            }
             l_ij = red_buf[0];
+            __syncthreads(); // Ensure all threads have read l_ij before red_buf is reused
             
             // --- Update Online Softmax State ---
             float m_i_old, l_i_old, m_new, alpha, beta, l_new;
