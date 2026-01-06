@@ -477,20 +477,20 @@ __global__ void grad_gather_Vq_kernel(
 
         /* ---- iterate inside loaded j-chunk (only active threads compute) */
         if (active) {
-        for (int jOff=0; jOff<T_J && (jBase+jOff)<N; ++jOff){
-            float logits=0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                logits += q_vec[d]*sh_R[jOff][d]*s_vec[d];
-            logits *= scale;
+            for (int jOff=0; jOff<T_J && (jBase+jOff)<N; ++jOff){
+                float logits=0.f;
+                #pragma unroll
+                for (int d=0; d<D; ++d)
+                    logits += q_vec[d]*sh_R[jOff][d]*s_vec[d];
+                logits *= scale;
 
                 float wj = __expf(fminf(logits - sh_mj[jOff], EXP_CLIP)) / fmaxf(sh_lj[jOff], DENOM_EPS);
                 float wk = __expf(fminf(logits - mKBH[k0], EXP_CLIP))    / fmaxf(lKBH[k0], DENOM_EPS);
 
-            #pragma unroll
-            for (int d=0; d<D; ++d){
-                grad_acc[d] += wj * sh_gY[jOff][d] * vs_vec[d]        /* Yr path */
-                              + wk * gYBH[k0*D + d]  * sh_Vr[jOff][d];/* Ys path */
+                #pragma unroll
+                for (int d=0; d<D; ++d){
+                    grad_acc[d] += wj * sh_gY[jOff][d] * vs_vec[d]        /* Yr path */
+                                  + wk * gYBH[k0*D + d]  * sh_Vr[jOff][d];/* Ys path */
                 }
             }
         }
@@ -499,9 +499,9 @@ __global__ void grad_gather_Vq_kernel(
 
     /* ---- atomic add to global grad (only active threads) --------------- */
     if (active) {
-    #pragma unroll
-    for (int d=0; d<D; ++d)
-        atomicAdd(&gVqBH[i0*D + d], grad_acc[d]);
+        #pragma unroll
+        for (int d=0; d<D; ++d)
+            atomicAdd(&gVqBH[i0*D + d], grad_acc[d]);
     }
 }
 
@@ -591,20 +591,20 @@ __global__ void grad_gather_Vr_kernel(
 
         // Only active threads compute
         if (active) {
-        for (int iOff=0; iOff<T_J && (iBase+iOff)<N; ++iOff){
-            float logits=0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                logits += sh_Q[iOff][d] * r_vec[d] * s_vec[d];
-            logits *= scale;
+            for (int iOff=0; iOff<T_J && (iBase+iOff)<N; ++iOff){
+                float logits=0.f;
+                #pragma unroll
+                for (int d=0; d<D; ++d)
+                    logits += sh_Q[iOff][d] * r_vec[d] * s_vec[d];
+                logits *= scale;
 
                 float wi = __expf(fminf(logits - sh_mi[iOff], EXP_CLIP)) / fmaxf(sh_li[iOff], DENOM_EPS);
                 float wk = __expf(fminf(logits - m_k_val, EXP_CLIP))     / fmaxf(l_k_val, DENOM_EPS);
 
-            #pragma unroll
-            for (int d=0; d<D; ++d){
-                grad_acc[d] += wi * sh_gY[iOff][d] * vs_vec[d]
-                              + wk * gy_k_vec[d]   * sh_Vq[iOff][d];
+                #pragma unroll
+                for (int d=0; d<D; ++d){
+                    grad_acc[d] += wi * sh_gY[iOff][d] * vs_vec[d]
+                                  + wk * gy_k_vec[d]   * sh_Vq[iOff][d];
                 }
             }
         }
@@ -613,9 +613,9 @@ __global__ void grad_gather_Vr_kernel(
 
     /* ---- atomic add to global grad (only active threads) --------------- */
     if (active) {
-    #pragma unroll
-    for (int d=0; d<D; ++d)
-        atomicAdd(&gVrBH[j0*D + d], grad_acc[d]);
+        #pragma unroll
+        for (int d=0; d<D; ++d)
+            atomicAdd(&gVrBH[j0*D + d], grad_acc[d]);
     }
 }
 
@@ -705,20 +705,20 @@ __global__ void grad_gather_Vs_kernel(
 
         // Only active threads compute
         if (active) {
-        for (int jOff=0; jOff<T_J && (jBase+jOff)<N; ++jOff){
-            float logits=0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                logits += q_vec[d] * sh_R[jOff][d] * s_vec[d];
-            logits *= scale;
+            for (int jOff=0; jOff<T_J && (jBase+jOff)<N; ++jOff){
+                float logits=0.f;
+                #pragma unroll
+                for (int d=0; d<D; ++d)
+                    logits += q_vec[d] * sh_R[jOff][d] * s_vec[d];
+                logits *= scale;
 
                 float wi = __expf(fminf(logits - m_i_val, EXP_CLIP)) / fmaxf(l_i_val, DENOM_EPS);
                 float wj = __expf(fminf(logits - sh_mj[jOff], EXP_CLIP)) / fmaxf(sh_lj[jOff], DENOM_EPS);
 
-            #pragma unroll
-            for (int d=0; d<D; ++d){
-                grad_acc[d] += wi * gy_i_vec[d]   * sh_Vr[jOff][d]
-                              + wj * sh_gY[jOff][d] * vq_vec[d];
+                #pragma unroll
+                for (int d=0; d<D; ++d){
+                    grad_acc[d] += wi * gy_i_vec[d]   * sh_Vr[jOff][d]
+                                  + wj * sh_gY[jOff][d] * vq_vec[d];
                 }
             }
         }
@@ -727,9 +727,9 @@ __global__ void grad_gather_Vs_kernel(
 
     /* ---- atomic add to global grad (only active threads) --------------- */
     if (active) {
-    #pragma unroll
-    for (int d=0; d<D; ++d)
-        atomicAdd(&gVsBH[k0*D + d], grad_acc[d]);
+        #pragma unroll
+        for (int d=0; d<D; ++d)
+            atomicAdd(&gVsBH[k0*D + d], grad_acc[d]);
     }
 }
 
@@ -756,7 +756,12 @@ __global__ void grad_scatter_Vq_kernel(
     const int i0 = blockIdx.x * T_I + threadIdx.x;   // 0..N-1 (column)
     const int k0 = blockIdx.y * T_K + threadIdx.y;   // 0..N-1 (row)
     const int bh = blockIdx.z;                       // flattened (B,H)
-    if (i0 >= N || k0 >= N) return;
+    
+    // ALL threads must participate in cooperative loading - use active flag instead of early return
+    const bool active = (i0 < N && k0 < N);
+    // Clamped indices for safe memory access during cooperative loading
+    const int i0_safe = min(i0, N - 1);
+    const int k0_safe = min(k0, N - 1);
 
     // per-BH base pointers and strides
     const int64_t stride_BH = (int64_t)N * D;
@@ -779,9 +784,9 @@ __global__ void grad_scatter_Vq_kernel(
     float s_vec[MAX_D_REG], vs2_vec[MAX_D_REG];
     #pragma unroll
     for (int d=0; d<D; ++d){
-        q_vec[d]  = QBH[i0*D + d];
-        s_vec[d]  = SBH[k0*D + d];
-        vs2_vec[d]= Vs2BH[k0*D + d];
+        q_vec[d]  = QBH[i0_safe*D + d];
+        s_vec[d]  = SBH[k0_safe*D + d];
+        vs2_vec[d]= Vs2BH[k0_safe*D + d];
     }
     float grad_acc[MAX_D_REG] = {0.0f};
 
@@ -789,8 +794,8 @@ __global__ void grad_scatter_Vq_kernel(
     constexpr float EXP_CLIP = 80.0f;   // safe range for expf
     constexpr float DENOM_EPS = 1e-6f;
 
-    const float coeff_i = __expf(fminf(-m_iBH[i0], EXP_CLIP)) / fmaxf(l_iBH[i0], DENOM_EPS);
-    const float coeff_k = __expf(fminf(-m_kBH[k0], EXP_CLIP)) / fmaxf(l_kBH[k0], DENOM_EPS);
+    const float coeff_i = __expf(fminf(-m_iBH[i0_safe], EXP_CLIP)) / fmaxf(l_iBH[i0_safe], DENOM_EPS);
+    const float coeff_k = __expf(fminf(-m_kBH[k0_safe], EXP_CLIP)) / fmaxf(l_kBH[k0_safe], DENOM_EPS);
 
     // ---- shared memory tiles for (j) ----------------------------------
     extern __shared__ float shmem[];
@@ -818,53 +823,48 @@ __global__ void grad_scatter_Vq_kernel(
         }
         __syncthreads();
 
-        // ---- loop inside J-tile --------------------------------------
-        for (int jOff=0; jOff<T_J && (jBase+jOff)<N; ++jOff){
-            // dot(Q[i],R[j],S[k])
-            float dot = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                dot += q_vec[d] * sh_R[jOff*D + d] * s_vec[d];
-            float logits = dot * scale;
-            float exp_logits = __expf(fminf(logits, EXP_CLIP));
+        // ---- loop inside J-tile (only active threads compute) --------
+        if (active) {
+            for (int jOff=0; jOff<T_J && (jBase+jOff)<N; ++jOff){
+                // dot(Q[i],R[j],S[k])
+                float dot = 0.f;
+                #pragma unroll
+                for (int d=0; d<D; ++d)
+                    dot += q_vec[d] * sh_R[jOff*D + d] * s_vec[d];
+                float logits = dot * scale;
+                float exp_logits = __expf(fminf(logits, EXP_CLIP));
 
-            // softmax numerators
-            float w_aq   = exp_logits * coeff_i;                    // Aq numerator (omit /li factor later?) Actually Aq=exp(logits-m_i)/l_i = exp_logits*coeff_i
-            float w_ar   = exp_logits * (__expf(fminf(-sh_mj[jOff], EXP_CLIP)) /
-                                         fmaxf(sh_lj[jOff], DENOM_EPS));
-            float w_as   = exp_logits * coeff_k;
+                // softmax numerators
+                float w_aq   = exp_logits * coeff_i;                    // Aq numerator (omit /li factor later?) Actually Aq=exp(logits-m_i)/l_i = exp_logits*coeff_i
+                float w_ar   = exp_logits * (__expf(fminf(-sh_mj[jOff], EXP_CLIP)) /
+                                             fmaxf(sh_lj[jOff], DENOM_EPS));
+                float w_as   = exp_logits * coeff_k;
 
-            // term 1: Aq*As
-            float w1 = w_aq * w_as; // exp_logits^2 * ... large but okay FP32
-            // term 2: Aq*Ar
-            float w2 = w_aq * w_ar;
+                // term 1: Aq*As
+                float w1 = w_aq * w_as; // exp_logits^2 * ... large but okay FP32
+                // term 2: Aq*Ar
+                float w2 = w_aq * w_ar;
 
-            // load vectors
-            const float* dYr_vec = &sh_gYr[jOff*D];
-            const float* Vr2_vec = &sh_Vr2[jOff*D];
-            const float* dYs_vec = &gYBH[k0*D]; // contiguous in global, fine
+                // load vectors
+                const float* dYr_vec = &sh_gYr[jOff*D];
+                const float* Vr2_vec = &sh_Vr2[jOff*D];
+                const float* dYs_vec = &gYBH[k0*D]; // contiguous in global, fine
 
-            #pragma unroll
-            for (int d=0; d<D; ++d){
-                grad_acc[d] += w1 * dYr_vec[d] * vs2_vec[d] +
-                               w2 * dYs_vec[d] * Vr2_vec[d];
+                #pragma unroll
+                for (int d=0; d<D; ++d){
+                    grad_acc[d] += w1 * dYr_vec[d] * vs2_vec[d] +
+                                   w2 * dYs_vec[d] * Vr2_vec[d];
+                }
             }
         }
         __syncthreads();
     }
 
-    // ---- atomic add results ------------------------------------------
-    #pragma unroll
-    for (int d=0; d<D; ++d)
-        atomicAdd(&gVqBH[i0*D + d], grad_acc[d]);
-
-    // ===== DEBUG: detect non-finite denominators or coefficients =====
-    if (!isfinite(coeff_i) || !isfinite(coeff_k) || !isfinite(l_iBH[i0]) || !isfinite(l_kBH[k0])) {
-        // Only one thread per threadblock should print to avoid clutter
-        if (threadIdx.x == 0 && threadIdx.y == 0) {
-            printf("[grad_scatter_Vq_kernel] BH=%d i=%d k=%d  coeff_i=%e  coeff_k=%e  l_i=%e  l_k=%e\n",
-                   bh, i0, k0, coeff_i, coeff_k, l_iBH[i0], l_kBH[k0]);
-        }
+    // ---- atomic add results (only active threads) --------------------
+    if (active) {
+        #pragma unroll
+        for (int d=0; d<D; ++d)
+            atomicAdd(&gVqBH[i0*D + d], grad_acc[d]);
     }
 }
 
@@ -887,7 +887,12 @@ __global__ void grad_scatter_Vr_kernel(
     const int j0 = blockIdx.x * T_I + threadIdx.x;
     const int k0 = blockIdx.y * T_K + threadIdx.y;
     const int bh = blockIdx.z;
-    if (j0 >= N || k0 >= N) return;
+    
+    // ALL threads must participate in cooperative loading - use active flag instead of early return
+    const bool active = (j0 < N && k0 < N);
+    // Clamped indices for safe memory access during cooperative loading
+    const int j0_safe = min(j0, N - 1);
+    const int k0_safe = min(k0, N - 1);
 
     const int64_t stride_BH = (int64_t)N * D;
     const float* QBH   = Q     + (int64_t)bh * stride_BH;
@@ -910,15 +915,15 @@ __global__ void grad_scatter_Vr_kernel(
     float gy_k_vec[MAX_D_REG];
     #pragma unroll
     for (int d=0; d<D; ++d){
-        r_vec[d]    = RBH[j0*D + d];
-        s_vec[d]    = SBH[k0*D + d];
-        vs2_vec[d]  = Vs2BH[k0*D + d];
-        gy_k_vec[d] = gYBH[k0*D + d];
+        r_vec[d]    = RBH[j0_safe*D + d];
+        s_vec[d]    = SBH[k0_safe*D + d];
+        vs2_vec[d]  = Vs2BH[k0_safe*D + d];
+        gy_k_vec[d] = gYBH[k0_safe*D + d];
     }
 
     float grad_acc[MAX_D_REG] = {0.0f};
-    const float coeff_j = __expf(-m_jBH[j0]) / l_jBH[j0];
-    const float coeff_k = __expf(-m_kBH[k0]) / l_kBH[k0];
+    const float coeff_j = __expf(fminf(-m_jBH[j0_safe], EXP_CLIP)) / fmaxf(l_jBH[j0_safe], DENOM_EPS);
+    const float coeff_k = __expf(fminf(-m_kBH[k0_safe], EXP_CLIP)) / fmaxf(l_kBH[k0_safe], DENOM_EPS);
 
     extern __shared__ float shmem[];
     float* sh_Q   = shmem;                    // T_J * D
@@ -943,37 +948,43 @@ __global__ void grad_scatter_Vr_kernel(
         }
         __syncthreads();
 
-        for (int iOff=0; iOff<T_J && (iBase+iOff)<N; ++iOff){
-            float dot = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                dot += sh_Q[iOff*D + d] * r_vec[d] * s_vec[d];
-            float logits = dot * scale;
-            float exp_logits = __expf(fminf(logits, EXP_CLIP));
+        // Only active threads compute
+        if (active) {
+            for (int iOff=0; iOff<T_J && (iBase+iOff)<N; ++iOff){
+                float dot = 0.f;
+                #pragma unroll
+                for (int d=0; d<D; ++d)
+                    dot += sh_Q[iOff*D + d] * r_vec[d] * s_vec[d];
+                float logits = dot * scale;
+                float exp_logits = __expf(fminf(logits, EXP_CLIP));
 
-            float coeff_i = __expf(-sh_mi[iOff]) / sh_li[iOff];
-            float w_aq = exp_logits * coeff_i;
-            float w_ar = exp_logits * coeff_j;
-            float w_as = exp_logits * coeff_k;
+                float coeff_i = __expf(fminf(-sh_mi[iOff], EXP_CLIP)) / fmaxf(sh_li[iOff], DENOM_EPS);
+                float w_aq = exp_logits * coeff_i;
+                float w_ar = exp_logits * coeff_j;
+                float w_as = exp_logits * coeff_k;
 
-            float w1 = w_ar * w_as;
-            float w2 = w_aq * w_ar;
+                float w1 = w_ar * w_as;
+                float w2 = w_aq * w_ar;
 
-            const float* dy_q_vec = &sh_gYq[iOff*D];
-            const float* vq2_vec  = &sh_Vq2[iOff*D];
+                const float* dy_q_vec = &sh_gYq[iOff*D];
+                const float* vq2_vec  = &sh_Vq2[iOff*D];
 
-            #pragma unroll
-            for (int d=0; d<D; ++d){
-                grad_acc[d] += w1 * dy_q_vec[d] * vs2_vec[d]
-                              + w2 * gy_k_vec[d] * vq2_vec[d];
+                #pragma unroll
+                for (int d=0; d<D; ++d){
+                    grad_acc[d] += w1 * dy_q_vec[d] * vs2_vec[d]
+                                  + w2 * gy_k_vec[d] * vq2_vec[d];
+                }
             }
         }
         __syncthreads();
     }
 
-    #pragma unroll
-    for (int d=0; d<D; ++d)
-        atomicAdd(&gVrBH[j0*D + d], grad_acc[d]);
+    // Only active threads write results
+    if (active) {
+        #pragma unroll
+        for (int d=0; d<D; ++d)
+            atomicAdd(&gVrBH[j0*D + d], grad_acc[d]);
+    }
 }
 
 __global__ void grad_scatter_Vs_kernel(
@@ -995,7 +1006,12 @@ __global__ void grad_scatter_Vs_kernel(
     const int i0 = blockIdx.x * T_I + threadIdx.x;
     const int k0 = blockIdx.y * T_K + threadIdx.y;
     const int bh = blockIdx.z;
-    if (i0 >= N || k0 >= N) return;
+    
+    // ALL threads must participate in cooperative loading - use active flag instead of early return
+    const bool active = (i0 < N && k0 < N);
+    // Clamped indices for safe memory access during cooperative loading
+    const int i0_safe = min(i0, N - 1);
+    const int k0_safe = min(k0, N - 1);
 
     const int64_t stride_BH = (int64_t)N * D;
     const float* QBH   = Q     + (int64_t)bh * stride_BH;
@@ -1018,15 +1034,15 @@ __global__ void grad_scatter_Vs_kernel(
     float gy_i_vec[MAX_D_REG];
     #pragma unroll
     for (int d=0; d<D; ++d){
-        q_vec[d]    = QBH[i0*D + d];
-        s_vec[d]    = SBH[k0*D + d];
-        vq2_vec[d]  = Vq2BH[i0*D + d];
-        gy_i_vec[d] = gYBH [i0*D + d];
+        q_vec[d]    = QBH[i0_safe*D + d];
+        s_vec[d]    = SBH[k0_safe*D + d];
+        vq2_vec[d]  = Vq2BH[i0_safe*D + d];
+        gy_i_vec[d] = gYBH [i0_safe*D + d];
     }
 
     float grad_acc[MAX_D_REG] = {0.0f};
-    const float coeff_i = __expf(-m_iBH[i0]) / l_iBH[i0];
-    const float coeff_k = __expf(-m_kBH[k0]) / l_kBH[k0];
+    const float coeff_i = __expf(fminf(-m_iBH[i0_safe], EXP_CLIP)) / fmaxf(l_iBH[i0_safe], DENOM_EPS);
+    const float coeff_k = __expf(fminf(-m_kBH[k0_safe], EXP_CLIP)) / fmaxf(l_kBH[k0_safe], DENOM_EPS);
 
     extern __shared__ float shmem[];
     float* sh_R   = shmem;                    // T_J * D
@@ -1052,37 +1068,43 @@ __global__ void grad_scatter_Vs_kernel(
         }
         __syncthreads();
 
-        for (int jOff=0; jOff<T_J && (jBase+jOff)<N; ++jOff){
-            float dot = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                dot += q_vec[d] * sh_R[jOff*D + d] * s_vec[d];
-            float logits = dot * scale;
-            float exp_logits = __expf(fminf(logits, EXP_CLIP));
+        // Only active threads compute
+        if (active) {
+            for (int jOff=0; jOff<T_J && (jBase+jOff)<N; ++jOff){
+                float dot = 0.f;
+                #pragma unroll
+                for (int d=0; d<D; ++d)
+                    dot += q_vec[d] * sh_R[jOff*D + d] * s_vec[d];
+                float logits = dot * scale;
+                float exp_logits = __expf(fminf(logits, EXP_CLIP));
 
-            float coeff_j = __expf(-sh_mj[jOff]) / sh_lj[jOff];
-            float w_aq = exp_logits * coeff_i;
-            float w_ar = exp_logits * coeff_j;
-            float w_as = exp_logits * coeff_k;
+                float coeff_j = __expf(fminf(-sh_mj[jOff], EXP_CLIP)) / fmaxf(sh_lj[jOff], DENOM_EPS);
+                float w_aq = exp_logits * coeff_i;
+                float w_ar = exp_logits * coeff_j;
+                float w_as = exp_logits * coeff_k;
 
-            float w1 = w_ar * w_as;
-            float w2 = w_aq * w_as;
+                float w1 = w_ar * w_as;
+                float w2 = w_aq * w_as;
 
-            const float* vr2_vec = &sh_Vr2[jOff*D];
-            const float* dy_r_vec = &sh_gYr[jOff*D];
+                const float* vr2_vec = &sh_Vr2[jOff*D];
+                const float* dy_r_vec = &sh_gYr[jOff*D];
 
-            #pragma unroll
-            for (int d=0; d<D; ++d){
-                grad_acc[d] += w1 * gy_i_vec[d] * vr2_vec[d]
-                              + w2 * dy_r_vec[d] * vq2_vec[d];
+                #pragma unroll
+                for (int d=0; d<D; ++d){
+                    grad_acc[d] += w1 * gy_i_vec[d] * vr2_vec[d]
+                                  + w2 * dy_r_vec[d] * vq2_vec[d];
+                }
             }
         }
         __syncthreads();
     }
 
-    #pragma unroll
-    for (int d=0; d<D; ++d)
-        atomicAdd(&gVsBH[k0*D + d], grad_acc[d]);
+    // Only active threads write results
+    if (active) {
+        #pragma unroll
+        for (int d=0; d<D; ++d)
+            atomicAdd(&gVsBH[k0*D + d], grad_acc[d]);
+    }
 }
 
 // ===================== precompute Jacobian corrections + helpers ==================
@@ -1208,14 +1230,18 @@ __global__ void precompute_jacobian_corrections_kernel(
         const float* dYj_vec  = &dYj_smem[tj * D];
         const float* dYk_vec  = &dYk_smem[tk * D];
 
+        // numerical stability constants
+        constexpr float EXP_CLIP = 80.0f;   // safe range for expf
+        constexpr float DENOM_EPS = 1e-6f;  // prevent division by zero
+
         // ---> Logits & Numerators
         float logits = dot3(Qi_vec, Rj_vec, Sk_vec, D) * scale;
-        float Aq_num = expf(logits - m_i[i]);
-        float Ar_num = expf(logits - m_j[j]);
-        float As_num = expf(logits - m_k[k]);
-        float Aq = Aq_num / l_i[i];
-        float Ar = Ar_num / l_j[j];
-        float As = As_num / l_k[k];
+        float Aq_num = expf(fminf(logits - m_i[i], EXP_CLIP));
+        float Ar_num = expf(fminf(logits - m_j[j], EXP_CLIP));
+        float As_num = expf(fminf(logits - m_k[k], EXP_CLIP));
+        float Aq = Aq_num / fmaxf(l_i[i], DENOM_EPS);
+        float Ar = Ar_num / fmaxf(l_j[j], DENOM_EPS);
+        float As = As_num / fmaxf(l_k[k], DENOM_EPS);
 
         // ---> Compute grad_A components
         // --- grad_Aq ---
@@ -1337,6 +1363,10 @@ __global__ void grad_Q_kernel(
     /* ---- accumulator for grad_Q[i,:] -------------------------------- */
     float grad_acc[REG_CAP] = {0.0f};
 
+    // numerical stability constants
+    constexpr float EXP_CLIP = 80.0f;   // safe range for expf
+    constexpr float DENOM_EPS = 1e-6f;  // prevent division by zero
+
     /* ---- iterate over J in tiles ------------------------------------ */
     for (int jBase = 0; jBase < N; jBase += BLOCK_J)
     {
@@ -1368,9 +1398,9 @@ __global__ void grad_Q_kernel(
                 dot += Qi[d] * sh_R[jOff*D + d] * Sk[d];
             float logits = dot * scale;
 
-            float Aq = __expf(logits - mi        ) / li;
-            float Ar = __expf(logits - sh_mj[jOff]) / sh_lj[jOff];
-            float As = __expf(logits - mk        ) / lk;
+            float Aq = __expf(fminf(logits - mi, EXP_CLIP))         / fmaxf(li, DENOM_EPS);
+            float Ar = __expf(fminf(logits - sh_mj[jOff], EXP_CLIP)) / fmaxf(sh_lj[jOff], DENOM_EPS);
+            float As = __expf(fminf(logits - mk, EXP_CLIP))         / fmaxf(lk, DENOM_EPS);
 
             /* --- grad_Aq ------------------------------------------- */
             float gAq = 0.f;
@@ -1534,6 +1564,10 @@ __global__ void grad_R_kernel(
     /* ---- accumulator for grad_R[j,:] -------------------------------- */
     float grad_acc[REG_CAP] = {0.0f};
 
+    // numerical stability constants
+    constexpr float EXP_CLIP = 80.0f;   // safe range for expf
+    constexpr float DENOM_EPS = 1e-6f;  // prevent division by zero
+
     /* ---- iterate over I in tiles ------------------------------------ */
     for (int iBase = 0; iBase < N; iBase += BLOCK_I)
     {
@@ -1572,9 +1606,9 @@ __global__ void grad_R_kernel(
                 dot += Qi[d] * Rj[d] * Sk[d];
             float logits = dot * scale;
 
-            float Aq = __expf(logits - mi) / li;
-            float Ar = __expf(logits - mj) / lj;
-            float As = __expf(logits - mk) / lk;
+            float Aq = __expf(fminf(logits - mi, EXP_CLIP)) / fmaxf(li, DENOM_EPS);
+            float Ar = __expf(fminf(logits - mj, EXP_CLIP)) / fmaxf(lj, DENOM_EPS);
+            float As = __expf(fminf(logits - mk, EXP_CLIP)) / fmaxf(lk, DENOM_EPS);
 
             /* --- grad_Aq ------------------------------------------- */
             float gAq = 0.f;
@@ -1744,6 +1778,10 @@ __global__ void grad_S_kernel(
     /* ---- accumulator for grad_S[k,:] -------------------------------- */
     float grad_acc[REG_CAP] = {0.0f};
 
+    // numerical stability constants
+    constexpr float EXP_CLIP = 80.0f;   // safe range for expf
+    constexpr float DENOM_EPS = 1e-6f;  // prevent division by zero
+
     /* ---- iterate over J in tiles ------------------------------------ */
     for (int jBase = 0; jBase < N; jBase += BLOCK_J)
     {
@@ -1782,9 +1820,9 @@ __global__ void grad_S_kernel(
                 dot += Qi[d] * Rj[d] * Sk[d];
             float logits = dot * scale;
 
-            float Aq = __expf(logits - mi) / li;
-            float Ar = __expf(logits - mj) / lj;
-            float As = __expf(logits - mk) / lk;
+            float Aq = __expf(fminf(logits - mi, EXP_CLIP)) / fmaxf(li, DENOM_EPS);
+            float Ar = __expf(fminf(logits - mj, EXP_CLIP)) / fmaxf(lj, DENOM_EPS);
+            float As = __expf(fminf(logits - mk, EXP_CLIP)) / fmaxf(lk, DENOM_EPS);
 
             /* --- grad_Aq ------------------------------------------- */
             float gAq = 0.f;
