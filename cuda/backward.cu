@@ -413,7 +413,9 @@ __global__ void grad_gather_Vq_kernel(
     int bh  = blockIdx.z;          // flattened (batch, head)
     int i0  = blockIdx.x * T_I + threadIdx.x;
     int k0  = blockIdx.y * T_K + threadIdx.y;
-    if (i0 >= N || k0 >= N) return;
+    
+    // Track if this thread should compute (DON'T return early - need all threads for shared mem loading)
+    const bool active = (i0 < N && k0 < N);
 
     const int64_t stride_BH = (int64_t)N * D;
     const float* QBH   = Q       + bh * stride_BH;
@@ -429,15 +431,24 @@ __global__ void grad_gather_Vq_kernel(
           float* gVqBH = gradVq  + bh * stride_BH;
 
     /* ---- load Q[i,:]  S[k,:]  Vs[k,:] into registers ------------------- */
-    float q_vec[MAX_D_REG];    // assumes D ≤ 16 (adjust if larger)
+    float q_vec[MAX_D_REG];
     float s_vec[MAX_D_REG], vs_vec[MAX_D_REG];
+    float grad_acc[MAX_D_REG] = {0.0f};
+    
+    // Clamp indices for safe memory access (inactive threads load from valid location)
+    const int i0_safe = min(i0, N-1);
+    const int k0_safe = min(k0, N-1);
+    
     #pragma unroll
     for (int d=0; d<D; ++d){
-        q_vec[d]  = QBH[i0*D + d];
-        s_vec[d]  = SBH[k0*D + d];
-        vs_vec[d] = VsBH[k0*D + d];
+        q_vec[d]  = QBH[i0_safe*D + d];
+        s_vec[d]  = SBH[k0_safe*D + d];
+        vs_vec[d] = VsBH[k0_safe*D + d];
     }
-    float grad_acc[MAX_D_REG] = {0.0f};
+
+    // numerical stability constants
+    constexpr float EXP_CLIP = 80.0f;   // safe range for expf
+    constexpr float DENOM_EPS = 1e-6f;  // prevent division by zero
 
     /* ---- loop over J in chunks ---------------------------------------- */
     for (int jBase=0; jBase<N; jBase+=T_J){
@@ -447,6 +458,7 @@ __global__ void grad_gather_Vq_kernel(
         __shared__ float sh_mj[T_J];
         __shared__ float sh_lj[T_J];
 
+        // Cooperative loading: ALL threads participate to cover all D dimensions
         int lj = threadIdx.y;                       // 0 … T_K-1 (≤T_J)
         if (lj < T_J && (jBase+lj) < N){
             int jGlob = jBase + lj;
@@ -463,7 +475,8 @@ __global__ void grad_gather_Vq_kernel(
         }
         __syncthreads();
 
-        /* ---- iterate inside loaded j-chunk ----------------------------- */
+        /* ---- iterate inside loaded j-chunk (only active threads compute) */
+        if (active) {
         for (int jOff=0; jOff<T_J && (jBase+jOff)<N; ++jOff){
             float logits=0.f;
             #pragma unroll
@@ -471,22 +484,25 @@ __global__ void grad_gather_Vq_kernel(
                 logits += q_vec[d]*sh_R[jOff][d]*s_vec[d];
             logits *= scale;
 
-            float wj = __expf(logits - sh_mj[jOff]) / sh_lj[jOff];
-            float wk = __expf(logits - mKBH[k0])    / lKBH[k0];
+                float wj = __expf(fminf(logits - sh_mj[jOff], EXP_CLIP)) / fmaxf(sh_lj[jOff], DENOM_EPS);
+                float wk = __expf(fminf(logits - mKBH[k0], EXP_CLIP))    / fmaxf(lKBH[k0], DENOM_EPS);
 
             #pragma unroll
             for (int d=0; d<D; ++d){
                 grad_acc[d] += wj * sh_gY[jOff][d] * vs_vec[d]        /* Yr path */
                               + wk * gYBH[k0*D + d]  * sh_Vr[jOff][d];/* Ys path */
+                }
             }
         }
         __syncthreads();
     }
 
-    /* ---- atomic add to global grad ------------------------------------ */
+    /* ---- atomic add to global grad (only active threads) --------------- */
+    if (active) {
     #pragma unroll
     for (int d=0; d<D; ++d)
         atomicAdd(&gVqBH[i0*D + d], grad_acc[d]);
+    }
 }
 
 __global__ void grad_gather_Vr_kernel(
@@ -507,7 +523,9 @@ __global__ void grad_gather_Vr_kernel(
     int bh  = blockIdx.z;
     int j0  = blockIdx.x * T_I + threadIdx.x;
     int k0  = blockIdx.y * T_K + threadIdx.y;
-    if (j0 >= N || k0 >= N) return;
+    
+    // Track if this thread should compute (DON'T return early - need all threads for shared mem loading)
+    const bool active = (j0 < N && k0 < N);
 
     const int64_t stride_BH = (int64_t)N * D;
     const float* QBH   = Q      + bh * stride_BH;
@@ -522,6 +540,10 @@ __global__ void grad_gather_Vr_kernel(
     const float* lKBH  = l_k    + (int64_t)bh * N;
           float* gVrBH = gradVr + bh * stride_BH;
 
+    // Clamp indices for safe memory access (inactive threads load from valid location)
+    const int j0_safe = min(j0, N-1);
+    const int k0_safe = min(k0, N-1);
+
     float r_vec[MAX_D_REG];
     float s_vec[MAX_D_REG];
     float vs_vec[MAX_D_REG];
@@ -529,15 +551,19 @@ __global__ void grad_gather_Vr_kernel(
 
     #pragma unroll
     for (int d=0; d<D; ++d){
-        r_vec[d]    = RBH[j0*D + d];
-        s_vec[d]    = SBH[k0*D + d];
-        vs_vec[d]   = VsBH[k0*D + d];
-        gy_k_vec[d] = gYBH[k0*D + d];
+        r_vec[d]    = RBH[j0_safe*D + d];
+        s_vec[d]    = SBH[k0_safe*D + d];
+        vs_vec[d]   = VsBH[k0_safe*D + d];
+        gy_k_vec[d] = gYBH[k0_safe*D + d];
     }
 
     float grad_acc[MAX_D_REG] = {0.0f};
-    float m_k_val = mKBH[k0];
-    float l_k_val = lKBH[k0];
+    float m_k_val = mKBH[k0_safe];
+    float l_k_val = lKBH[k0_safe];
+
+    // numerical stability constants
+    constexpr float EXP_CLIP = 80.0f;   // safe range for expf
+    constexpr float DENOM_EPS = 1e-6f;  // prevent division by zero
 
     for (int iBase=0; iBase<N; iBase+=T_J){
         __shared__ float sh_Q [T_J][MAX_D_REG];
@@ -546,6 +572,7 @@ __global__ void grad_gather_Vr_kernel(
         __shared__ float sh_mi[T_J];
         __shared__ float sh_li[T_J];
 
+        // Cooperative loading: ALL threads participate to cover all D dimensions
         int li = threadIdx.y;
         if (li < T_J && (iBase+li) < N){
             int iGlob = iBase + li;
@@ -562,6 +589,8 @@ __global__ void grad_gather_Vr_kernel(
         }
         __syncthreads();
 
+        // Only active threads compute
+        if (active) {
         for (int iOff=0; iOff<T_J && (iBase+iOff)<N; ++iOff){
             float logits=0.f;
             #pragma unroll
@@ -569,21 +598,25 @@ __global__ void grad_gather_Vr_kernel(
                 logits += sh_Q[iOff][d] * r_vec[d] * s_vec[d];
             logits *= scale;
 
-            float wi = __expf(logits - sh_mi[iOff]) / sh_li[iOff];
-            float wk = __expf(logits - m_k_val)     / l_k_val;
+                float wi = __expf(fminf(logits - sh_mi[iOff], EXP_CLIP)) / fmaxf(sh_li[iOff], DENOM_EPS);
+                float wk = __expf(fminf(logits - m_k_val, EXP_CLIP))     / fmaxf(l_k_val, DENOM_EPS);
 
             #pragma unroll
             for (int d=0; d<D; ++d){
                 grad_acc[d] += wi * sh_gY[iOff][d] * vs_vec[d]
                               + wk * gy_k_vec[d]   * sh_Vq[iOff][d];
+                }
             }
         }
         __syncthreads();
     }
 
+    /* ---- atomic add to global grad (only active threads) --------------- */
+    if (active) {
     #pragma unroll
     for (int d=0; d<D; ++d)
         atomicAdd(&gVrBH[j0*D + d], grad_acc[d]);
+    }
 }
 
 __global__ void grad_gather_Vs_kernel(
@@ -604,7 +637,9 @@ __global__ void grad_gather_Vs_kernel(
     int bh  = blockIdx.z;
     int i0  = blockIdx.x * T_I + threadIdx.x;
     int k0  = blockIdx.y * T_K + threadIdx.y;
-    if (i0 >= N || k0 >= N) return;
+    
+    // Track if this thread should compute (DON'T return early - need all threads for shared mem loading)
+    const bool active = (i0 < N && k0 < N);
 
     const int64_t stride_BH = (int64_t)N * D;
     const float* QBH   = Q      + bh * stride_BH;
@@ -619,6 +654,10 @@ __global__ void grad_gather_Vs_kernel(
     const float* lJBH  = l_j    + (int64_t)bh * N;
           float* gVsBH = gradVs + bh * stride_BH;
 
+    // Clamp indices for safe memory access (inactive threads load from valid location)
+    const int i0_safe = min(i0, N-1);
+    const int k0_safe = min(k0, N-1);
+
     float q_vec[MAX_D_REG];
     float s_vec[MAX_D_REG];
     float vq_vec[MAX_D_REG];
@@ -626,15 +665,19 @@ __global__ void grad_gather_Vs_kernel(
 
     #pragma unroll
     for (int d=0; d<D; ++d){
-        q_vec[d]    = QBH[i0*D + d];
-        s_vec[d]    = SBH[k0*D + d];
-        vq_vec[d]   = VqBH[i0*D + d];
-        gy_i_vec[d] = gYBH[i0*D + d];
+        q_vec[d]    = QBH[i0_safe*D + d];
+        s_vec[d]    = SBH[k0_safe*D + d];
+        vq_vec[d]   = VqBH[i0_safe*D + d];
+        gy_i_vec[d] = gYBH[i0_safe*D + d];
     }
 
     float grad_acc[MAX_D_REG] = {0.0f};
-    float m_i_val = mIBH[i0];
-    float l_i_val = lIBH[i0];
+    float m_i_val = mIBH[i0_safe];
+    float l_i_val = lIBH[i0_safe];
+
+    // numerical stability constants
+    constexpr float EXP_CLIP = 80.0f;   // safe range for expf
+    constexpr float DENOM_EPS = 1e-6f;  // prevent division by zero
 
     for (int jBase=0; jBase<N; jBase+=T_J){
         __shared__ float sh_R [T_J][MAX_D_REG];
@@ -643,6 +686,7 @@ __global__ void grad_gather_Vs_kernel(
         __shared__ float sh_mj[T_J];
         __shared__ float sh_lj[T_J];
 
+        // Cooperative loading: ALL threads participate to cover all D dimensions
         int lj = threadIdx.y;
         if (lj < T_J && (jBase+lj) < N){
             int jGlob = jBase + lj;
@@ -659,6 +703,8 @@ __global__ void grad_gather_Vs_kernel(
         }
         __syncthreads();
 
+        // Only active threads compute
+        if (active) {
         for (int jOff=0; jOff<T_J && (jBase+jOff)<N; ++jOff){
             float logits=0.f;
             #pragma unroll
@@ -666,21 +712,25 @@ __global__ void grad_gather_Vs_kernel(
                 logits += q_vec[d] * sh_R[jOff][d] * s_vec[d];
             logits *= scale;
 
-            float wi = __expf(logits - m_i_val) / l_i_val;
-            float wj = __expf(logits - sh_mj[jOff]) / sh_lj[jOff];
+                float wi = __expf(fminf(logits - m_i_val, EXP_CLIP)) / fmaxf(l_i_val, DENOM_EPS);
+                float wj = __expf(fminf(logits - sh_mj[jOff], EXP_CLIP)) / fmaxf(sh_lj[jOff], DENOM_EPS);
 
             #pragma unroll
             for (int d=0; d<D; ++d){
                 grad_acc[d] += wi * gy_i_vec[d]   * sh_Vr[jOff][d]
                               + wj * sh_gY[jOff][d] * vq_vec[d];
+                }
             }
         }
         __syncthreads();
     }
 
+    /* ---- atomic add to global grad (only active threads) --------------- */
+    if (active) {
     #pragma unroll
     for (int d=0; d<D; ++d)
         atomicAdd(&gVsBH[k0*D + d], grad_acc[d]);
+    }
 }
 
 // ===================== scatter-grad Vq2, Vr2, Vs2 ======================
