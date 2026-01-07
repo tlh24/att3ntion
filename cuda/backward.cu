@@ -1507,7 +1507,9 @@ __global__ void grad_R_kernel(
     const int k0 = blockIdx.y * BLOCK_K + threadIdx.y;   // k-index owned by this lane
     const int bh = blockIdx.z;                           // flattened (batch, head)
 
-    if (j0 >= N || k0 >= N) return;
+    /* NOTE: Do NOT early return here! All threads must participate in
+       __syncthreads() for cooperative loading. Use validity flag instead. */
+    const bool valid = (j0 < N && k0 < N);
 
     /* ---- per (B,H) base pointers & strides -------------------------- */
     const int64_t stride_BH = (int64_t)N * D;
@@ -1536,30 +1538,36 @@ __global__ void grad_R_kernel(
     float* gRbh = gradR + (int64_t)bh * stride_BH;
 
     /* ---- registers for j-/k-local vectors --------------------------- */
-    float Rj [REG_CAP];
-    float Sk [REG_CAP];
-    float Vr1j[REG_CAP], Vr2j[REG_CAP];
-    float Vs1k[REG_CAP], Vs2k[REG_CAP];
-    float dYj [REG_CAP], dYk [REG_CAP];
+    float Rj [REG_CAP] = {0.0f};
+    float Sk [REG_CAP] = {0.0f};
+    float Vr1j[REG_CAP] = {0.0f}, Vr2j[REG_CAP] = {0.0f};
+    float Vs1k[REG_CAP] = {0.0f}, Vs2k[REG_CAP] = {0.0f};
+    float dYj [REG_CAP] = {0.0f}, dYk [REG_CAP] = {0.0f};
 
-    #pragma unroll
-    for (int d=0; d<D; ++d){
-        Rj [d] = Rbh [j0*D + d];
-        Sk [d] = Sbh [k0*D + d];
-        Vr1j[d] = Vr1bh[j0*D + d];
-        Vr2j[d] = Vr2bh[j0*D + d];
-        Vs1k[d] = Vs1bh[k0*D + d];
-        Vs2k[d] = Vs2bh[k0*D + d];
-        dYj [d] = gYbh [j0*D + d];
-        dYk [d] = gYbh [k0*D + d];
+    float mj = 0.0f, lj = 1.0f, mk = 0.0f, lk = 1.0f;
+    float sumRj = 0.0f, sumSk = 0.0f;
+
+    /* Only load per-thread data if this thread owns a valid (j,k) pair */
+    if (valid) {
+        #pragma unroll
+        for (int d=0; d<D; ++d){
+            Rj [d] = Rbh [j0*D + d];
+            Sk [d] = Sbh [k0*D + d];
+            Vr1j[d] = Vr1bh[j0*D + d];
+            Vr2j[d] = Vr2bh[j0*D + d];
+            Vs1k[d] = Vs1bh[k0*D + d];
+            Vs2k[d] = Vs2bh[k0*D + d];
+            dYj [d] = gYbh [j0*D + d];
+            dYk [d] = gYbh [k0*D + d];
+        }
+
+        mj    = mjBH  [j0];
+        lj    = ljBH  [j0];
+        mk    = mkBH  [k0];
+        lk    = lkBH  [k0];
+        sumRj = sum_rBH[j0];
+        sumSk = sum_sBH[k0];
     }
-
-    const float mj    = mjBH  [j0];
-    const float lj    = ljBH  [j0];
-    const float mk    = mkBH  [k0];
-    const float lk    = lkBH  [k0];
-    const float sumRj = sum_rBH[j0];
-    const float sumSk = sum_sBH[k0];
 
     /* ---- shared memory for I-tiles ---------------------------------- */
     extern __shared__ float shmem[];
@@ -1581,8 +1589,9 @@ __global__ void grad_R_kernel(
     /* ---- iterate over I in tiles ------------------------------------ */
     for (int iBase = 0; iBase < N; iBase += BLOCK_I)
     {
-        const int ld = threadIdx.y;           // use y-lane for row loading
-        if (ld < BLOCK_I && (iBase + ld) < N){
+        /* cooperative load by all (j,k) threads */
+        /* NOTE: BLOCK_I may exceed BLOCK_K, so we loop to cover all rows */
+        for (int ld = threadIdx.y; ld < BLOCK_I && (iBase + ld) < N; ld += BLOCK_K) {
             const int iGlob = iBase + ld;
             #pragma unroll
             for (int d = threadIdx.x; d < D; d += BLOCK_J){
@@ -1688,9 +1697,11 @@ __global__ void grad_R_kernel(
     }
 
     /* ---- atomic add to global grad_R ------------------------------- */
-    #pragma unroll
-    for (int d=0; d<D; ++d)
-        atomicAdd(&gRbh[j0*D + d], scale * grad_acc[d]);
+    if (valid) {
+        #pragma unroll
+        for (int d=0; d<D; ++d)
+            atomicAdd(&gRbh[j0*D + d], scale * grad_acc[d]);
+    }
 }
 
 template<int BLOCK_K, int BLOCK_J, int BLOCK_I, int REG_CAP = MAX_D_REG>
@@ -1721,7 +1732,9 @@ __global__ void grad_S_kernel(
     const int i0 = blockIdx.y * BLOCK_I + threadIdx.y;   // i-index owned by this lane
     const int bh = blockIdx.z;                           // flattened (batch, head)
 
-    if (k0 >= N || i0 >= N) return;
+    /* NOTE: Do NOT early return here! All threads must participate in
+       __syncthreads() for cooperative loading. Use validity flag instead. */
+    const bool valid = (k0 < N && i0 < N);
 
     /* ---- per (B,H) base pointers & strides -------------------------- */
     const int64_t stride_BH = (int64_t)N * D;
@@ -1750,30 +1763,36 @@ __global__ void grad_S_kernel(
     float* gSbh = gradS + (int64_t)bh * stride_BH;
 
     /* ---- registers for k-/i-local vectors --------------------------- */
-    float Sk [REG_CAP];
-    float Qi [REG_CAP];
-    float Vs1k[REG_CAP], Vs2k[REG_CAP];
-    float Vq1i[REG_CAP], Vq2i[REG_CAP];
-    float dYk [REG_CAP], dYi [REG_CAP];
+    float Sk [REG_CAP] = {0.0f};
+    float Qi [REG_CAP] = {0.0f};
+    float Vs1k[REG_CAP] = {0.0f}, Vs2k[REG_CAP] = {0.0f};
+    float Vq1i[REG_CAP] = {0.0f}, Vq2i[REG_CAP] = {0.0f};
+    float dYk [REG_CAP] = {0.0f}, dYi [REG_CAP] = {0.0f};
 
-    #pragma unroll
-    for (int d=0; d<D; ++d){
-        Sk [d] = Sbh [k0*D + d];
-        Qi [d] = Qbh [i0*D + d];
-        Vs1k[d] = Vs1bh[k0*D + d];
-        Vs2k[d] = Vs2bh[k0*D + d];
-        Vq1i[d] = Vq1bh[i0*D + d];
-        Vq2i[d] = Vq2bh[i0*D + d];
-        dYk [d] = gYbh [k0*D + d];
-        dYi [d] = gYbh [i0*D + d];
+    float mi = 0.0f, li = 1.0f, mk = 0.0f, lk = 1.0f;
+    float sumQi = 0.0f, sumSk = 0.0f;
+
+    /* Only load per-thread data if this thread owns a valid (k,i) pair */
+    if (valid) {
+        #pragma unroll
+        for (int d=0; d<D; ++d){
+            Sk [d] = Sbh [k0*D + d];
+            Qi [d] = Qbh [i0*D + d];
+            Vs1k[d] = Vs1bh[k0*D + d];
+            Vs2k[d] = Vs2bh[k0*D + d];
+            Vq1i[d] = Vq1bh[i0*D + d];
+            Vq2i[d] = Vq2bh[i0*D + d];
+            dYk [d] = gYbh [k0*D + d];
+            dYi [d] = gYbh [i0*D + d];
+        }
+
+        mi    = miBH  [i0];
+        li    = liBH  [i0];
+        mk    = mkBH  [k0];
+        lk    = lkBH  [k0];
+        sumQi = sum_qBH[i0];
+        sumSk = sum_sBH[k0];
     }
-
-    const float mi    = miBH  [i0];
-    const float li    = liBH  [i0];
-    const float mk    = mkBH  [k0];
-    const float lk    = lkBH  [k0];
-    const float sumQi = sum_qBH[i0];
-    const float sumSk = sum_sBH[k0];
 
     /* ---- shared memory for J-tiles ---------------------------------- */
     extern __shared__ float shmem[];
@@ -1795,8 +1814,9 @@ __global__ void grad_S_kernel(
     /* ---- iterate over J in tiles ------------------------------------ */
     for (int jBase = 0; jBase < N; jBase += BLOCK_J)
     {
-        const int ld = threadIdx.y;           // use y-lane for row loading
-        if (ld < BLOCK_J && (jBase + ld) < N){
+        /* cooperative load by all (k,i) threads */
+        /* NOTE: BLOCK_J may exceed BLOCK_I, so we loop to cover all rows */
+        for (int ld = threadIdx.y; ld < BLOCK_J && (jBase + ld) < N; ld += BLOCK_I) {
             const int jGlob = jBase + ld;
             #pragma unroll
             for (int d = threadIdx.x; d < D; d += BLOCK_K){
@@ -1902,9 +1922,11 @@ __global__ void grad_S_kernel(
     }
 
     /* ---- atomic add to global grad_S ------------------------------- */
-    #pragma unroll
-    for (int d=0; d<D; ++d)
-        atomicAdd(&gSbh[k0*D + d], scale * grad_acc[d]);
+    if (valid) {
+        #pragma unroll
+        for (int d=0; d<D; ++d)
+            atomicAdd(&gSbh[k0*D + d], scale * grad_acc[d]);
+    }
 }
 
 
