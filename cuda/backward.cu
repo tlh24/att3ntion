@@ -790,12 +790,9 @@ __global__ void grad_scatter_Vq_kernel(
     }
     float grad_acc[MAX_D_REG] = {0.0f};
 
-    // coefficients depending only on i or k  ----------------------------
+    // numerical stability constants
     constexpr float EXP_CLIP = 80.0f;   // safe range for expf
     constexpr float DENOM_EPS = 1e-6f;
-
-    const float coeff_i = __expf(fminf(-m_iBH[i0_safe], EXP_CLIP)) / fmaxf(l_iBH[i0_safe], DENOM_EPS);
-    const float coeff_k = __expf(fminf(-m_kBH[k0_safe], EXP_CLIP)) / fmaxf(l_kBH[k0_safe], DENOM_EPS);
 
     // ---- shared memory tiles for (j) ----------------------------------
     extern __shared__ float shmem[];
@@ -832,18 +829,22 @@ __global__ void grad_scatter_Vq_kernel(
                 for (int d=0; d<D; ++d)
                     dot += q_vec[d] * sh_R[jOff*D + d] * s_vec[d];
                 float logits = dot * scale;
-                float exp_logits = __expf(fminf(logits, EXP_CLIP));
 
-                // softmax numerators
-                float w_aq   = exp_logits * coeff_i;                    // Aq numerator (omit /li factor later?) Actually Aq=exp(logits-m_i)/l_i = exp_logits*coeff_i
-                float w_ar   = exp_logits * (__expf(fminf(-sh_mj[jOff], EXP_CLIP)) /
-                                             fmaxf(sh_lj[jOff], DENOM_EPS));
-                float w_as   = exp_logits * coeff_k;
+                // Compute combined attention weights in LOG-SPACE to avoid overflow
+                // Aq = exp(logits - m_i) / l_i,  As = exp(logits - m_k) / l_k
+                // Aq * As = exp(2*logits - m_i - m_k) / (l_i * l_k)
+                float log_Aq = logits - m_iBH[i0_safe];
+                float log_Ar = logits - sh_mj[jOff];
+                float log_As = logits - m_kBH[k0_safe];
 
-                // term 1: Aq*As
-                float w1 = w_aq * w_as; // exp_logits^2 * ... large but okay FP32
-                // term 2: Aq*Ar
-                float w2 = w_aq * w_ar;
+                float l_i_val = fmaxf(l_iBH[i0_safe], DENOM_EPS);
+                float l_j_val = fmaxf(sh_lj[jOff], DENOM_EPS);
+                float l_k_val = fmaxf(l_kBH[k0_safe], DENOM_EPS);
+
+                // term 1: Aq*As = exp(log_Aq + log_As) / (l_i * l_k)
+                float w1 = __expf(fminf(log_Aq + log_As, EXP_CLIP)) / (l_i_val * l_k_val);
+                // term 2: Aq*Ar = exp(log_Aq + log_Ar) / (l_i * l_j)
+                float w2 = __expf(fminf(log_Aq + log_Ar, EXP_CLIP)) / (l_i_val * l_j_val);
 
                 // load vectors
                 const float* dYr_vec = &sh_gYr[jOff*D];
@@ -922,8 +923,6 @@ __global__ void grad_scatter_Vr_kernel(
     }
 
     float grad_acc[MAX_D_REG] = {0.0f};
-    const float coeff_j = __expf(fminf(-m_jBH[j0_safe], EXP_CLIP)) / fmaxf(l_jBH[j0_safe], DENOM_EPS);
-    const float coeff_k = __expf(fminf(-m_kBH[k0_safe], EXP_CLIP)) / fmaxf(l_kBH[k0_safe], DENOM_EPS);
 
     extern __shared__ float shmem[];
     float* sh_Q   = shmem;                    // T_J * D
@@ -956,15 +955,20 @@ __global__ void grad_scatter_Vr_kernel(
                 for (int d=0; d<D; ++d)
                     dot += sh_Q[iOff*D + d] * r_vec[d] * s_vec[d];
                 float logits = dot * scale;
-                float exp_logits = __expf(fminf(logits, EXP_CLIP));
 
-                float coeff_i = __expf(fminf(-sh_mi[iOff], EXP_CLIP)) / fmaxf(sh_li[iOff], DENOM_EPS);
-                float w_aq = exp_logits * coeff_i;
-                float w_ar = exp_logits * coeff_j;
-                float w_as = exp_logits * coeff_k;
+                // Compute combined attention weights in LOG-SPACE to avoid overflow
+                float log_Aq = logits - sh_mi[iOff];
+                float log_Ar = logits - m_jBH[j0_safe];
+                float log_As = logits - m_kBH[k0_safe];
 
-                float w1 = w_ar * w_as;
-                float w2 = w_aq * w_ar;
+                float l_i_val = fmaxf(sh_li[iOff], DENOM_EPS);
+                float l_j_val = fmaxf(l_jBH[j0_safe], DENOM_EPS);
+                float l_k_val = fmaxf(l_kBH[k0_safe], DENOM_EPS);
+
+                // term 1: Ar*As = exp(log_Ar + log_As) / (l_j * l_k)
+                float w1 = __expf(fminf(log_Ar + log_As, EXP_CLIP)) / (l_j_val * l_k_val);
+                // term 2: Aq*Ar = exp(log_Aq + log_Ar) / (l_i * l_j)
+                float w2 = __expf(fminf(log_Aq + log_Ar, EXP_CLIP)) / (l_i_val * l_j_val);
 
                 const float* dy_q_vec = &sh_gYq[iOff*D];
                 const float* vq2_vec  = &sh_Vq2[iOff*D];
@@ -1041,8 +1045,6 @@ __global__ void grad_scatter_Vs_kernel(
     }
 
     float grad_acc[MAX_D_REG] = {0.0f};
-    const float coeff_i = __expf(fminf(-m_iBH[i0_safe], EXP_CLIP)) / fmaxf(l_iBH[i0_safe], DENOM_EPS);
-    const float coeff_k = __expf(fminf(-m_kBH[k0_safe], EXP_CLIP)) / fmaxf(l_kBH[k0_safe], DENOM_EPS);
 
     extern __shared__ float shmem[];
     float* sh_R   = shmem;                    // T_J * D
@@ -1076,15 +1078,20 @@ __global__ void grad_scatter_Vs_kernel(
                 for (int d=0; d<D; ++d)
                     dot += q_vec[d] * sh_R[jOff*D + d] * s_vec[d];
                 float logits = dot * scale;
-                float exp_logits = __expf(fminf(logits, EXP_CLIP));
 
-                float coeff_j = __expf(fminf(-sh_mj[jOff], EXP_CLIP)) / fmaxf(sh_lj[jOff], DENOM_EPS);
-                float w_aq = exp_logits * coeff_i;
-                float w_ar = exp_logits * coeff_j;
-                float w_as = exp_logits * coeff_k;
+                // Compute combined attention weights in LOG-SPACE to avoid overflow
+                float log_Aq = logits - m_iBH[i0_safe];
+                float log_Ar = logits - sh_mj[jOff];
+                float log_As = logits - m_kBH[k0_safe];
 
-                float w1 = w_ar * w_as;
-                float w2 = w_aq * w_as;
+                float l_i_val = fmaxf(l_iBH[i0_safe], DENOM_EPS);
+                float l_j_val = fmaxf(sh_lj[jOff], DENOM_EPS);
+                float l_k_val = fmaxf(l_kBH[k0_safe], DENOM_EPS);
+
+                // term 1: Ar*As = exp(log_Ar + log_As) / (l_j * l_k)
+                float w1 = __expf(fminf(log_Ar + log_As, EXP_CLIP)) / (l_j_val * l_k_val);
+                // term 2: Aq*As = exp(log_Aq + log_As) / (l_i * l_k)
+                float w2 = __expf(fminf(log_Aq + log_As, EXP_CLIP)) / (l_i_val * l_k_val);
 
                 const float* vr2_vec = &sh_Vr2[jOff*D];
                 const float* dy_r_vec = &sh_gYr[jOff*D];
