@@ -1483,7 +1483,7 @@ __global__ void Yq_scatter_flash(
 
     float* o_tile = lk_tile + TILE_K;
 
-    float* reduction_smem = o_tile + TILE_I_SPECIAL * D; 
+    float* attn_scores_tile = o_tile + TILE_I_SPECIAL * D;  // [TILE_I_SPECIAL] for storing computed attention values
     
     int flat_thread_id_2d = threadIdx.y * blockDim.x + threadIdx.x; 
     int threads_per_block = blockDim.x * blockDim.y; // tile I * D
@@ -1542,49 +1542,54 @@ __global__ void Yq_scatter_flash(
         __syncthreads();
 
         // --- Fused Computation ---
+        const float* q_vec = q_tile + thread_i_idx * D;
+
         for (int j_tile_idx = 0; j_tile_idx < TILE_J; ++j_tile_idx) { //j=0,1,2,...,TILE_J-1
             if (j_start + j_tile_idx >= J) continue;
+            const float* r_vec = r_tile + j_tile_idx * D;
+            float inv_lj = 1.0f / lj_tile[j_tile_idx];
+            float current_mj = mj_tile[j_tile_idx];
 
             for (int k_tile_idx = 0; k_tile_idx < TILE_K; ++k_tile_idx) { //k=0,1,2,...,TILE_K-1
                 if (k0 + k_tile_idx >= K) continue;
                 
-                // --- Step 2.1: Parallel Reduction for Dot Product ---
-                const float* q_vec = q_tile + thread_i_idx * D; // 0 to start
-                const float* r_vec = r_tile + j_tile_idx * D;
-                const float* s_vec = s_tile + k_tile_idx * D;
+                // --- Serial Dot Product (thread 0 per I-row computes it) ---
+                // This approach matches Yr_scatter_flash and Ys_scatter_flash
+                if (thread_d_idx == 0) {
+                    const float* s_vec = s_tile + k_tile_idx * D;
+                    float inv_lk = 1.0f / lk_tile[k_tile_idx];
 
-                // Each thread computes its product and stores it in smem
-                reduction_smem[thread_i_idx * D + thread_d_idx] = q_vec[thread_d_idx] * r_vec[thread_d_idx] * s_vec[thread_d_idx];
-                __syncthreads(); 
-
-                // Perform the reduction in smem.
-                for (int offset = D / 2; offset > 0; offset >>= 1) {
-                    if (thread_d_idx < offset) {
-                        reduction_smem[thread_i_idx * D + thread_d_idx] += reduction_smem[thread_i_idx * D + thread_d_idx + offset];
+                    // Compute dot product using float4 for vectorized loads
+                    const float4* q_vec_f4 = (const float4*)q_vec;
+                    const float4* r_vec_f4 = (const float4*)r_vec;
+                    const float4* s_vec_f4 = (const float4*)s_vec;
+                    float dot = 0.0f;
+                    #pragma unroll
+                    for (int d4 = 0; d4 < D / 4; ++d4) {
+                        float4 q = q_vec_f4[d4];
+                        float4 r = r_vec_f4[d4];
+                        float4 s = s_vec_f4[d4];
+                        dot += q.x * r.x * s.x + q.y * r.y * s.y + q.z * r.z * s.z + q.w * r.w * s.w;
                     }
-                    __syncthreads();
+                    // Handle remaining elements if D is not a multiple of 4
+                    for (int d = (D / 4) * 4; d < D; ++d) {
+                        dot += q_vec[d] * r_vec[d] * s_vec[d];
+                    }
+
+                    float logit = dot * scale;
+                    float ar_val = expf(logit - current_mj) * inv_lj;
+                    float as_val = expf(logit - mk_tile[k_tile_idx]) * inv_lk;
+                    attn_scores_tile[thread_i_idx] = ar_val * as_val;
                 }
-                // The final dot product is now in reduction_smem[thread_i_idx * D + 0].
+                __syncthreads();
 
-                // --- Step 2.2: Redundant but Parallel Scalar Computation ---
-                // All threads read the final dot product for curr I,J,K tile
-
-                float dot = reduction_smem[thread_i_idx * D];
-                float logit = dot * scale;
-
-                float inv_lj = 1.0f / lj_tile[j_tile_idx]; 
-                float inv_lk = 1.0f / lk_tile[k_tile_idx]; 
-                float ar_val = expf(logit - mj_tile[j_tile_idx]) * inv_lj; //exp(dot - max) / sum of exps
-                float as_val = expf(logit - mk_tile[k_tile_idx]) * inv_lk; 
-                float combined_attn_val = ar_val * as_val; 
-                
-                // --- Step 2.3: Parallel Vector Update ---
+                // --- Parallel Vector Update ---
+                // All threads read the computed attention value and update o_tile
                 const float* vr_vec = vr_tile + j_tile_idx * D;
                 const float* vs_vec = vs_tile + k_tile_idx * D;
-
-                o_tile[thread_i_idx * D + thread_d_idx] += combined_attn_val * vr_vec[thread_d_idx] * vs_vec[thread_d_idx];
+                float combined_attn_val = attn_scores_tile[thread_i_idx];
                 
-                // Sync before next iteration writes to reduction_smem
+                o_tile[thread_i_idx * D + thread_d_idx] += combined_attn_val * vr_vec[thread_d_idx] * vs_vec[thread_d_idx];
                 __syncthreads();
             }
         }
@@ -1654,7 +1659,7 @@ void Yq_scatter_flash_launcher(
             TILE_J*D + TILE_K*D +                    // vr_tile, vs_tile
             TILE_J + TILE_J + TILE_K + TILE_K +      // mj_tile, lj_tile, mk_tile, lk_tile
             TILE_I_SPECIAL*D +                       // o_tile accumulator
-            TILE_I_SPECIAL*D                         // reduction_smem for dot product
+            TILE_I_SPECIAL                           // attn_scores_tile for computed attention values
         );
         Yq_scatter_flash<<<grid, block, smem_size>>>(
             Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
