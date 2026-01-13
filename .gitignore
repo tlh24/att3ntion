@@ -31,3 +31,20 @@ __pycache__/
 # Temporary files
 *.log
 .DS_Store
+
+# Profiling reports
+*.ncu-rep
+profiling_reports/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter notebooks
+.ipynb_checkpoints/
+
+# Output directories
+comparison_plots/
