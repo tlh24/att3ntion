@@ -16,7 +16,7 @@
 #include <tuple>
 
 #include "common.cuh"
-#include "../cpp/manual_att3ntion.h"
+#include "../cpp/cuda_bindings.h"
 
 // Backward-specific tile aliases for gradient kernels
 #ifndef T_I

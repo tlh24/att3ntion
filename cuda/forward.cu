@@ -15,7 +15,7 @@
 #include <cuda_bf16.h>
 
 #include "common.cuh"
-#include "../cpp/manual_att3ntion.h"
+#include "../cpp/cuda_bindings.h"
 
 // ===================== gather kernels ======================
 

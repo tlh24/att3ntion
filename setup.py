@@ -6,12 +6,12 @@ setup(
     ext_modules=[
         CppExtension(
             name='hyper_attn_cpp_reference',
-            sources=['cpp/torch_att3ntion.cpp'],
+            sources=['cpp/torch_reference.cpp'],
         ),
         CUDAExtension(
             name='hyper_attn_cpp_manual',
             sources=[
-                'cpp/manual_att3ntion.cpp',
+                'cpp/cuda_bindings.cpp',
                 'cuda/forward.cu',
                 'cuda/backward.cu'
             ],
