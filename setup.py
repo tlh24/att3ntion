@@ -17,6 +17,7 @@ def get_cuda_arch_flags():
 
 setup(
     name='hyper_attn_extensions',
+    version='0.2.0',
     ext_modules=[
         CppExtension(
             name='hyper_attn_cpp_reference',
