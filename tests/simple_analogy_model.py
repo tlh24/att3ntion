@@ -13,8 +13,8 @@ parent_dir_str = str(parent_dir)
 if parent_dir_str not in sys.path:
     sys.path.insert(0, parent_dir_str)
 
-from hyper_attn_pytorch import HypergraphAttention_Naive
-from hyper_attn_cpp_wrapper import HypergraphAttentionCPP
+from pure_pytorch_reference import HypergraphAttention_Naive
+from hypergraph_attention import HypergraphAttentionCPP, HypergraphAttentionCPPReference
 from gen_data import genData
 import pdb
 
@@ -46,10 +46,12 @@ class SimpleAnalogyModel(nn.Module):
 		self.repeated_layers = nn.ModuleList()
 		for _ in range(n_layers):
 			# Select attention implementation for this layer
-			if attn_impl == 'pytorch':
-				attention_layer = HypergraphAttention_Naive(hidden_dim, num_heads)
-			elif attn_impl == 'cpp':
+			if attn_impl == 'torch':
+				attention_layer = HypergraphAttention_Naive(hidden_dim, num_heads, head_subspaces=True)
+			elif attn_impl == 'cuda':
 				attention_layer = HypergraphAttentionCPP(hidden_dim, num_heads)
+			elif attn_impl == 'torch_cpp':
+				attention_layer = HypergraphAttentionCPPReference(hidden_dim, num_heads)
 			else:
 				raise ValueError(f"Unknown attention implementation: {attn_impl}")
 
@@ -243,7 +245,7 @@ if __name__ == '__main__':
 	parser.add_argument('--modulo', type=int, default=19, help='Modulo for arithmetic operations')
 	parser.add_argument('--hidden-dim', type=int, default=64, help='Hidden dimension size')
 	parser.add_argument('--num-heads', type=int, default=4, help='Number of attention heads')
-	parser.add_argument('--attn-impl', type=str, default='pytorch', choices=['pytorch', 'cpp'],
+	parser.add_argument('--attn-impl', type=str, default='torch', choices=['torch', 'cuda', 'torch_cpp'],
 						help='Attention implementation to use')
 	parser.add_argument('--max-batches', type=int, default=None,
 						help='Max batches per epoch for quick debug runs')
