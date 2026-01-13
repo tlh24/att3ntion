@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import math
-import pdb
 
 # this is the "naive" implementation
 # which uses autograd
@@ -123,17 +122,22 @@ class HypergraphAttention_Naive(nn.Module):
 			Y_r_ = torch.einsum('bhijk,bhid,bhijk,bhkd->bhjd', Aq, Vq_, As, Vs_)
 			Y_s_ = torch.einsum('bhijk,bhid,bhijk,bhjd->bhkd', Aq, Vq_, Ar, Vr_)
 		
-		Y_q = self.gelu(Y_q) # test!
-		Y_r = self.gelu(Y_r)
-		Y_s = self.gelu(Y_s)
-		Y_q_ = self.gelu(Y_q_)
-		Y_r_ = self.gelu(Y_r_)
-		Y_s_ = self.gelu(Y_s_)
+		# Skip GELU for testing
+		# Y_q = self.gelu(Y_q)
+		# Y_r = self.gelu(Y_r)
+		# Y_s = self.gelu(Y_s)
+		# Y_q_ = self.gelu(Y_q_)
+		# Y_r_ = self.gelu(Y_r_)
+		# Y_s_ = self.gelu(Y_s_)
 		y = Y_q + Y_r + Y_s + Y_q_ + Y_r_ + Y_s_
 		
-		# sum along the heads
-		y = y.permute(0, 2, 1, 3).sum(dim=2).squeeze()
-		# y = self.gelu(y)
+		# Handle heads based on head_subspaces setting
+		if self.head_subspaces:
+			# Concatenate heads (standard multi-head attention)
+			y = y.permute(0, 2, 1, 3).reshape(batch_size, ntok, self.d_model)
+		else:
+			# Sum over heads
+			y = y.permute(0, 2, 1, 3).sum(dim=2).squeeze()
 		y = self.Wo(y)
 		# residual path is external to this layer.
 		return y 
