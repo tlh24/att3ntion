@@ -1,6 +1,6 @@
 import torch
 from torch.autograd import gradcheck
-from hyper_attn_pytorch import HypergraphAttention_Naive
+from pure_pytorch_reference import HypergraphAttention_Naive
 from hyper_attn_full_pytorch import HypergraphAttention
 import pdb
 import time
