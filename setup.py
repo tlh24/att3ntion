@@ -1,5 +1,19 @@
 from setuptools import setup
+import torch
 from torch.utils.cpp_extension import CppExtension, BuildExtension, CUDAExtension
+
+def get_cuda_arch_flags():
+	# return flags for the minimum capability seen
+	arch_flags = []
+	min_arch = 999
+
+	for i in range(torch.cuda.device_count()):
+		major, minor = torch.cuda.get_device_capability(i)
+		decimal = major + (minor / 100)
+		if decimal < min_arch:
+			arch = f'{major}{minor}'
+
+	return f'-gencode=arch=compute_{arch},code=sm_{arch}'
 
 setup(
     name='hyper_attn_extensions',
@@ -19,7 +33,7 @@ setup(
                 'cxx': ['-O3'],
                 'nvcc': [
                     '-O3',
-                    '-gencode=arch=compute_89,code=sm_89',
+                    get_cuda_arch_flags(),
                     # '-lineinfo' # uncomment for debugging
                 ]
             }
