@@ -1,29 +1,24 @@
+/**
+ * @file backward.cu
+ * @brief Backward pass CUDA kernels for hypergraph attention.
+ *
+ * Computes gradients for Q, R, S, and all V tensors using online softmax
+ * statistics for numerical stability. Includes Jacobian correction terms
+ * for proper gradient flow through the softmax.
+ *
+ * Copyright (c) 2026 Springtail AI. MIT License.
+ */
+
 #include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>      
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include "../cpp/manual_att3ntion.h"
 #include <tuple>
 
-constexpr float EXP_CLIP = 80.0f;   // safe range for expf in FP32
-constexpr float DENOM_EPS = 1e-6f;  // avoid divide-by-zero
+#include "common.cuh"
+#include "../cpp/manual_att3ntion.h"
 
-// Tunable tile sizes (shared defaults; override per build if needed)
-#ifndef TILE_I
-#define TILE_I 8
-#endif
-#ifndef TILE_J
-#define TILE_J 8
-#endif
-#ifndef TILE_K
-#define TILE_K 8
-#endif
-
-#ifndef MAX_D_REG
-#define MAX_D_REG 64
-#endif
-
-// Gather/scatter kernels reuse these aliases so callers can override independently.
+// Backward-specific tile aliases for gradient kernels
 #ifndef T_I
 #define T_I TILE_I
 #endif
@@ -34,367 +29,18 @@ constexpr float DENOM_EPS = 1e-6f;  // avoid divide-by-zero
 #define T_K TILE_K
 #endif
 
-// ==================== softmax stats ====================== (TODO: optimize)
+// =============================================================================
+// Softmax stats kernels are defined in common.cuh:
+//   - softmax_stats_q (for i-centric softmax)
+//   - softmax_stats_r (for j-centric softmax)
+//   - softmax_stats_s (for k-centric softmax)
+// =============================================================================
 
+// =============================================================================
+// Gradient Kernels for V Tensors (Gather Path)
+// =============================================================================
 
-// Ar = softmax_{i,k}(A)
-static __global__ void Ar_tiled_softmax(
-    const float* __restrict__ Q, const float* __restrict__ R, const float* __restrict__ S,
-    float* __restrict__ m_j_out, float* __restrict__ l_j_out,
-    int B, int H, int I, int J, int K, int D, float scale
-) {
-    // --- Grid/Block Mapping ---
-    // Each block computes the stats for a single j_idx, for a single batch/head.
-    const int j_idx = blockIdx.x;
-    const int bh_idx = blockIdx.y;
-    
-    if (j_idx >= J) return;
-
-    const int tid = threadIdx.x;
-    const int block_size = blockDim.x;
-
-    // --- Pointers ---
-    const int64_t q_bh_offset = (int64_t)bh_idx * I * D;
-    const int64_t r_bh_offset = (int64_t)bh_idx * J * D;
-    const int64_t s_bh_offset = (int64_t)bh_idx * K * D;
-
-    const float* Q_slice = Q + q_bh_offset;
-    const float* R_slice = R + r_bh_offset;
-    const float* S_slice = S + s_bh_offset;
-
-    // --- Shared Memory ---
-    extern __shared__ float smem[];
-    float* r_vec_sh = smem;                              // D
-    float* q_tile = r_vec_sh + D;                        // TILE_I * D
-    float* s_tile = q_tile + TILE_I * D;                 // TILE_K * D
-    float* p_tile = s_tile + TILE_K * D;                 // TILE_I * TILE_K (for intermediate dots)
-    float* red_buf = p_tile + TILE_I * TILE_K;           // block_size (for reduction)
-
-    // --- Load R[j] into shared memory ---
-    for(int d=tid; d<D; d+=block_size) {
-        r_vec_sh[d] = R_slice[j_idx * D + d];
-    }
-    
-    // Each thread holds a local copy of the block-wide stats
-    float m_block = -1e30f;
-    float l_block = 0.0f;
-
-    // numerical stability constant
-    constexpr float EXP_CLIP = 80.0f;   // safe range for expf
-
-    __syncthreads();
-
-    // --- Main Loop: Iterate over all i and k tiles ---
-    for (int i0 = 0; i0 < I; i0 += TILE_I) {
-        for (int k0 = 0; k0 < K; k0 += TILE_K) {
-            // Cooperatively load Q and S tiles
-            for (int idx = tid; idx < TILE_I * D; idx += block_size) {
-                int i_load = i0 + (idx/D);
-                if(i_load < I) q_tile[idx] = Q_slice[i_load * D + (idx%D)];
-            }
-            for (int idx = tid; idx < TILE_K * D; idx += block_size) {
-                int k_load = k0 + (idx/D);
-                if(k_load < K) s_tile[idx] = S_slice[k_load * D + (idx%D)];
-            }
-            __syncthreads();
-
-            // --- Compute dot products for this tile and store in p_tile ---
-            for (int flat_idx = tid; flat_idx < TILE_I * TILE_K; flat_idx += block_size) {
-                int i_tile_idx = flat_idx / TILE_K;
-                int k_tile_idx = flat_idx % TILE_K;
-                
-                float dot = 0.0f;
-                if (i0 + i_tile_idx < I && k0 + k_tile_idx < K) {
-                    const float* q_vec_sh = q_tile + i_tile_idx * D;
-                    const float* s_vec_sh = s_tile + k_tile_idx * D;
-                    for(int d=0; d<D; ++d) dot += q_vec_sh[d] * r_vec_sh[d] * s_vec_sh[d];
-                    p_tile[flat_idx] = dot * scale;
-                } else {
-                    p_tile[flat_idx] = -1e30f; // Padding
-                }
-            }
-            __syncthreads();
-
-            // --- Parallel reduction to find tile max (m_tile) ---
-            float m_tile_thread = -1e30f;
-            for (int flat_idx = tid; flat_idx < TILE_I * TILE_K; flat_idx += block_size) {
-                m_tile_thread = fmaxf(m_tile_thread, p_tile[flat_idx]);
-            }
-            red_buf[tid] = m_tile_thread;
-            __syncthreads();
-            for (int s = block_size / 2; s > 0; s >>= 1) {
-                if (tid < s) red_buf[tid] = fmaxf(red_buf[tid], red_buf[tid + s]);
-                __syncthreads();
-            }
-            float m_tile = red_buf[0];
-            __syncthreads(); // CRITICAL: Ensure all threads read m_tile before red_buf is reused
-
-            // --- Parallel reduction to find tile sum_exp (l_tile) ---
-            float l_tile_thread = 0.0f;
-            for (int flat_idx = tid; flat_idx < TILE_I * TILE_K; flat_idx += block_size) {
-                if (p_tile[flat_idx] > -1e29f) { // Check if it's not padding
-                    l_tile_thread += expf(fminf(p_tile[flat_idx] - m_tile, EXP_CLIP));
-                }
-            }
-            red_buf[tid] = l_tile_thread;
-            __syncthreads();
-            for (int s = block_size / 2; s > 0; s >>= 1) {
-                if (tid < s) red_buf[tid] += red_buf[tid + s];
-                __syncthreads();
-            }
-            float l_tile = red_buf[0];
-            
-            // --- Online update of block-wide stats (each thread updates its copy) ---
-            float m_new = fmaxf(m_block, m_tile);
-            l_block = expf(fminf(m_block - m_new, EXP_CLIP)) * l_block + expf(fminf(m_tile - m_new, EXP_CLIP)) * l_tile;
-            m_block = m_new;
-            __syncthreads(); // Sync to ensure all threads are ready for the next tile
-        }
-    }
-    
-    // --- Write final stats to global memory (only thread 0) ---
-    if (tid == 0) {
-        m_j_out[bh_idx * J + j_idx] = m_block;
-        l_j_out[bh_idx * J + j_idx] = l_block;
-    }
-}
-
-
-// Aq = softmax_{j,k}(A)
-static __global__ void Aq_tiled_softmax(
-    const float* __restrict__ Q, const float* __restrict__ R, const float* __restrict__ S,
-    float* __restrict__ m_i_out, float* __restrict__ l_i_out,
-    int B, int H, int I, int J, int K, int D, float scale
-) { 
-    // --- Grid/Block Mapping ---
-    // Each block computes the stats for a single i_idx, for a single batch/head.
-    const int i_idx = blockIdx.x;
-    const int bh_idx = blockIdx.y;
-    
-    if (i_idx >= I) return;
-
-    const int tid = threadIdx.x;
-    const int block_size = blockDim.x;
-
-    // --- Pointers ---
-    const int64_t q_bh_offset = (int64_t)bh_idx * I * D;
-    const int64_t r_bh_offset = (int64_t)bh_idx * J * D;
-    const int64_t s_bh_offset = (int64_t)bh_idx * K * D;
-
-    const float* Q_slice = Q + q_bh_offset;
-    const float* R_slice = R + r_bh_offset;
-    const float* S_slice = S + s_bh_offset;
-
-    // --- Shared Memory ---
-    extern __shared__ float smem[];
-    float* q_vec_sh = smem;                              // D
-    float* r_tile = q_vec_sh + D;                        // TILE_J * D
-    float* s_tile = r_tile + TILE_J * D;                 // TILE_K * D
-    float* p_tile = s_tile + TILE_K * D;                 // TILE_J * TILE_K
-    float* red_buf = p_tile + TILE_J * TILE_K;           // block_size
-
-    // --- Load Q[i] into shared memory ---
-    for(int d=tid; d<D; d+=block_size) {
-        q_vec_sh[d] = Q_slice[i_idx * D + d];
-    }
-    
-    // Each thread holds a local copy of the block-wide stats
-    float m_block = -1e30f;
-    float l_block = 0.0f;
-
-    // numerical stability constant
-    constexpr float EXP_CLIP = 80.0f;   // safe range for expf
-
-    __syncthreads();
-
-    // --- Main Loop: Iterate over all j and k tiles ---
-    for (int j0 = 0; j0 < J; j0 += TILE_J) {
-        for (int k0 = 0; k0 < K; k0 += TILE_K) {
-            // Cooperatively load R and S tiles
-            for (int idx = tid; idx < TILE_J * D; idx += block_size) {
-                int j_load = j0 + (idx/D);
-                if(j_load < J) r_tile[idx] = R_slice[j_load * D + (idx%D)];
-            }
-            for (int idx = tid; idx < TILE_K * D; idx += block_size) {
-                int k_load = k0 + (idx/D);
-                if(k_load < K) s_tile[idx] = S_slice[k_load * D + (idx%D)];
-            }
-            __syncthreads();
-
-            // --- Compute dot products for this tile and store in p_tile ---
-            for (int flat_idx = tid; flat_idx < TILE_J * TILE_K; flat_idx += block_size) {
-                int j_tile_idx = flat_idx / TILE_K;
-                int k_tile_idx = flat_idx % TILE_K;
-                
-                float dot = 0.0f;
-                if (j0 + j_tile_idx < J && k0 + k_tile_idx < K) {
-                    const float* r_vec_sh = r_tile + j_tile_idx * D;
-                    const float* s_vec_sh = s_tile + k_tile_idx * D;
-                    for(int d=0; d<D; ++d) dot += q_vec_sh[d] * r_vec_sh[d] * s_vec_sh[d];
-                    p_tile[flat_idx] = dot * scale;
-                } else {
-                    p_tile[flat_idx] = -1e30f; // Padding
-                }
-            }
-            __syncthreads();
-
-            // --- Parallel reduction to find tile max (m_tile) ---
-            float m_tile_thread = -1e30f;
-            for (int flat_idx = tid; flat_idx < TILE_J * TILE_K; flat_idx += block_size) {
-                m_tile_thread = fmaxf(m_tile_thread, p_tile[flat_idx]);
-            }
-            red_buf[tid] = m_tile_thread;
-            __syncthreads();
-            for (int s = block_size / 2; s > 0; s >>= 1) {
-                if (tid < s) red_buf[tid] = fmaxf(red_buf[tid], red_buf[tid + s]);
-                __syncthreads();
-            }
-            float m_tile = red_buf[0];
-            __syncthreads(); // CRITICAL: Ensure all threads read m_tile before red_buf is reused
-
-            // --- Parallel reduction to find tile sum_exp (l_tile) ---
-            float l_tile_thread = 0.0f;
-            for (int flat_idx = tid; flat_idx < TILE_J * TILE_K; flat_idx += block_size) {
-                if (p_tile[flat_idx] > -1e29f) { // Check if it's not padding
-                    l_tile_thread += expf(fminf(p_tile[flat_idx] - m_tile, EXP_CLIP));
-                }
-            }
-            red_buf[tid] = l_tile_thread;
-            __syncthreads();
-            for (int s = block_size / 2; s > 0; s >>= 1) {
-                if (tid < s) red_buf[tid] += red_buf[tid + s];
-                __syncthreads();
-            }
-            float l_tile = red_buf[0];
-            
-            // --- Online update of block-wide stats (each thread updates its copy) ---
-            float m_new = fmaxf(m_block, m_tile);
-            l_block = expf(fminf(m_block - m_new, EXP_CLIP)) * l_block + expf(fminf(m_tile - m_new, EXP_CLIP)) * l_tile;
-            m_block = m_new;
-            __syncthreads(); 
-        }
-    }
-    
-    // --- Write final stats to global memory (only thread 0) ---
-    if (tid == 0) {
-        m_i_out[bh_idx * I + i_idx] = m_block;
-        l_i_out[bh_idx * I + i_idx] = l_block;
-    }
-}
-
-// As = softmax_{i,j}(A)
-static __global__ void As_tiled_softmax(
-    const float* __restrict__ Q, const float* __restrict__ R, const float* __restrict__ S,
-    float* __restrict__ m_k_out, float* __restrict__ l_k_out,
-    int B, int H, int I, int J, int K, int D, float scale
-) {
-    // --- Grid/Block Mapping ---
-    const int k_idx = blockIdx.x;
-    const int bh_idx = blockIdx.y;
-    if (k_idx >= K) return;
-
-    const int tid = threadIdx.x;
-    const int block_size = blockDim.x;
-
-    // --- Pointers ---
-    const int64_t q_bh_offset = (int64_t)bh_idx * I * D;
-    const int64_t r_bh_offset = (int64_t)bh_idx * J * D;
-    const int64_t s_bh_offset = (int64_t)bh_idx * K * D;
-
-    const float* Q_slice = Q + q_bh_offset;
-    const float* R_slice = R + r_bh_offset;
-    const float* S_slice = S + s_bh_offset;
-
-    // --- Shared Memory ---
-    extern __shared__ float smem[];
-    float* s_vec_sh = smem;                              // D
-    float* q_tile = s_vec_sh + D;                        // TILE_I * D
-    float* r_tile = q_tile + TILE_I * D;                 // TILE_J * D
-    float* p_tile = r_tile + TILE_J * D;                 // TILE_I * TILE_J
-    float* red_buf = p_tile + TILE_I * TILE_J;           // block_size
-
-    for(int d=tid; d<D; d+=block_size) s_vec_sh[d] = S_slice[k_idx * D + d];
-    
-    float m_block = -1e30f;
-    float l_block = 0.0f;
-
-    // numerical stability constant
-    constexpr float EXP_CLIP = 80.0f;   // safe range for expf
-
-    __syncthreads();
-
-    // --- Main Loop: Iterate over all i and j tiles ---
-    for (int i0 = 0; i0 < I; i0 += TILE_I) {
-        for (int j0 = 0; j0 < J; j0 += TILE_J) {
-            // Cooperatively load Q and R tiles
-            for (int idx = tid; idx < TILE_I * D; idx += block_size) {
-                int i_load = i0 + (idx/D);
-                if(i_load < I) q_tile[idx] = Q_slice[i_load * D + (idx%D)];
-            }
-            for (int idx = tid; idx < TILE_J * D; idx += block_size) {
-                int j_load = j0 + (idx/D);
-                if(j_load < J) r_tile[idx] = R_slice[j_load * D + (idx%D)];
-            }
-            __syncthreads();
-
-            // Compute dot products
-            for (int flat_idx = tid; flat_idx < TILE_I * TILE_J; flat_idx += block_size) {
-                int i_tile_idx = flat_idx / TILE_J;
-                int j_tile_idx = flat_idx % TILE_J;
-                float dot = 0.0f;
-                if (i0 + i_tile_idx < I && j0 + j_tile_idx < J) {
-                    const float* q_vec_sh = q_tile + i_tile_idx * D;
-                    const float* r_vec_sh = r_tile + j_tile_idx * D;
-                    for(int d=0; d<D; ++d) dot += q_vec_sh[d] * r_vec_sh[d] * s_vec_sh[d];
-                    p_tile[flat_idx] = dot * scale;
-                } else {
-                    p_tile[flat_idx] = -1e30f;
-                }
-            }
-            __syncthreads();
-
-            // Find tile max (m_tile) - with proper sync in reduction
-            float m_tile_thread = -1e30f;
-            for (int i = tid; i < TILE_I*TILE_J; i+=block_size) m_tile_thread = fmaxf(m_tile_thread, p_tile[i]);
-            red_buf[tid] = m_tile_thread;
-            __syncthreads();
-            for (int s=block_size/2; s>0; s>>=1) {
-                if (tid<s) red_buf[tid] = fmaxf(red_buf[tid], red_buf[tid+s]);
-                __syncthreads(); // CRITICAL: sync inside reduction loop
-            }
-            float m_tile = red_buf[0];
-            __syncthreads(); // CRITICAL: Ensure all threads read m_tile before red_buf is reused
-
-            // Find tile sum_exp (l_tile) - with proper sync in reduction
-            float l_tile_thread = 0.0f;
-            for (int i = tid; i < TILE_I*TILE_J; i+=block_size) {
-                if(p_tile[i] > -1e29f) l_tile_thread += expf(fminf(p_tile[i] - m_tile, EXP_CLIP));
-            }
-            red_buf[tid] = l_tile_thread;
-            __syncthreads();
-            for (int s=block_size/2; s>0; s>>=1) {
-                if (tid<s) red_buf[tid] += red_buf[tid+s];
-                __syncthreads(); // CRITICAL: sync inside reduction loop
-            }
-            float l_tile = red_buf[0];
-
-            // Online update
-            float m_new = fmaxf(m_block, m_tile);
-            l_block = expf(fminf(m_block - m_new, EXP_CLIP)) * l_block + expf(fminf(m_tile - m_new, EXP_CLIP)) * l_tile;
-            m_block = m_new;
-            __syncthreads();
-        }
-    }
-    
-    if (tid == 0) {
-        m_k_out[bh_idx * K + k_idx] = m_block;
-        l_k_out[bh_idx * K + k_idx] = l_block;
-    }
-}
-
-// ===================== gather-grad Vq1, Vr1, Vs1 ======================
-
-__global__ void grad_gather_Vq_kernel(
+__global__ void Vq_gather_grad(
     const float* __restrict__ Q,        // [B,H,N,D]
     const float* __restrict__ R,        // [B,H,N,D]
     const float* __restrict__ S,        // [B,H,N,D]
@@ -446,9 +92,6 @@ __global__ void grad_gather_Vq_kernel(
         vs_vec[d] = VsBH[k0_safe*D + d];
     }
 
-    // numerical stability constants
-    constexpr float EXP_CLIP = 80.0f;   // safe range for expf
-    constexpr float DENOM_EPS = 1e-6f;  // prevent division by zero
 
     /* ---- loop over J in chunks ---------------------------------------- */
     for (int jBase=0; jBase<N; jBase+=T_J){
@@ -505,7 +148,7 @@ __global__ void grad_gather_Vq_kernel(
     }
 }
 
-__global__ void grad_gather_Vr_kernel(
+__global__ void Vr_gather_grad(
     const float* __restrict__ Q,        // [B,H,N,D]
     const float* __restrict__ R,        // [B,H,N,D]
     const float* __restrict__ S,        // [B,H,N,D]
@@ -561,9 +204,6 @@ __global__ void grad_gather_Vr_kernel(
     float m_k_val = mKBH[k0_safe];
     float l_k_val = lKBH[k0_safe];
 
-    // numerical stability constants
-    constexpr float EXP_CLIP = 80.0f;   // safe range for expf
-    constexpr float DENOM_EPS = 1e-6f;  // prevent division by zero
 
     for (int iBase=0; iBase<N; iBase+=T_J){
         __shared__ float sh_Q [T_J][MAX_D_REG];
@@ -619,7 +259,7 @@ __global__ void grad_gather_Vr_kernel(
     }
 }
 
-__global__ void grad_gather_Vs_kernel(
+__global__ void Vs_gather_grad(
     const float* __restrict__ Q,        // [B,H,N,D]
     const float* __restrict__ R,        // [B,H,N,D]
     const float* __restrict__ S,        // [B,H,N,D]
@@ -675,9 +315,6 @@ __global__ void grad_gather_Vs_kernel(
     float m_i_val = mIBH[i0_safe];
     float l_i_val = lIBH[i0_safe];
 
-    // numerical stability constants
-    constexpr float EXP_CLIP = 80.0f;   // safe range for expf
-    constexpr float DENOM_EPS = 1e-6f;  // prevent division by zero
 
     for (int jBase=0; jBase<N; jBase+=T_J){
         __shared__ float sh_R [T_J][MAX_D_REG];
@@ -736,7 +373,7 @@ __global__ void grad_gather_Vs_kernel(
 // ===================== scatter-grad Vq2, Vr2, Vs2 ======================
 
 
-__global__ void grad_scatter_Vq_kernel(
+__global__ void Vq_scatter_grad(
     const float* __restrict__ Q,      // [B,H,N,D]
     const float* __restrict__ R,      // [B,H,N,D]
     const float* __restrict__ S,      // [B,H,N,D]
@@ -789,10 +426,6 @@ __global__ void grad_scatter_Vq_kernel(
         vs2_vec[d]= Vs2BH[k0_safe*D + d];
     }
     float grad_acc[MAX_D_REG] = {0.0f};
-
-    // numerical stability constants
-    constexpr float EXP_CLIP = 80.0f;   // safe range for expf
-    constexpr float DENOM_EPS = 1e-6f;
 
     // ---- shared memory tiles for (j) ----------------------------------
     extern __shared__ float shmem[];
@@ -869,7 +502,7 @@ __global__ void grad_scatter_Vq_kernel(
     }
 }
 
-__global__ void grad_scatter_Vr_kernel(
+__global__ void Vr_scatter_grad(
     const float* __restrict__ Q,      // [B,H,N,D]
     const float* __restrict__ R,      // [B,H,N,D]
     const float* __restrict__ S,      // [B,H,N,D]
@@ -991,7 +624,7 @@ __global__ void grad_scatter_Vr_kernel(
     }
 }
 
-__global__ void grad_scatter_Vs_kernel(
+__global__ void Vs_scatter_grad(
     const float* __restrict__ Q,      // [B,H,N,D]
     const float* __restrict__ R,      // [B,H,N,D]
     const float* __restrict__ S,      // [B,H,N,D]
@@ -1114,26 +747,13 @@ __global__ void grad_scatter_Vs_kernel(
     }
 }
 
-// ===================== precompute Jacobian corrections + helpers ==================
-
-
-// Helper for integer division rounded up
-__host__ __device__ inline int ceilDiv(int a, int b) {
-    return (a + b - 1) / b;
-}
-
-// Device helper for 3-way element-wise product and sum reduction (dot product)
-__device__ __forceinline__ float dot3(const float* a, const float* b, const float* c, int D) {
-    float sum = 0.0f;
-    #pragma unroll
-    for (int d = 0; d < D; ++d) {
-        sum += a[d] * b[d] * c[d];
-    }
-    return sum;
-}
+// =============================================================================
+// Jacobian Correction Precomputation
+// =============================================================================
+// Note: ceil_div and dot3 are defined in common.cuh
 
 template<int Bq, int Br, int Bk>
-__global__ void precompute_jacobian_corrections_kernel(
+__global__ void jacobian_corrections(
     // Inputs
     const float* Q,   const float* R,   const float* S,
     const float* Vq1, const float* Vq2,
@@ -1237,10 +857,6 @@ __global__ void precompute_jacobian_corrections_kernel(
         const float* dYj_vec  = &dYj_smem[tj * D];
         const float* dYk_vec  = &dYk_smem[tk * D];
 
-        // numerical stability constants
-        constexpr float EXP_CLIP = 80.0f;   // safe range for expf
-        constexpr float DENOM_EPS = 1e-6f;  // prevent division by zero
-
         // ---> Logits & Numerators
         float logits = dot3(Qi_vec, Rj_vec, Sk_vec, D) * scale;
         float Aq_num = expf(fminf(logits - m_i[i], EXP_CLIP));
@@ -1276,7 +892,7 @@ __global__ void precompute_jacobian_corrections_kernel(
 // ===================== grad Q, R, S ====================== (TODO: optimize)
 
 template<int BLOCK_I, int BLOCK_J, int BLOCK_K, int REG_CAP = MAX_D_REG>
-__global__ void grad_Q_kernel(
+__global__ void Q_grad(
     /* ---- operands ---------------------------------------------------- */
     const float* __restrict__ Q,   // [B,H,N,D]
     const float* __restrict__ R,   // [B,H,N,D]
@@ -1378,9 +994,6 @@ __global__ void grad_Q_kernel(
     /* ---- accumulator for grad_Q[i,:] -------------------------------- */
     float grad_acc[REG_CAP] = {0.0f};
 
-    // numerical stability constants
-    constexpr float EXP_CLIP = 80.0f;   // safe range for expf
-    constexpr float DENOM_EPS = 1e-6f;  // prevent division by zero
 
     /* ---- iterate over J in tiles ------------------------------------ */
     for (int jBase = 0; jBase < N; jBase += BLOCK_J)
@@ -1487,7 +1100,7 @@ __global__ void grad_Q_kernel(
 }
 
 template<int BLOCK_J, int BLOCK_I, int BLOCK_K, int REG_CAP = MAX_D_REG>
-__global__ void grad_R_kernel(
+__global__ void R_grad(
     /* ---- operands ---------------------------------------------------- */
     const float* __restrict__ Q,   // [B,H,N,D]
     const float* __restrict__ R,   // [B,H,N,D]
@@ -1589,9 +1202,6 @@ __global__ void grad_R_kernel(
     /* ---- accumulator for grad_R[j,:] -------------------------------- */
     float grad_acc[REG_CAP] = {0.0f};
 
-    // numerical stability constants
-    constexpr float EXP_CLIP = 80.0f;   // safe range for expf
-    constexpr float DENOM_EPS = 1e-6f;  // prevent division by zero
 
     /* ---- iterate over I in tiles ------------------------------------ */
     for (int iBase = 0; iBase < N; iBase += BLOCK_I)
@@ -1712,7 +1322,7 @@ __global__ void grad_R_kernel(
 }
 
 template<int BLOCK_K, int BLOCK_J, int BLOCK_I, int REG_CAP = MAX_D_REG>
-__global__ void grad_S_kernel(
+__global__ void S_grad(
     /* ---- operands ---------------------------------------------------- */
     const float* __restrict__ Q,   // [B,H,N,D]
     const float* __restrict__ R,   // [B,H,N,D]
@@ -1814,9 +1424,6 @@ __global__ void grad_S_kernel(
     /* ---- accumulator for grad_S[k,:] -------------------------------- */
     float grad_acc[REG_CAP] = {0.0f};
 
-    // numerical stability constants
-    constexpr float EXP_CLIP = 80.0f;   // safe range for expf
-    constexpr float DENOM_EPS = 1e-6f;  // prevent division by zero
 
     /* ---- iterate over J in tiles ------------------------------------ */
     for (int jBase = 0; jBase < N; jBase += BLOCK_J)
@@ -2017,7 +1624,7 @@ backward_cuda(torch::Tensor grad_output,
     dim3 blocks(I, B * H);
     dim3 threads(block_threads);
 
-    Aq_tiled_softmax<<<blocks, threads, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+    softmax_stats_q<<<blocks, threads, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
         Q.data_ptr<float>(),
         R.data_ptr<float>(),
         S.data_ptr<float>(),
@@ -2027,7 +1634,7 @@ backward_cuda(torch::Tensor grad_output,
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-      fprintf(stderr, "CUDA error in Aq_tiled_softmax: %s\n", cudaGetErrorString(err));
+      fprintf(stderr, "CUDA error in softmax_stats_q: %s\n", cudaGetErrorString(err));
     }
   }
 
@@ -2042,7 +1649,7 @@ backward_cuda(torch::Tensor grad_output,
     dim3 blocks(J, B * H);
     dim3 threads(block_threads);
 
-    Ar_tiled_softmax<<<blocks, threads, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+    softmax_stats_r<<<blocks, threads, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
         Q.data_ptr<float>(),
         R.data_ptr<float>(),
         S.data_ptr<float>(),
@@ -2052,7 +1659,7 @@ backward_cuda(torch::Tensor grad_output,
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-      fprintf(stderr, "CUDA error in Ar_tiled_softmax: %s\n", cudaGetErrorString(err));
+      fprintf(stderr, "CUDA error in softmax_stats_r: %s\n", cudaGetErrorString(err));
     }
   }
 
@@ -2067,7 +1674,7 @@ backward_cuda(torch::Tensor grad_output,
     dim3 blocks(K, B * H);
     dim3 threads(block_threads);
 
-    As_tiled_softmax<<<blocks, threads, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+    softmax_stats_s<<<blocks, threads, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
         Q.data_ptr<float>(),
         R.data_ptr<float>(),
         S.data_ptr<float>(),
@@ -2077,7 +1684,7 @@ backward_cuda(torch::Tensor grad_output,
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-      fprintf(stderr, "CUDA error in As_tiled_softmax: %s\n", cudaGetErrorString(err));
+      fprintf(stderr, "CUDA error in softmax_stats_s: %s\n", cudaGetErrorString(err));
     }
   }
 
@@ -2093,7 +1700,7 @@ backward_cuda(torch::Tensor grad_output,
     dim3 grid_dim((N + TI - 1) / TI, (N + TK - 1) / TK, B * H);
     size_t shmem_bytes = T_J * D * 3 * sizeof(float);  // R + Vr + gradY
 
-    grad_gather_Vq_kernel<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+    Vq_gather_grad<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
         Q.data_ptr<float>(),
         R.data_ptr<float>(),
         S.data_ptr<float>(),
@@ -2118,7 +1725,7 @@ backward_cuda(torch::Tensor grad_output,
     size_t shmem_bytes =
         T_J * D * 3 * sizeof(float) + T_J * 2 * sizeof(float);  // Q + Vq + gradY + mi/li
 
-    grad_gather_Vr_kernel<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+    Vr_gather_grad<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
         Q.data_ptr<float>(),
         R.data_ptr<float>(),
         S.data_ptr<float>(),
@@ -2143,7 +1750,7 @@ backward_cuda(torch::Tensor grad_output,
     size_t shmem_bytes =
         T_J * D * 3 * sizeof(float) + T_J * 2 * sizeof(float);  // R + Vr + gradY + mj/lj
 
-    grad_gather_Vs_kernel<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+    Vs_gather_grad<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
         Q.data_ptr<float>(),
         R.data_ptr<float>(),
         S.data_ptr<float>(),
@@ -2171,7 +1778,7 @@ backward_cuda(torch::Tensor grad_output,
     size_t shmem_bytes =
         T_J * D * 3 * sizeof(float) + T_J * 2 * sizeof(float);
 
-    grad_scatter_Vq_kernel<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+    Vq_scatter_grad<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
         Q.data_ptr<float>(),
         R.data_ptr<float>(),
         S.data_ptr<float>(),
@@ -2188,10 +1795,6 @@ backward_cuda(torch::Tensor grad_output,
         N, D, scale);
 
     AT_CUDA_CHECK(cudaGetLastError());
-    AT_CUDA_CHECK(cudaDeviceSynchronize());
-    TORCH_CHECK(
-        grad_Vq_2.isfinite().all().item<bool>(),
-        "grad_Vq_2 contains non-finite values after grad_scatter_Vq_kernel");
   }
 
   {
@@ -2204,7 +1807,7 @@ backward_cuda(torch::Tensor grad_output,
     size_t shmem_bytes =
         T_J * D * 3 * sizeof(float) + T_J * 2 * sizeof(float);
 
-    grad_scatter_Vr_kernel<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+    Vr_scatter_grad<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
         Q.data_ptr<float>(),
         R.data_ptr<float>(),
         S.data_ptr<float>(),
@@ -2231,7 +1834,7 @@ backward_cuda(torch::Tensor grad_output,
     size_t shmem_bytes =
         T_J * D * 3 * sizeof(float) + T_J * 2 * sizeof(float);
 
-    grad_scatter_Vs_kernel<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+    Vs_scatter_grad<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
         Q.data_ptr<float>(),
         R.data_ptr<float>(),
         S.data_ptr<float>(),
@@ -2258,7 +1861,7 @@ backward_cuda(torch::Tensor grad_output,
     constexpr int Br = 8;
     constexpr int Bk = 8;
 
-    dim3 grid(ceilDiv(N, Bq), ceilDiv(N, Br), ceilDiv(N, Bk));
+    dim3 grid(ceil_div(N, Bq), ceil_div(N, Br), ceil_div(N, Bk));
     dim3 threads(Bq, Br, Bk);
 
     const size_t shmem_bytes =
@@ -2271,7 +1874,7 @@ backward_cuda(torch::Tensor grad_output,
 
     for (int b = 0; b < B; ++b) {
       for (int h = 0; h < H; ++h) {
-        precompute_jacobian_corrections_kernel<Bq, Br, Bk><<<grid, threads, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+        jacobian_corrections<Bq, Br, Bk><<<grid, threads, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
             Q.select(0, b).select(0, h).data_ptr<float>(),
             R.select(0, b).select(0, h).data_ptr<float>(),
             S.select(0, b).select(0, h).data_ptr<float>(),
@@ -2312,7 +1915,7 @@ backward_cuda(torch::Tensor grad_output,
     constexpr int tileJ = 16;      // independent knob for J streaming
 
     TORCH_CHECK(D <= MAX_D_REG,
-                "grad_Q_kernel requires D <= ",
+                "Q_grad requires D <= ",
                 MAX_D_REG,
                 ", but got D = ",
                 D);
@@ -2326,7 +1929,7 @@ backward_cuda(torch::Tensor grad_output,
         4 * tileJ * D * sizeof(float) +  // R, Vr1, Vr2, gYj
         3 * tileJ * sizeof(float);       // mj, lj, sum_r
 
-    grad_Q_kernel<tileI, tileJ, tileK>
+    Q_grad<tileI, tileJ, tileK>
         <<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
             Q.data_ptr<float>(),
             R.data_ptr<float>(),
@@ -2352,13 +1955,9 @@ backward_cuda(torch::Tensor grad_output,
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-      fprintf(stderr, "CUDA error in grad_Q_kernel launch: %s\n", cudaGetErrorString(err));
+      fprintf(stderr, "CUDA error in Q_grad launch: %s\n", cudaGetErrorString(err));
     }
 
-    AT_CUDA_CHECK(cudaDeviceSynchronize());
-    TORCH_CHECK(
-        grad_Vq_2.isfinite().all().item<bool>(),
-        "grad_Vq_2 contains non-finite values after grad_Q_kernel");
   }
 
   {
@@ -2368,7 +1967,7 @@ backward_cuda(torch::Tensor grad_output,
     constexpr int tileI = 16;      // independent knob for I streaming
 
     TORCH_CHECK(D <= MAX_D_REG,
-                "grad_R_kernel requires D <= ",
+                "R_grad requires D <= ",
                 MAX_D_REG,
                 ", but got D = ",
                 D);
@@ -2381,7 +1980,7 @@ backward_cuda(torch::Tensor grad_output,
     const size_t shmem_bytes =
         (4 * tileI * D + 3 * tileI) * sizeof(float);  // Q, Vq1, Vq2, dY + stats
 
-    grad_R_kernel<tileJ, tileI, tileK>
+    R_grad<tileJ, tileI, tileK>
         <<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
             Q.data_ptr<float>(),
             R.data_ptr<float>(),
@@ -2407,13 +2006,9 @@ backward_cuda(torch::Tensor grad_output,
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-      fprintf(stderr, "CUDA error in grad_R_kernel launch: %s\n", cudaGetErrorString(err));
+      fprintf(stderr, "CUDA error in R_grad launch: %s\n", cudaGetErrorString(err));
     }
 
-    AT_CUDA_CHECK(cudaDeviceSynchronize());
-    TORCH_CHECK(
-        grad_Vq_2.isfinite().all().item<bool>(),
-        "grad_Vq_2 contains non-finite values after grad_R_kernel");
   }
 
   {
@@ -2423,7 +2018,7 @@ backward_cuda(torch::Tensor grad_output,
     constexpr int tileJ = 16;      // stream over J independently
 
     TORCH_CHECK(D <= MAX_D_REG,
-                "grad_S_kernel requires D <= ",
+                "S_grad requires D <= ",
                 MAX_D_REG,
                 ", but got D = ",
                 D);
@@ -2436,7 +2031,7 @@ backward_cuda(torch::Tensor grad_output,
     const size_t shmem_bytes =
         4 * tileJ * D * sizeof(float) + 3 * tileJ * sizeof(float);
 
-    grad_S_kernel<tileK, tileJ, tileI>
+    S_grad<tileK, tileJ, tileI>
         <<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
             Q.data_ptr<float>(),
             R.data_ptr<float>(),
@@ -2462,13 +2057,9 @@ backward_cuda(torch::Tensor grad_output,
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-      fprintf(stderr, "CUDA error in grad_S_kernel launch: %s\n", cudaGetErrorString(err));
+      fprintf(stderr, "CUDA error in S_grad launch: %s\n", cudaGetErrorString(err));
     }
 
-    AT_CUDA_CHECK(cudaDeviceSynchronize());
-    TORCH_CHECK(
-        grad_Vq_2.isfinite().all().item<bool>(),
-        "grad_Vq_2 contains non-finite values after grad_S_kernel");
   }
 
   cudaDeviceSynchronize();
