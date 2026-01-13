@@ -34,13 +34,41 @@ y = layer(x)  # Same shape as input
 ## Notes
 
 
-- **3-way token interactions**: Models relationships between triplets (Q, R, S) instead of pairwise relationships typical in standard self-attention
-- **O(N) memory**: The kernels use tiling and online softmax to reduce memory complexity from O(N³) to O(N), making 3-way attention feasible. However, the kernels are not yet fully optimized for speed — this is a work in progress!
-- **Full autograd support**: Custom CUDA kernels with hand-written backward pass, equivalent to torch.autograd. 
+- **3-way token interactions**: Models relationships between triplets (Q, R, S) instead of pairwise relationships typical in standard self-attention. Read more below (see Theory).
+- **O(N) memory**: The naive implementation would require O(N³) memory for the attention tensor. This library uses Flash-style tiling and online streaming techniques to reduce memory complexity from O(N³) to O(N), making 3-way attention feasible. However, the kernels are not yet fully optimized for speed — this is a work in progress!
 
-## Hardware Requirements
+| Seq Length | att3ntion | Naive O(N³) | Savings |
+|------------|-----------|-------------|---------|
+| 64         | ~50 MB    | ~67 MB      | 1.3x    |
+| 256        | ~200 MB   | ~4.3 GB     | 21x     |
+| 1024       | ~800 MB   | ~275 GB     | 344x    |
 
-Developed and tested on an **NVIDIA RTX 4080**. Should work on any CUDA-capable GPU with compute capability 7.0+ (Volta and newer).
+Run `python demo.py --memory` to benchmark on your hardware.
+
+- **Full autograd support**: Custom CUDA kernels with hand-written backward pass equivalent to torch.autograd. 
+
+---
+
+## Project Structure
+
+```
+att3ntion/
+├── demo.py                    # Interactive demo
+├── hypergraph_attention.py    # Main PyTorch module
+├── pure_pytorch_reference.py  # Naive reference implementation
+├── cpp/                       # C++ bindings
+├── cuda/                      # CUDA kernels (forward.cu, backward.cu)
+└── tests/                     # Benchmarks and equivalence tests
+```
+
+
+## Requirements
+
+- Developed and tested on an **NVIDIA RTX 4080**. Should work on any CUDA-capable GPU with compute capability 7.0+ (Volta and newer).
+- Python 3.10+
+- PyTorch 2.0+ with CUDA support
+- CUDA Toolkit 11.8+
+- NVIDIA GPU (tested on RTX 4080)
 
 ---
 
@@ -135,44 +163,7 @@ Y = Y_q + Y'_q + Y_r + Y'_r + Y_s + Y'_s
 The obvious problem with calculating directly via above is that you don't want to instantiate a $\large A[b,h,i,j,k]$ tensor -- if the number of tokens is large, this is a huge tensor!  
 The above summations would suggest that a full $\large A[..]$ is required for calculating the various softmaxes -- but, given enough floating-point resolution (and stability), all of these operations and their inverses can be calculated in-place, without blowing up GPU memory. 
 
----
 
-## Memory Scaling
-
-The naive implementation would require O(N³) memory for the attention tensor. att3ntion uses Flash-style tiling:
-
-| Seq Length | att3ntion | Naive O(N³) | Savings |
-|------------|-----------|-------------|---------|
-| 64         | ~50 MB    | ~67 MB      | 1.3x    |
-| 256        | ~200 MB   | ~4.3 GB     | 21x     |
-| 1024       | ~800 MB   | ~275 GB     | 344x    |
-
-Run `python demo.py --memory` to benchmark on your hardware.
-
----
-
-## Project Structure
-
-```
-att3ntion/
-├── demo.py                    # Interactive demo
-├── hypergraph_attention.py    # Main PyTorch module
-├── pure_pytorch_reference.py  # Naive reference implementation
-├── cpp/                       # C++ bindings
-├── cuda/                      # CUDA kernels (forward.cu, backward.cu)
-└── tests/                     # Benchmarks and equivalence tests
-```
-
-## Requirements
-
-- Python 3.10+
-- PyTorch 2.0+ with CUDA support
-- CUDA Toolkit 11.8+
-- NVIDIA GPU (tested on RTX 4080)
-
-## License
-
-MIT
 
 ---
 
