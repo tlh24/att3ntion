@@ -6,12 +6,12 @@ setup(
     ext_modules=[
         CppExtension(
             name='hyper_attn_cpp_reference',
-            sources=['cpp/torch_att3ntion.cpp'],
+            sources=['cpp/torch_reference.cpp'],
         ),
         CUDAExtension(
             name='hyper_attn_cpp_manual',
             sources=[
-                'cpp/manual_att3ntion.cpp',
+                'cpp/cuda_bindings.cpp',
                 'cuda/forward.cu',
                 'cuda/backward.cu'
             ],
@@ -19,8 +19,8 @@ setup(
                 'cxx': ['-O3'],
                 'nvcc': [
                     '-O3',
-                    '-gencode=arch=compute_86,code=sm_86',
-                    '-lineinfo'
+                    '-gencode=arch=compute_89,code=sm_89',
+                    # '-lineinfo' # uncomment for debugging
                 ]
             }
         ),

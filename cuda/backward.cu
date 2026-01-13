@@ -1,1711 +1,2078 @@
+/**
+ * @file backward.cu
+ * @brief Backward pass CUDA kernels for hypergraph attention.
+ *
+ * Computes gradients for Q, R, S, and all V tensors using online softmax
+ * statistics for numerical stability. Includes Jacobian correction terms
+ * for proper gradient flow through the softmax.
+ *
+ * Copyright (c) 2026 Springtail AI. MIT License.
+ */
+
 #include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>      
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include "../cpp/manual_att3ntion.h"
+#include <tuple>
+
+#include "common.cuh"
+#include "../cpp/cuda_bindings.h"
+
+// Backward-specific tile aliases for gradient kernels
+#ifndef T_I
+#define T_I TILE_I
+#endif
+#ifndef T_J
+#define T_J TILE_J
+#endif
+#ifndef T_K
+#define T_K TILE_K
+#endif
+
+// =============================================================================
+// Softmax stats kernels are defined in common.cuh:
+//   - softmax_stats_q (for i-centric softmax)
+//   - softmax_stats_r (for j-centric softmax)
+//   - softmax_stats_s (for k-centric softmax)
+// =============================================================================
+
+// =============================================================================
+// Gradient Kernels for V Tensors (Gather Path)
+// =============================================================================
+
+__global__ void Vq_gather_grad(
+    const float* __restrict__ Q,        // [B,H,N,D]
+    const float* __restrict__ R,        // [B,H,N,D]
+    const float* __restrict__ S,        // [B,H,N,D]
+    const float* __restrict__ Vs,       // [B,H,N,D]   (Vs_1 slice)
+    const float* __restrict__ Vr,       // [B,H,N,D]   (Vr_1 slice)
+    const float* __restrict__ gradY,    // [B,H,N,D]   (grad_output slice)   <-- single source
+    const float* __restrict__ m_j,      // [B,H,N]
+    const float* __restrict__ l_j,      // [B,H,N]
+    const float* __restrict__ m_k,      // [B,H,N]
+    const float* __restrict__ l_k,      // [B,H,N]
+    float*       __restrict__ gradVq,   // [B,H,N,D]   (output)
+    int  N, int D,
+    float scale )
+{
+    /* ---- decode indices ------------------------------------------------ */
+    int bh  = blockIdx.z;          // flattened (batch, head)
+    int i0  = blockIdx.x * T_I + threadIdx.x;
+    int k0  = blockIdx.y * T_K + threadIdx.y;
     
-// --- Backward Pass ---
+    // Track if this thread should compute (DON'T return early - need all threads for shared mem loading)
+    const bool active = (i0 < N && k0 < N);
 
-__global__ void gather_grad_Vq1_kernel_optimized(
-    const float* __restrict__ gradY_slice,     // [N, D]
-    const float* __restrict__ Vr_1_slice,      // [J, D]
-    const float* __restrict__ Vs_1_slice,      // [K, D]
-    const float* __restrict__ Ar_slice,        // [I, J, K]
-    const float* __restrict__ As_slice,        // [I, J, K]
-    float*       __restrict__ gradVq1_slice_out, // [I, D]
-    int I, int J, int K, int D, int N_grad){
-    // Grid of I*D threads, each computes one element of the output gradVq1_slice
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (int64_t)I * D) return;
+    const int64_t stride_BH = (int64_t)N * D;
+    const float* QBH   = Q       + bh * stride_BH;
+    const float* RBH   = R       + bh * stride_BH;
+    const float* SBH   = S       + bh * stride_BH;
+    const float* VsBH  = Vs      + bh * stride_BH;
+    const float* VrBH  = Vr      + bh * stride_BH;
+    const float* gYBH  = gradY   + bh * stride_BH;
+    const float* mJBH  = m_j     + (int64_t)bh * N;
+    const float* lJBH  = l_j     + (int64_t)bh * N;
+    const float* mKBH  = m_k     + (int64_t)bh * N;
+    const float* lKBH  = l_k     + (int64_t)bh * N;
+          float* gVqBH = gradVq  + bh * stride_BH;
 
-    int d = idx % D;
-    int i_target = idx / D;
-
-    float grad_accum = 0.0f;
-
-    // --- 1. Contribution from Y_r path (dL/dY_r) ---
-    // dL/dVq_1[i] += sum_{j} [ dL/dY_r[j,d] * sum_{k} ( Ar[i,j,k] * Vs_1[k,d] ) ]
-    for (int j = 0; j < J; ++j) {
-        if (j >= N_grad) continue;
-        float dy_r = gradY_slice[(int64_t)j * D + d];
-        if (dy_r == 0.0f) continue;
-
-        float inner_sum_k = 0.0f;
-        for (int k = 0; k < K; ++k) {
-            int64_t ijk_idx = (int64_t)i_target * J * K + (int64_t)j * K + k;
-            inner_sum_k += Ar_slice[ijk_idx] * Vs_1_slice[(int64_t)k * D + d];
-        }
-        grad_accum += dy_r * inner_sum_k;
-    }
-
-    // --- 2. Contribution from Y_s path (dL/dY_s) ---
-    // dL/dVq_1[i] += sum_{k} [ dL/dY_s[k,d] * sum_{j} ( As[i,j,k] * Vr_1[j,d] ) ]
-    for (int k = 0; k < K; ++k) {
-        if (k >= N_grad) continue;
-        float dy_s = gradY_slice[(int64_t)k * D + d];
-        if (dy_s == 0.0f) continue;
-        
-        float inner_sum_j = 0.0f;
-        for (int j = 0; j < J; ++j) {
-            int64_t ijk_idx = (int64_t)i_target * J * K + (int64_t)j * K + k;
-            inner_sum_j += As_slice[ijk_idx] * Vr_1_slice[(int64_t)j * D + d];
-        }
-        grad_accum += dy_s * inner_sum_j;
-    }
-
-    gradVq1_slice_out[idx] = grad_accum;}
-
-__global__ void gather_grad_Vr1_kernel_optimized(
-    const float* __restrict__ gradY_slice,       // [N, D]
-    const float* __restrict__ Vq_1_slice,        // [I, D]
-    const float* __restrict__ Vs_1_slice,        // [K, D]
-    const float* __restrict__ Aq_slice,          // [I, J, K]
-    const float* __restrict__ As_slice,          // [I, J, K]
-    float*       __restrict__ gradVr1_slice_out,   // [J, D]
-    int I, int J, int K, int D, int N_grad){
-    // Grid of J*D threads
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (int64_t)J * D) return;
-
-    int d = idx % D;
-    int j_target = idx / D;
-
-    float grad_accum = 0.0f;
-
-    // --- 1. Contribution from Y_q path (dL/dY_q) ---
-    for (int i = 0; i < I; ++i) {
-        if (i >= N_grad) continue;
-        float dy_q = gradY_slice[(int64_t)i * D + d];
-        if (dy_q == 0.0f) continue;
-        
-        float inner_sum_k = 0.0f;
-        for (int k = 0; k < K; ++k) {
-            int64_t ijk_idx = (int64_t)i * J * K + (int64_t)j_target * K + k;
-            inner_sum_k += Aq_slice[ijk_idx] * Vs_1_slice[(int64_t)k * D + d];
-        }
-        grad_accum += dy_q * inner_sum_k;
-    }
-
-    // --- 2. Contribution from Y_s path (dL/dY_s) ---
-    for (int k = 0; k < K; ++k) {
-        if (k >= N_grad) continue;
-        float dy_s = gradY_slice[(int64_t)k * D + d];
-        if (dy_s == 0.0f) continue;
-        
-        float inner_sum_i = 0.0f;
-        for (int i = 0; i < I; ++i) {
-            int64_t ijk_idx = (int64_t)i * J * K + (int64_t)j_target * K + k;
-            inner_sum_i += As_slice[ijk_idx] * Vq_1_slice[(int64_t)i * D + d];
-        }
-        grad_accum += dy_s * inner_sum_i;
-    }
-
-    gradVr1_slice_out[idx] = grad_accum;}
-
-__global__ void gather_grad_Vs1_kernel_optimized(
-    const float* __restrict__ gradY_slice,     // [N, D]
-    const float* __restrict__ Vq_1_slice,      // [I, D]
-    const float* __restrict__ Vr_1_slice,      // [J, D]
-    const float* __restrict__ Aq_slice,        // [I, J, K]
-    const float* __restrict__ Ar_slice,        // [I, J, K]
-    float*       __restrict__ gradVs1_slice_out, // [K, D]
-    int I, int J, int K, int D, int N_grad){
-    // Grid of K*D threads
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (int64_t)K * D) return;
-
-    int d = idx % D;
-    int k_target = idx / D;
-
-    float grad_accum = 0.0f;
-
-    // --- 1. Contribution from Y_q path (dL/dY_q) ---
-    for (int i = 0; i < I; ++i) {
-        if (i >= N_grad) continue;
-        float dy_q = gradY_slice[(int64_t)i * D + d];
-        if (dy_q == 0.0f) continue;
-
-        float inner_sum_j = 0.0f;
-        for (int j = 0; j < J; ++j) {
-            int64_t ijk_idx = (int64_t)i * J * K + (int64_t)j * K + k_target;
-            inner_sum_j += Aq_slice[ijk_idx] * Vr_1_slice[(int64_t)j * D + d];
-        }
-        grad_accum += dy_q * inner_sum_j;
-    }
-
-    // --- 2. Contribution from Y_r path (dL/dY_r) ---
-    for (int j = 0; j < J; ++j) {
-        if (j >= N_grad) continue;
-        float dy_r = gradY_slice[(int64_t)j * D + d];
-        if (dy_r == 0.0f) continue;
-
-        float inner_sum_i = 0.0f;
-        for (int i = 0; i < I; ++i) {
-            int64_t ijk_idx = (int64_t)i * J * K + (int64_t)j * K + k_target;
-            inner_sum_i += Ar_slice[ijk_idx] * Vq_1_slice[(int64_t)i * D + d];
-        }
-        grad_accum += dy_r * inner_sum_i;
-    }
-
-    gradVs1_slice_out[idx] = grad_accum;}
-
-__global__ void scatter_grad_Vq2_kernel_optimized(
-    const float* __restrict__ gradY_slice,
-    const float* __restrict__ Aq_slice,
-    const float* __restrict__ Ar_slice,
-    const float* __restrict__ As_slice,
-    const float* __restrict__ Vr_2_slice,
-    const float* __restrict__ Vs_2_slice,
-    float*       __restrict__ gradVq2_slice_out,
-    int I, int J, int K, int D, int N_grad) {
-
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (int64_t)I * D) return;
-
-    int d = idx % D;
-    int i_target = idx / D;
-
-    float grad_accum = 0.0f;
-
-    // Term 1: from dL/dY_r'
-    for (int j = 0; j < J; ++j) {
-        if (j >= N_grad) continue;
-        float dy_r = gradY_slice[(int64_t)j * D + d];
-        if (dy_r == 0.0f) continue;
-
-        for (int k = 0; k < K; ++k) {
-            int64_t ijk_idx = (int64_t)i_target * J * K + (int64_t)j * K + k;
-            grad_accum += dy_r * Aq_slice[ijk_idx] * As_slice[ijk_idx] * Vs_2_slice[(int64_t)k * D + d];
-        }
-    }
-
-    // Term 2: from dL/dY_s'
-    for (int k = 0; k < K; ++k) {
-        if (k >= N_grad) continue;
-        float dy_s = gradY_slice[(int64_t)k * D + d];
-        if (dy_s == 0.0f) continue;
-        
-        for (int j = 0; j < J; ++j) {
-            int64_t ijk_idx = (int64_t)i_target * J * K + (int64_t)j * K + k;
-            grad_accum += dy_s * Aq_slice[ijk_idx] * Ar_slice[ijk_idx] * Vr_2_slice[(int64_t)j * D + d];
-        }
-    }
-
-    gradVq2_slice_out[idx] = grad_accum;}
-
-__global__ void scatter_grad_Vr2_kernel_optimized(
-    const float* __restrict__ gradY_slice,
-    const float* __restrict__ Aq_slice,
-    const float* __restrict__ Ar_slice,
-    const float* __restrict__ As_slice,
-    const float* __restrict__ Vq_2_slice,
-    const float* __restrict__ Vs_2_slice,
-    float*       __restrict__ gradVr2_slice_out,
-    int I, int J, int K, int D, int N_grad) {
-
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (int64_t)J * D) return;
-
-    int d = idx % D;
-    int j_target = idx / D;
-
-    float grad_accum = 0.0f;
-
-    // Term 1: from dL/dY_q'
-    for (int i = 0; i < I; ++i) {
-        if (i >= N_grad) continue;
-        float dy_q = gradY_slice[(int64_t)i * D + d];
-        if (dy_q == 0.0f) continue;
-
-        for (int k = 0; k < K; ++k) {
-            int64_t ijk_idx = (int64_t)i * J * K + (int64_t)j_target * K + k;
-            grad_accum += dy_q * Ar_slice[ijk_idx] * As_slice[ijk_idx] * Vs_2_slice[(int64_t)k * D + d];
-        }
-    }
-
-    // Term 2: from dL/dY_s'
-    for (int k = 0; k < K; ++k) {
-        if (k >= N_grad) continue;
-        float dy_s = gradY_slice[(int64_t)k * D + d];
-        if (dy_s == 0.0f) continue;
-        
-        for (int i = 0; i < I; ++i) {
-            int64_t ijk_idx = (int64_t)i * J * K + (int64_t)j_target * K + k;
-            grad_accum += dy_s * Aq_slice[ijk_idx] * Ar_slice[ijk_idx] * Vq_2_slice[(int64_t)i * D + d];
-        }
-    }
-
-    gradVr2_slice_out[idx] = grad_accum;}
-
-__global__ void scatter_grad_Vs2_kernel_optimized(
-    const float* __restrict__ gradY_slice,
-    const float* __restrict__ Aq_slice,
-    const float* __restrict__ Ar_slice,
-    const float* __restrict__ As_slice,
-    const float* __restrict__ Vq_2_slice,
-    const float* __restrict__ Vr_2_slice,
-    float*       __restrict__ gradVs2_slice_out,
-    int I, int J, int K, int D, int N_grad) {
+    /* ---- load Q[i,:]  S[k,:]  Vs[k,:] into registers ------------------- */
+    float q_vec[MAX_D_REG];
+    float s_vec[MAX_D_REG], vs_vec[MAX_D_REG];
+    float grad_acc[MAX_D_REG] = {0.0f};
     
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (int64_t)K * D) return;
+    // Clamp indices for safe memory access (inactive threads load from valid location)
+    const int i0_safe = min(i0, N-1);
+    const int k0_safe = min(k0, N-1);
+    
+    #pragma unroll
+    for (int d=0; d<D; ++d){
+        q_vec[d]  = QBH[i0_safe*D + d];
+        s_vec[d]  = SBH[k0_safe*D + d];
+        vs_vec[d] = VsBH[k0_safe*D + d];
+    }
 
-    int d = idx % D;
-    int k_target = idx / D;
 
-    float grad_accum = 0.0f;
+    /* ---- loop over J in chunks ---------------------------------------- */
+    for (int jBase=0; jBase<N; jBase+=T_J){
+        __shared__ float sh_R [T_J][MAX_D_REG];
+        __shared__ float sh_Vr[T_J][MAX_D_REG];
+        __shared__ float sh_gY[T_J][MAX_D_REG];
+        __shared__ float sh_mj[T_J];
+        __shared__ float sh_lj[T_J];
 
-    // Term 1: from dL/dY_q'
-    for (int i = 0; i < I; ++i) {
-        if (i >= N_grad) continue;
-        float dy_q = gradY_slice[(int64_t)i * D + d];
-        if (dy_q == 0.0f) continue;
-
-        for (int j = 0; j < J; ++j) {
-            int64_t ijk_idx = (int64_t)i * J * K + (int64_t)j * K + k_target;
-            grad_accum += dy_q * Ar_slice[ijk_idx] * As_slice[ijk_idx] * Vr_2_slice[(int64_t)j * D + d];
+        // Cooperative loading: ALL threads participate to cover all D dimensions
+        int lj = threadIdx.y;                       // 0 … T_K-1 (≤T_J)
+        if (lj < T_J && (jBase+lj) < N){
+            int jGlob = jBase + lj;
+            #pragma unroll
+            for (int d=threadIdx.x; d<D; d+=T_I){
+                sh_R [lj][d] = RBH [jGlob*D + d];
+                sh_Vr[lj][d] = VrBH[jGlob*D + d];
+                sh_gY[lj][d] = gYBH[jGlob*D + d];   // grad_Yr = grad_output
+            }
+            if (threadIdx.x == 0){
+                sh_mj[lj] = mJBH[jGlob];
+                sh_lj[lj] = lJBH[jGlob];
+            }
         }
-    }
+        __syncthreads();
 
-    // Term 2: from dL/dY_r'
-    for (int j = 0; j < J; ++j) {
-        if (j >= N_grad) continue;
-        float dy_r = gradY_slice[(int64_t)j * D + d];
-        if (dy_r == 0.0f) continue;
+        /* ---- iterate inside loaded j-chunk (only active threads compute) */
+        if (active) {
+            for (int jOff=0; jOff<T_J && (jBase+jOff)<N; ++jOff){
+                float logits=0.f;
+                #pragma unroll
+                for (int d=0; d<D; ++d)
+                    logits += q_vec[d]*sh_R[jOff][d]*s_vec[d];
+                logits *= scale;
 
-        for (int i = 0; i < I; ++i) {
-            int64_t ijk_idx = (int64_t)i * J * K + (int64_t)j * K + k_target;
-            grad_accum += dy_r * Aq_slice[ijk_idx] * As_slice[ijk_idx] * Vq_2_slice[(int64_t)i * D + d];
-        }
-    }
+                float wj = __expf(fminf(logits - sh_mj[jOff], EXP_CLIP)) / fmaxf(sh_lj[jOff], DENOM_EPS);
+                float wk = __expf(fminf(logits - mKBH[k0], EXP_CLIP))    / fmaxf(lKBH[k0], DENOM_EPS);
 
-    gradVs2_slice_out[idx] = grad_accum;}
-
-
-__global__ void compute_A_slice_kernel(
-    const float* __restrict__ Q_slice_global, // Input Q_slice [I,D] on GPU
-    const float* __restrict__ R_slice_global, // Input R_slice [J,D] on GPU
-    const float* __restrict__ S_slice_global, // Input S_slice [K,D] on GPU
-    float*       __restrict__ A_out_global,   // Output A_slice [I,J,K] on GPU
-    int I, int J, int K, int D,
-    float scale
-) {
-    // Map 3D block and thread indices to I, J, K
-    // This kernel is intended to be launched with a 3D grid/block structure
-    // that covers all elements of A_slice [I,J,K].
-    // E.g., GridDim could be ( (I+BlockDim.x-1)/BlockDim.x, (J+BlockDim.y-1)/BlockDim.y, (K+BlockDim.z-1)/BlockDim.z )
-    // BlockDim could be (DIM_I_THREADS, DIM_J_THREADS, DIM_K_THREADS)
-    
-    int i_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int j_idx = blockIdx.y * blockDim.y + threadIdx.y;
-    int k_idx = blockIdx.z * blockDim.z + threadIdx.z;
-
-    // Boundary check
-    if (i_idx >= I || j_idx >= J || k_idx >= K) {
-        return;
-    }
-
-    // Compute dot product Q_slice[i_idx,:] * R_slice[j_idx,:] * S_slice[k_idx,:]
-    float dot_product = 0.0f;
-    for (int d_loop = 0; d_loop < D; ++d_loop) {
-        // Q_slice_global is [I, D], so access Q_slice_global[i_idx * D + d_loop]
-        // R_slice_global is [J, D], so access R_slice_global[j_idx * D + d_loop]
-        // S_slice_global is [K, D], so access S_slice_global[k_idx * D + d_loop]
-        dot_product += Q_slice_global[i_idx * D + d_loop] * \
-                       R_slice_global[j_idx * D + d_loop] * \
-                       S_slice_global[k_idx * D + d_loop];
-    }
-
-    // Apply scale and store in A_out_global
-    // A_out_global is [I,J,K]. Index is i_idx * (J*K) + j_idx * K + k_idx
-    A_out_global[i_idx * J * K + j_idx * K + k_idx] = dot_product * scale;
-}
-// C++ Wrapper for compute_A_slice_kernel
-torch::Tensor compute_A_slice_cuda_wrapper(
-    const torch::Tensor& Q_slice_gpu, // Assumed to be on GPU, shape [I,D]
-    const torch::Tensor& R_slice_gpu, // Assumed to be on GPU, shape [J,D]
-    const torch::Tensor& S_slice_gpu, // Assumed to be on GPU, shape [K,D]
-    float scale
-) {
-    TORCH_CHECK(Q_slice_gpu.is_cuda(), "Q_slice_gpu must be a CUDA tensor");
-    TORCH_CHECK(R_slice_gpu.is_cuda(), "R_slice_gpu must be a CUDA tensor");
-    TORCH_CHECK(S_slice_gpu.is_cuda(), "S_slice_gpu must be a CUDA tensor");
-
-    TORCH_CHECK(Q_slice_gpu.dim() == 2, "Q_slice_gpu must be 2D");
-    TORCH_CHECK(R_slice_gpu.dim() == 2, "R_slice_gpu must be 2D");
-    TORCH_CHECK(S_slice_gpu.dim() == 2, "S_slice_gpu must be 2D");
-
-    const int I = Q_slice_gpu.size(0);
-    const int D_q = Q_slice_gpu.size(1);
-    const int J = R_slice_gpu.size(0);
-    const int D_r = R_slice_gpu.size(1);
-    const int K = S_slice_gpu.size(0);
-    const int D_s = S_slice_gpu.size(1);
-
-    TORCH_CHECK(D_q == D_r && D_r == D_s, "Dimension D must match for Q, R, S slices");
-    const int D = D_q;
-
-    // Allocate output tensor A_slice_out_gpu [I,J,K] on GPU
-    auto options = Q_slice_gpu.options(); // Inherit dtype and device
-    torch::Tensor A_slice_out_gpu = torch::zeros({I, J, K}, options);
-
-    // Define block dimensions (e.g., 8x8x8 = 512 threads, adjust as needed)
-    // These are example values, can be tuned.
-    // Max threads per block is 1024.
-    // Block dimensions should ideally be multiples of warp size (32 for NVIDIA GPUs) for one dim.
-    constexpr int BLOCK_DIM_I = 8;
-    constexpr int BLOCK_DIM_J = 8;
-    constexpr int BLOCK_DIM_K = 8; 
-    
-    dim3 blockDim(BLOCK_DIM_I, BLOCK_DIM_J, BLOCK_DIM_K);
-
-    // Calculate grid dimensions
-    dim3 gridDim(
-        (I + BLOCK_DIM_I - 1) / BLOCK_DIM_I,
-        (J + BLOCK_DIM_J - 1) / BLOCK_DIM_J,
-        (K + BLOCK_DIM_K - 1) / BLOCK_DIM_K
-    );
-    
-    // Ensure inputs are contiguous (important for direct pointer access in kernel)
-    auto Q_cont = Q_slice_gpu.contiguous();
-    auto R_cont = R_slice_gpu.contiguous();
-    auto S_cont = S_slice_gpu.contiguous();
-
-    // Launch Kernel
-    compute_A_slice_kernel<<<gridDim, blockDim>>>(
-        Q_cont.data_ptr<float>(),
-        R_cont.data_ptr<float>(),
-        S_cont.data_ptr<float>(),
-        A_slice_out_gpu.data_ptr<float>(),
-        I, J, K, D,
-        scale
-    );
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "CUDA error in compute_A_slice_cuda_wrapper: %s\n", cudaGetErrorString(err));
-        // Optionally throw an exception
-        // throw std::runtime_error(std::string("CUDA kernel launch failed in compute_A_slice_cuda_wrapper: ") + cudaGetErrorString(err));
-    }
-    // cudaDeviceSynchronize(); // For debugging, to ensure kernel finishes before wrapper returns
-
-    return A_slice_out_gpu;
-}
-// Kernel to compute Aq_slice (softmax over j, k for each fixed i)
-// Each block processes one 'i' plane.
-__global__ void compute_Aq_slice_kernel(
-    const float* __restrict__ A_slice_global, // Input A_slice [I,J,K] (global mem)
-    float*       __restrict__ Aq_out_global,  // Output Aq_slice [I,J,K] (global mem)
-    int I_dim, int J_dim, int K_dim // Use _dim to avoid conflict with loop vars
-) {
-    // Shared memory is now only for reduction, not for the entire data plane.
-    extern __shared__ float s_reduction_pad[]; 
-    
-    // Current 'i' index this block is responsible for
-    int i_current = blockIdx.x;
-    if (i_current >= I_dim) {
-        return;
-    }
-
-    const float* current_A_plane_global = A_slice_global + (int64_t)i_current * J_dim * K_dim;
-    float* current_Aq_plane_global = Aq_out_global + (int64_t)i_current * J_dim * K_dim;
-
-    int plane_size = J_dim * K_dim;
-    int tid_in_block = threadIdx.x;
-    int threads_in_block = blockDim.x;
-
-    // --- Pass 1: Find max_val in the plane using a parallel reduction ---
-    float thread_max_val = -FLT_MAX;
-    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        thread_max_val = fmaxf(thread_max_val, current_A_plane_global[idx]);
-    }
-    s_reduction_pad[tid_in_block] = thread_max_val;
-    __syncthreads();
-
-    // Reduce to find the max value for the whole plane
-    for (int offset = threads_in_block / 2; offset > 0; offset >>= 1) {
-        if (tid_in_block < offset) {
-            s_reduction_pad[tid_in_block] = fmaxf(s_reduction_pad[tid_in_block], s_reduction_pad[tid_in_block + offset]);
+                #pragma unroll
+                for (int d=0; d<D; ++d){
+                    grad_acc[d] += wj * sh_gY[jOff][d] * vs_vec[d]        /* Yr path */
+                                  + wk * gYBH[k0*D + d]  * sh_Vr[jOff][d];/* Ys path */
+                }
+            }
         }
         __syncthreads();
     }
-    float plane_max_val = s_reduction_pad[0];
-    __syncthreads(); // Ensure all threads see the correct max value
 
-    // --- Pass 2: Compute sum_exp for the plane ---
-    float thread_sum_exp = 0.0f;
-    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        thread_sum_exp += expf(current_A_plane_global[idx] - plane_max_val);
+    /* ---- atomic add to global grad (only active threads) --------------- */
+    if (active) {
+        #pragma unroll
+        for (int d=0; d<D; ++d)
+            atomicAdd(&gVqBH[i0*D + d], grad_acc[d]);
     }
-    s_reduction_pad[tid_in_block] = thread_sum_exp;
-    __syncthreads();
+}
 
-    // Reduce to find the sum of exponents for the whole plane
-    for (int offset = threads_in_block / 2; offset > 0; offset >>= 1) {
-        if (tid_in_block < offset) {
-            s_reduction_pad[tid_in_block] += s_reduction_pad[tid_in_block + offset];
+__global__ void Vr_gather_grad(
+    const float* __restrict__ Q,        // [B,H,N,D]
+    const float* __restrict__ R,        // [B,H,N,D]
+    const float* __restrict__ S,        // [B,H,N,D]
+    const float* __restrict__ Vq,       // [B,H,N,D]
+    const float* __restrict__ Vs,       // [B,H,N,D]
+    const float* __restrict__ gradY,    // [B,H,N,D]
+    const float* __restrict__ m_i,      // [B,H,N]
+    const float* __restrict__ l_i,      // [B,H,N]
+    const float* __restrict__ m_k,      // [B,H,N]
+    const float* __restrict__ l_k,      // [B,H,N]
+    float*       __restrict__ gradVr,   // [B,H,N,D]
+    int  N, int D,
+    float scale )
+{
+    int bh  = blockIdx.z;
+    int j0  = blockIdx.x * T_I + threadIdx.x;
+    int k0  = blockIdx.y * T_K + threadIdx.y;
+    
+    // Track if this thread should compute (DON'T return early - need all threads for shared mem loading)
+    const bool active = (j0 < N && k0 < N);
+
+    const int64_t stride_BH = (int64_t)N * D;
+    const float* QBH   = Q      + bh * stride_BH;
+    const float* RBH   = R      + bh * stride_BH;
+    const float* SBH   = S      + bh * stride_BH;
+    const float* VqBH  = Vq     + bh * stride_BH;
+    const float* VsBH  = Vs     + bh * stride_BH;
+    const float* gYBH  = gradY  + bh * stride_BH;
+    const float* mIBH  = m_i    + (int64_t)bh * N;
+    const float* lIBH  = l_i    + (int64_t)bh * N;
+    const float* mKBH  = m_k    + (int64_t)bh * N;
+    const float* lKBH  = l_k    + (int64_t)bh * N;
+          float* gVrBH = gradVr + bh * stride_BH;
+
+    // Clamp indices for safe memory access (inactive threads load from valid location)
+    const int j0_safe = min(j0, N-1);
+    const int k0_safe = min(k0, N-1);
+
+    float r_vec[MAX_D_REG];
+    float s_vec[MAX_D_REG];
+    float vs_vec[MAX_D_REG];
+    float gy_k_vec[MAX_D_REG];
+
+    #pragma unroll
+    for (int d=0; d<D; ++d){
+        r_vec[d]    = RBH[j0_safe*D + d];
+        s_vec[d]    = SBH[k0_safe*D + d];
+        vs_vec[d]   = VsBH[k0_safe*D + d];
+        gy_k_vec[d] = gYBH[k0_safe*D + d];
+    }
+
+    float grad_acc[MAX_D_REG] = {0.0f};
+    float m_k_val = mKBH[k0_safe];
+    float l_k_val = lKBH[k0_safe];
+
+
+    for (int iBase=0; iBase<N; iBase+=T_J){
+        __shared__ float sh_Q [T_J][MAX_D_REG];
+        __shared__ float sh_Vq[T_J][MAX_D_REG];
+        __shared__ float sh_gY[T_J][MAX_D_REG];
+        __shared__ float sh_mi[T_J];
+        __shared__ float sh_li[T_J];
+
+        // Cooperative loading: ALL threads participate to cover all D dimensions
+        int li = threadIdx.y;
+        if (li < T_J && (iBase+li) < N){
+            int iGlob = iBase + li;
+            #pragma unroll
+            for (int d=threadIdx.x; d<D; d+=T_I){
+                sh_Q [li][d] = QBH [iGlob*D + d];
+                sh_Vq[li][d] = VqBH[iGlob*D + d];
+                sh_gY[li][d] = gYBH[iGlob*D + d];
+            }
+            if (threadIdx.x == 0){
+                sh_mi[li] = mIBH[iGlob];
+                sh_li[li] = lIBH[iGlob];
+            }
+        }
+        __syncthreads();
+
+        // Only active threads compute
+        if (active) {
+            for (int iOff=0; iOff<T_J && (iBase+iOff)<N; ++iOff){
+                float logits=0.f;
+                #pragma unroll
+                for (int d=0; d<D; ++d)
+                    logits += sh_Q[iOff][d] * r_vec[d] * s_vec[d];
+                logits *= scale;
+
+                float wi = __expf(fminf(logits - sh_mi[iOff], EXP_CLIP)) / fmaxf(sh_li[iOff], DENOM_EPS);
+                float wk = __expf(fminf(logits - m_k_val, EXP_CLIP))     / fmaxf(l_k_val, DENOM_EPS);
+
+                #pragma unroll
+                for (int d=0; d<D; ++d){
+                    grad_acc[d] += wi * sh_gY[iOff][d] * vs_vec[d]
+                                  + wk * gy_k_vec[d]   * sh_Vq[iOff][d];
+                }
+            }
         }
         __syncthreads();
     }
-    float plane_sum_exp = s_reduction_pad[0];
-    __syncthreads();
 
-    // --- Pass 3: Compute softmax values and write to global memory ---
-    if (plane_sum_exp == 0.0f) plane_sum_exp = 1e-20f; // Avoid division by zero
-    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        current_Aq_plane_global[idx] = expf(current_A_plane_global[idx] - plane_max_val) / plane_sum_exp;
+    /* ---- atomic add to global grad (only active threads) --------------- */
+    if (active) {
+        #pragma unroll
+        for (int d=0; d<D; ++d)
+            atomicAdd(&gVrBH[j0*D + d], grad_acc[d]);
     }
 }
 
-
-torch::Tensor compute_Aq_slice_cuda_wrapper(
-    const torch::Tensor& A_slice_gpu // Assumed to be on GPU, shape [I,J,K]
-) {
-    TORCH_CHECK(A_slice_gpu.is_cuda(), "A_slice_gpu must be a CUDA tensor");
-    TORCH_CHECK(A_slice_gpu.dim() == 3, "A_slice_gpu must be 3D [I,J,K]");
-
-    const int I = A_slice_gpu.size(0);
-    const int J = A_slice_gpu.size(1);
-    const int K = A_slice_gpu.size(2);
-
-    auto options = A_slice_gpu.options();
-    torch::Tensor Aq_slice_out_gpu = torch::zeros({I, J, K}, options);
-
-    dim3 gridDim(I);
-    int threads_per_block = 256;
-    dim3 blockDim(threads_per_block);
-
-    // Shared memory size is now fixed and small, proportional to block size
-    size_t shared_mem_size = threads_per_block * sizeof(float);
+__global__ void Vs_gather_grad(
+    const float* __restrict__ Q,        // [B,H,N,D]
+    const float* __restrict__ R,        // [B,H,N,D]
+    const float* __restrict__ S,        // [B,H,N,D]
+    const float* __restrict__ Vq,       // [B,H,N,D]
+    const float* __restrict__ Vr,       // [B,H,N,D]
+    const float* __restrict__ gradY,    // [B,H,N,D]
+    const float* __restrict__ m_i,      // [B,H,N]
+    const float* __restrict__ l_i,      // [B,H,N]
+    const float* __restrict__ m_j,      // [B,H,N]
+    const float* __restrict__ l_j,      // [B,H,N]
+    float*       __restrict__ gradVs,   // [B,H,N,D]
+    int  N, int D,
+    float scale )
+{
+    int bh  = blockIdx.z;
+    int i0  = blockIdx.x * T_I + threadIdx.x;
+    int k0  = blockIdx.y * T_K + threadIdx.y;
     
-    // The explicit call to cudaFuncSetAttribute is no longer needed, as the requested
-    // shared memory size is small and constant. Passing it in the kernel launch is sufficient.
+    // Track if this thread should compute (DON'T return early - need all threads for shared mem loading)
+    const bool active = (i0 < N && k0 < N);
 
-    auto A_cont = A_slice_gpu.contiguous();
+    const int64_t stride_BH = (int64_t)N * D;
+    const float* QBH   = Q      + bh * stride_BH;
+    const float* RBH   = R      + bh * stride_BH;
+    const float* SBH   = S      + bh * stride_BH;
+    const float* VqBH  = Vq     + bh * stride_BH;
+    const float* VrBH  = Vr     + bh * stride_BH;
+    const float* gYBH  = gradY  + bh * stride_BH;
+    const float* mIBH  = m_i    + (int64_t)bh * N;
+    const float* lIBH  = l_i    + (int64_t)bh * N;
+    const float* mJBH  = m_j    + (int64_t)bh * N;
+    const float* lJBH  = l_j    + (int64_t)bh * N;
+          float* gVsBH = gradVs + bh * stride_BH;
 
-    // Launch Kernel
-    compute_Aq_slice_kernel<<<gridDim, blockDim, shared_mem_size>>>(
-        A_cont.data_ptr<float>(),
-        Aq_slice_out_gpu.data_ptr<float>(),
-        I, J, K
-    );
+    // Clamp indices for safe memory access (inactive threads load from valid location)
+    const int i0_safe = min(i0, N-1);
+    const int k0_safe = min(k0, N-1);
 
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "CUDA error in compute_Aq_slice_cuda_wrapper: %s\n", cudaGetErrorString(err));
+    float q_vec[MAX_D_REG];
+    float s_vec[MAX_D_REG];
+    float vq_vec[MAX_D_REG];
+    float gy_i_vec[MAX_D_REG];
+
+    #pragma unroll
+    for (int d=0; d<D; ++d){
+        q_vec[d]    = QBH[i0_safe*D + d];
+        s_vec[d]    = SBH[k0_safe*D + d];
+        vq_vec[d]   = VqBH[i0_safe*D + d];
+        gy_i_vec[d] = gYBH[i0_safe*D + d];
     }
-    return Aq_slice_out_gpu;
-}
 
-// Kernel to compute Ar_slice (softmax over i, k for each fixed j)
-// Each block processes one 'j' plane.
-__global__ void compute_Ar_slice_kernel(
-    const float* __restrict__ A_slice_global, // Input A_slice [I,J,K] (global mem)
-    float*       __restrict__ Ar_out_global,  // Output Ar_slice [I,J,K] (global mem)
-    int I_dim, int J_dim, int K_dim
-) {
-    extern __shared__ float s_reduction_pad[]; 
-    
-    int j_current = blockIdx.x;
-    if (j_current >= J_dim) return;
+    float grad_acc[MAX_D_REG] = {0.0f};
+    float m_i_val = mIBH[i0_safe];
+    float l_i_val = lIBH[i0_safe];
 
-    int plane_size = I_dim * K_dim;
-    int tid_in_block = threadIdx.x;
-    int threads_in_block = blockDim.x;
 
-    // --- Pass 1: Find max_val ---
-    float thread_max_val = -FLT_MAX;
-    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        int i_load = idx / K_dim;
-        int k_load = idx % K_dim;
-        int64_t global_idx = (int64_t)i_load * J_dim * K_dim + (int64_t)j_current * K_dim + k_load;
-        thread_max_val = fmaxf(thread_max_val, A_slice_global[global_idx]);
-    }
-    s_reduction_pad[tid_in_block] = thread_max_val;
-    __syncthreads();
-    for (int offset = threads_in_block / 2; offset > 0; offset >>= 1) {
-        if (tid_in_block < offset) s_reduction_pad[tid_in_block] = fmaxf(s_reduction_pad[tid_in_block], s_reduction_pad[tid_in_block + offset]);
+    for (int jBase=0; jBase<N; jBase+=T_J){
+        __shared__ float sh_R [T_J][MAX_D_REG];
+        __shared__ float sh_Vr[T_J][MAX_D_REG];
+        __shared__ float sh_gY[T_J][MAX_D_REG];
+        __shared__ float sh_mj[T_J];
+        __shared__ float sh_lj[T_J];
+
+        // Cooperative loading: ALL threads participate to cover all D dimensions
+        int lj = threadIdx.y;
+        if (lj < T_J && (jBase+lj) < N){
+            int jGlob = jBase + lj;
+            #pragma unroll
+            for (int d=threadIdx.x; d<D; d+=T_I){
+                sh_R [lj][d] = RBH [jGlob*D + d];
+                sh_Vr[lj][d] = VrBH[jGlob*D + d];
+                sh_gY[lj][d] = gYBH[jGlob*D + d];
+            }
+            if (threadIdx.x == 0){
+                sh_mj[lj] = mJBH[jGlob];
+                sh_lj[lj] = lJBH[jGlob];
+            }
+        }
+        __syncthreads();
+
+        // Only active threads compute
+        if (active) {
+            for (int jOff=0; jOff<T_J && (jBase+jOff)<N; ++jOff){
+                float logits=0.f;
+                #pragma unroll
+                for (int d=0; d<D; ++d)
+                    logits += q_vec[d] * sh_R[jOff][d] * s_vec[d];
+                logits *= scale;
+
+                float wi = __expf(fminf(logits - m_i_val, EXP_CLIP)) / fmaxf(l_i_val, DENOM_EPS);
+                float wj = __expf(fminf(logits - sh_mj[jOff], EXP_CLIP)) / fmaxf(sh_lj[jOff], DENOM_EPS);
+
+                #pragma unroll
+                for (int d=0; d<D; ++d){
+                    grad_acc[d] += wi * gy_i_vec[d]   * sh_Vr[jOff][d]
+                                  + wj * sh_gY[jOff][d] * vq_vec[d];
+                }
+            }
+        }
         __syncthreads();
     }
-    float plane_max_val = s_reduction_pad[0];
-    __syncthreads();
 
-    // --- Pass 2: Compute sum_exp ---
-    float thread_sum_exp = 0.0f;
-    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        int i_load = idx / K_dim;
-        int k_load = idx % K_dim;
-        int64_t global_idx = (int64_t)i_load * J_dim * K_dim + (int64_t)j_current * K_dim + k_load;
-        thread_sum_exp += expf(A_slice_global[global_idx] - plane_max_val);
-    }
-    s_reduction_pad[tid_in_block] = thread_sum_exp;
-    __syncthreads();
-    for (int offset = threads_in_block / 2; offset > 0; offset >>= 1) {
-        if (tid_in_block < offset) s_reduction_pad[tid_in_block] += s_reduction_pad[tid_in_block + offset];
-        __syncthreads();
-    }
-    float plane_sum_exp = s_reduction_pad[0];
-    __syncthreads();
-
-    // --- Pass 3: Compute softmax and write ---
-    if (plane_sum_exp == 0.0f) plane_sum_exp = 1e-20f;
-    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        int i_write = idx / K_dim;
-        int k_write = idx % K_dim;
-        int64_t global_idx = (int64_t)i_write * J_dim * K_dim + (int64_t)j_current * K_dim + k_write;
-        Ar_out_global[global_idx] = expf(A_slice_global[global_idx] - plane_max_val) / plane_sum_exp;
+    /* ---- atomic add to global grad (only active threads) --------------- */
+    if (active) {
+        #pragma unroll
+        for (int d=0; d<D; ++d)
+            atomicAdd(&gVsBH[k0*D + d], grad_acc[d]);
     }
 }
 
+// ===================== scatter-grad Vq2, Vr2, Vs2 ======================
 
-// Kernel to compute As_slice (softmax over i, j for each fixed k)
-// Each block processes one 'k' plane.
-__global__ void compute_As_slice_kernel(
-    const float* __restrict__ A_slice_global, // Input A_slice [I,J,K] (global mem)
-    float*       __restrict__ As_out_global,  // Output As_slice [I,J,K] (global mem)
-    int I_dim, int J_dim, int K_dim
-) {
-    extern __shared__ float s_reduction_pad[];
 
-    int k_current = blockIdx.x;
-    if (k_current >= K_dim) return;
-
-    int plane_size = I_dim * J_dim;
-    int tid_in_block = threadIdx.x;
-    int threads_in_block = blockDim.x;
-
-    // --- Pass 1: Find max_val ---
-    float thread_max_val = -FLT_MAX;
-    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        int i_load = idx / J_dim;
-        int j_load = idx % J_dim;
-        int64_t global_idx = (int64_t)i_load * J_dim * K_dim + (int64_t)j_load * K_dim + k_current;
-        thread_max_val = fmaxf(thread_max_val, A_slice_global[global_idx]);
-    }
-    s_reduction_pad[tid_in_block] = thread_max_val;
-    __syncthreads();
-    for (int offset = threads_in_block / 2; offset > 0; offset >>= 1) {
-        if (tid_in_block < offset) s_reduction_pad[tid_in_block] = fmaxf(s_reduction_pad[tid_in_block], s_reduction_pad[tid_in_block + offset]);
-        __syncthreads();
-    }
-    float plane_max_val = s_reduction_pad[0];
-    __syncthreads();
-
-    // --- Pass 2: Compute sum_exp ---
-    float thread_sum_exp = 0.0f;
-    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        int i_load = idx / J_dim;
-        int j_load = idx % J_dim;
-        int64_t global_idx = (int64_t)i_load * J_dim * K_dim + (int64_t)j_load * K_dim + k_current;
-        thread_sum_exp += expf(A_slice_global[global_idx] - plane_max_val);
-    }
-    s_reduction_pad[tid_in_block] = thread_sum_exp;
-    __syncthreads();
-    for (int offset = threads_in_block / 2; offset > 0; offset >>= 1) {
-        if (tid_in_block < offset) s_reduction_pad[tid_in_block] += s_reduction_pad[tid_in_block + offset];
-        __syncthreads();
-    }
-    float plane_sum_exp = s_reduction_pad[0];
-    __syncthreads();
-
-    // --- Pass 3: Compute softmax and write ---
-    if (plane_sum_exp == 0.0f) plane_sum_exp = 1e-20f;
-    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        int i_write = idx / J_dim;
-        int j_write = idx % J_dim;
-        int64_t global_idx = (int64_t)i_write * J_dim * K_dim + (int64_t)j_write * K_dim + k_current;
-        As_out_global[global_idx] = expf(A_slice_global[global_idx] - plane_max_val) / plane_sum_exp;
-    }
-}
-
-// C++ Wrapper for compute_Ar_slice_kernel
-torch::Tensor compute_Ar_slice_cuda_wrapper(
-    const torch::Tensor& A_slice_gpu // Assumed to be on GPU, shape [I,J,K]
-) {
-    TORCH_CHECK(A_slice_gpu.is_cuda(), "A_slice_gpu must be a CUDA tensor");
-    TORCH_CHECK(A_slice_gpu.dim() == 3, "A_slice_gpu must be 3D [I,J,K]");
-
-    const int I = A_slice_gpu.size(0);
-    const int J = A_slice_gpu.size(1);
-    const int K = A_slice_gpu.size(2);
-
-    auto options = A_slice_gpu.options(); 
-    torch::Tensor Ar_slice_out_gpu = torch::zeros({I, J, K}, options);
-
-    dim3 gridDim(J); // J blocks, one for each j-plane
-
-    int threads_per_block = 256;
-    dim3 blockDim(threads_per_block); 
-
-    size_t shared_mem_size = threads_per_block * sizeof(float);
+__global__ void Vq_scatter_grad(
+    const float* __restrict__ Q,      // [B,H,N,D]
+    const float* __restrict__ R,      // [B,H,N,D]
+    const float* __restrict__ S,      // [B,H,N,D]
+    const float* __restrict__ Vr2,    // [B,H,N,D]
+    const float* __restrict__ Vs2,    // [B,H,N,D]
+    const float* __restrict__ gradY,  // [B,H,N,D]  (same tensor provides dYr & dYs)
+    const float* __restrict__ m_i,    // [B,H,N]
+    const float* __restrict__ l_i,    // [B,H,N]
+    const float* __restrict__ m_j,    // [B,H,N]
+    const float* __restrict__ l_j,    // [B,H,N]
+    const float* __restrict__ m_k,    // [B,H,N]
+    const float* __restrict__ l_k,    // [B,H,N]
+    float*       __restrict__ gradVq, // [B,H,N,D]
+    int N, int D, float scale)
+{
+    /* threadblock organisation = (i,k) tile  --------------------------- */
+    const int i0 = blockIdx.x * T_I + threadIdx.x;   // 0..N-1 (column)
+    const int k0 = blockIdx.y * T_K + threadIdx.y;   // 0..N-1 (row)
+    const int bh = blockIdx.z;                       // flattened (B,H)
     
-    auto A_cont = A_slice_gpu.contiguous();
+    // ALL threads must participate in cooperative loading - use active flag instead of early return
+    const bool active = (i0 < N && k0 < N);
+    // Clamped indices for safe memory access during cooperative loading
+    const int i0_safe = min(i0, N - 1);
+    const int k0_safe = min(k0, N - 1);
 
-    compute_Ar_slice_kernel<<<gridDim, blockDim, shared_mem_size>>>(
-        A_cont.data_ptr<float>(),
-        Ar_slice_out_gpu.data_ptr<float>(),
-        I, J, K
-    );
+    // per-BH base pointers and strides
+    const int64_t stride_BH = (int64_t)N * D;
+    const float* QBH   = Q    + (int64_t)bh * stride_BH;
+    const float* RBH   = R    + (int64_t)bh * stride_BH;
+    const float* SBH   = S    + (int64_t)bh * stride_BH;
+    const float* Vr2BH = Vr2  + (int64_t)bh * stride_BH;
+    const float* Vs2BH = Vs2  + (int64_t)bh * stride_BH;
+    const float* gYBH  = gradY+ (int64_t)bh * stride_BH;
+    const float* m_iBH = m_i  + (int64_t)bh * N;
+    const float* l_iBH = l_i  + (int64_t)bh * N;
+    const float* m_jBH = m_j  + (int64_t)bh * N;
+    const float* l_jBH = l_j  + (int64_t)bh * N;
+    const float* m_kBH = m_k  + (int64_t)bh * N;
+    const float* l_kBH = l_k  + (int64_t)bh * N;
+          float* gVqBH = gradVq + (int64_t)bh * stride_BH;
 
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "CUDA error in compute_Ar_slice_cuda_wrapper: %s\n", cudaGetErrorString(err));
+    // ---- registers for Q[i0], S[k0], Vs2[k0] --------------------------
+    float q_vec[MAX_D_REG];
+    float s_vec[MAX_D_REG], vs2_vec[MAX_D_REG];
+    #pragma unroll
+    for (int d=0; d<D; ++d){
+        q_vec[d]  = QBH[i0_safe*D + d];
+        s_vec[d]  = SBH[k0_safe*D + d];
+        vs2_vec[d]= Vs2BH[k0_safe*D + d];
     }
-    return Ar_slice_out_gpu;
+    float grad_acc[MAX_D_REG] = {0.0f};
+
+    // ---- shared memory tiles for (j) ----------------------------------
+    extern __shared__ float shmem[];
+    float* sh_R   = shmem;                   // T_J * D
+    float* sh_Vr2 = sh_R   + T_J * D;        // T_J * D
+    float* sh_gYr = sh_Vr2 + T_J * D;        // T_J * D   (dYr[j,:])
+    float* sh_mj  = (float*)(sh_gYr + T_J * D);  // T_J scalars
+    float* sh_lj  = sh_mj  + T_J;
+
+    /* iterate over J tiles --------------------------------------------- */
+    for (int jBase=0; jBase < N; jBase+=T_J){
+        // cooperative load by all (i,k) threads inside TB
+        const int ld_idx = threadIdx.y;  // reuse y-dimension for co-load rows
+        if (ld_idx < T_J && (jBase+ld_idx) < N){
+            const int jGlob = jBase + ld_idx;
+            for (int d=threadIdx.x; d<D; d+=T_I){
+                sh_R  [ld_idx*D + d] = RBH  [jGlob*D + d];
+                sh_Vr2[ld_idx*D + d] = Vr2BH[jGlob*D + d];
+                sh_gYr[ld_idx*D + d] = gYBH [jGlob*D + d];
+            }
+            if (threadIdx.x==0){
+                sh_mj[ld_idx] = m_jBH[jGlob];
+                sh_lj[ld_idx] = l_jBH[jGlob];
+            }
+        }
+        __syncthreads();
+
+        // ---- loop inside J-tile (only active threads compute) --------
+        if (active) {
+            for (int jOff=0; jOff<T_J && (jBase+jOff)<N; ++jOff){
+                // dot(Q[i],R[j],S[k])
+                float dot = 0.f;
+                #pragma unroll
+                for (int d=0; d<D; ++d)
+                    dot += q_vec[d] * sh_R[jOff*D + d] * s_vec[d];
+                float logits = dot * scale;
+
+                // Compute combined attention weights in LOG-SPACE to avoid overflow
+                // Aq = exp(logits - m_i) / l_i,  As = exp(logits - m_k) / l_k
+                // Aq * As = exp(2*logits - m_i - m_k) / (l_i * l_k)
+                float log_Aq = logits - m_iBH[i0_safe];
+                float log_Ar = logits - sh_mj[jOff];
+                float log_As = logits - m_kBH[k0_safe];
+
+                float l_i_val = fmaxf(l_iBH[i0_safe], DENOM_EPS);
+                float l_j_val = fmaxf(sh_lj[jOff], DENOM_EPS);
+                float l_k_val = fmaxf(l_kBH[k0_safe], DENOM_EPS);
+
+                // term 1: Aq*As = exp(log_Aq + log_As) / (l_i * l_k)
+                float w1 = __expf(fminf(log_Aq + log_As, EXP_CLIP)) / (l_i_val * l_k_val);
+                // term 2: Aq*Ar = exp(log_Aq + log_Ar) / (l_i * l_j)
+                float w2 = __expf(fminf(log_Aq + log_Ar, EXP_CLIP)) / (l_i_val * l_j_val);
+
+                // load vectors
+                const float* dYr_vec = &sh_gYr[jOff*D];
+                const float* Vr2_vec = &sh_Vr2[jOff*D];
+                const float* dYs_vec = &gYBH[k0*D]; // contiguous in global, fine
+
+                #pragma unroll
+                for (int d=0; d<D; ++d){
+                    grad_acc[d] += w1 * dYr_vec[d] * vs2_vec[d] +
+                                   w2 * dYs_vec[d] * Vr2_vec[d];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // ---- atomic add results (only active threads) --------------------
+    if (active) {
+        #pragma unroll
+        for (int d=0; d<D; ++d)
+            atomicAdd(&gVqBH[i0*D + d], grad_acc[d]);
+    }
 }
 
-
-// C++ Wrapper for compute_As_slice_kernel
-torch::Tensor compute_As_slice_cuda_wrapper(
-    const torch::Tensor& A_slice_gpu // Assumed to be on GPU, shape [I,J,K]
-) {
-    TORCH_CHECK(A_slice_gpu.is_cuda(), "A_slice_gpu must be a CUDA tensor");
-    TORCH_CHECK(A_slice_gpu.dim() == 3, "A_slice_gpu must be 3D [I,J,K]");
-
-    const int I = A_slice_gpu.size(0);
-    const int J = A_slice_gpu.size(1);
-    const int K = A_slice_gpu.size(2);
-
-    auto options = A_slice_gpu.options(); 
-    torch::Tensor As_slice_out_gpu = torch::zeros({I, J, K}, options);
-
-    dim3 gridDim(K); // K blocks, one for each k-plane
-
-    int threads_per_block = 256;
-    dim3 blockDim(threads_per_block); 
-
-    size_t shared_mem_size = threads_per_block * sizeof(float);
+__global__ void Vr_scatter_grad(
+    const float* __restrict__ Q,      // [B,H,N,D]
+    const float* __restrict__ R,      // [B,H,N,D]
+    const float* __restrict__ S,      // [B,H,N,D]
+    const float* __restrict__ Vq2,    // [B,H,N,D]
+    const float* __restrict__ Vs2,    // [B,H,N,D]
+    const float* __restrict__ gradY,  // [B,H,N,D]
+    const float* __restrict__ m_i,    // [B,H,N]
+    const float* __restrict__ l_i,    // [B,H,N]
+    const float* __restrict__ m_j,    // [B,H,N]
+    const float* __restrict__ l_j,    // [B,H,N]
+    const float* __restrict__ m_k,    // [B,H,N]
+    const float* __restrict__ l_k,    // [B,H,N]
+    float*       __restrict__ gradVr, // [B,H,N,D]
+    int N, int D, float scale)
+{
+    const int j0 = blockIdx.x * T_I + threadIdx.x;
+    const int k0 = blockIdx.y * T_K + threadIdx.y;
+    const int bh = blockIdx.z;
     
-    auto A_cont = A_slice_gpu.contiguous();
+    // ALL threads must participate in cooperative loading - use active flag instead of early return
+    const bool active = (j0 < N && k0 < N);
+    // Clamped indices for safe memory access during cooperative loading
+    const int j0_safe = min(j0, N - 1);
+    const int k0_safe = min(k0, N - 1);
 
-    compute_As_slice_kernel<<<gridDim, blockDim, shared_mem_size>>>(
-        A_cont.data_ptr<float>(),
-        As_slice_out_gpu.data_ptr<float>(),
-        I, J, K
-    );
+    const int64_t stride_BH = (int64_t)N * D;
+    const float* QBH   = Q     + (int64_t)bh * stride_BH;
+    const float* RBH   = R     + (int64_t)bh * stride_BH;
+    const float* SBH   = S     + (int64_t)bh * stride_BH;
+    const float* Vq2BH = Vq2   + (int64_t)bh * stride_BH;
+    const float* Vs2BH = Vs2   + (int64_t)bh * stride_BH;
+    const float* gYBH  = gradY + (int64_t)bh * stride_BH;
+    const float* m_iBH = m_i   + (int64_t)bh * N;
+    const float* l_iBH = l_i   + (int64_t)bh * N;
+    const float* m_jBH = m_j   + (int64_t)bh * N;
+    const float* l_jBH = l_j   + (int64_t)bh * N;
+    const float* m_kBH = m_k   + (int64_t)bh * N;
+    const float* l_kBH = l_k   + (int64_t)bh * N;
+          float* gVrBH = gradVr+ (int64_t)bh * stride_BH;
 
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "CUDA error in compute_As_slice_cuda_wrapper: %s\n", cudaGetErrorString(err));
+    float r_vec[MAX_D_REG];
+    float s_vec[MAX_D_REG];
+    float vs2_vec[MAX_D_REG];
+    float gy_k_vec[MAX_D_REG];
+    #pragma unroll
+    for (int d=0; d<D; ++d){
+        r_vec[d]    = RBH[j0_safe*D + d];
+        s_vec[d]    = SBH[k0_safe*D + d];
+        vs2_vec[d]  = Vs2BH[k0_safe*D + d];
+        gy_k_vec[d] = gYBH[k0_safe*D + d];
     }
-    return As_slice_out_gpu;
+
+    float grad_acc[MAX_D_REG] = {0.0f};
+
+    extern __shared__ float shmem[];
+    float* sh_Q   = shmem;                    // T_J * D
+    float* sh_Vq2 = sh_Q   + T_J * D;         // T_J * D
+    float* sh_gYq = sh_Vq2 + T_J * D;         // T_J * D
+    float* sh_mi  = (float*)(sh_gYq + T_J * D); // T_J
+    float* sh_li  = sh_mi + T_J;              // T_J
+
+    for (int iBase=0; iBase < N; iBase+=T_J){
+        const int li = threadIdx.y;
+        if (li < T_J && (iBase + li) < N){
+            const int iGlob = iBase + li;
+            for (int d=threadIdx.x; d<D; d+=T_I){
+                sh_Q  [li*D + d] = QBH [iGlob*D + d];
+                sh_Vq2[li*D + d] = Vq2BH[iGlob*D + d];
+                sh_gYq[li*D + d] = gYBH [iGlob*D + d];
+            }
+            if (threadIdx.x == 0){
+                sh_mi[li] = m_iBH[iGlob];
+                sh_li[li] = l_iBH[iGlob];
+            }
+        }
+        __syncthreads();
+
+        // Only active threads compute
+        if (active) {
+            for (int iOff=0; iOff<T_J && (iBase+iOff)<N; ++iOff){
+                float dot = 0.f;
+                #pragma unroll
+                for (int d=0; d<D; ++d)
+                    dot += sh_Q[iOff*D + d] * r_vec[d] * s_vec[d];
+                float logits = dot * scale;
+
+                // Compute combined attention weights in LOG-SPACE to avoid overflow
+                float log_Aq = logits - sh_mi[iOff];
+                float log_Ar = logits - m_jBH[j0_safe];
+                float log_As = logits - m_kBH[k0_safe];
+
+                float l_i_val = fmaxf(sh_li[iOff], DENOM_EPS);
+                float l_j_val = fmaxf(l_jBH[j0_safe], DENOM_EPS);
+                float l_k_val = fmaxf(l_kBH[k0_safe], DENOM_EPS);
+
+                // term 1: Ar*As = exp(log_Ar + log_As) / (l_j * l_k)
+                float w1 = __expf(fminf(log_Ar + log_As, EXP_CLIP)) / (l_j_val * l_k_val);
+                // term 2: Aq*Ar = exp(log_Aq + log_Ar) / (l_i * l_j)
+                float w2 = __expf(fminf(log_Aq + log_Ar, EXP_CLIP)) / (l_i_val * l_j_val);
+
+                const float* dy_q_vec = &sh_gYq[iOff*D];
+                const float* vq2_vec  = &sh_Vq2[iOff*D];
+
+                #pragma unroll
+                for (int d=0; d<D; ++d){
+                    grad_acc[d] += w1 * dy_q_vec[d] * vs2_vec[d]
+                                  + w2 * gy_k_vec[d] * vq2_vec[d];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Only active threads write results
+    if (active) {
+        #pragma unroll
+        for (int d=0; d<D; ++d)
+            atomicAdd(&gVrBH[j0*D + d], grad_acc[d]);
+    }
 }
 
-// Kernel to compute grad_Aq_slice, grad_Ar_slice, grad_As_slice (Phase 1 of C++ compute_grad_A_single)
-__global__ void compute_interim_grads_kernel(
+__global__ void Vs_scatter_grad(
+    const float* __restrict__ Q,      // [B,H,N,D]
+    const float* __restrict__ R,      // [B,H,N,D]
+    const float* __restrict__ S,      // [B,H,N,D]
+    const float* __restrict__ Vq2,    // [B,H,N,D]
+    const float* __restrict__ Vr2,    // [B,H,N,D]
+    const float* __restrict__ gradY,  // [B,H,N,D]
+    const float* __restrict__ m_i,    // [B,H,N]
+    const float* __restrict__ l_i,    // [B,H,N]
+    const float* __restrict__ m_j,    // [B,H,N]
+    const float* __restrict__ l_j,    // [B,H,N]
+    const float* __restrict__ m_k,    // [B,H,N]
+    const float* __restrict__ l_k,    // [B,H,N]
+    float*       __restrict__ gradVs, // [B,H,N,D]
+    int N, int D, float scale)
+{
+    const int i0 = blockIdx.x * T_I + threadIdx.x;
+    const int k0 = blockIdx.y * T_K + threadIdx.y;
+    const int bh = blockIdx.z;
+    
+    // ALL threads must participate in cooperative loading - use active flag instead of early return
+    const bool active = (i0 < N && k0 < N);
+    // Clamped indices for safe memory access during cooperative loading
+    const int i0_safe = min(i0, N - 1);
+    const int k0_safe = min(k0, N - 1);
+
+    const int64_t stride_BH = (int64_t)N * D;
+    const float* QBH   = Q     + (int64_t)bh * stride_BH;
+    const float* RBH   = R     + (int64_t)bh * stride_BH;
+    const float* SBH   = S     + (int64_t)bh * stride_BH;
+    const float* Vq2BH = Vq2   + (int64_t)bh * stride_BH;
+    const float* Vr2BH = Vr2   + (int64_t)bh * stride_BH;
+    const float* gYBH  = gradY + (int64_t)bh * stride_BH;
+    const float* m_iBH = m_i   + (int64_t)bh * N;
+    const float* l_iBH = l_i   + (int64_t)bh * N;
+    const float* m_jBH = m_j   + (int64_t)bh * N;
+    const float* l_jBH = l_j   + (int64_t)bh * N;
+    const float* m_kBH = m_k   + (int64_t)bh * N;
+    const float* l_kBH = l_k   + (int64_t)bh * N;
+          float* gVsBH = gradVs+ (int64_t)bh * stride_BH;
+
+    float q_vec[MAX_D_REG];
+    float s_vec[MAX_D_REG];
+    float vq2_vec[MAX_D_REG];
+    float gy_i_vec[MAX_D_REG];
+    #pragma unroll
+    for (int d=0; d<D; ++d){
+        q_vec[d]    = QBH[i0_safe*D + d];
+        s_vec[d]    = SBH[k0_safe*D + d];
+        vq2_vec[d]  = Vq2BH[i0_safe*D + d];
+        gy_i_vec[d] = gYBH [i0_safe*D + d];
+    }
+
+    float grad_acc[MAX_D_REG] = {0.0f};
+
+    extern __shared__ float shmem[];
+    float* sh_R   = shmem;                    // T_J * D
+    float* sh_Vr2 = sh_R   + T_J * D;         // T_J * D
+    float* sh_gYr = sh_Vr2 + T_J * D;         // T_J * D
+    float* sh_mj  = (float*)(sh_gYr + T_J * D);
+    float* sh_lj  = sh_mj + T_J;
+
+    for (int jBase=0; jBase < N; jBase+=T_J){
+        int lj = threadIdx.y;
+        if (lj < T_J && (jBase + lj) < N){
+            int jGlob = jBase + lj;
+            #pragma unroll
+            for (int d=threadIdx.x; d<D; d+=T_I){
+                sh_R  [lj*D + d] = RBH [jGlob*D + d];
+                sh_Vr2[lj*D + d] = Vr2BH[jGlob*D + d];
+                sh_gYr[lj*D + d] = gYBH[jGlob*D + d];
+            }
+            if (threadIdx.x == 0){
+                sh_mj[lj] = m_jBH[jGlob];
+                sh_lj[lj] = l_jBH[jGlob];
+            }
+        }
+        __syncthreads();
+
+        // Only active threads compute
+        if (active) {
+            for (int jOff=0; jOff<T_J && (jBase+jOff)<N; ++jOff){
+                float dot = 0.f;
+                #pragma unroll
+                for (int d=0; d<D; ++d)
+                    dot += q_vec[d] * sh_R[jOff*D + d] * s_vec[d];
+                float logits = dot * scale;
+
+                // Compute combined attention weights in LOG-SPACE to avoid overflow
+                float log_Aq = logits - m_iBH[i0_safe];
+                float log_Ar = logits - sh_mj[jOff];
+                float log_As = logits - m_kBH[k0_safe];
+
+                float l_i_val = fmaxf(l_iBH[i0_safe], DENOM_EPS);
+                float l_j_val = fmaxf(sh_lj[jOff], DENOM_EPS);
+                float l_k_val = fmaxf(l_kBH[k0_safe], DENOM_EPS);
+
+                // term 1: Ar*As = exp(log_Ar + log_As) / (l_j * l_k)
+                float w1 = __expf(fminf(log_Ar + log_As, EXP_CLIP)) / (l_j_val * l_k_val);
+                // term 2: Aq*As = exp(log_Aq + log_As) / (l_i * l_k)
+                float w2 = __expf(fminf(log_Aq + log_As, EXP_CLIP)) / (l_i_val * l_k_val);
+
+                const float* vr2_vec = &sh_Vr2[jOff*D];
+                const float* dy_r_vec = &sh_gYr[jOff*D];
+
+                #pragma unroll
+                for (int d=0; d<D; ++d){
+                    grad_acc[d] += w1 * gy_i_vec[d] * vr2_vec[d]
+                                  + w2 * dy_r_vec[d] * vq2_vec[d];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Only active threads write results
+    if (active) {
+        #pragma unroll
+        for (int d=0; d<D; ++d)
+            atomicAdd(&gVsBH[k0*D + d], grad_acc[d]);
+    }
+}
+
+// =============================================================================
+// Jacobian Correction Precomputation
+// =============================================================================
+// Note: ceil_div and dot3 are defined in common.cuh
+
+template<int Bq, int Br, int Bk>
+__global__ void jacobian_corrections(
     // Inputs
-    const float* __restrict__ grad_output_slice, // [N, D]
-    const float* __restrict__ Vq_1_slice,        // [I, D]
-    const float* __restrict__ Vq_2_slice,        // [I, D]
-    const float* __restrict__ Vr_1_slice,        // [J, D]
-    const float* __restrict__ Vr_2_slice,        // [J, D]
-    const float* __restrict__ Vs_1_slice,        // [K, D]
-    const float* __restrict__ Vs_2_slice,        // [K, D]
-    const float* __restrict__ Aq_slice,          // [I, J, K]
-    const float* __restrict__ Ar_slice,          // [I, J, K]
-    const float* __restrict__ As_slice,          // [I, J, K]
-    // Outputs (Temporary)
-    float* __restrict__ grad_Aq_slice_out,     // [I, J, K]
-    float* __restrict__ grad_Ar_slice_out,     // [I, J, K]
-    float* __restrict__ grad_As_slice_out,     // [I, J, K]
-    // Dimensions
-    int I_dim, int J_dim, int K_dim, int D_dim, int N_dim // Use _dim suffix
+    const float* Q,   const float* R,   const float* S,
+    const float* Vq1, const float* Vq2,
+    const float* Vr1, const float* Vr2,
+    const float* Vs1, const float* Vs2,
+    const float* grad_out,
+    const float* m_i, const float* l_i,
+    const float* m_j, const float* l_j,
+    const float* m_k, const float* l_k,
+    // Outputs
+    float* sum_q, float* sum_r, float* sum_s,
+    // Dimensions & Scale
+    int N, int D, float scale
 ) {
-    // Map 3D thread indices to (i, j, k)
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
-    int k = blockIdx.z * blockDim.z + threadIdx.z;
+    // Shared memory for tensor tiles
+    extern __shared__ float smem[];
+    float* Qi_smem   = smem;                                  // Bq x D
+    float* Rj_smem   = Qi_smem   + Bq * D;                    // Br x D
+    float* Sk_smem   = Rj_smem   + Br * D;                    // Bk x D
+    float* Vq1i_smem = Sk_smem   + Bk * D;                    // Bq x D
+    float* Vq2i_smem = Vq1i_smem + Bq * D;                    // Bq x D
+    float* Vr1j_smem = Vq2i_smem + Bq * D;                    // Br x D
+    float* Vr2j_smem = Vr1j_smem + Br * D;                    // Br x D
+    float* Vs1k_smem = Vr2j_smem + Br * D;                    // Bk x D
+    float* Vs2k_smem = Vs1k_smem + Bk * D;                    // Bk x D
+    float* dYi_smem  = Vs2k_smem + Bk * D;                    // Bq x D
+    float* dYj_smem  = dYi_smem  + Bq * D;                    // Br x D
+    float* dYk_smem  = dYj_smem  + Br * D;                    // Bk x D
 
-    // Boundary check
-    if (i >= I_dim || j >= J_dim || k >= K_dim) {
-        return;
-    }
-    
-    // Calculate linear index for output arrays [I,J,K]
-    int64_t ijk_idx = (int64_t)i * J_dim * K_dim + (int64_t)j * K_dim + k;
+    // Tile base indices
+    const int i0 = blockIdx.x * Bq;
+    const int j0 = blockIdx.y * Br;
+    const int k0 = blockIdx.z * Bk;
 
-    float grad_aq_val = 0.0f;
-    float grad_ar_val = 0.0f;
-    float grad_as_val = 0.0f;
+    // Thread indices within the tile
+    const int ti = threadIdx.x;
+    const int tj = threadIdx.y;
+    const int tk = threadIdx.z;
 
-    // Get pointers to relevant rows in V matrices (based on i, j, k)
-    const float* vq1_row_i = Vq_1_slice + (int64_t)i * D_dim;
-    const float* vq2_row_i = Vq_2_slice + (int64_t)i * D_dim;
-    const float* vr1_row_j = Vr_1_slice + (int64_t)j * D_dim;
-    const float* vr2_row_j = Vr_2_slice + (int64_t)j * D_dim;
-    const float* vs1_row_k = Vs_1_slice + (int64_t)k * D_dim;
-    const float* vs2_row_k = Vs_2_slice + (int64_t)k * D_dim;
-    
-    // Pre-fetch Aq, Ar, As values for this (i,j,k)
-    float aq_ijk = Aq_slice[ijk_idx];
-    float ar_ijk = Ar_slice[ijk_idx];
-    float as_ijk = As_slice[ijk_idx];
+    // Linear thread ID for cooperative loading
+    const int lid = tk * (Bq * Br) + tj * Bq + ti;
+    const int num_threads = Bq * Br * Bk;
 
-
-    // --- Term 1.a: grad_Aq from Yq (gather) ---
-    if (i < N_dim) {
-        const float* grad_out_row_i = grad_output_slice + (int64_t)i * D_dim;
-        for (int d = 0; d < D_dim; ++d) {
-            grad_aq_val += grad_out_row_i[d] * vr1_row_j[d] * vs1_row_k[d];
+    // Load tiles into shared memory
+    // Each loop iterates over a type of tile (i-indexed, j-indexed, k-indexed)
+    for (int i = lid; i < Bq * D; i += num_threads) {
+        int row = i / D;
+        int col = i % D;
+        if (i0 + row < N) {
+            Qi_smem[i]   = Q[(i0 + row) * D + col];
+            Vq1i_smem[i] = Vq1[(i0 + row) * D + col];
+            Vq2i_smem[i] = Vq2[(i0 + row) * D + col];
+            dYi_smem[i]  = grad_out[(i0 + row) * D + col];
+        } else {
+            // Zero padding if tile extends beyond N
+            Qi_smem[i] = 0.0f; Vq1i_smem[i] = 0.0f; Vq2i_smem[i] = 0.0f; dYi_smem[i] = 0.0f;
         }
     }
-
-    // --- Term 1.b: grad_Aq from Yr' (scatter) ---
-    if (j < N_dim) {
-        float grad_x_term_j = 0.0f;
-        const float* grad_out_row_j = grad_output_slice + (int64_t)j * D_dim;
-        for (int d = 0; d < D_dim; ++d) {
-            grad_x_term_j += grad_out_row_j[d] * vq2_row_i[d] * vs2_row_k[d];
-        }
-        grad_aq_val += grad_x_term_j * as_ijk; // Multiply by As[i,j,k]
-    }
-
-    // --- Term 1.c: grad_Aq from Ys' (scatter) ---
-    if (k < N_dim) {
-        float grad_x_term_k = 0.0f;
-        const float* grad_out_row_k = grad_output_slice + (int64_t)k * D_dim;
-        for (int d = 0; d < D_dim; ++d) {
-            grad_x_term_k += grad_out_row_k[d] * vq2_row_i[d] * vr2_row_j[d];
-        }
-        grad_aq_val += grad_x_term_k * ar_ijk; // Multiply by Ar[i,j,k]
-    }
-
-    // --- Term 2.a: grad_Ar from Yr (gather) ---
-     if (j < N_dim) {
-        const float* grad_out_row_j = grad_output_slice + (int64_t)j * D_dim;
-        for (int d = 0; d < D_dim; ++d) {
-            grad_ar_val += grad_out_row_j[d] * vq1_row_i[d] * vs1_row_k[d];
+    for (int i = lid; i < Br * D; i += num_threads) {
+        int row = i / D;
+        int col = i % D;
+        if (j0 + row < N) {
+            Rj_smem[i]   = R[(j0 + row) * D + col];
+            Vr1j_smem[i] = Vr1[(j0 + row) * D + col];
+            Vr2j_smem[i] = Vr2[(j0 + row) * D + col];
+            dYj_smem[i]  = grad_out[(j0 + row) * D + col];
+        } else {
+            Rj_smem[i] = 0.0f; Vr1j_smem[i] = 0.0f; Vr2j_smem[i] = 0.0f; dYj_smem[i] = 0.0f;
         }
     }
-
-    // --- Term 2.b: grad_Ar from Yq' (scatter) ---
-     if (i < N_dim) {
-        float grad_x_term_i = 0.0f;
-        const float* grad_out_row_i = grad_output_slice + (int64_t)i * D_dim;
-        for (int d = 0; d < D_dim; ++d) {
-            grad_x_term_i += grad_out_row_i[d] * vr2_row_j[d] * vs2_row_k[d];
-        }
-        grad_ar_val += grad_x_term_i * as_ijk; // Multiply by As[i,j,k]
-    }
-   
-    // --- Term 2.c: grad_Ar from Ys' (scatter) ---
-    if (k < N_dim) {
-        float grad_x_term_k = 0.0f;
-        const float* grad_out_row_k = grad_output_slice + (int64_t)k * D_dim;
-         for (int d = 0; d < D_dim; ++d) {
-             grad_x_term_k += grad_out_row_k[d] * vq2_row_i[d] * vr2_row_j[d];
-         }
-        grad_ar_val += grad_x_term_k * aq_ijk; // Multiply by Aq[i,j,k]
-    }
-
-    // --- Term 3.a: grad_As from Ys (gather) ---
-     if (k < N_dim) {
-        const float* grad_out_row_k = grad_output_slice + (int64_t)k * D_dim;
-        for (int d = 0; d < D_dim; ++d) {
-            grad_as_val += grad_out_row_k[d] * vq1_row_i[d] * vr1_row_j[d];
+    for (int i = lid; i < Bk * D; i += num_threads) {
+        int row = i / D;
+        int col = i % D;
+        if (k0 + row < N) {
+            Sk_smem[i]   = S[(k0 + row) * D + col];
+            Vs1k_smem[i] = Vs1[(k0 + row) * D + col];
+            Vs2k_smem[i] = Vs2[(k0 + row) * D + col];
+            dYk_smem[i]  = grad_out[(k0 + row) * D + col];
+        } else {
+            Sk_smem[i] = 0.0f; Vs1k_smem[i] = 0.0f; Vs2k_smem[i] = 0.0f; dYk_smem[i] = 0.0f;
         }
     }
-
-    // --- Term 3.b: grad_As from Yq' (scatter) ---
-     if (i < N_dim) {
-        float grad_x_term_i = 0.0f;
-        const float* grad_out_row_i = grad_output_slice + (int64_t)i * D_dim;
-        for (int d = 0; d < D_dim; ++d) {
-            grad_x_term_i += grad_out_row_i[d] * vr2_row_j[d] * vs2_row_k[d];
-        }
-        grad_as_val += grad_x_term_i * ar_ijk; // Multiply by Ar[i,j,k]
-    }
-    
-    // --- Term 3.c: grad_As from Yr' (scatter) ---
-    if (j < N_dim) {
-        float grad_x_term_j = 0.0f;
-        const float* grad_out_row_j = grad_output_slice + (int64_t)j * D_dim;
-        for (int d = 0; d < D_dim; ++d) {
-            grad_x_term_j += grad_out_row_j[d] * vq2_row_i[d] * vs2_row_k[d];
-        }
-        grad_as_val += grad_x_term_j * aq_ijk; // Multiply by Aq[i,j,k]
-    }
-
-    // Write results to output tensors
-    grad_Aq_slice_out[ijk_idx] = grad_aq_val;
-    grad_Ar_slice_out[ijk_idx] = grad_ar_val;
-    grad_As_slice_out[ijk_idx] = grad_as_val;
-}
-
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-compute_interim_grads_cuda_wrapper(
-    // Inputs (GPU tensors)
-    const torch::Tensor& grad_output_slice, // [N, D]
-    const torch::Tensor& Vq_1_slice,        // [I, D]
-    const torch::Tensor& Vq_2_slice,        // [I, D]
-    const torch::Tensor& Vr_1_slice,        // [J, D]
-    const torch::Tensor& Vr_2_slice,        // [J, D]
-    const torch::Tensor& Vs_1_slice,        // [K, D]
-    const torch::Tensor& Vs_2_slice,        // [K, D]
-    const torch::Tensor& Aq_slice,          // [I, J, K]
-    const torch::Tensor& Ar_slice,          // [I, J, K]
-    const torch::Tensor& As_slice           // [I, J, K]
-) {
-    // Input validation (basic checks)
-    TORCH_CHECK(grad_output_slice.is_cuda(), "Input grad_output_slice must be CUDA tensor");
-    // ... check other inputs are CUDA ...
-    TORCH_CHECK(Aq_slice.dim() == 3, "Aq_slice must be 3D");
-    // ... check other dimensions ...
-
-    const int I = Vq_1_slice.size(0);
-    const int J = Vr_1_slice.size(0);
-    const int K = Vs_1_slice.size(0);
-    const int D = Vq_1_slice.size(1);
-    const int N = grad_output_slice.size(0);
-
-    // Check dimension consistency
-    TORCH_CHECK(Vq_2_slice.sizes() == Vq_1_slice.sizes(), "Vq shapes mismatch");
-    TORCH_CHECK(Vr_2_slice.sizes() == Vr_1_slice.sizes(), "Vr shapes mismatch");
-    TORCH_CHECK(Vs_2_slice.sizes() == Vs_1_slice.sizes(), "Vs shapes mismatch");
-    TORCH_CHECK(Aq_slice.sizes() == torch::IntArrayRef({I, J, K}), "Aq shape mismatch");
-    TORCH_CHECK(Ar_slice.sizes() == torch::IntArrayRef({I, J, K}), "Ar shape mismatch");
-    TORCH_CHECK(As_slice.sizes() == torch::IntArrayRef({I, J, K}), "As shape mismatch");
-    TORCH_CHECK(grad_output_slice.size(1) == D, "grad_output D mismatch");
-    // ... add more checks as needed ...
-
-    // Allocate output tensors (temporary grads)
-    auto options = Aq_slice.options();
-    torch::Tensor grad_Aq_slice_out = torch::zeros({I, J, K}, options);
-    torch::Tensor grad_Ar_slice_out = torch::zeros({I, J, K}, options);
-    torch::Tensor grad_As_slice_out = torch::zeros({I, J, K}, options);
-
-    // Kernel launch configuration (similar to compute_A_slice_kernel)
-    constexpr int BLOCK_DIM_I = 8;
-    constexpr int BLOCK_DIM_J = 8;
-    constexpr int BLOCK_DIM_K = 8; 
-    dim3 blockDim(BLOCK_DIM_I, BLOCK_DIM_J, BLOCK_DIM_K);
-    dim3 gridDim(
-        (I + BLOCK_DIM_I - 1) / BLOCK_DIM_I,
-        (J + BLOCK_DIM_J - 1) / BLOCK_DIM_J,
-        (K + BLOCK_DIM_K - 1) / BLOCK_DIM_K
-    );
-
-    auto grad_output_cont = grad_output_slice.contiguous();
-    auto Vq_1_cont = Vq_1_slice.contiguous();
-    auto Vq_2_cont = Vq_2_slice.contiguous();
-    auto Vr_1_cont = Vr_1_slice.contiguous();
-    auto Vr_2_cont = Vr_2_slice.contiguous();
-    auto Vs_1_cont = Vs_1_slice.contiguous();
-    auto Vs_2_cont = Vs_2_slice.contiguous();
-    auto Aq_cont = Aq_slice.contiguous();
-    auto Ar_cont = Ar_slice.contiguous();
-    auto As_cont = As_slice.contiguous();
-
-    // Launch Kernel
-    compute_interim_grads_kernel<<<gridDim, blockDim>>>(
-        grad_output_cont.data_ptr<float>(),
-        Vq_1_cont.data_ptr<float>(), Vq_2_cont.data_ptr<float>(),
-        Vr_1_cont.data_ptr<float>(), Vr_2_cont.data_ptr<float>(),
-        Vs_1_cont.data_ptr<float>(), Vs_2_cont.data_ptr<float>(),
-        Aq_cont.data_ptr<float>(), Ar_cont.data_ptr<float>(), As_cont.data_ptr<float>(),
-        grad_Aq_slice_out.data_ptr<float>(),
-        grad_Ar_slice_out.data_ptr<float>(),
-        grad_As_slice_out.data_ptr<float>(),
-        I, J, K, D, N
-    );
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "CUDA error in compute_interim_grads_cuda_wrapper: %s\n", cudaGetErrorString(err));
-    }
-
-    return std::make_tuple(grad_Aq_slice_out, grad_Ar_slice_out, grad_As_slice_out);
-}
-
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-get_interim_grads_cpu(
-    const torch::Tensor& grad_output_slice_cpu, // [N, D]
-    const torch::Tensor& Q_slice_cpu,           // [I, D]
-    const torch::Tensor& R_slice_cpu,           // [J, D]
-    const torch::Tensor& S_slice_cpu,           // [K, D]
-    const torch::Tensor& Vq_1_slice_cpu,        // [I, D]
-    const torch::Tensor& Vq_2_slice_cpu,        // [I, D]
-    const torch::Tensor& Vr_1_slice_cpu,        // [J, D]
-    const torch::Tensor& Vr_2_slice_cpu,        // [J, D]
-    const torch::Tensor& Vs_1_slice_cpu,        // [K, D]
-    const torch::Tensor& Vs_2_slice_cpu,        // [K, D]
-    const torch::Tensor& Aq_slice_cpu,          // [I, J, K]
-    const torch::Tensor& Ar_slice_cpu,          // [I, J, K]
-    const torch::Tensor& As_slice_cpu           // [I, J, K]
-) {
-    const int I = Q_slice_cpu.size(0);
-    const int J = R_slice_cpu.size(0);
-    const int K = S_slice_cpu.size(0);
-    const int D = Q_slice_cpu.size(1);
-    const int N = grad_output_slice_cpu.size(0); 
-    auto options = Aq_slice_cpu.options(); 
-
-    auto grad_Aq_slice_ref = torch::zeros({I, J, K}, options);
-    auto grad_Ar_slice_ref = torch::zeros({I, J, K}, options);
-    auto grad_As_slice_ref = torch::zeros({I, J, K}, options);
-
-    auto grad_Aq_acc = grad_Aq_slice_ref.accessor<float, 3>();
-    auto grad_Ar_acc = grad_Ar_slice_ref.accessor<float, 3>();
-    auto grad_As_acc = grad_As_slice_ref.accessor<float, 3>();
-    
-    auto grad_output_acc = grad_output_slice_cpu.accessor<float, 2>();
-    auto Vq_1_acc = Vq_1_slice_cpu.accessor<float, 2>();
-    auto Vq_2_acc = Vq_2_slice_cpu.accessor<float, 2>();
-    auto Vr_1_acc = Vr_1_slice_cpu.accessor<float, 2>();
-    auto Vr_2_acc = Vr_2_slice_cpu.accessor<float, 2>();
-    auto Vs_1_acc = Vs_1_slice_cpu.accessor<float, 2>();
-    auto Vs_2_acc = Vs_2_slice_cpu.accessor<float, 2>();
-    auto Aq_acc = Aq_slice_cpu.accessor<float, 3>();
-    auto Ar_acc = Ar_slice_cpu.accessor<float, 3>();
-    auto As_acc = As_slice_cpu.accessor<float, 3>();
-
-    // Replicate Phase 1 logic from compute_grad_A_single here
-    // Term 1.a
-    if (I <= N) {
-        for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) { for (int d = 0; d < D; ++d) {
-            grad_Aq_acc[i][j][k] += grad_output_acc[i][d] * Vr_1_acc[j][d] * Vs_1_acc[k][d];
-        }}}}
-    }
-    // Term 1.b
-    if (J <= N) {
-        for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) {
-            float grad_x_vals = 0.0f;
-            for (int d = 0; d < D; ++d) { grad_x_vals += grad_output_acc[j][d] * Vq_2_acc[i][d] * Vs_2_acc[k][d]; }
-            grad_Aq_acc[i][j][k] += grad_x_vals * As_acc[i][j][k];
-        }}}
-    }
-    // Term 1.c
-    if (K <= N) {
-         for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) {
-             float grad_x_vals = 0.0f;
-             for (int d = 0; d < D; ++d) { grad_x_vals += grad_output_acc[k][d] * Vq_2_acc[i][d] * Vr_2_acc[j][d]; }
-             grad_Aq_acc[i][j][k] += grad_x_vals * Ar_acc[i][j][k];
-         }}}
-     }
-
-    // Term 2.a
-     if (J <= N) {
-         for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) { for (int d = 0; d < D; ++d) {
-             grad_Ar_acc[i][j][k] += grad_output_acc[j][d] * Vq_1_acc[i][d] * Vs_1_acc[k][d];
-         }}}}
-     }
-    // Term 2.b
-     if (I <= N) {
-         for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) {
-             float grad_x_vals = 0.0f;
-             for (int d = 0; d < D; ++d) { grad_x_vals += grad_output_acc[i][d] * Vr_2_acc[j][d] * Vs_2_acc[k][d]; }
-             grad_Ar_acc[i][j][k] += grad_x_vals * As_acc[i][j][k];
-         }}}
-     }
-    // Term 2.c
-     if (K <= N) {
-          for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) {
-              float grad_x_vals = 0.0f;
-              for (int d = 0; d < D; ++d) { grad_x_vals += grad_output_acc[k][d] * Vq_2_acc[i][d] * Vr_2_acc[j][d]; }
-              grad_Ar_acc[i][j][k] += grad_x_vals * Aq_acc[i][j][k];
-          }}}
-      }
-
-    // Term 3.a
-      if (K <= N) {
-          for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) { for (int d = 0; d < D; ++d) {
-              grad_As_acc[i][j][k] += grad_output_acc[k][d] * Vq_1_acc[i][d] * Vr_1_acc[j][d];
-          }}}}
-      }
-    // Term 3.b
-      if (I <= N) {
-          for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) {
-              float grad_x_vals = 0.0f;
-              for (int d = 0; d < D; ++d) { grad_x_vals += grad_output_acc[i][d] * Vr_2_acc[j][d] * Vs_2_acc[k][d]; }
-              grad_As_acc[i][j][k] += grad_x_vals * Ar_acc[i][j][k];
-          }}}
-      }
-    // Term 3.c
-      if (J <= N) {
-          for (int i = 0; i < I; ++i) { for (int j = 0; j < J; ++j) { for (int k = 0; k < K; ++k) {
-              float grad_x_vals = 0.0f;
-              for (int d = 0; d < D; ++d) { grad_x_vals += grad_output_acc[j][d] * Vq_2_acc[i][d] * Vs_2_acc[k][d]; }
-              grad_As_acc[i][j][k] += grad_x_vals * Aq_acc[i][j][k];
-          }}}
-      }
-
-    return std::make_tuple(grad_Aq_slice_ref, grad_Ar_slice_ref, grad_As_slice_ref);
-}
-
-//     cudaError_t err = cudaGetLastError();
-//     if (err != cudaSuccess) {
-//         fprintf(stderr, "CUDA error in apply_softmax_backward_cuda_wrapper: %s\n", cudaGetErrorString(err));
-//     }
-
-//     return grad_A_slice_out_gpu;
-// }
-
-// --- Optimized Softmax Backward Implementation ---
-
-// Stage 1, Kernel 1: Compute sum_q[i] = sum_{j,k} (grad_Aq[i,j,k] * Aq[i,j,k])
-__global__ void compute_softmax_backward_sum_q_kernel(
-    const float* __restrict__ grad_Aq_slice_in,
-    const float* __restrict__ Aq_slice_in,
-    float* __restrict__ sum_q_vec_out, // [I]
-    int I_dim, int J_dim, int K_dim)
-{
-    extern __shared__ float s_reduction_pad[];
-    int i_current = blockIdx.x;
-    if (i_current >= I_dim) return;
-
-    const float* grad_Aq_plane = grad_Aq_slice_in + (int64_t)i_current * J_dim * K_dim;
-    const float* Aq_plane = Aq_slice_in + (int64_t)i_current * J_dim * K_dim;
-
-    int plane_size = J_dim * K_dim;
-    int tid_in_block = threadIdx.x;
-    int threads_in_block = blockDim.x;
-
-    // --- Pass 1: Compute sum of products for the plane ---
-    float thread_sum = 0.0f;
-    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        thread_sum += grad_Aq_plane[idx] * Aq_plane[idx];
-    }
-    s_reduction_pad[tid_in_block] = thread_sum;
     __syncthreads();
 
-    // --- Pass 2: Reduce sums in shared memory ---
-    for (int offset = threads_in_block / 2; offset > 0; offset >>= 1) {
-        if (tid_in_block < offset) {
-            s_reduction_pad[tid_in_block] += s_reduction_pad[tid_in_block + offset];
+    // Global indices for this thread's (i, j, k) point
+    const int i = i0 + ti;
+    const int j = j0 + tj;
+    const int k = k0 + tk;
+
+    if (i < N && j < N && k < N) {
+        const float* Qi_vec   = &Qi_smem[ti * D];
+        const float* Rj_vec   = &Rj_smem[tj * D];
+        const float* Sk_vec   = &Sk_smem[tk * D];
+        const float* Vq1i_vec = &Vq1i_smem[ti * D];
+        const float* Vq2i_vec = &Vq2i_smem[ti * D];
+        const float* Vr1j_vec = &Vr1j_smem[tj * D];
+        const float* Vr2j_vec = &Vr2j_smem[tj * D];
+        const float* Vs1k_vec = &Vs1k_smem[tk * D];
+        const float* Vs2k_vec = &Vs2k_smem[tk * D];
+        const float* dYi_vec  = &dYi_smem[ti * D];
+        const float* dYj_vec  = &dYj_smem[tj * D];
+        const float* dYk_vec  = &dYk_smem[tk * D];
+
+        // ---> Logits & Numerators
+        float logits = dot3(Qi_vec, Rj_vec, Sk_vec, D) * scale;
+        float Aq_num = expf(fminf(logits - m_i[i], EXP_CLIP));
+        float Ar_num = expf(fminf(logits - m_j[j], EXP_CLIP));
+        float As_num = expf(fminf(logits - m_k[k], EXP_CLIP));
+        float Aq = Aq_num / fmaxf(l_i[i], DENOM_EPS);
+        float Ar = Ar_num / fmaxf(l_j[j], DENOM_EPS);
+        float As = As_num / fmaxf(l_k[k], DENOM_EPS);
+
+        // ---> Compute grad_A components
+        // --- grad_Aq ---
+        float gAq  = dot3(dYi_vec, Vr1j_vec, Vs1k_vec, D);
+              gAq += dot3(dYj_vec, Vq2i_vec, Vs2k_vec, D) * As;
+              gAq += dot3(dYk_vec, Vq2i_vec, Vr2j_vec, D) * Ar;
+        // --- grad_Ar ---
+        float gAr  = dot3(dYj_vec, Vq1i_vec, Vs1k_vec, D);
+              gAr += dot3(dYi_vec, Vr2j_vec, Vs2k_vec, D) * As;
+              gAr += dot3(dYk_vec, Vq2i_vec, Vr2j_vec, D) * Aq;
+        // --- grad_As ---
+        float gAs  = dot3(dYk_vec, Vq1i_vec, Vr1j_vec, D);
+              gAs += dot3(dYi_vec, Vr2j_vec, Vs2k_vec, D) * Ar;
+              gAs += dot3(dYj_vec, Vq2i_vec, Vs2k_vec, D) * Aq;
+
+        // ---> Accumulate dot products
+        atomicAdd(&sum_q[i], gAq * Aq);
+        atomicAdd(&sum_r[j], gAr * Ar);
+        atomicAdd(&sum_s[k], gAs * As);
+    }
+}
+
+
+
+// ===================== grad Q, R, S ====================== (TODO: optimize)
+
+template<int BLOCK_I, int BLOCK_J, int BLOCK_K, int REG_CAP = MAX_D_REG>
+__global__ void Q_grad(
+    /* ---- operands ---------------------------------------------------- */
+    const float* __restrict__ Q,   // [B,H,N,D]
+    const float* __restrict__ R,   // [B,H,N,D]
+    const float* __restrict__ S,   // [B,H,N,D]
+    const float* __restrict__ Vq1, const float* __restrict__ Vq2,
+    const float* __restrict__ Vr1, const float* __restrict__ Vr2,
+    const float* __restrict__ Vs1, const float* __restrict__ Vs2,
+    const float* __restrict__ gradY,   // [B,H,N,D]   (∂L/∂Y)
+    /* ---- softmax statistics ----------------------------------------- */
+    const float* __restrict__ m_i, const float* __restrict__ l_i,
+    const float* __restrict__ m_j, const float* __restrict__ l_j,
+    const float* __restrict__ m_k, const float* __restrict__ l_k,
+    /* ---- correction scalars from pass-1 ----------------------------- */
+    const float* __restrict__ sum_q,
+    const float* __restrict__ sum_r,
+    const float* __restrict__ sum_s,
+    /* ---- output ------------------------------------------------------ */
+    float* __restrict__ gradQ,          // [B,H,N,D]
+    /* ---- sizes ------------------------------------------------------- */
+    int  N, int D, float scale)
+{
+    /* ---- decode indices --------------------------------------------- */
+    const int i0 = blockIdx.x * BLOCK_I + threadIdx.x;   // i-index owned by this lane
+    const int k0 = blockIdx.y * BLOCK_K + threadIdx.y;   // k-index owned by this lane
+    const int bh = blockIdx.z;                       // flattened (batch, head)
+
+    /* NOTE: Do NOT early return - all threads must participate in __syncthreads()
+       for cooperative loading. Use 'valid' flag to guard computation instead. */
+    const bool valid = (i0 < N && k0 < N);
+
+    /* ---- per (B,H) base pointers & strides -------------------------- */
+    const int64_t stride_BH = (int64_t)N * D;
+    const float* Qbh   = Q   + (int64_t)bh * stride_BH;
+    const float* Rbh   = R   + (int64_t)bh * stride_BH;
+    const float* Sbh   = S   + (int64_t)bh * stride_BH;
+    const float* Vq1bh = Vq1 + (int64_t)bh * stride_BH;
+    const float* Vq2bh = Vq2 + (int64_t)bh * stride_BH;
+    const float* Vr1bh = Vr1 + (int64_t)bh * stride_BH;
+    const float* Vr2bh = Vr2 + (int64_t)bh * stride_BH;
+    const float* Vs1bh = Vs1 + (int64_t)bh * stride_BH;
+    const float* Vs2bh = Vs2 + (int64_t)bh * stride_BH;
+    const float* gYbh  = gradY + (int64_t)bh * stride_BH;
+
+    const float* miBH  = m_i + (int64_t)bh * N;
+    const float* liBH  = l_i + (int64_t)bh * N;
+    const float* mjBH  = m_j + (int64_t)bh * N;
+    const float* ljBH  = l_j + (int64_t)bh * N;
+    const float* mkBH  = m_k + (int64_t)bh * N;
+    const float* lkBH  = l_k + (int64_t)bh * N;
+
+    const float* sum_qBH = sum_q + (int64_t)bh * N;
+    const float* sum_rBH = sum_r + (int64_t)bh * N;
+    const float* sum_sBH = sum_s + (int64_t)bh * N;
+
+    float* gQbh = gradQ + (int64_t)bh * stride_BH;
+
+    /* ---- registers for i-/k-local vectors --------------------------- */
+    float Qi [REG_CAP] = {0.0f};
+    float Sk [REG_CAP] = {0.0f};
+    float Vq1i[REG_CAP] = {0.0f}, Vq2i[REG_CAP] = {0.0f};
+    float Vs1k[REG_CAP] = {0.0f}, Vs2k[REG_CAP] = {0.0f};
+    float dYi [REG_CAP] = {0.0f}, dYk [REG_CAP] = {0.0f};
+
+    float mi = 0.0f, li = 1.0f, mk = 0.0f, lk = 1.0f;
+    float sumQi = 0.0f, sumSk = 0.0f;
+
+    /* Only load per-thread data if this thread owns a valid (i,k) pair */
+    if (valid) {
+        #pragma unroll
+        for (int d=0; d<D; ++d){
+            Qi [d] = Qbh [i0*D + d];
+            Sk [d] = Sbh [k0*D + d];
+            Vq1i[d] = Vq1bh[i0*D + d];
+            Vq2i[d] = Vq2bh[i0*D + d];
+            Vs1k[d] = Vs1bh[k0*D + d];
+            Vs2k[d] = Vs2bh[k0*D + d];
+            dYi [d] = gYbh [i0*D + d];
+            dYk [d] = gYbh [k0*D + d];
+        }
+
+        mi    = miBH [i0];
+        li    = liBH [i0];
+        mk    = mkBH [k0];
+        lk    = lkBH [k0];
+        sumQi = sum_qBH[i0];
+        sumSk = sum_sBH[k0];
+    }
+
+    /* ---- shared memory for J-tiles ---------------------------------- */
+    extern __shared__ float shmem[];
+    float* sh_R   = shmem;                    // BLOCK_J × D
+    float* sh_Vr1 = sh_R   + BLOCK_J * D;
+    float* sh_Vr2 = sh_Vr1 + BLOCK_J * D;
+    float* sh_gYj = sh_Vr2 + BLOCK_J * D;
+    float* sh_mj  = sh_gYj + BLOCK_J * D;         // BLOCK_J
+    float* sh_lj  = sh_mj  + BLOCK_J;             // BLOCK_J
+    float* sh_sumr= sh_lj  + BLOCK_J;             // BLOCK_J
+
+    /* ---- accumulator for grad_Q[i,:] -------------------------------- */
+    float grad_acc[REG_CAP] = {0.0f};
+
+
+    /* ---- iterate over J in tiles ------------------------------------ */
+    for (int jBase = 0; jBase < N; jBase += BLOCK_J)
+    {
+        /* cooperative load by all (i,k) threads ----------------------- */
+        /* NOTE: BLOCK_J may exceed BLOCK_K, so we loop to cover all rows */
+        for (int ld = threadIdx.y; ld < BLOCK_J && (jBase + ld) < N; ld += BLOCK_K) {
+            const int jGlob = jBase + ld;
+            #pragma unroll
+            for (int d = threadIdx.x; d < D; d += BLOCK_I){
+                sh_R   [ld*D + d] = Rbh  [jGlob*D + d];
+                sh_Vr1 [ld*D + d] = Vr1bh[jGlob*D + d];
+                sh_Vr2 [ld*D + d] = Vr2bh[jGlob*D + d];
+                sh_gYj [ld*D + d] = gYbh [jGlob*D + d];
+            }
+            if (threadIdx.x == 0){
+                sh_mj [ld]  = mjBH  [jGlob];
+                sh_lj [ld]  = ljBH  [jGlob];
+                sh_sumr[ld] = sum_rBH[jGlob];
+            }
+        }
+        __syncthreads();
+
+        /* ---- loop inside loaded J-tile ------------------------------ */
+        for (int jOff = 0; jOff < BLOCK_J && (jBase + jOff) < N; ++jOff){
+            /* --- logits & softmax numerators ------------------------ */
+            float dot = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                dot += Qi[d] * sh_R[jOff*D + d] * Sk[d];
+            float logits = dot * scale;
+
+            float Aq = __expf(fminf(logits - mi, EXP_CLIP))         / fmaxf(li, DENOM_EPS);
+            float Ar = __expf(fminf(logits - sh_mj[jOff], EXP_CLIP)) / fmaxf(sh_lj[jOff], DENOM_EPS);
+            float As = __expf(fminf(logits - mk, EXP_CLIP))         / fmaxf(lk, DENOM_EPS);
+
+            /* --- grad_Aq ------------------------------------------- */
+            float gAq = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                gAq += dYi[d] * sh_Vr1[jOff*D + d] * Vs1k[d];
+            float tmp = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                tmp += sh_gYj[jOff*D + d] * Vq2i[d] * Vs2k[d];
+            gAq += tmp * As;
+            tmp = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                tmp += dYk[d] * Vq2i[d] * sh_Vr2[jOff*D + d];
+            gAq += tmp * Ar;
+
+            /* --- grad_Ar ------------------------------------------- */
+            float gAr = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                gAr += sh_gYj[jOff*D + d] * Vq1i[d] * Vs1k[d];
+            tmp = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                tmp += dYi[d] * sh_Vr2[jOff*D + d] * Vs2k[d];
+            gAr += tmp * As;
+            tmp = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                tmp += dYk[d] * Vq2i[d] * sh_Vr2[jOff*D + d];
+            gAr += tmp * Aq;
+
+            /* --- grad_As ------------------------------------------- */
+            float gAs = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                gAs += dYk[d] * Vq1i[d] * sh_Vr1[jOff*D + d];
+            tmp = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                tmp += dYi[d] * sh_Vr2[jOff*D + d] * Vs2k[d];
+            gAs += tmp * Ar;
+            tmp = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                tmp += sh_gYj[jOff*D + d] * Vq2i[d] * Vs2k[d];
+            gAs += tmp * Aq;
+
+            /* --- Jacobian-corrected grad_A ------------------------- */
+            float grad_A = (gAq -  sumQi          ) * Aq
+                         + (gAr -  sh_sumr[jOff]  ) * Ar
+                         + (gAs -  sumSk          ) * As;
+
+            /* --- accumulate contribution to grad_Q[i,:] ------------ */
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                grad_acc[d] += grad_A * sh_R[jOff*D + d] * Sk[d];
         }
         __syncthreads();
     }
 
-    if (tid_in_block == 0) {
-        sum_q_vec_out[i_current] = s_reduction_pad[0];
+    /* ---- atomic add to global grad_Q ------------------------------- */
+    if (valid) {
+        #pragma unroll
+        for (int d=0; d<D; ++d)
+            atomicAdd(&gQbh[i0*D + d], scale * grad_acc[d]);
     }
 }
 
-// Stage 1, Kernel 2: Compute sum_r[j] = sum_{i,k} (grad_Ar[i,j,k] * Ar[i,j,k])
-__global__ void compute_softmax_backward_sum_r_kernel(
-    const float* __restrict__ grad_Ar_slice_in,
-    const float* __restrict__ Ar_slice_in,
-    float* __restrict__ sum_r_vec_out, // [J]
-    int I_dim, int J_dim, int K_dim)
+template<int BLOCK_J, int BLOCK_I, int BLOCK_K, int REG_CAP = MAX_D_REG>
+__global__ void R_grad(
+    /* ---- operands ---------------------------------------------------- */
+    const float* __restrict__ Q,   // [B,H,N,D]
+    const float* __restrict__ R,   // [B,H,N,D]
+    const float* __restrict__ S,   // [B,H,N,D]
+    const float* __restrict__ Vq1, const float* __restrict__ Vq2,
+    const float* __restrict__ Vr1, const float* __restrict__ Vr2,
+    const float* __restrict__ Vs1, const float* __restrict__ Vs2,
+    const float* __restrict__ gradY,   // [B,H,N,D]   (∂L/∂Y)
+    /* ---- softmax statistics ----------------------------------------- */
+    const float* __restrict__ m_i, const float* __restrict__ l_i,
+    const float* __restrict__ m_j, const float* __restrict__ l_j,
+    const float* __restrict__ m_k, const float* __restrict__ l_k,
+    /* ---- correction scalars from pass-1 ----------------------------- */
+    const float* __restrict__ sum_q,
+    const float* __restrict__ sum_r,
+    const float* __restrict__ sum_s,
+    /* ---- output ------------------------------------------------------ */
+    float* __restrict__ gradR,          // [B,H,N,D]
+    /* ---- sizes ------------------------------------------------------- */
+    int  N, int D, float scale)
 {
-    extern __shared__ float s_reduction_pad[];
-    int j_current = blockIdx.x;
-    if (j_current >= J_dim) return;
+    /* ---- decode indices --------------------------------------------- */
+    const int j0 = blockIdx.x * BLOCK_J + threadIdx.x;   // j-index owned by this lane
+    const int k0 = blockIdx.y * BLOCK_K + threadIdx.y;   // k-index owned by this lane
+    const int bh = blockIdx.z;                           // flattened (batch, head)
 
-    int plane_size = I_dim * K_dim;
-    int tid_in_block = threadIdx.x;
-    int threads_in_block = blockDim.x;
+    /* NOTE: Do NOT early return here! All threads must participate in
+       __syncthreads() for cooperative loading. Use validity flag instead. */
+    const bool valid = (j0 < N && k0 < N);
 
-    float thread_sum = 0.0f;
-    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        int i = idx / K_dim;
-        int k = idx % K_dim;
-        int64_t global_idx = (int64_t)i * J_dim * K_dim + (int64_t)j_current * K_dim + k;
-        thread_sum += grad_Ar_slice_in[global_idx] * Ar_slice_in[global_idx];
+    /* ---- per (B,H) base pointers & strides -------------------------- */
+    const int64_t stride_BH = (int64_t)N * D;
+    const float* Qbh   = Q   + (int64_t)bh * stride_BH;
+    const float* Rbh   = R   + (int64_t)bh * stride_BH;
+    const float* Sbh   = S   + (int64_t)bh * stride_BH;
+    const float* Vq1bh = Vq1 + (int64_t)bh * stride_BH;
+    const float* Vq2bh = Vq2 + (int64_t)bh * stride_BH;
+    const float* Vr1bh = Vr1 + (int64_t)bh * stride_BH;
+    const float* Vr2bh = Vr2 + (int64_t)bh * stride_BH;
+    const float* Vs1bh = Vs1 + (int64_t)bh * stride_BH;
+    const float* Vs2bh = Vs2 + (int64_t)bh * stride_BH;
+    const float* gYbh  = gradY + (int64_t)bh * stride_BH;
+
+    const float* miBH  = m_i + (int64_t)bh * N;
+    const float* liBH  = l_i + (int64_t)bh * N;
+    const float* mjBH  = m_j + (int64_t)bh * N;
+    const float* ljBH  = l_j + (int64_t)bh * N;
+    const float* mkBH  = m_k + (int64_t)bh * N;
+    const float* lkBH  = l_k + (int64_t)bh * N;
+
+    const float* sum_qBH = sum_q + (int64_t)bh * N;
+    const float* sum_rBH = sum_r + (int64_t)bh * N;
+    const float* sum_sBH = sum_s + (int64_t)bh * N;
+
+    float* gRbh = gradR + (int64_t)bh * stride_BH;
+
+    /* ---- registers for j-/k-local vectors --------------------------- */
+    float Rj [REG_CAP] = {0.0f};
+    float Sk [REG_CAP] = {0.0f};
+    float Vr1j[REG_CAP] = {0.0f}, Vr2j[REG_CAP] = {0.0f};
+    float Vs1k[REG_CAP] = {0.0f}, Vs2k[REG_CAP] = {0.0f};
+    float dYj [REG_CAP] = {0.0f}, dYk [REG_CAP] = {0.0f};
+
+    float mj = 0.0f, lj = 1.0f, mk = 0.0f, lk = 1.0f;
+    float sumRj = 0.0f, sumSk = 0.0f;
+
+    /* Only load per-thread data if this thread owns a valid (j,k) pair */
+    if (valid) {
+        #pragma unroll
+        for (int d=0; d<D; ++d){
+            Rj [d] = Rbh [j0*D + d];
+            Sk [d] = Sbh [k0*D + d];
+            Vr1j[d] = Vr1bh[j0*D + d];
+            Vr2j[d] = Vr2bh[j0*D + d];
+            Vs1k[d] = Vs1bh[k0*D + d];
+            Vs2k[d] = Vs2bh[k0*D + d];
+            dYj [d] = gYbh [j0*D + d];
+            dYk [d] = gYbh [k0*D + d];
+        }
+
+        mj    = mjBH  [j0];
+        lj    = ljBH  [j0];
+        mk    = mkBH  [k0];
+        lk    = lkBH  [k0];
+        sumRj = sum_rBH[j0];
+        sumSk = sum_sBH[k0];
     }
-    s_reduction_pad[tid_in_block] = thread_sum;
-    __syncthreads();
 
-    for (int offset = threads_in_block / 2; offset > 0; offset >>= 1) {
-        if (tid_in_block < offset) {
-            s_reduction_pad[tid_in_block] += s_reduction_pad[tid_in_block + offset];
+    /* ---- shared memory for I-tiles ---------------------------------- */
+    extern __shared__ float shmem[];
+    float* sh_Q    = shmem;                    // BLOCK_I × D
+    float* sh_Vq1  = sh_Q    + BLOCK_I * D;
+    float* sh_Vq2  = sh_Vq1  + BLOCK_I * D;
+    float* sh_dYi  = sh_Vq2  + BLOCK_I * D;
+    float* sh_mi   = sh_dYi  + BLOCK_I * D;    // BLOCK_I
+    float* sh_li   = sh_mi   + BLOCK_I;        // BLOCK_I
+    float* sh_sumq = sh_li   + BLOCK_I;        // BLOCK_I
+
+    /* ---- accumulator for grad_R[j,:] -------------------------------- */
+    float grad_acc[REG_CAP] = {0.0f};
+
+
+    /* ---- iterate over I in tiles ------------------------------------ */
+    for (int iBase = 0; iBase < N; iBase += BLOCK_I)
+    {
+        /* cooperative load by all (j,k) threads */
+        /* NOTE: BLOCK_I may exceed BLOCK_K, so we loop to cover all rows */
+        for (int ld = threadIdx.y; ld < BLOCK_I && (iBase + ld) < N; ld += BLOCK_K) {
+            const int iGlob = iBase + ld;
+            #pragma unroll
+            for (int d = threadIdx.x; d < D; d += BLOCK_J){
+                sh_Q   [ld*D + d] = Qbh  [iGlob*D + d];
+                sh_Vq1 [ld*D + d] = Vq1bh[iGlob*D + d];
+                sh_Vq2 [ld*D + d] = Vq2bh[iGlob*D + d];
+                sh_dYi [ld*D + d] = gYbh [iGlob*D + d];
+            }
+            if (threadIdx.x == 0){
+                sh_mi  [ld] = miBH  [iGlob];
+                sh_li  [ld] = liBH  [iGlob];
+                sh_sumq[ld] = sum_qBH[iGlob];
+            }
+        }
+        __syncthreads();
+
+        /* ---- loop inside loaded I-tile ------------------------------ */
+        for (int iOff = 0; iOff < BLOCK_I && (iBase + iOff) < N; ++iOff){
+            const float* Qi   = sh_Q   + iOff*D;
+            const float* Vq1i = sh_Vq1 + iOff*D;
+            const float* Vq2i = sh_Vq2 + iOff*D;
+            const float* dYi  = sh_dYi + iOff*D;
+            const float mi    = sh_mi  [iOff];
+            const float li    = sh_li  [iOff];
+            const float sumQi = sh_sumq[iOff];
+
+            /* --- logits & softmax numerators ------------------------ */
+            float dot = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                dot += Qi[d] * Rj[d] * Sk[d];
+            float logits = dot * scale;
+
+            float Aq = __expf(fminf(logits - mi, EXP_CLIP)) / fmaxf(li, DENOM_EPS);
+            float Ar = __expf(fminf(logits - mj, EXP_CLIP)) / fmaxf(lj, DENOM_EPS);
+            float As = __expf(fminf(logits - mk, EXP_CLIP)) / fmaxf(lk, DENOM_EPS);
+
+            /* --- grad_Aq ------------------------------------------- */
+            float gAq = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                gAq += dYi[d] * Vr1j[d] * Vs1k[d];
+
+            float tmp = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                tmp += dYj[d] * Vq2i[d] * Vs2k[d];
+            gAq += tmp * As;
+
+            tmp = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                tmp += dYk[d] * Vq2i[d] * Vr2j[d];
+            gAq += tmp * Ar;
+
+            /* --- grad_Ar ------------------------------------------- */
+            float gAr = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                gAr += dYj[d] * Vq1i[d] * Vs1k[d];
+
+            tmp = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                tmp += dYi[d] * Vr2j[d] * Vs2k[d];
+            gAr += tmp * As;
+
+            tmp = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                tmp += dYk[d] * Vq2i[d] * Vr2j[d];
+            gAr += tmp * Aq;
+
+            /* --- grad_As ------------------------------------------- */
+            float gAs = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                gAs += dYk[d] * Vq1i[d] * Vr1j[d];
+
+            tmp = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                tmp += dYi[d] * Vr2j[d] * Vs2k[d];
+            gAs += tmp * Ar;
+
+            tmp = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                tmp += dYj[d] * Vq2i[d] * Vs2k[d];
+            gAs += tmp * Aq;
+
+            /* --- Jacobian-corrected grad_A ------------------------- */
+            float grad_A = (gAq -  sumQi ) * Aq
+                         + (gAr -  sumRj ) * Ar
+                         + (gAs -  sumSk ) * As;
+
+            /* --- accumulate contribution to grad_R[j,:] ------------ */
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                grad_acc[d] += grad_A * Qi[d] * Sk[d];
         }
         __syncthreads();
     }
 
-    if (tid_in_block == 0) {
-        sum_r_vec_out[j_current] = s_reduction_pad[0];
+    /* ---- atomic add to global grad_R ------------------------------- */
+    if (valid) {
+        #pragma unroll
+        for (int d=0; d<D; ++d)
+            atomicAdd(&gRbh[j0*D + d], scale * grad_acc[d]);
     }
 }
 
-// Stage 1, Kernel 3: Compute sum_s[k] = sum_{i,j} (grad_As[i,j,k] * As[i,j,k])
-__global__ void compute_softmax_backward_sum_s_kernel(
-    const float* __restrict__ grad_As_slice_in,
-    const float* __restrict__ As_slice_in,
-    float* __restrict__ sum_s_vec_out, // [K]
-    int I_dim, int J_dim, int K_dim)
+template<int BLOCK_K, int BLOCK_J, int BLOCK_I, int REG_CAP = MAX_D_REG>
+__global__ void S_grad(
+    /* ---- operands ---------------------------------------------------- */
+    const float* __restrict__ Q,   // [B,H,N,D]
+    const float* __restrict__ R,   // [B,H,N,D]
+    const float* __restrict__ S,   // [B,H,N,D]
+    const float* __restrict__ Vq1, const float* __restrict__ Vq2,
+    const float* __restrict__ Vr1, const float* __restrict__ Vr2,
+    const float* __restrict__ Vs1, const float* __restrict__ Vs2,
+    const float* __restrict__ gradY,   // [B,H,N,D]   (∂L/∂Y)
+    /* ---- softmax statistics ----------------------------------------- */
+    const float* __restrict__ m_i, const float* __restrict__ l_i,
+    const float* __restrict__ m_j, const float* __restrict__ l_j,
+    const float* __restrict__ m_k, const float* __restrict__ l_k,
+    /* ---- correction scalars from pass-1 ----------------------------- */
+    const float* __restrict__ sum_q,
+    const float* __restrict__ sum_r,
+    const float* __restrict__ sum_s,
+    /* ---- output ------------------------------------------------------ */
+    float* __restrict__ gradS,          // [B,H,N,D]
+    /* ---- sizes ------------------------------------------------------- */
+    int  N, int D, float scale)
 {
-    extern __shared__ float s_reduction_pad[];
-    int k_current = blockIdx.x;
-    if (k_current >= K_dim) return;
+    /* ---- decode indices --------------------------------------------- */
+    const int k0 = blockIdx.x * BLOCK_K + threadIdx.x;   // k-index owned by this lane
+    const int i0 = blockIdx.y * BLOCK_I + threadIdx.y;   // i-index owned by this lane
+    const int bh = blockIdx.z;                           // flattened (batch, head)
 
-    int plane_size = I_dim * J_dim;
-    int tid_in_block = threadIdx.x;
-    int threads_in_block = blockDim.x;
+    /* NOTE: Do NOT early return here! All threads must participate in
+       __syncthreads() for cooperative loading. Use validity flag instead. */
+    const bool valid = (k0 < N && i0 < N);
 
-    float thread_sum = 0.0f;
-    for (int idx = tid_in_block; idx < plane_size; idx += threads_in_block) {
-        int i = idx / J_dim;
-        int j = idx % J_dim;
-        int64_t global_idx = (int64_t)i * J_dim * K_dim + (int64_t)j * K_dim + k_current;
-        thread_sum += grad_As_slice_in[global_idx] * As_slice_in[global_idx];
+    /* ---- per (B,H) base pointers & strides -------------------------- */
+    const int64_t stride_BH = (int64_t)N * D;
+    const float* Qbh   = Q   + (int64_t)bh * stride_BH;
+    const float* Rbh   = R   + (int64_t)bh * stride_BH;
+    const float* Sbh   = S   + (int64_t)bh * stride_BH;
+    const float* Vq1bh = Vq1 + (int64_t)bh * stride_BH;
+    const float* Vq2bh = Vq2 + (int64_t)bh * stride_BH;
+    const float* Vr1bh = Vr1 + (int64_t)bh * stride_BH;
+    const float* Vr2bh = Vr2 + (int64_t)bh * stride_BH;
+    const float* Vs1bh = Vs1 + (int64_t)bh * stride_BH;
+    const float* Vs2bh = Vs2 + (int64_t)bh * stride_BH;
+    const float* gYbh  = gradY + (int64_t)bh * stride_BH;
+
+    const float* miBH  = m_i + (int64_t)bh * N;
+    const float* liBH  = l_i + (int64_t)bh * N;
+    const float* mjBH  = m_j + (int64_t)bh * N;
+    const float* ljBH  = l_j + (int64_t)bh * N;
+    const float* mkBH  = m_k + (int64_t)bh * N;
+    const float* lkBH  = l_k + (int64_t)bh * N;
+
+    const float* sum_qBH = sum_q + (int64_t)bh * N;
+    const float* sum_rBH = sum_r + (int64_t)bh * N;
+    const float* sum_sBH = sum_s + (int64_t)bh * N;
+
+    float* gSbh = gradS + (int64_t)bh * stride_BH;
+
+    /* ---- registers for k-/i-local vectors --------------------------- */
+    float Sk [REG_CAP] = {0.0f};
+    float Qi [REG_CAP] = {0.0f};
+    float Vs1k[REG_CAP] = {0.0f}, Vs2k[REG_CAP] = {0.0f};
+    float Vq1i[REG_CAP] = {0.0f}, Vq2i[REG_CAP] = {0.0f};
+    float dYk [REG_CAP] = {0.0f}, dYi [REG_CAP] = {0.0f};
+
+    float mi = 0.0f, li = 1.0f, mk = 0.0f, lk = 1.0f;
+    float sumQi = 0.0f, sumSk = 0.0f;
+
+    /* Only load per-thread data if this thread owns a valid (k,i) pair */
+    if (valid) {
+        #pragma unroll
+        for (int d=0; d<D; ++d){
+            Sk [d] = Sbh [k0*D + d];
+            Qi [d] = Qbh [i0*D + d];
+            Vs1k[d] = Vs1bh[k0*D + d];
+            Vs2k[d] = Vs2bh[k0*D + d];
+            Vq1i[d] = Vq1bh[i0*D + d];
+            Vq2i[d] = Vq2bh[i0*D + d];
+            dYk [d] = gYbh [k0*D + d];
+            dYi [d] = gYbh [i0*D + d];
+        }
+
+        mi    = miBH  [i0];
+        li    = liBH  [i0];
+        mk    = mkBH  [k0];
+        lk    = lkBH  [k0];
+        sumQi = sum_qBH[i0];
+        sumSk = sum_sBH[k0];
     }
-    s_reduction_pad[tid_in_block] = thread_sum;
-    __syncthreads();
 
-    for (int offset = threads_in_block / 2; offset > 0; offset >>= 1) {
-        if (tid_in_block < offset) {
-            s_reduction_pad[tid_in_block] += s_reduction_pad[tid_in_block + offset];
+    /* ---- shared memory for J-tiles ---------------------------------- */
+    extern __shared__ float shmem[];
+    float* sh_R    = shmem;                    // BLOCK_J × D
+    float* sh_Vr1  = sh_R    + BLOCK_J * D;
+    float* sh_Vr2  = sh_Vr1  + BLOCK_J * D;
+    float* sh_dYj  = sh_Vr2  + BLOCK_J * D;
+    float* sh_mj   = sh_dYj  + BLOCK_J * D;    // BLOCK_J
+    float* sh_lj   = sh_mj   + BLOCK_J;        // BLOCK_J
+    float* sh_sumr = sh_lj   + BLOCK_J;        // BLOCK_J
+
+    /* ---- accumulator for grad_S[k,:] -------------------------------- */
+    float grad_acc[REG_CAP] = {0.0f};
+
+
+    /* ---- iterate over J in tiles ------------------------------------ */
+    for (int jBase = 0; jBase < N; jBase += BLOCK_J)
+    {
+        /* cooperative load by all (k,i) threads */
+        /* NOTE: BLOCK_J may exceed BLOCK_I, so we loop to cover all rows */
+        for (int ld = threadIdx.y; ld < BLOCK_J && (jBase + ld) < N; ld += BLOCK_I) {
+            const int jGlob = jBase + ld;
+            #pragma unroll
+            for (int d = threadIdx.x; d < D; d += BLOCK_K){
+                sh_R   [ld*D + d] = Rbh  [jGlob*D + d];
+                sh_Vr1 [ld*D + d] = Vr1bh[jGlob*D + d];
+                sh_Vr2 [ld*D + d] = Vr2bh[jGlob*D + d];
+                sh_dYj [ld*D + d] = gYbh [jGlob*D + d];
+            }
+            if (threadIdx.x == 0){
+                sh_mj  [ld] = mjBH  [jGlob];
+                sh_lj  [ld] = ljBH  [jGlob];
+                sh_sumr[ld] = sum_rBH[jGlob];
+            }
+        }
+        __syncthreads();
+
+        /* ---- loop inside loaded J-tile ------------------------------ */
+        for (int jOff = 0; jOff < BLOCK_J && (jBase + jOff) < N; ++jOff){
+            const float* Rj   = sh_R   + jOff*D;
+            const float* Vr1j = sh_Vr1 + jOff*D;
+            const float* Vr2j = sh_Vr2 + jOff*D;
+            const float* dYj  = sh_dYj + jOff*D;
+            const float mj    = sh_mj  [jOff];
+            const float lj    = sh_lj  [jOff];
+            const float sumRj = sh_sumr[jOff];
+
+            /* --- logits & softmax numerators ------------------------ */
+            float dot = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                dot += Qi[d] * Rj[d] * Sk[d];
+            float logits = dot * scale;
+
+            float Aq = __expf(fminf(logits - mi, EXP_CLIP)) / fmaxf(li, DENOM_EPS);
+            float Ar = __expf(fminf(logits - mj, EXP_CLIP)) / fmaxf(lj, DENOM_EPS);
+            float As = __expf(fminf(logits - mk, EXP_CLIP)) / fmaxf(lk, DENOM_EPS);
+
+            /* --- grad_Aq ------------------------------------------- */
+            float gAq = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                gAq += dYi[d] * Vr1j[d] * Vs1k[d];
+
+            float tmp = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                tmp += dYj[d] * Vq2i[d] * Vs2k[d];
+            gAq += tmp * As;
+
+            tmp = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                tmp += dYk[d] * Vq2i[d] * Vr2j[d];
+            gAq += tmp * Ar;
+
+            /* --- grad_Ar ------------------------------------------- */
+            float gAr = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                gAr += dYj[d] * Vq1i[d] * Vs1k[d];
+
+            tmp = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                tmp += dYi[d] * Vr2j[d] * Vs2k[d];
+            gAr += tmp * As;
+
+            tmp = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                tmp += dYk[d] * Vq2i[d] * Vr2j[d];
+            gAr += tmp * Aq;
+
+            /* --- grad_As ------------------------------------------- */
+            float gAs = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                gAs += dYk[d] * Vq1i[d] * Vr1j[d];
+
+            tmp = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                tmp += dYi[d] * Vr2j[d] * Vs2k[d];
+            gAs += tmp * Ar;
+
+            tmp = 0.f;
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                tmp += dYj[d] * Vq2i[d] * Vs2k[d];
+            gAs += tmp * Aq;
+
+            /* --- Jacobian-corrected grad_A ------------------------- */
+            float grad_A = (gAq -  sumQi ) * Aq
+                         + (gAr -  sumRj ) * Ar
+                         + (gAs -  sumSk ) * As;
+
+            /* --- accumulate contribution to grad_S[k,:] ------------ */
+            #pragma unroll
+            for (int d=0; d<D; ++d)
+                grad_acc[d] += grad_A * Qi[d] * Rj[d];
         }
         __syncthreads();
     }
 
-    if (tid_in_block == 0) {
-        sum_s_vec_out[k_current] = s_reduction_pad[0];
+    /* ---- atomic add to global grad_S ------------------------------- */
+    if (valid) {
+        #pragma unroll
+        for (int d=0; d<D; ++d)
+            atomicAdd(&gSbh[k0*D + d], scale * grad_acc[d]);
     }
 }
 
-
-// Stage 2: Final combination kernel
-__global__ void apply_softmax_backward_optimized_kernel(
-    const float* __restrict__ grad_Aq_slice_in,
-    const float* __restrict__ grad_Ar_slice_in,
-    const float* __restrict__ grad_As_slice_in,
-    const float* __restrict__ Aq_slice_in,
-    const float* __restrict__ Ar_slice_in,
-    const float* __restrict__ As_slice_in,
-    const float* __restrict__ sum_q_vec, // [I]
-    const float* __restrict__ sum_r_vec, // [J]
-    const float* __restrict__ sum_s_vec, // [K]
-    float* __restrict__ grad_A_slice_out, // [I, J, K]
-    int I_dim, int J_dim, int K_dim
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
-    int k = blockIdx.z * blockDim.z + threadIdx.z;
-
-    if (i >= I_dim || j >= J_dim || k >= K_dim) {
-        return;
-    }
-
-    int64_t ijk_idx = (int64_t)i * J_dim * K_dim + (int64_t)j * K_dim + k;
-
-    // Each component is calculated without loops using the pre-computed sums
-    float grad_A_q_comp = (grad_Aq_slice_in[ijk_idx] - sum_q_vec[i]) * Aq_slice_in[ijk_idx];
-    float grad_A_r_comp = (grad_Ar_slice_in[ijk_idx] - sum_r_vec[j]) * Ar_slice_in[ijk_idx];
-    float grad_A_s_comp = (grad_As_slice_in[ijk_idx] - sum_s_vec[k]) * As_slice_in[ijk_idx];
-
-    grad_A_slice_out[ijk_idx] = grad_A_q_comp + grad_A_r_comp + grad_A_s_comp;
-}
-
-
-torch::Tensor apply_softmax_backward_cuda_wrapper(
-    const torch::Tensor& grad_Aq_slice_gpu,
-    const torch::Tensor& grad_Ar_slice_gpu,
-    const torch::Tensor& grad_As_slice_gpu,
-    const torch::Tensor& Aq_slice_gpu,
-    const torch::Tensor& Ar_slice_gpu,
-    const torch::Tensor& As_slice_gpu
-) {
-    TORCH_CHECK(grad_Aq_slice_gpu.is_cuda(), "grad_Aq_slice_gpu must be CUDA");
-    TORCH_CHECK(grad_Aq_slice_gpu.dim() == 3 && Aq_slice_gpu.dim() == 3, "Inputs must be 3D");
-    
-    const int I = grad_Aq_slice_gpu.size(0);
-    const int J = grad_Aq_slice_gpu.size(1);
-    const int K = grad_Aq_slice_gpu.size(2);
-    auto options = grad_Aq_slice_gpu.options();
-
-    // Ensure inputs are contiguous
-    auto grad_Aq_cont = grad_Aq_slice_gpu.contiguous();
-    auto grad_Ar_cont = grad_Ar_slice_gpu.contiguous();
-    auto grad_As_cont = grad_As_slice_gpu.contiguous();
-    auto Aq_cont = Aq_slice_gpu.contiguous();
-    auto Ar_cont = Ar_slice_gpu.contiguous();
-    auto As_cont = As_slice_gpu.contiguous();
-
-    // --- Stage 1: Pre-compute sums ---
-    torch::Tensor sum_q_vec = torch::zeros({I}, options);
-    torch::Tensor sum_r_vec = torch::zeros({J}, options);
-    torch::Tensor sum_s_vec = torch::zeros({K}, options);
-    
-    int threads_per_block = 256; // Common choice for reduction kernels
-
-    // Launch sum_q kernel
-    dim3 gridDim_q(I);
-    dim3 blockDim(threads_per_block);
-    size_t shmem_size = threads_per_block * sizeof(float);
-    compute_softmax_backward_sum_q_kernel<<<gridDim_q, blockDim, shmem_size>>>(
-        grad_Aq_cont.data_ptr<float>(), Aq_cont.data_ptr<float>(), sum_q_vec.data_ptr<float>(), I, J, K
-    );
-
-    // Launch sum_r kernel
-    dim3 gridDim_r(J);
-    compute_softmax_backward_sum_r_kernel<<<gridDim_r, blockDim, shmem_size>>>(
-        grad_Ar_cont.data_ptr<float>(), Ar_cont.data_ptr<float>(), sum_r_vec.data_ptr<float>(), I, J, K
-    );
-
-    // Launch sum_s kernel
-    dim3 gridDim_s(K);
-    compute_softmax_backward_sum_s_kernel<<<gridDim_s, blockDim, shmem_size>>>(
-        grad_As_cont.data_ptr<float>(), As_cont.data_ptr<float>(), sum_s_vec.data_ptr<float>(), I, J, K
-    );
-
-    // --- Stage 2: Final Combination ---
-    torch::Tensor grad_A_slice_out_gpu = torch::zeros({I, J, K}, options);
-    constexpr int BLOCK_DIM_I = 8;
-    constexpr int BLOCK_DIM_J = 8;
-    constexpr int BLOCK_DIM_K = 8; 
-    dim3 blockDim_final(BLOCK_DIM_I, BLOCK_DIM_J, BLOCK_DIM_K);
-    dim3 gridDim_final(
-        (I + BLOCK_DIM_I - 1) / BLOCK_DIM_I,
-        (J + BLOCK_DIM_J - 1) / BLOCK_DIM_J,
-        (K + BLOCK_DIM_K - 1) / BLOCK_DIM_K
-    );
-
-    apply_softmax_backward_optimized_kernel<<<gridDim_final, blockDim_final>>>(
-        grad_Aq_cont.data_ptr<float>(), grad_Ar_cont.data_ptr<float>(), grad_As_cont.data_ptr<float>(),
-        Aq_cont.data_ptr<float>(), Ar_cont.data_ptr<float>(), As_cont.data_ptr<float>(),
-        sum_q_vec.data_ptr<float>(), sum_r_vec.data_ptr<float>(), sum_s_vec.data_ptr<float>(),
-        grad_A_slice_out_gpu.data_ptr<float>(),
-        I, J, K
-    );
-    
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "CUDA error in apply_softmax_backward_cuda_wrapper (optimized): %s\n", cudaGetErrorString(err));
-    }
-
-    return grad_A_slice_out_gpu;
-}
-
-// Kernel to compute gradient for Q, assuming grad_A is pre-computed
-__global__ void grad_Q_kernel(
-    const float* __restrict__ grad_A, // Shape [B, H, I, J, K]
-    const float* __restrict__ R,      // Shape [B, H, J, D]
-    const float* __restrict__ S,      // Shape [B, H, K, D]
-    float*       __restrict__ grad_Q, // Shape [B, H, I, D] - Output
-    const int B, const int H, const int I, const int J, const int K, const int D,
-    const float scale
-) {
-    // --- Calculate indices for this thread ---
-    // Map threads to output elements (b, h, i, d)
-    // Using 1D grid/block for simplicity, can be optimized later
-    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total_elements = (int64_t)B * H * I * D;
-    if (idx >= total_elements) {
-        return;
-    }
-
-    // Decode indices (b, h, i, d) from linear index idx
-    const int d = idx % D;
-    const int64_t temp_idx_d = idx / D;
-    const int i = temp_idx_d % I;
-    const int64_t temp_idx_i = temp_idx_d / I;
-    const int h = temp_idx_i % H;
-    const int b = temp_idx_i / H;
-
-
-    // --- Calculate strides ---
-    const int64_t stride_A_B = (int64_t)H * I * J * K;
-    const int64_t stride_A_H = (int64_t)I * J * K;
-    const int64_t stride_A_I = (int64_t)J * K;
-    const int64_t stride_A_J = (int64_t)K;
-    const int64_t stride_A_K = 1;
-
-    const int64_t stride_R_B = (int64_t)H * J * D;
-    const int64_t stride_R_H = (int64_t)J * D;
-    const int64_t stride_R_J = (int64_t)D;
-    const int64_t stride_R_D = 1;
-
-    const int64_t stride_S_B = (int64_t)H * K * D;
-    const int64_t stride_S_H = (int64_t)K * D;
-    const int64_t stride_S_K = (int64_t)D;
-    const int64_t stride_S_D = 1;
-
-    // Output stride calculation not needed as we write to grad_Q[idx]
-
-
-    // --- Calculate base pointers for this slice (b, h) ---
-    // Note: We need the base for the entire tensors here, not just slices,
-    // because the loops below access elements across different j and k.
-    const float* grad_A_base = grad_A + b * stride_A_B + h * stride_A_H;
-    const float* R_base = R + b * stride_R_B + h * stride_R_H;
-    const float* S_base = S + b * stride_S_B + h * stride_S_H;
-
-
-    // --- Compute sum for grad_Q[b, h, i, d] ---
-    // grad_Q[i,d] = scale * sum_{j,k} ( grad_A[i,j,k] * R[j,d] * S[k,d] )
-    float sum_for_grad_q = 0.0f;
-    for (int j_idx = 0; j_idx < J; ++j_idx) {
-        for (int k_idx = 0; k_idx < K; ++k_idx) {
-            // Calculate linear indices relative to slice base pointers (b,h)
-            // grad_A[i, j, k] within the (b,h) slice
-            int64_t idx_A = (int64_t)i * stride_A_I + (int64_t)j_idx * stride_A_J + (int64_t)k_idx * stride_A_K;
-            // R[j, d] within the (b,h) slice
-            int64_t idx_R = (int64_t)j_idx * stride_R_J + (int64_t)d * stride_R_D;
-            // S[k, d] within the (b,h) slice
-            int64_t idx_S = (int64_t)k_idx * stride_S_K + (int64_t)d * stride_S_D;
-
-            // Accumulate directly as float
-            sum_for_grad_q += grad_A_base[idx_A] * R_base[idx_R] * S_base[idx_S];
-        }
-    }
-
-    grad_Q[idx] = scale * sum_for_grad_q;
-}
-
-// Kernel to compute gradient for R, following grad_Q pattern
-__global__ void grad_R_kernel(
-    const float* __restrict__ grad_A, // Shape [B, H, I, J, K]
-    const float* __restrict__ Q,      // Shape [B, H, I, D]
-    const float* __restrict__ S,      // Shape [B, H, K, D]
-    float*       __restrict__ grad_R, // Shape [B, H, J, D] - Output
-    const int B_dim, const int H_dim, const int I_dim, const int J_dim, const int K_dim, const int D_dim,
-    const float scale
-) {
-    // --- Calculate indices for this thread ---
-    // Map threads to output elements (b, h, j, d)
-    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total_elements = (int64_t)B_dim * H_dim * J_dim * D_dim; // Output shape B*H*J*D
-    if (idx >= total_elements) {
-        return;
-    }
-
-    // Decode indices (b, h, j, d) from linear index idx
-    const int d = idx % D_dim;
-    const int64_t temp_idx_d = idx / D_dim;
-    const int j = temp_idx_d % J_dim;
-    const int64_t temp_idx_j = temp_idx_d / J_dim;
-    const int h = temp_idx_j % H_dim;
-    const int b = temp_idx_j / H_dim;
-
-
-    // --- Calculate strides ---
-    const int64_t stride_A_B = (int64_t)H_dim * I_dim * J_dim * K_dim;
-    const int64_t stride_A_H = (int64_t)I_dim * J_dim * K_dim;
-    const int64_t stride_A_I = (int64_t)J_dim * K_dim;
-    const int64_t stride_A_J = (int64_t)K_dim;
-    const int64_t stride_A_K = 1;
-
-    const int64_t stride_Q_B = (int64_t)H_dim * I_dim * D_dim;
-    const int64_t stride_Q_H = (int64_t)I_dim * D_dim;
-    const int64_t stride_Q_I = (int64_t)D_dim;
-    const int64_t stride_Q_D = 1;
-
-    const int64_t stride_S_B = (int64_t)H_dim * K_dim * D_dim;
-    const int64_t stride_S_H = (int64_t)K_dim * D_dim;
-    const int64_t stride_S_K = (int64_t)D_dim;
-    const int64_t stride_S_D = 1;
-
-    // Output stride calculation not needed as we write to grad_R[idx]
-
-
-    // --- Calculate base pointers for this slice (b, h) ---
-    // Note: We need the base for the entire tensors here, not just slices,
-    // because the loops below access elements across different i and k.
-    const float* grad_A_base = grad_A + b * stride_A_B + h * stride_A_H;
-    const float* Q_base = Q + b * stride_Q_B + h * stride_Q_H;
-    const float* S_base = S + b * stride_S_B + h * stride_S_H;
-
-
-    // --- Compute sum for grad_R[b, h, j, d] ---
-    // grad_R[b, h, j, d] = scale * sum_{i,k} ( grad_A[i,j,k] * Q[i,d] * S[k,d] )
-    float sum_for_grad_r = 0.0f;
-    for (int i_idx = 0; i_idx < I_dim; ++i_idx) {
-        for (int k_idx = 0; k_idx < K_dim; ++k_idx) {
-            // Calculate linear indices relative to slice base pointers (b,h)
-            // grad_A[i, j, k] within the (b,h) slice
-            int64_t idx_A = (int64_t)i_idx * stride_A_I + (int64_t)j * stride_A_J + (int64_t)k_idx * stride_A_K;
-            // Q[i, d] within the (b,h) slice
-            int64_t idx_Q = (int64_t)i_idx * stride_Q_I + (int64_t)d * stride_Q_D;
-            // S[k, d] within the (b,h) slice
-            int64_t idx_S = (int64_t)k_idx * stride_S_K + (int64_t)d * stride_S_D;
-
-            // Accumulate directly as float
-            sum_for_grad_r += grad_A_base[idx_A] * Q_base[idx_Q] * S_base[idx_S];
-        }
-    }
-
-    grad_R[idx] = scale * sum_for_grad_r;
-}
-
-// Kernel to compute gradient for S, following grad_Q/R pattern
-__global__ void grad_S_kernel(
-    const float* __restrict__ grad_A, // Shape [B, H, I, J, K]
-    const float* __restrict__ Q,      // Shape [B, H, I, D]
-    const float* __restrict__ R,      // Shape [B, H, J, D]
-    float*       __restrict__ grad_S, // Shape [B, H, K, D] - Output
-    const int B_dim, const int H_dim, const int I_dim, const int J_dim, const int K_dim, const int D_dim,
-    const float scale
-) {
-    // Map threads to output elements (b, h, k, d)
-    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total_elements = (int64_t)B_dim * H_dim * K_dim * D_dim; // Output shape B*H*K*D
-    if (idx >= total_elements) {
-        return;
-    }
-
-    // Decode indices (b, h, k, d) from linear index idx
-    const int d = idx % D_dim;
-    const int64_t temp_idx_d = idx / D_dim;
-    const int k = temp_idx_d % K_dim; // This thread calculates for grad_S[k,d]
-    const int64_t temp_idx_k = temp_idx_d / K_dim;
-    const int h = temp_idx_k % H_dim;
-    const int b = temp_idx_k / H_dim;
-
-    // Strides for grad_A[B, H, I, J, K]
-    const int64_t stride_A_B = (int64_t)H_dim * I_dim * J_dim * K_dim;
-    const int64_t stride_A_H = (int64_t)I_dim * J_dim * K_dim;
-    const int64_t stride_A_I = (int64_t)J_dim * K_dim;
-    const int64_t stride_A_J = (int64_t)K_dim;
-    const int64_t stride_A_K = 1;
-
-    // Strides for Q[B, H, I, D]
-    const int64_t stride_Q_B = (int64_t)H_dim * I_dim * D_dim;
-    const int64_t stride_Q_H = (int64_t)I_dim * D_dim;
-    const int64_t stride_Q_I = (int64_t)D_dim;
-    const int64_t stride_Q_D = 1;
-
-    // Strides for R[B, H, J, D]
-    const int64_t stride_R_B = (int64_t)H_dim * J_dim * D_dim;
-    const int64_t stride_R_H = (int64_t)J_dim * D_dim;
-    const int64_t stride_R_J = (int64_t)D_dim;
-    const int64_t stride_R_D = 1;
-
-    // Calculate base pointers for this batch/head (b, h)
-    const float* grad_A_base = grad_A + b * stride_A_B + h * stride_A_H;
-    const float* Q_base = Q + b * stride_Q_B + h * stride_Q_H;
-    const float* R_base = R + b * stride_R_B + h * stride_R_H;
-
-    // Compute sum for grad_S[b, h, k, d]
-    // grad_S[k,d] = scale * sum_{i,j} ( grad_A[i,j,k] * Q[i,d] * R[j,d] )
-    float sum_for_grad_s = 0.0f;
-    for (int i_loop = 0; i_loop < I_dim; ++i_loop) { // Sum over i
-        for (int j_loop = 0; j_loop < J_dim; ++j_loop) { // Sum over j
-            // Calculate linear indices relative to slice base pointers (b,h)
-            int64_t idx_A = (int64_t)i_loop * stride_A_I + (int64_t)j_loop * stride_A_J + (int64_t)k * stride_A_K;
-            int64_t idx_Q = (int64_t)i_loop * stride_Q_I + (int64_t)d * stride_Q_D;
-            int64_t idx_R = (int64_t)j_loop * stride_R_J + (int64_t)d * stride_R_D;
-
-            sum_for_grad_s += grad_A_base[idx_A] * Q_base[idx_Q] * R_base[idx_R];
-        }
-    }
-    grad_S[idx] = scale * sum_for_grad_s;
-}
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
-          torch::Tensor, torch::Tensor,
-          torch::Tensor, torch::Tensor,
-          torch::Tensor, torch::Tensor>
-backward_cuda(
-    torch::Tensor grad_output, 
-    torch::Tensor Q,           
-    torch::Tensor R,           
-    torch::Tensor S,           
-    torch::Tensor Vq_1,        
-    torch::Tensor Vq_2,        
-    torch::Tensor Vr_1,        
-    torch::Tensor Vr_2,        
-    torch::Tensor Vs_1,        
-    torch::Tensor Vs_2,        
-    double dropout_rate)
-{
+           torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor>
+backward_cuda(torch::Tensor grad_output,
+              torch::Tensor Q,
+              torch::Tensor R,
+              torch::Tensor S,
+              torch::Tensor Vq_1,
+              torch::Tensor Vq_2,
+              torch::Tensor Vr_1,
+              torch::Tensor Vr_2,
+              torch::Tensor Vs_1,
+              torch::Tensor Vs_2,
+              double dropout_rate) {
+                
+  // ============================================================================
+  // 1. ENSURE ALL TENSORS ARE CONTIGUOUS
+  // ============================================================================
   grad_output = grad_output.contiguous();
-  Q = Q.contiguous();  
-  R = R.contiguous();  
+  Q = Q.contiguous();
+  R = R.contiguous();
   S = S.contiguous();
   Vq_1 = Vq_1.contiguous();
-  Vq_2 = Vq_2.contiguous(); 
+  Vq_2 = Vq_2.contiguous();
   Vr_1 = Vr_1.contiguous();
-  Vr_2 = Vr_2.contiguous(); 
+  Vr_2 = Vr_2.contiguous();
   Vs_1 = Vs_1.contiguous();
-  Vs_2 = Vs_2.contiguous(); 
+  Vs_2 = Vs_2.contiguous();
 
-  // 1) allocate final output gradient tensors
-  auto grad_Q   = torch::zeros_like(Q);
-  auto grad_R   = torch::zeros_like(R); 
-  auto grad_S   = torch::zeros_like(S); 
+  // ============================================================================
+  // 2. EXTRACT DIMENSIONS AND CONSTANTS
+  // ============================================================================
+  const int B = Q.size(0);
+  const int H = Q.size(1);
+  const int N = Q.size(2);
+  const int I = Q.size(2);
+  const int J = R.size(2);
+  const int K = S.size(2);
+  const int D = Q.size(3);
+  const int N_grad = grad_output.size(2);
+  const float scale = 1.0f / sqrtf(static_cast<float>(D));
+
+  // ============================================================================
+  // 3. ALLOCATE TENSORS
+  // ============================================================================
+  auto grad_Q = torch::zeros_like(Q);
+  auto grad_R = torch::zeros_like(R);
+  auto grad_S = torch::zeros_like(S);
   auto grad_Vq_1 = torch::zeros_like(Vq_1);
-  auto grad_Vq_2 = torch::zeros_like(Vq_2); 
+  auto grad_Vq_2 = torch::zeros_like(Vq_2);
   auto grad_Vr_1 = torch::zeros_like(Vr_1);
   auto grad_Vr_2 = torch::zeros_like(Vr_2);
   auto grad_Vs_1 = torch::zeros_like(Vs_1);
   auto grad_Vs_2 = torch::zeros_like(Vs_2);
 
-  // 2) extract dims + scale
-  const int B = Q.size(0);
-  const int H = Q.size(1);
-  const int I = Q.size(2); 
-  const int J = R.size(2); 
-  const int K = S.size(2); 
-  const int D = Q.size(3);
-  const int N_grad = grad_output.size(2); 
+  auto optionsBH = Q.options();
+  auto m_i = torch::empty({B, H, N}, optionsBH);
+  auto l_i = torch::empty({B, H, N}, optionsBH);
+  auto m_j = torch::empty({B, H, N}, optionsBH);
+  auto l_j = torch::empty({B, H, N}, optionsBH);
+  auto m_k = torch::empty({B, H, N}, optionsBH);
+  auto l_k = torch::empty({B, H, N}, optionsBH);
+  auto sum_q = torch::zeros({B, H, N}, optionsBH);
+  auto sum_r = torch::zeros({B, H, N}, optionsBH);
+  auto sum_s = torch::zeros({B, H, N}, optionsBH);
 
-  const float scale = 1.0f / sqrtf((float)D);
-  const int threads = 256; 
+  // ============================================================================
+  // 4. PRECOMPUTE SOFTMAX STATISTICS   
+  // ============================================================================
+  constexpr int block_threads = 256;
 
-  // 3) Compute grad_A tensor on GPU by processing slice by slice - materializes on GPU 
-  auto grad_A_batched_gpu = torch::zeros({B, H, I, J, K}, Q.options()); 
+  // --- Aq (i-centric) stats ---
+  {
+    const size_t shmem_bytes =
+        (D + TILE_J * D + TILE_K * D + TILE_J * TILE_K + block_threads) * sizeof(float);
 
-  for (int b = 0; b < B; ++b) {
+    dim3 blocks(I, B * H);
+    dim3 threads(block_threads);
+
+    softmax_stats_q<<<blocks, threads, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+        Q.data_ptr<float>(),
+        R.data_ptr<float>(),
+        S.data_ptr<float>(),
+        m_i.data_ptr<float>(),
+        l_i.data_ptr<float>(),
+        B, H, N, J, K, D, scale);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      fprintf(stderr, "CUDA error in softmax_stats_q: %s\n", cudaGetErrorString(err));
+    }
+  }
+
+  // --- Ar (j-centric) stats ---
+  {
+    const size_t shmem_bytes =
+        (D                                  /* r_vec */
+         + TILE_I * D + TILE_K * D           /* q_tile + s_tile */
+         + TILE_I * TILE_K                   /* p_tile */
+         + block_threads) * sizeof(float);   /* red_buf */
+
+    dim3 blocks(J, B * H);
+    dim3 threads(block_threads);
+
+    softmax_stats_r<<<blocks, threads, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+        Q.data_ptr<float>(),
+        R.data_ptr<float>(),
+        S.data_ptr<float>(),
+        m_j.data_ptr<float>(),
+        l_j.data_ptr<float>(),
+        B, H, N, J, K, D, scale);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      fprintf(stderr, "CUDA error in softmax_stats_r: %s\n", cudaGetErrorString(err));
+    }
+  }
+
+  // --- As (k-centric) stats ---
+  {
+    const size_t shmem_bytes =
+        (D                                  /* s_vec */
+         + TILE_I * D + TILE_J * D           /* q_tile + r_tile */
+         + TILE_I * TILE_J                   /* p_tile */
+         + block_threads) * sizeof(float);   /* red_buf */
+
+    dim3 blocks(K, B * H);
+    dim3 threads(block_threads);
+
+    softmax_stats_s<<<blocks, threads, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+        Q.data_ptr<float>(),
+        R.data_ptr<float>(),
+        S.data_ptr<float>(),
+        m_k.data_ptr<float>(),
+        l_k.data_ptr<float>(),
+        B, H, N, J, K, D, scale);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      fprintf(stderr, "CUDA error in softmax_stats_s: %s\n", cudaGetErrorString(err));
+    }
+  }
+
+  // ============================================================================
+  // 5. COMPUTE grad_{Vq,Vr,Vs}_1 (GATHER-GRAD KERNELS)
+  // ============================================================================
+  {
+    // --- grad_Vq_1 ---
+    constexpr int TI = T_I;
+    constexpr int TK = T_K;
+
+    dim3 block_dim(TI, TK);
+    dim3 grid_dim((N + TI - 1) / TI, (N + TK - 1) / TK, B * H);
+    size_t shmem_bytes = T_J * D * 3 * sizeof(float);  // R + Vr + gradY
+
+    Vq_gather_grad<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+        Q.data_ptr<float>(),
+        R.data_ptr<float>(),
+        S.data_ptr<float>(),
+        Vs_1.data_ptr<float>(),
+        Vr_1.data_ptr<float>(),
+        grad_output.data_ptr<float>(),
+        m_j.data_ptr<float>(),
+        l_j.data_ptr<float>(),
+        m_k.data_ptr<float>(),
+        l_k.data_ptr<float>(),
+        grad_Vq_1.data_ptr<float>(),
+        N, D, scale);
+  }
+
+  {
+    // --- grad_Vr_1 ---
+    constexpr int TI = T_I;
+    constexpr int TK = T_K;
+
+    dim3 block_dim(TI, TK);
+    dim3 grid_dim((N + TI - 1) / TI, (N + TK - 1) / TK, B * H);
+    size_t shmem_bytes =
+        T_J * D * 3 * sizeof(float) + T_J * 2 * sizeof(float);  // Q + Vq + gradY + mi/li
+
+    Vr_gather_grad<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+        Q.data_ptr<float>(),
+        R.data_ptr<float>(),
+        S.data_ptr<float>(),
+        Vq_1.data_ptr<float>(),
+        Vs_1.data_ptr<float>(),
+        grad_output.data_ptr<float>(),
+        m_i.data_ptr<float>(),
+        l_i.data_ptr<float>(),
+        m_k.data_ptr<float>(),
+        l_k.data_ptr<float>(),
+        grad_Vr_1.data_ptr<float>(),
+        N, D, scale);
+  }
+
+  {
+    // --- grad_Vs_1 ---
+    constexpr int TI = T_I;
+    constexpr int TK = T_K;
+
+    dim3 block_dim(TI, TK);
+    dim3 grid_dim((N + TI - 1) / TI, (N + TK - 1) / TK, B * H);
+    size_t shmem_bytes =
+        T_J * D * 3 * sizeof(float) + T_J * 2 * sizeof(float);  // R + Vr + gradY + mj/lj
+
+    Vs_gather_grad<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+        Q.data_ptr<float>(),
+        R.data_ptr<float>(),
+        S.data_ptr<float>(),
+        Vq_1.data_ptr<float>(),
+        Vr_1.data_ptr<float>(),
+        grad_output.data_ptr<float>(),
+        m_i.data_ptr<float>(),
+        l_i.data_ptr<float>(),
+        m_j.data_ptr<float>(),
+        l_j.data_ptr<float>(),
+        grad_Vs_1.data_ptr<float>(),
+        N, D, scale);
+  }
+
+  // ============================================================================
+  // 6. COMPUTE grad_{Vq,Vr,Vs}_2 (SCATTER-GRAD KERNELS)
+  // ============================================================================
+  {
+    // --- grad_Vq_2 ---
+    constexpr int TI = T_I;
+    constexpr int TK = T_K;
+
+    dim3 block_dim(TI, TK);
+    dim3 grid_dim((N + TI - 1) / TI, (N + TK - 1) / TK, B * H);
+    size_t shmem_bytes =
+        T_J * D * 3 * sizeof(float) + T_J * 2 * sizeof(float);
+
+    Vq_scatter_grad<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+        Q.data_ptr<float>(),
+        R.data_ptr<float>(),
+        S.data_ptr<float>(),
+        Vr_2.data_ptr<float>(),
+        Vs_2.data_ptr<float>(),
+        grad_output.data_ptr<float>(),
+        m_i.data_ptr<float>(),
+        l_i.data_ptr<float>(),
+        m_j.data_ptr<float>(),
+        l_j.data_ptr<float>(),
+        m_k.data_ptr<float>(),
+        l_k.data_ptr<float>(),
+        grad_Vq_2.data_ptr<float>(),
+        N, D, scale);
+
+    AT_CUDA_CHECK(cudaGetLastError());
+  }
+
+  {
+    // --- grad_Vr_2 ---
+    constexpr int TI = T_I;
+    constexpr int TK = T_K;
+
+    dim3 block_dim(TI, TK);
+    dim3 grid_dim((N + TI - 1) / TI, (N + TK - 1) / TK, B * H);
+    size_t shmem_bytes =
+        T_J * D * 3 * sizeof(float) + T_J * 2 * sizeof(float);
+
+    Vr_scatter_grad<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+        Q.data_ptr<float>(),
+        R.data_ptr<float>(),
+        S.data_ptr<float>(),
+        Vq_2.data_ptr<float>(),
+        Vs_2.data_ptr<float>(),
+        grad_output.data_ptr<float>(),
+        m_i.data_ptr<float>(),
+        l_i.data_ptr<float>(),
+        m_j.data_ptr<float>(),
+        l_j.data_ptr<float>(),
+        m_k.data_ptr<float>(),
+        l_k.data_ptr<float>(),
+        grad_Vr_2.data_ptr<float>(),
+        N, D, scale);
+  }
+
+  {
+    // --- grad_Vs_2 ---
+    constexpr int TI = T_I;
+    constexpr int TK = T_K;
+
+    dim3 block_dim(TI, TK);
+    dim3 grid_dim((N + TI - 1) / TI, (N + TK - 1) / TK, B * H);
+    size_t shmem_bytes =
+        T_J * D * 3 * sizeof(float) + T_J * 2 * sizeof(float);
+
+    Vs_scatter_grad<<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+        Q.data_ptr<float>(),
+        R.data_ptr<float>(),
+        S.data_ptr<float>(),
+        Vq_2.data_ptr<float>(),
+        Vr_2.data_ptr<float>(),
+        grad_output.data_ptr<float>(),
+        m_i.data_ptr<float>(),
+        l_i.data_ptr<float>(),
+        m_j.data_ptr<float>(),
+        l_j.data_ptr<float>(),
+        m_k.data_ptr<float>(),
+        l_k.data_ptr<float>(),
+        grad_Vs_2.data_ptr<float>(),
+        N, D, scale);
+  }
+
+
+  // ===========================================================================
+  // 7. PRECOMPUTE JACOBIAN CORRECTIONS for grad_Q, R, S
+  // ============================================================================
+  {
+    // --- Correction sums shared by grad_Q/grad_R/grad_S ---
+    constexpr int Bq = 8;
+    constexpr int Br = 8;
+    constexpr int Bk = 8;
+
+    dim3 grid(ceil_div(N, Bq), ceil_div(N, Br), ceil_div(N, Bk));
+    dim3 threads(Bq, Br, Bk);
+
+    const size_t shmem_bytes =
+        (Bq * D + Br * D + Bk * D +   // Q, R, S
+         Bq * D + Bq * D +            // Vq1, Vq2
+         Br * D + Br * D +            // Vr1, Vr2
+         Bk * D + Bk * D +            // Vs1, Vs2
+         Bq * D + Br * D + Bk * D)    // dY
+        * sizeof(float);
+
+    for (int b = 0; b < B; ++b) {
       for (int h = 0; h < H; ++h) {
-          // Get GPU slices for current (b,h)
-          auto Q_slice_gpu = Q.select(0, b).select(0, h);
-          auto R_slice_gpu = R.select(0, b).select(0, h);
-          auto S_slice_gpu = S.select(0, b).select(0, h);
-          auto grad_output_slice_gpu = grad_output.select(0, b).select(0, h);
-          auto Vq_1_slice_gpu = Vq_1.select(0, b).select(0, h);
-          auto Vq_2_slice_gpu = Vq_2.select(0, b).select(0, h);
-          auto Vr_1_slice_gpu = Vr_1.select(0, b).select(0, h);
-          auto Vr_2_slice_gpu = Vr_2.select(0, b).select(0, h);
-          auto Vs_1_slice_gpu = Vs_1.select(0, b).select(0, h);
-          auto Vs_2_slice_gpu = Vs_2.select(0, b).select(0, h);
-        
-          torch::Tensor A_slice_gpu = compute_A_slice_cuda_wrapper(
-              Q_slice_gpu, R_slice_gpu, S_slice_gpu, scale
-          );
-          
-          torch::Tensor Aq_slice_gpu = compute_Aq_slice_cuda_wrapper(A_slice_gpu);
-          torch::Tensor Ar_slice_gpu = compute_Ar_slice_cuda_wrapper(A_slice_gpu);
-          torch::Tensor As_slice_gpu = compute_As_slice_cuda_wrapper(A_slice_gpu);
-
-                    // --- Launch OPTIMIZED gather kernels for V1 grads ---
-          {
-              auto gradVq1_slice = grad_Vq_1.select(0, b).select(0, h);
-              const int64_t N_kernel = (int64_t)I * D;
-              const dim3 blocks((N_kernel + threads - 1) / threads);
-              gather_grad_Vq1_kernel_optimized<<<blocks, threads>>>(
-                  grad_output_slice_gpu.data_ptr<float>(),
-                  Vr_1_slice_gpu.data_ptr<float>(),
-                  Vs_1_slice_gpu.data_ptr<float>(),
-                  Ar_slice_gpu.data_ptr<float>(),
-                  As_slice_gpu.data_ptr<float>(),
-                  gradVq1_slice.data_ptr<float>(),
-                  I, J, K, D, N_grad
-              );
-          }
-          {
-              auto gradVr1_slice = grad_Vr_1.select(0, b).select(0, h);
-              const int64_t N_kernel = (int64_t)J * D;
-              const dim3 blocks((N_kernel + threads - 1) / threads);
-              gather_grad_Vr1_kernel_optimized<<<blocks, threads>>>(
-                  grad_output_slice_gpu.data_ptr<float>(),
-                  Vq_1_slice_gpu.data_ptr<float>(),
-                  Vs_1_slice_gpu.data_ptr<float>(),
-                  Aq_slice_gpu.data_ptr<float>(),
-                  As_slice_gpu.data_ptr<float>(),
-                  gradVr1_slice.data_ptr<float>(),
-                  I, J, K, D, N_grad
-              );
-          }
-          {
-              auto gradVs1_slice = grad_Vs_1.select(0, b).select(0, h);
-              const int64_t N_kernel = (int64_t)K * D;
-              const dim3 blocks((N_kernel + threads - 1) / threads);
-              gather_grad_Vs1_kernel_optimized<<<blocks, threads>>>(
-                  grad_output_slice_gpu.data_ptr<float>(),
-                  Vq_1_slice_gpu.data_ptr<float>(),
-                  Vr_1_slice_gpu.data_ptr<float>(),
-                  Aq_slice_gpu.data_ptr<float>(),
-                  Ar_slice_gpu.data_ptr<float>(),
-                  gradVs1_slice.data_ptr<float>(),
-                  I, J, K, D, N_grad
-              );
-          }
-          
-          {
-              auto gradVq2_slice = grad_Vq_2.select(0, b).select(0, h);
-              const int64_t N_kernel = (int64_t)I * D;
-              const dim3 blocks((N_kernel + threads - 1) / threads);
-              scatter_grad_Vq2_kernel_optimized<<<blocks, threads>>>(
-                  grad_output_slice_gpu.data_ptr<float>(),
-                  Aq_slice_gpu.data_ptr<float>(), Ar_slice_gpu.data_ptr<float>(), As_slice_gpu.data_ptr<float>(),
-                  Vr_2_slice_gpu.data_ptr<float>(), Vs_2_slice_gpu.data_ptr<float>(),
-                  gradVq2_slice.data_ptr<float>(),
-                  I, J, K, D, N_grad
-              );
-          }
-          {
-              auto gradVr2_slice = grad_Vr_2.select(0, b).select(0, h);
-              const int64_t N_kernel = (int64_t)J * D;
-              const dim3 blocks((N_kernel + threads - 1) / threads);
-              scatter_grad_Vr2_kernel_optimized<<<blocks, threads>>>(
-                  grad_output_slice_gpu.data_ptr<float>(),
-                  Aq_slice_gpu.data_ptr<float>(), Ar_slice_gpu.data_ptr<float>(), As_slice_gpu.data_ptr<float>(),
-                  Vq_2_slice_gpu.data_ptr<float>(), Vs_2_slice_gpu.data_ptr<float>(),
-                  gradVr2_slice.data_ptr<float>(),
-                  I, J, K, D, N_grad
-              );
-          }
-          {
-              auto gradVs2_slice = grad_Vs_2.select(0, b).select(0, h);
-              const int64_t N_kernel = (int64_t)K * D;
-              const dim3 blocks((N_kernel + threads - 1) / threads);
-              scatter_grad_Vs2_kernel_optimized<<<blocks, threads>>>(
-                  grad_output_slice_gpu.data_ptr<float>(),
-                  Aq_slice_gpu.data_ptr<float>(), Ar_slice_gpu.data_ptr<float>(), As_slice_gpu.data_ptr<float>(),
-                  Vq_2_slice_gpu.data_ptr<float>(), Vr_2_slice_gpu.data_ptr<float>(),
-                  gradVs2_slice.data_ptr<float>(),
-                  I, J, K, D, N_grad
-              );
-          }
-          torch::Tensor grad_Aq_slice_gpu_tmp, grad_Ar_slice_gpu_tmp, grad_As_slice_gpu_tmp;
-          std::tie(grad_Aq_slice_gpu_tmp, grad_Ar_slice_gpu_tmp, grad_As_slice_gpu_tmp) = 
-              compute_interim_grads_cuda_wrapper(
-                  grad_output_slice_gpu, 
-                  Vq_1_slice_gpu, Vq_2_slice_gpu, 
-                  Vr_1_slice_gpu, Vr_2_slice_gpu, 
-                  Vs_1_slice_gpu, Vs_2_slice_gpu, 
-                  Aq_slice_gpu, Ar_slice_gpu, As_slice_gpu);
-          
-          torch::Tensor final_grad_A_slice_gpu = apply_softmax_backward_cuda_wrapper(
-              grad_Aq_slice_gpu_tmp, grad_Ar_slice_gpu_tmp, grad_As_slice_gpu_tmp,
-              Aq_slice_gpu, Ar_slice_gpu, As_slice_gpu
-          );
-          // ----------------------------------------------------------------
-
-          // Copy the computed slice into the full batched grad_A tensor on GPU
-          grad_A_batched_gpu.select(0, b).select(0, h).copy_(final_grad_A_slice_gpu);
+        jacobian_corrections<Bq, Br, Bk><<<grid, threads, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+            Q.select(0, b).select(0, h).data_ptr<float>(),
+            R.select(0, b).select(0, h).data_ptr<float>(),
+            S.select(0, b).select(0, h).data_ptr<float>(),
+            Vq_1.select(0, b).select(0, h).data_ptr<float>(),
+            Vq_2.select(0, b).select(0, h).data_ptr<float>(),
+            Vr_1.select(0, b).select(0, h).data_ptr<float>(),
+            Vr_2.select(0, b).select(0, h).data_ptr<float>(),
+            Vs_1.select(0, b).select(0, h).data_ptr<float>(),
+            Vs_2.select(0, b).select(0, h).data_ptr<float>(),
+            grad_output.select(0, b).select(0, h).data_ptr<float>(),
+            m_i.select(0, b).select(0, h).data_ptr<float>(),
+            l_i.select(0, b).select(0, h).data_ptr<float>(),
+            m_j.select(0, b).select(0, h).data_ptr<float>(),
+            l_j.select(0, b).select(0, h).data_ptr<float>(),
+            m_k.select(0, b).select(0, h).data_ptr<float>(),
+            l_k.select(0, b).select(0, h).data_ptr<float>(),
+            sum_q.select(0, b).select(0, h).data_ptr<float>(),
+            sum_r.select(0, b).select(0, h).data_ptr<float>(),
+            sum_s.select(0, b).select(0, h).data_ptr<float>(),
+            N, D, scale);
       }
-  }
-  // Error check after grad_A computation loop
-  cudaError_t ga_err = cudaGetLastError();
-  if (ga_err != cudaSuccess) {
-    fprintf(stderr, "CUDA error after grad_A loop in backward_cuda: %s\n", cudaGetErrorString(ga_err));
-  }
+    }
 
-  // --- 5. Launch kernelS for full grad_Q/R/S using the full grad_A_batched_gpu ---
-  {
-      const int64_t N_kernel_Q = (int64_t)B * H * I * D; //output size for grad_Q/R/S
-      const dim3 blocks_Q((N_kernel_Q + threads - 1) / threads);
-      grad_Q_kernel<<<blocks_Q, threads>>>( 
-          grad_A_batched_gpu.data_ptr<float>(), 
-          R.data_ptr<float>(),                  
-          S.data_ptr<float>(),                  
-          grad_Q.data_ptr<float>(),             
-          B, H, I, J, K, D, scale);      
-  }  
-  {
-      const int64_t N_kernel_R = (int64_t)B * H * J * D; 
-      const dim3 blocks_R((N_kernel_R + threads - 1) / threads);
-      grad_R_kernel<<<blocks_R, threads>>>( 
-          grad_A_batched_gpu.data_ptr<float>(), 
-          Q.data_ptr<float>(),                 
-          S.data_ptr<float>(),                 
-          grad_R.data_ptr<float>(),            
-          B, H, I, J, K, D, scale);
-   }
-
-  {
-      const int64_t N_kernel_S = (int64_t)B * H * K * D; 
-      const dim3 blocks_S((N_kernel_S + threads - 1) / threads);
-      grad_S_kernel<<<blocks_S, threads>>>( 
-          grad_A_batched_gpu.data_ptr<float>(), 
-          Q.data_ptr<float>(),                 
-          R.data_ptr<float>(),                 
-          grad_S.data_ptr<float>(),            
-          B, H, I, J, K, D, scale);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      fprintf(stderr, "CUDA error in precompute_jacobian_corrections launch: %s\n", cudaGetErrorString(err));
+    }
   }
 
-  cudaDeviceSynchronize(); 
+  // ===========================================================================
+  // 8. COMPUTE grad_Q, R, S
+  // ============================================================================   
+
+  {
+    // --- grad_Q accumulation ---
+    constexpr int tileI = TILE_I;  // reuse existing macro defaults (8)
+    constexpr int tileK = TILE_K;
+    constexpr int tileJ = 16;      // independent knob for J streaming
+
+    TORCH_CHECK(D <= MAX_D_REG,
+                "Q_grad requires D <= ",
+                MAX_D_REG,
+                ", but got D = ",
+                D);
+
+    dim3 block_dim(tileI, tileK);
+    dim3 grid_dim((N + tileI - 1) / tileI,
+                  (N + tileK - 1) / tileK,
+                  B * H);
+
+    const size_t shmem_bytes =
+        4 * tileJ * D * sizeof(float) +  // R, Vr1, Vr2, gYj
+        3 * tileJ * sizeof(float);       // mj, lj, sum_r
+
+    Q_grad<tileI, tileJ, tileK>
+        <<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+            Q.data_ptr<float>(),
+            R.data_ptr<float>(),
+            S.data_ptr<float>(),
+            Vq_1.data_ptr<float>(),
+            Vq_2.data_ptr<float>(),
+            Vr_1.data_ptr<float>(),
+            Vr_2.data_ptr<float>(),
+            Vs_1.data_ptr<float>(),
+            Vs_2.data_ptr<float>(),
+            grad_output.data_ptr<float>(),
+            m_i.data_ptr<float>(),
+            l_i.data_ptr<float>(),
+            m_j.data_ptr<float>(),
+            l_j.data_ptr<float>(),
+            m_k.data_ptr<float>(),
+            l_k.data_ptr<float>(),
+            sum_q.data_ptr<float>(),
+            sum_r.data_ptr<float>(),
+            sum_s.data_ptr<float>(),
+            grad_Q.data_ptr<float>(),
+            N, D, scale);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      fprintf(stderr, "CUDA error in Q_grad launch: %s\n", cudaGetErrorString(err));
+    }
+
+  }
+
+  {
+    // --- grad_R accumulation ---
+    constexpr int tileJ = TILE_J;  // reuse macro defaults for target axis
+    constexpr int tileK = TILE_K;
+    constexpr int tileI = 16;      // independent knob for I streaming
+
+    TORCH_CHECK(D <= MAX_D_REG,
+                "R_grad requires D <= ",
+                MAX_D_REG,
+                ", but got D = ",
+                D);
+
+    dim3 block_dim(tileJ, tileK);
+    dim3 grid_dim((N + tileJ - 1) / tileJ,
+                  (N + tileK - 1) / tileK,
+                  B * H);
+
+    const size_t shmem_bytes =
+        (4 * tileI * D + 3 * tileI) * sizeof(float);  // Q, Vq1, Vq2, dY + stats
+
+    R_grad<tileJ, tileI, tileK>
+        <<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+            Q.data_ptr<float>(),
+            R.data_ptr<float>(),
+            S.data_ptr<float>(),
+            Vq_1.data_ptr<float>(),
+            Vq_2.data_ptr<float>(),
+            Vr_1.data_ptr<float>(),
+            Vr_2.data_ptr<float>(),
+            Vs_1.data_ptr<float>(),
+            Vs_2.data_ptr<float>(),
+            grad_output.data_ptr<float>(),
+            m_i.data_ptr<float>(),
+            l_i.data_ptr<float>(),
+            m_j.data_ptr<float>(),
+            l_j.data_ptr<float>(),
+            m_k.data_ptr<float>(),
+            l_k.data_ptr<float>(),
+            sum_q.data_ptr<float>(),
+            sum_r.data_ptr<float>(),
+            sum_s.data_ptr<float>(),
+            grad_R.data_ptr<float>(),
+            N, D, scale);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      fprintf(stderr, "CUDA error in R_grad launch: %s\n", cudaGetErrorString(err));
+    }
+
+  }
+
+  {
+    // --- grad_S accumulation ---
+    constexpr int tileK = TILE_K;
+    constexpr int tileI = TILE_I;
+    constexpr int tileJ = 16;      // stream over J independently
+
+    TORCH_CHECK(D <= MAX_D_REG,
+                "S_grad requires D <= ",
+                MAX_D_REG,
+                ", but got D = ",
+                D);
+
+    dim3 block_dim(tileK, tileI);
+    dim3 grid_dim((N + tileK - 1) / tileK,
+                  (N + tileI - 1) / tileI,
+                  B * H);
+
+    const size_t shmem_bytes =
+        4 * tileJ * D * sizeof(float) + 3 * tileJ * sizeof(float);
+
+    S_grad<tileK, tileJ, tileI>
+        <<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+            Q.data_ptr<float>(),
+            R.data_ptr<float>(),
+            S.data_ptr<float>(),
+            Vq_1.data_ptr<float>(),
+            Vq_2.data_ptr<float>(),
+            Vr_1.data_ptr<float>(),
+            Vr_2.data_ptr<float>(),
+            Vs_1.data_ptr<float>(),
+            Vs_2.data_ptr<float>(),
+            grad_output.data_ptr<float>(),
+            m_i.data_ptr<float>(),
+            l_i.data_ptr<float>(),
+            m_j.data_ptr<float>(),
+            l_j.data_ptr<float>(),
+            m_k.data_ptr<float>(),
+            l_k.data_ptr<float>(),
+            sum_q.data_ptr<float>(),
+            sum_r.data_ptr<float>(),
+            sum_s.data_ptr<float>(),
+            grad_S.data_ptr<float>(),
+            N, D, scale);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      fprintf(stderr, "CUDA error in S_grad launch: %s\n", cudaGetErrorString(err));
+    }
+
+  }
+
+  cudaDeviceSynchronize();
 
   return std::make_tuple(
-      grad_Q, grad_R, grad_S,
-      grad_Vq_1, grad_Vq_2, 
-      grad_Vr_1, grad_Vr_2,
-      grad_Vs_1, grad_Vs_2
-  );
+      grad_Q,
+      grad_R,
+      grad_S,
+      grad_Vq_1,
+      grad_Vq_2,
+      grad_Vr_1,
+      grad_Vr_2,
+      grad_Vs_1,
+      grad_Vs_2);
 }
-
-
 
