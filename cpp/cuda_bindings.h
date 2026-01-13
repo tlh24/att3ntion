@@ -10,7 +10,6 @@
 #include <torch/extension.h>
 #include <tuple>
 
-// Forward pass - implemented in cuda/forward.cu
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 forward_cuda(
     at::Tensor Q, at::Tensor R, at::Tensor S,
@@ -19,7 +18,6 @@ forward_cuda(
     at::Tensor Vs_1, at::Tensor Vs_2,
     double dropout_rate = 0.0);
 
-// Backward pass - implemented in cuda/backward.cu
 std::tuple<at::Tensor, at::Tensor, at::Tensor,
            at::Tensor, at::Tensor, at::Tensor,
            at::Tensor, at::Tensor, at::Tensor>
