@@ -3,13 +3,12 @@
 **Hypergraph attention: 3-way attention between token triplets, with O(N) memory scaling.**
 
 ## Quick Start
-
+Clone this repository, then: 
 ```bash
 # Install
-git clone https://github.com/YOUR_USERNAME/att3ntion.git
 cd att3ntion
 pip install -r requirements.txt
-pip install -e .
+pip install -e .   
 
 # Run demo
 python demo.py              # Basic usage
@@ -31,11 +30,11 @@ x = torch.randn(batch_size, seq_len, d_model, device='cuda')
 y = layer(x)  # Same shape as input
 ```
 
-## Notes
+## Synopsis
 
 
-- **3-way token interactions**: Models relationships between triplets (Q, R, S) instead of pairwise relationships typical in standard self-attention. Read more below (see Theory).
-- **O(N) memory**: The naive implementation would require O(N³) memory for the attention tensor. This library uses Flash-style tiling and online streaming techniques to reduce memory complexity from O(N³) to O(N), making 3-way attention feasible. However, the kernels are not yet fully optimized for speed — this is a work in progress!
+- **3-way token interactions**: Models relationships between triplets $(Q, R, S)$ instead of pairwise relationships typical in standard self-attention. For more information & motivation, see **Theory**, below.
+- **O(N) memory**: The naive implementation would require $O(N^3)$ memory for the attention tensor. This library uses Flash-style tiling and online streaming techniques to reduce memory complexity from $O(N^3)$ to $O(N)$, making 3-way attention feasible. However, the kernels are not yet fully optimized for _speed_ — this is a work in progress!
 
 | Seq Length | att3ntion | Naive O(N³) | Savings |
 |------------|-----------|-------------|---------|
@@ -49,18 +48,6 @@ Run `python demo.py --memory` to benchmark on your hardware.
 
 ---
 
-## Project Structure
-
-```
-att3ntion/
-├── demo.py                    # Interactive demo
-├── hypergraph_attention.py    # Main PyTorch module
-├── pure_pytorch_reference.py  # Naive reference implementation
-├── cpp/                       # C++ bindings
-├── cuda/                      # CUDA kernels (forward.cu, backward.cu)
-└── tests/                     # Benchmarks and equivalence tests
-```
-
 
 ## Requirements
 
@@ -69,6 +56,7 @@ att3ntion/
 - PyTorch 2.0+ with CUDA support
 - CUDA Toolkit 11.8+
 - NVIDIA GPU (tested on RTX 4080)
+- {You may need to downgrade GCC to work with NVCC}
 
 ---
 
@@ -93,9 +81,9 @@ Above, $b$ is the batch dimension, $h$ head dim, $i$ ranges over the query token
 [L1 attention](https://github.com/tlh24/l1-attention) experimented with using the L1 norm to measure similarity between $Q$ and $K$. In the course of these experiments, it was realized that you can bidirectionalize attention, so that $Q$ gets info from $K$'s, and $Q$ sends info to $K$ as well - affording both 'gather' and 'scatter' operations. In preliminary experiments, this improves convergence on function-approximation test fixtures by ~ 2x, (depending on the problem type, sometimes bidirectional attention is required for convergence). 
 (The 'gather' and 'scatter' $W_V$ can either be tied or independent -- more testing is needed on a wider variety of problems.)
 
-Conditional scatter and gather operations are core elements of CS algorithms, and given enough memory and time[^1], they should be able to approximate any function.  Yet some seemingly fundamental operations are poorly expressed in these conditional message passing primitives.  For example, model inference: based on structure between pairs of tokens (detectable, presumably, in the latent space), you ought to modify another token - not either of the pair.  Alternately, you cannot by fiat 'create' a linkage or edge between tokens with normal attention: attention is ephemeral and dependent on structure within the latent dimensions, and cannot be easily modified, only instantiated.  Creating linkages requires being able to 'write' to more than one token at the same time.  
+Conditional scatter and gather operations are core elements of CS algorithms, and given enough memory and time[^1], they should be able to approximate any function.  Yet some seemingly fundamental operations are poorly expressed in these conditional message passing primitives.  For example, model inference: based on **structure between pairs** of tokens (detectable, presumably, in the latent space), you ought to modify _another_ token - not either of the pair.  Alternately, you cannot by fiat 'create' a linkage or edge between tokens with normal attention: attention is ephemeral and dependent on structure within the latent dimensions; it cannot be easily modified, only instantiated.  Creating linkages requires being able to 'write' to more than one token at the same time. 
 
-An experimental solution to this problem is to allow for higher-order operations on the graph of relations between tokens; the first step of which is to increase the arity of the attention operation.  
+An experimental solution to this problem is to allow for higher-order operations on the graph of relations between tokens; the first step of which is to increase the arity of the attention operation. 
 
 Assume that you measure some similarity between three tokens, $Q,R,S$  ('K' is replaced by 'S' to avoid naming confusion - the corresponding natural indexes are then $i,j,k$).  Raw attention becomes:
 
@@ -167,4 +155,18 @@ The above summations would suggest that a full $\large A[..]$ is required for ca
 
 ---
 
-[^1]: Normal transformers can have limitless computation via autoregression, but are highly limited in internal memory by their fixed latent space.  Sure, you can have an expanding list of tokens in the (also limited) context window, but each head is  limited in the number of latent-space "named" global variables.  This is a deep problem for another time. 
+[^1]: Normal transformers can have limitless computation via autoregression, but are highly limited in internal memory by their fixed latent space.  Sure, you can have an expanding list of tokens in the (also limited) context window, but each head is  limited in the number of latent-space "named" global variables.  This is a deep problem that can be _partly_ addressed by hypergraph attention. 
+
+---
+
+## Project Structure
+
+```
+att3ntion/
+├── demo.py                    # Interactive demo
+├── hypergraph_attention.py    # Main PyTorch module
+├── pure_pytorch_reference.py  # Naive reference implementation
+├── cpp/                       # C++ bindings
+├── cuda/                      # CUDA kernels (forward.cu, backward.cu)
+└── tests/                     # Benchmarks and equivalence tests
+```
