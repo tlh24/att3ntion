@@ -9,7 +9,7 @@
 git clone https://github.com/YOUR_USERNAME/att3ntion.git
 cd att3ntion
 pip install -r requirements.txt
-python setup.py develop
+pip install -e .
 
 # Run demo
 python demo.py              # Basic usage
