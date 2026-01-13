@@ -52,12 +52,11 @@ Run `python demo.py --memory` to benchmark on your hardware.
 ## Requirements
 
 - Developed and tested on an **NVIDIA RTX 4080**. Should work on any CUDA-capable GPU with compute capability 7.0+ (Volta and newer).
-- If you have an older GPU, please edit setup.py line 
-``` '-gencode=arch=compute_86,code=sm_86' ``` to match https://developer.nvidia.com/cuda/gpus 
 - Python 3.10+
 - PyTorch 2.0+ with CUDA support
 - CUDA Toolkit 11.8+
 - NVIDIA GPU (tested on RTX 4080)
+- {You may need to downgrade GCC to work with NVCC}
 
 ---
 
