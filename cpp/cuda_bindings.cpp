@@ -19,7 +19,7 @@
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &forward_cuda,
-          "Hypergraph Attention forward (returns Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_)",
+          "Hypergraph Attention forward (returns Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_, m_i, l_i, m_j, l_j, m_k, l_k)",
           py::arg("Q"),
           py::arg("R"),
           py::arg("S"),
@@ -32,7 +32,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("dropout_rate") = 0.0);
 
     m.def("backward", &backward_cuda,
-          "Hypergraph Attention backward (returns dQ, dR, dS, dVq_1, dVq_2, dVr_1, dVr_2, dVs_1, dVs_2)",
+          "Hypergraph Attention backward (requires pre-computed softmax stats from forward pass)",
           py::arg("grad_output"),
           py::arg("Q"),
           py::arg("R"),
@@ -43,5 +43,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("Vr_2"),
           py::arg("Vs_1"),
           py::arg("Vs_2"),
+          py::arg("m_i"),
+          py::arg("l_i"),
+          py::arg("m_j"),
+          py::arg("l_j"),
+          py::arg("m_k"),
+          py::arg("l_k"),
           py::arg("dropout_rate") = 0.0);
 }
