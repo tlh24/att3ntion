@@ -27,6 +27,8 @@ void Yq_gather(
     const float4* __restrict__ V1_f4, // Vr_1
     const float4* __restrict__ V2_f4, // Vs_1
     float*       __restrict__ Y,  // Y_q
+    float*       __restrict__ m_i_out,  // softmax stats output (can be nullptr)
+    float*       __restrict__ l_i_out,  // softmax stats output (can be nullptr)
     int B, int H, int I, int J, int K, int D, float scale)
 {
     // --- Grid Mapping and Block Setup ---
@@ -204,6 +206,13 @@ void Yq_gather(
     // --- Write Final Output from Shared to Global Memory ---
     for(int d = tid; d < D; d += block_size) {
         Y[q_base_off + d] = o_sh[d];
+    }
+    
+    // --- Write Softmax Stats (if output pointers provided) ---
+    if (tid == 0 && m_i_out != nullptr && l_i_out != nullptr) {
+        int64_t stats_idx = ((int64_t)b * H + h) * I + i;
+        m_i_out[stats_idx] = m_l_sh[0];
+        l_i_out[stats_idx] = m_l_sh[1];
     }
 }
 
@@ -423,6 +432,8 @@ void Yr_gather(
     const float4* __restrict__ V1_f4, // Vq_1
     const float4* __restrict__ V2_f4, // Vs_1
     float*       __restrict__ Y,      // Y_r
+    float*       __restrict__ m_j_out,  // softmax stats output (can be nullptr)
+    float*       __restrict__ l_j_out,  // softmax stats output (can be nullptr)
     int B, int H, int I, int J, int K, int D, float scale)
 {
     // --- Grid Mapping and Block Setup ---
@@ -567,6 +578,13 @@ void Yr_gather(
     // --- Write Final Output to Global Memory ---
     for(int d = tid; d < D; d += block_size) {
         Y[query_base_off + d] = o_sh[d];
+    }
+    
+    // --- Write Softmax Stats (if output pointers provided) ---
+    if (tid == 0 && m_j_out != nullptr && l_j_out != nullptr) {
+        int64_t stats_idx = ((int64_t)b * H + h) * J + j;
+        m_j_out[stats_idx] = m_l_sh[0];
+        l_j_out[stats_idx] = m_l_sh[1];
     }
 }
 
@@ -756,6 +774,8 @@ void Ys_gather(
     const float4* __restrict__ V1_f4, // Vq_1
     const float4* __restrict__ V2_f4, // Vr_1
     float*       __restrict__ Y,      // Y_s
+    float*       __restrict__ m_k_out,  // softmax stats output (can be nullptr)
+    float*       __restrict__ l_k_out,  // softmax stats output (can be nullptr)
     int B, int H, int I, int J, int K, int D, float scale)
 {
     // --- Grid Mapping and Block Setup ---
@@ -900,6 +920,13 @@ void Ys_gather(
     // --- Write Final Output to Global Memory ---
     for(int d = tid; d < D; d += block_size) {
         Y[query_base_off + d] = o_sh[d];
+    }
+    
+    // --- Write Softmax Stats (if output pointers provided) ---
+    if (tid == 0 && m_k_out != nullptr && l_k_out != nullptr) {
+        int64_t stats_idx = ((int64_t)b * H + h) * K + k;
+        m_k_out[stats_idx] = m_l_sh[0];
+        l_k_out[stats_idx] = m_l_sh[1];
     }
 }
 
@@ -1400,48 +1427,6 @@ void Yq_scatter_launcher_with_stats(
     );
 }
 
-// Legacy version that computes its own stats (for backward compatibility)
-void Yq_scatter_launcher(
-    const at::Tensor& Q, const at::Tensor& R, const at::Tensor& S,
-    const at::Tensor& Vr_2, const at::Tensor& Vs_2,
-    at::Tensor& Y_q_, float scale
-) {
-    const auto B = Q.size(0);
-    const auto H = Q.size(1);
-    const auto I = Q.size(2);
-    const auto J = R.size(2);
-    const auto K = S.size(2);
-    const auto D = Q.size(3);
-    auto opts = Q.options();
-
-    auto m_j = torch::zeros({B, H, J}, opts);
-    auto l_j = torch::zeros({B, H, J}, opts);
-    auto m_k = torch::zeros({B, H, K}, opts);
-    auto l_k = torch::zeros({B, H, K}, opts);
-
-    const int stats_threads = 256;
-    { // Ar stats
-        dim3 grid(J, B * H);
-        dim3 block(stats_threads);
-        size_t smem_size = sizeof(float) * (D + TILE_I*D + TILE_K*D + TILE_I*TILE_K + stats_threads);
-        softmax_stats_r<<<grid, block, smem_size>>>(
-            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
-            m_j.data_ptr<float>(), l_j.data_ptr<float>(),
-            B, H, I, J, K, D, scale);
-    }
-    { // As stats
-        dim3 grid(K, B * H);
-        dim3 block(stats_threads);
-        size_t smem_size = sizeof(float) * (D + TILE_I*D + TILE_J*D + TILE_I*TILE_J + stats_threads);
-        softmax_stats_s<<<grid, block, smem_size>>>(
-            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
-            m_k.data_ptr<float>(), l_k.data_ptr<float>(),
-            B, H, I, J, K, D, scale);
-    }
-
-    Yq_scatter_launcher_with_stats(Q, R, S, Vr_2, Vs_2, m_j, l_j, m_k, l_k, Y_q_, scale);
-}
-
 
 __global__ void Yr_scatter(
     const float* __restrict__ Q, const float* __restrict__ R, const float* __restrict__ S,
@@ -1640,47 +1625,6 @@ void Yr_scatter_launcher_with_stats(
     }
 }
 
-// Legacy version that computes its own stats (for backward compatibility)
-void Yr_scatter_launcher(
-    const at::Tensor& Q, const at::Tensor& R, const at::Tensor& S,
-    const at::Tensor& Vq_2, const at::Tensor& Vs_2,
-    at::Tensor& Y_r_, float scale
-) {
-    const auto B = Q.size(0);
-    const auto H = Q.size(1);
-    const auto I = Q.size(2);
-    const auto J = R.size(2);
-    const auto K = S.size(2);
-    const auto D = Q.size(3);
-    auto opts = Q.options();
-
-    auto m_i = torch::zeros({B, H, I}, opts);
-    auto l_i = torch::zeros({B, H, I}, opts);
-    auto m_k = torch::zeros({B, H, K}, opts);
-    auto l_k = torch::zeros({B, H, K}, opts);
-
-    const int stats_threads = 256;
-    { // Aq stats
-        dim3 grid(I, B * H);
-        dim3 block(stats_threads);
-        size_t smem_size = sizeof(float) * (D + TILE_J*D + TILE_K*D + TILE_J*TILE_K + stats_threads);
-        softmax_stats_q<<<grid, block, smem_size>>>(
-            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
-            m_i.data_ptr<float>(), l_i.data_ptr<float>(),
-            B, H, I, J, K, D, scale);
-    }
-    { // As stats
-        dim3 grid(K, B * H);
-        dim3 block(stats_threads);
-        size_t smem_size = sizeof(float) * (D + TILE_I*D + TILE_J*D + TILE_I*TILE_J + stats_threads);
-        softmax_stats_s<<<grid, block, smem_size>>>(
-            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
-            m_k.data_ptr<float>(), l_k.data_ptr<float>(),
-            B, H, I, J, K, D, scale);
-    }
-
-    Yr_scatter_launcher_with_stats(Q, R, S, Vq_2, Vs_2, m_i, l_i, m_k, l_k, Y_r_, scale);
-}
 
 __global__ void Ys_scatter(
     const float* __restrict__ Q, const float* __restrict__ R, const float* __restrict__ S,
@@ -1877,48 +1821,6 @@ void Ys_scatter_launcher_with_stats(
     }
 }
 
-// Legacy version that computes its own stats (for backward compatibility)
-void Ys_scatter_launcher(
-    const at::Tensor& Q, const at::Tensor& R, const at::Tensor& S,
-    const at::Tensor& Vq_2, const at::Tensor& Vr_2,
-    at::Tensor& Y_s_, float scale
-) {
-    const auto B = Q.size(0);
-    const auto H = Q.size(1);
-    const auto I = Q.size(2);
-    const auto J = R.size(2);
-    const auto K = S.size(2);
-    const auto D = Q.size(3);
-    auto opts = Q.options();
-
-    auto m_i = torch::zeros({B, H, I}, opts);
-    auto l_i = torch::zeros({B, H, I}, opts);
-    auto m_j = torch::zeros({B, H, J}, opts);
-    auto l_j = torch::zeros({B, H, J}, opts);
-
-    const int stats_threads = 256;
-    { // Aq stats
-        dim3 grid(I, B * H);
-        dim3 block(stats_threads);
-        size_t smem_size = sizeof(float) * (D + TILE_J*D + TILE_K*D + TILE_J*TILE_K + stats_threads);
-        softmax_stats_q<<<grid, block, smem_size>>>(
-            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
-            m_i.data_ptr<float>(), l_i.data_ptr<float>(),
-            B, H, I, J, K, D, scale);
-    }
-    { // Ar stats
-        dim3 grid(J, B * H);
-        dim3 block(stats_threads);
-        size_t smem_size = sizeof(float) * (D + TILE_I*D + TILE_K*D + TILE_I*TILE_K + stats_threads);
-        softmax_stats_r<<<grid, block, smem_size>>>(
-            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
-            m_j.data_ptr<float>(), l_j.data_ptr<float>(),
-            B, H, I, J, K, D, scale);
-    }
-
-    Ys_scatter_launcher_with_stats(Q, R, S, Vq_2, Vr_2, m_i, l_i, m_j, l_j, Y_s_, scale);
-}
-
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
            at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> forward_cuda(
     at::Tensor Q, at::Tensor R, at::Tensor S,
@@ -1953,10 +1855,20 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     auto Y_q_ = torch::zeros({B,H,I,D}, opts); 
     auto Y_r_ = torch::zeros({B,H,J,D}, opts);
     auto Y_s_ = torch::zeros({B,H,K,D}, opts);
+    
+    // Allocate softmax stats tensors - gather kernels will populate these
+    // Stats are computed during gather and reused by scatter kernels + backward pass
+    auto m_i = torch::zeros({B,H,I}, opts);
+    auto l_i = torch::zeros({B,H,I}, opts);
+    auto m_j = torch::zeros({B,H,J}, opts);
+    auto l_j = torch::zeros({B,H,J}, opts);
+    auto m_k = torch::zeros({B,H,K}, opts);
+    auto l_k = torch::zeros({B,H,K}, opts);
+    
     const int TpB = 128;
     dim3 block(TpB);
 
-    // GATHER: Y_q
+    // GATHER: Y_q (also computes m_i, l_i stats)
     {
         dim3 grid(I, H, B);
         size_t smem_size = sizeof(float) * (D + TILE_J*D + TILE_K*D + TILE_J*D + TILE_K*D + TILE_J*TILE_K + TpB + 2 + D);
@@ -1970,6 +1882,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
                 reinterpret_cast<const float4*>(Vr_1.data_ptr<float>()),
                 reinterpret_cast<const float4*>(Vs_1.data_ptr<float>()),
                 Y_q.data_ptr<float>(),
+                m_i.data_ptr<float>(),  // output: softmax stats
+                l_i.data_ptr<float>(),  // output: softmax stats
                 B, H, I, J, K, D, scale
             );
         } else if (Q.scalar_type() == at::kBFloat16) {
@@ -1983,13 +1897,22 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
                 reinterpret_cast<__nv_bfloat16*>(Y_q.data_ptr<at::BFloat16>()),
                 B, H, I, J, K, D, scale
             );
+            // BF16 path: compute stats separately (TODO: add stats output to bf16 kernels)
+            const int stats_threads = 256;
+            dim3 grid_stats(I, B * H);
+            dim3 block_stats(stats_threads);
+            size_t smem_stats = sizeof(float) * (D + TILE_J*D + TILE_K*D + TILE_J*TILE_K + stats_threads);
+            softmax_stats_q<<<grid_stats, block_stats, smem_stats>>>(
+                Q.to(at::kFloat).data_ptr<float>(), R.to(at::kFloat).data_ptr<float>(), S.to(at::kFloat).data_ptr<float>(),
+                m_i.data_ptr<float>(), l_i.data_ptr<float>(),
+                B, H, I, J, K, D, scale);
         } else {
             TORCH_CHECK(false, "Unsupported dtype for Q: only float32 and bfloat16 are supported.");
         }
         AT_CUDA_CHECK(cudaGetLastError());
     }
     
-   // GATHER: Y_r
+   // GATHER: Y_r (also computes m_j, l_j stats)
     {
         dim3 grid(J, H, B);
         size_t smem_size = sizeof(float) * (D + TILE_I*D + TILE_K*D + TILE_I*D + TILE_K*D + TILE_I*TILE_K + TpB + 2 + D);
@@ -2003,6 +1926,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
                 reinterpret_cast<const float4*>(Vq_1.data_ptr<float>()),
                 reinterpret_cast<const float4*>(Vs_1.data_ptr<float>()),
                 Y_r.data_ptr<float>(),
+                m_j.data_ptr<float>(),  // output: softmax stats
+                l_j.data_ptr<float>(),  // output: softmax stats
                 B, H, I, J, K, D, scale
             );
         } else if (Q.scalar_type() == at::kBFloat16) {
@@ -2016,12 +1941,21 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
                 reinterpret_cast<__nv_bfloat16*>(Y_r.data_ptr<at::BFloat16>()),
                 B, H, I, J, K, D, scale
             );
+            // BF16 path: compute stats separately
+            const int stats_threads = 256;
+            dim3 grid_stats(J, B * H);
+            dim3 block_stats(stats_threads);
+            size_t smem_stats = sizeof(float) * (D + TILE_I*D + TILE_K*D + TILE_I*TILE_K + stats_threads);
+            softmax_stats_r<<<grid_stats, block_stats, smem_stats>>>(
+                Q.to(at::kFloat).data_ptr<float>(), R.to(at::kFloat).data_ptr<float>(), S.to(at::kFloat).data_ptr<float>(),
+                m_j.data_ptr<float>(), l_j.data_ptr<float>(),
+                B, H, I, J, K, D, scale);
         } else {
             TORCH_CHECK(false, "Unsupported dtype: only float32 and bfloat16 are supported.");
         }
         AT_CUDA_CHECK(cudaGetLastError());
     }
-    // GATHER: Y_s
+    // GATHER: Y_s (also computes m_k, l_k stats)
     {
         dim3 grid(K, H, B);
         size_t smem_size = sizeof(float) * (D + TILE_I*D + TILE_J*D + TILE_I*D + TILE_J*D + TILE_I*TILE_J + TpB + 2 + D);
@@ -2035,6 +1969,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
                 reinterpret_cast<const float4*>(Vq_1.data_ptr<float>()),
                 reinterpret_cast<const float4*>(Vr_1.data_ptr<float>()),
                 Y_s.data_ptr<float>(),
+                m_k.data_ptr<float>(),  // output: softmax stats
+                l_k.data_ptr<float>(),  // output: softmax stats
                 B, H, I, J, K, D, scale
             );
         } else if (Q.scalar_type() == at::kBFloat16) {
@@ -2048,50 +1984,22 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
                 reinterpret_cast<__nv_bfloat16*>(Y_s.data_ptr<at::BFloat16>()),
                 B, H, I, J, K, D, scale
             );
+            // BF16 path: compute stats separately
+            const int stats_threads = 256;
+            dim3 grid_stats(K, B * H);
+            dim3 block_stats(stats_threads);
+            size_t smem_stats = sizeof(float) * (D + TILE_I*D + TILE_J*D + TILE_I*TILE_J + stats_threads);
+            softmax_stats_s<<<grid_stats, block_stats, smem_stats>>>(
+                Q.to(at::kFloat).data_ptr<float>(), R.to(at::kFloat).data_ptr<float>(), S.to(at::kFloat).data_ptr<float>(),
+                m_k.data_ptr<float>(), l_k.data_ptr<float>(),
+                B, H, I, J, K, D, scale);
         } else {
             TORCH_CHECK(false, "Unsupported dtype: only float32 and bfloat16 are supported.");
         }
         AT_CUDA_CHECK(cudaGetLastError());
     }
 
-    // SCATTER - Compute softmax stats ONCE and reuse across all scatter kernels
-    auto m_i = torch::zeros({B,H,I}, opts);
-    auto l_i = torch::zeros({B,H,I}, opts);
-    auto m_j = torch::zeros({B,H,J}, opts);
-    auto l_j = torch::zeros({B,H,J}, opts);
-    auto m_k = torch::zeros({B,H,K}, opts);
-    auto l_k = torch::zeros({B,H,K}, opts);
-
-    const int stats_threads = 256;
-    { // Aq stats (m_i, l_i) - used by Yr_scatter and Ys_scatter
-        dim3 grid(I, B * H);
-        dim3 block_stats(stats_threads);
-        size_t smem_size = sizeof(float) * (D + TILE_J*D + TILE_K*D + TILE_J*TILE_K + stats_threads);
-        softmax_stats_q<<<grid, block_stats, smem_size>>>(
-            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
-            m_i.data_ptr<float>(), l_i.data_ptr<float>(),
-            B, H, I, J, K, D, scale);
-    }
-    { // Ar stats (m_j, l_j) - used by Yq_scatter and Ys_scatter
-        dim3 grid(J, B * H);
-        dim3 block_stats(stats_threads);
-        size_t smem_size = sizeof(float) * (D + TILE_I*D + TILE_K*D + TILE_I*TILE_K + stats_threads);
-        softmax_stats_r<<<grid, block_stats, smem_size>>>(
-            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
-            m_j.data_ptr<float>(), l_j.data_ptr<float>(),
-            B, H, I, J, K, D, scale);
-    }
-    { // As stats (m_k, l_k) - used by Yq_scatter and Yr_scatter
-        dim3 grid(K, B * H);
-        dim3 block_stats(stats_threads);
-        size_t smem_size = sizeof(float) * (D + TILE_I*D + TILE_J*D + TILE_I*TILE_J + stats_threads);
-        softmax_stats_s<<<grid, block_stats, smem_size>>>(
-            Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
-            m_k.data_ptr<float>(), l_k.data_ptr<float>(),
-            B, H, I, J, K, D, scale);
-    }
-
-    // Now call scatter launchers with pre-computed stats
+    // SCATTER - softmax stats were computed by gather kernels above, reuse them
     Yq_scatter_launcher_with_stats(Q, R, S, Vr_2, Vs_2, m_j, l_j, m_k, l_k, Y_q_, scale);
     Yr_scatter_launcher_with_stats(Q, R, S, Vq_2, Vs_2, m_i, l_i, m_k, l_k, Y_r_, scale);
     Ys_scatter_launcher_with_stats(Q, R, S, Vq_2, Vr_2, m_i, l_i, m_j, l_j, Y_s_, scale);

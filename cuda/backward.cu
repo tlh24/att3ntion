@@ -30,10 +30,9 @@
 #endif
 
 // =============================================================================
-// Softmax stats kernels are defined in common.cuh:
-//   - softmax_stats_q (for i-centric softmax)
-//   - softmax_stats_r (for j-centric softmax)
-//   - softmax_stats_s (for k-centric softmax)
+// NOTE: Softmax stats (m_i, l_i, m_j, l_j, m_k, l_k) are computed during the
+// forward pass and passed to backward. The backward pass does NOT recompute
+// these stats - this avoids redundant work.
 // =============================================================================
 
 // =============================================================================
@@ -1989,106 +1988,16 @@ backward_impl(torch::Tensor grad_output,
 }
 
 // =============================================================================
-// Public API: backward_cuda (computes its own softmax stats)
+// Public API: backward_cuda (uses pre-computed softmax stats from forward pass)
 // =============================================================================
+// NOTE: The forward pass computes and returns softmax stats (m_i, l_i, m_j, l_j, m_k, l_k).
+// These MUST be passed to the backward pass to avoid redundant computation and ensure
+// numerical consistency between forward and backward passes.
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor>
 backward_cuda(torch::Tensor grad_output,
-              torch::Tensor Q,
-              torch::Tensor R,
-              torch::Tensor S,
-              torch::Tensor Vq_1,
-              torch::Tensor Vq_2,
-              torch::Tensor Vr_1,
-              torch::Tensor Vr_2,
-              torch::Tensor Vs_1,
-              torch::Tensor Vs_2,
-              double dropout_rate) {
-                
-  // Ensure all tensors are contiguous
-  grad_output = grad_output.contiguous();
-  Q = Q.contiguous();
-  R = R.contiguous();
-  S = S.contiguous();
-  Vq_1 = Vq_1.contiguous();
-  Vq_2 = Vq_2.contiguous();
-  Vr_1 = Vr_1.contiguous();
-  Vr_2 = Vr_2.contiguous();
-  Vs_1 = Vs_1.contiguous();
-  Vs_2 = Vs_2.contiguous();
-
-  // Extract dimensions
-  const int B = Q.size(0);
-  const int H = Q.size(1);
-  const int N = Q.size(2);
-  const int I = Q.size(2);
-  const int J = R.size(2);
-  const int K = S.size(2);
-  const int D = Q.size(3);
-  const float scale = 1.0f / sqrtf(static_cast<float>(D));
-
-  // Allocate and compute softmax statistics
-  auto optionsBH = Q.options();
-  auto m_i = torch::empty({B, H, N}, optionsBH);
-  auto l_i = torch::empty({B, H, N}, optionsBH);
-  auto m_j = torch::empty({B, H, N}, optionsBH);
-  auto l_j = torch::empty({B, H, N}, optionsBH);
-  auto m_k = torch::empty({B, H, N}, optionsBH);
-  auto l_k = torch::empty({B, H, N}, optionsBH);
-
-  constexpr int block_threads = 256;
-
-  // Aq (i-centric) stats
-  {
-    const size_t shmem_bytes =
-        (D + TILE_J * D + TILE_K * D + TILE_J * TILE_K + block_threads) * sizeof(float);
-    dim3 blocks(I, B * H);
-    dim3 threads(block_threads);
-    softmax_stats_q<<<blocks, threads, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
-        Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
-        m_i.data_ptr<float>(), l_i.data_ptr<float>(),
-        B, H, N, J, K, D, scale);
-  }
-
-  // Ar (j-centric) stats
-  {
-    const size_t shmem_bytes =
-        (D + TILE_I * D + TILE_K * D + TILE_I * TILE_K + block_threads) * sizeof(float);
-    dim3 blocks(J, B * H);
-    dim3 threads(block_threads);
-    softmax_stats_r<<<blocks, threads, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
-        Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
-        m_j.data_ptr<float>(), l_j.data_ptr<float>(),
-        B, H, N, J, K, D, scale);
-  }
-
-  // As (k-centric) stats
-  {
-    const size_t shmem_bytes =
-        (D + TILE_I * D + TILE_J * D + TILE_I * TILE_J + block_threads) * sizeof(float);
-    dim3 blocks(K, B * H);
-    dim3 threads(block_threads);
-    softmax_stats_s<<<blocks, threads, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
-        Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
-        m_k.data_ptr<float>(), l_k.data_ptr<float>(),
-        B, H, N, J, K, D, scale);
-  }
-
-  // Call the internal implementation with computed stats
-  return backward_impl(grad_output, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
-                       m_i, l_i, m_j, l_j, m_k, l_k, dropout_rate);
-}
-
-// =============================================================================
-// Public API: backward_cuda_with_stats (uses pre-computed softmax stats)
-// =============================================================================
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
-           torch::Tensor, torch::Tensor,
-           torch::Tensor, torch::Tensor,
-           torch::Tensor, torch::Tensor>
-backward_cuda_with_stats(torch::Tensor grad_output,
               torch::Tensor Q,
               torch::Tensor R,
               torch::Tensor S,
