@@ -8,6 +8,7 @@ from torch.autograd import Function
 class HyperAttentionAutograd(Function):
     """
     Bridge between PyTorch autograd and the manual C++ forward/backward passes.
+    Saves softmax statistics from forward pass to avoid redundant computation in backward.
     """
 
     @staticmethod
@@ -35,20 +36,24 @@ class HyperAttentionAutograd(Function):
             Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
         )
 
-        # Sum the 6 tensors from C++ backend
-        if isinstance(outputs_tuple, tuple) and len(outputs_tuple) == 6:
-            final_output = sum(outputs_tuple)
+        # Forward now returns 12 tensors: 6 outputs + 6 softmax stats
+        if isinstance(outputs_tuple, tuple) and len(outputs_tuple) == 12:
+            Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_, m_i, l_i, m_j, l_j, m_k, l_k = outputs_tuple
+            final_output = Y_q + Y_r + Y_s + Y_q_ + Y_r_ + Y_s_
         else:
-            raise TypeError(f"C++ forward expected to return a tuple of 6 Tensors, but got {type(outputs_tuple)}")
+            raise TypeError(f"C++ forward expected to return a tuple of 12 Tensors, but got {type(outputs_tuple)} with len {len(outputs_tuple) if isinstance(outputs_tuple, tuple) else 'N/A'}")
 
-        ctx.save_for_backward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2)
+        # Save input tensors AND softmax stats for backward pass
+        ctx.save_for_backward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
+                              m_i, l_i, m_j, l_j, m_k, l_k)
         
         return final_output
 
     @staticmethod
     def backward(ctx, grad_output):
         """
-        Calls the C++ backward pass using saved tensors and the incoming gradient.
+        Calls the C++ backward pass using saved tensors and pre-computed softmax stats.
+        This avoids redundant computation of softmax statistics.
         Args:
             ctx: Context object with saved tensors.
             grad_output: Gradient of the loss w.r.t. the summed output.
@@ -58,10 +63,14 @@ class HyperAttentionAutograd(Function):
         """
         grad_output = grad_output.contiguous()
 
-        Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2 = ctx.saved_tensors
+        # Retrieve saved tensors including softmax stats
+        Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, \
+            m_i, l_i, m_j, l_j, m_k, l_k = ctx.saved_tensors
 
+        # Use backward with pre-computed softmax stats from forward pass
         grad_tuple = hyper_attn_cpp_manual.backward(
-            grad_output, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2 #,dropout_rate
+            grad_output, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
+            m_i, l_i, m_j, l_j, m_k, l_k
         )
 
         # Ensure grad_tuple from C++ has the correct number of elements (9 for the 9 tensor inputs)

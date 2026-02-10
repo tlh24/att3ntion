@@ -3,17 +3,33 @@ import torch
 from torch.utils.cpp_extension import CppExtension, BuildExtension, CUDAExtension
 
 def get_cuda_arch_flags():
-	# return flags for the minimum capability seen
-	arch_flags = []
-	min_arch = 999
+	"""Generate nvcc -gencode flags for all detected GPU architectures.
 
-	for i in range(torch.cuda.device_count()):
+	Produces SASS for each detected arch AND embeds PTX for the highest
+	detected arch to enable forward compatibility with newer GPUs
+	(e.g., code compiled on sm_89 can JIT-compile for sm_120 at load time).
+	"""
+	# Default to sm_89 (Ada Lovelace / RTX 4080) if no GPU detected
+	seen_archs = set()
+	device_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+	for i in range(device_count):
 		major, minor = torch.cuda.get_device_capability(i)
-		decimal = major + (minor / 100)
-		if decimal < min_arch:
-			arch = f'{major}{minor}'
+		seen_archs.add(f'{major}{minor}')
 
-	return f'-gencode=arch=compute_{arch},code=sm_{arch}'
+	if not seen_archs:
+		seen_archs.add('89')
+
+	flags = []
+	max_arch = max(seen_archs)
+	for arch in sorted(seen_archs):
+		# Emit SASS for each detected architecture
+		flags.append(f'-gencode=arch=compute_{arch},code=sm_{arch}')
+
+	# Also embed PTX for the highest arch for forward compatibility
+	# This allows the CUDA driver to JIT-compile for future architectures
+	flags.append(f'-gencode=arch=compute_{max_arch},code=compute_{max_arch}')
+
+	return flags
 
 setup(
     name='hyper_attn_extensions',
@@ -34,7 +50,7 @@ setup(
                 'cxx': ['-O3'],
                 'nvcc': [
                     '-O3',
-                    get_cuda_arch_flags(),
+                    *get_cuda_arch_flags(),
                     # '-lineinfo' # uncomment for debugging
                 ]
             }

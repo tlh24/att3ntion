@@ -8,9 +8,10 @@ across various configurations to ensure mathematical correctness.
 Forward kernels: Y_q, Y_r, Y_s (gather), Y_q_, Y_r_, Y_s_ (scatter)
 Backward kernels: grad_Q, grad_R, grad_S, grad_Vq_1, grad_Vq_2, grad_Vr_1, grad_Vr_2, grad_Vs_1, grad_Vs_2
 
-Constraints:
-    - D must be <= 64 and a multiple of 4
-    - Large N values may cause OOM in PyTorch reference
+Constraints (optimized kernels):
+    - N must be a multiple of 32
+    - D must be a multiple of 32 and <= 64 (shared memory limit)
+    - I == J == K (enforced by using N for all)
 """
 import os
 import sys
@@ -63,92 +64,73 @@ class TestConfig:
         return f"{self.name}: B={self.B} H={self.H} N={self.N} D={self.D}{scale_str}"
 
 
+# All configs use N and D as multiples of 32 for optimized kernel requirements
 QUICK_CONFIGS = [
-    TestConfig("tiny_N8_D16",       B=1, H=1, N=8,  D=16),
-    TestConfig("tiny_N8_D32",       B=1, H=2, N=8,  D=32),
-    TestConfig("small_N16_D32",     B=1, H=2, N=16, D=32),
-    TestConfig("small_N24_D32",     B=1, H=1, N=24, D=32),
     TestConfig("small_N32_D32",     B=1, H=2, N=32, D=32),
+    TestConfig("small_N64_D32",     B=1, H=2, N=64, D=32),
+    TestConfig("small_N32_D64",     B=1, H=2, N=32, D=64),
 ]
 
 STANDARD_CONFIGS = [
-    # Varying N
-    TestConfig("N8_D32",            B=1, H=2, N=8,  D=32),
-    TestConfig("N16_D32",           B=1, H=2, N=16, D=32),
-    TestConfig("N24_D32",           B=1, H=2, N=24, D=32),
-    TestConfig("N32_D32",           B=1, H=2, N=32, D=32),
-    TestConfig("N48_D32",           B=1, H=2, N=48, D=32),
-    TestConfig("N52_D32",           B=1, H=2, N=52, D=32),
-    TestConfig("N54_D32",           B=1, H=2, N=54, D=32),
-    TestConfig("N58_D32",           B=1, H=2, N=58, D=32),
-    TestConfig("N60_D32",           B=1, H=2, N=60, D=32),
-    TestConfig("N64_D32",           B=1, H=2, N=64, D=32),
-    # Varying D
-    TestConfig("N32_D8",            B=1, H=2, N=32, D=8),
-    TestConfig("N32_D12",           B=1, H=2, N=32, D=12),
-    TestConfig("N32_D16",           B=1, H=2, N=32, D=16),
-    TestConfig("N32_D20",           B=1, H=2, N=32, D=20),
-    TestConfig("N32_D24",           B=1, H=2, N=32, D=24),
-    TestConfig("N32_D28",           B=1, H=2, N=32, D=28),
-    TestConfig("N32_D32",           B=1, H=2, N=32, D=32),
-    TestConfig("N32_D36",           B=1, H=2, N=32, D=36),
-    TestConfig("N32_D40",           B=1, H=2, N=32, D=40),
-    TestConfig("N32_D44",           B=1, H=2, N=32, D=44),
-    TestConfig("N32_D48",           B=1, H=2, N=32, D=48),
-    TestConfig("N32_D52",           B=1, H=2, N=32, D=52),
-    TestConfig("N32_D56",           B=1, H=2, N=32, D=56),
-    TestConfig("N32_D60",           B=1, H=2, N=32, D=60),
+    # Varying N (multiples of 32)
+    TestConfig("N32_D32",           B=1, H=2, N=32,  D=32),
+    TestConfig("N64_D32",           B=1, H=2, N=64,  D=32),
+    TestConfig("N96_D32",           B=1, H=2, N=96,  D=32),
+    TestConfig("N128_D32",          B=1, H=2, N=128, D=32),
+    TestConfig("N160_D32",          B=1, H=2, N=160, D=32),
+    TestConfig("N192_D32",          B=1, H=2, N=192, D=32),
+    # Varying D (multiples of 32, max 64 due to shared memory)
+    TestConfig("N32_D32_",          B=1, H=2, N=32, D=32),
     TestConfig("N32_D64",           B=1, H=2, N=32, D=64),
+    TestConfig("N64_D64",           B=1, H=2, N=64, D=64),
     # Varying B
     TestConfig("B1_N32_D32",        B=1, H=2, N=32, D=32),
     TestConfig("B2_N32_D32",        B=2, H=2, N=32, D=32),
     TestConfig("B3_N32_D32",        B=3, H=2, N=32, D=32),
     TestConfig("B4_N32_D32",        B=4, H=2, N=32, D=32),
-    TestConfig("B8_N24_D32",        B=8, H=2, N=24, D=32),
+    TestConfig("B8_N32_D32",        B=8, H=2, N=32, D=32),
     # Varying H
     TestConfig("H1_N32_D32",        B=1, H=1, N=32, D=32),
     TestConfig("H2_N32_D32",        B=1, H=2, N=32, D=32),
     TestConfig("H4_N32_D32",        B=1, H=4, N=32, D=32),
     TestConfig("H6_N32_D32",        B=1, H=6, N=32, D=32),
     TestConfig("H8_N32_D32",        B=1, H=8, N=32, D=32),
-    TestConfig("H12_N24_D32",       B=1, H=12, N=24, D=32),
+    TestConfig("H12_N32_D32",       B=1, H=12, N=32, D=32),
+    TestConfig("H16_N32_D32",       B=1, H=16, N=32, D=32),
     # Combined
-    TestConfig("B2_H4_N24_D32",     B=2, H=4, N=24, D=32),
+    TestConfig("B2_H4_N32_D32",     B=2, H=4, N=32, D=32),
     TestConfig("B2_H4_N32_D64",     B=2, H=4, N=32, D=64),
-    TestConfig("B4_H2_N48_D32",     B=4, H=2, N=48, D=32),
-    TestConfig("B2_H8_N32_D48",     B=2, H=8, N=32, D=48),
+    TestConfig("B4_H2_N64_D32",     B=4, H=2, N=64, D=32),
+    TestConfig("B2_H8_N32_D64",     B=2, H=8, N=32, D=64),
+    TestConfig("B4_H4_N64_D64",     B=4, H=4, N=64, D=64),
 ]
 
 LARGE_CONFIGS = [
-    TestConfig("N96_D32",           B=1, H=2, N=96,  D=32),
-    TestConfig("N128_D32",          B=1, H=2, N=128, D=32),
-    TestConfig("N128_D64",          B=1, H=2, N=128, D=64),
-    TestConfig("N160_D32",          B=1, H=2, N=160, D=32),
-    TestConfig("N192_D32",          B=1, H=1, N=192, D=32),
-    TestConfig("N224_D32",          B=1, H=1, N=224, D=32),
-    TestConfig("N256_D32",          B=1, H=1, N=256, D=32),
+    TestConfig("N224_D32",          B=1, H=2, N=224, D=32),
+    TestConfig("N224_D64",          B=1, H=2, N=224, D=64),
+    TestConfig("N256_D32",          B=1, H=2, N=256, D=32),
+    TestConfig("N256_D64",          B=1, H=2, N=256, D=64),
     TestConfig("N320_D32",          B=1, H=1, N=320, D=32),
     TestConfig("N384_D32",          B=1, H=1, N=384, D=32),
+    TestConfig("N448_D32",          B=1, H=1, N=448, D=32),
+    TestConfig("N512_D32",          B=1, H=1, N=512, D=32),
 ]
 
 STRESS_CONFIGS = [
     TestConfig("stress_scale2",     B=1, H=2, N=32, D=32, input_scale=2.0),
     TestConfig("stress_scale3",     B=1, H=2, N=32, D=32, input_scale=3.0),
-    TestConfig("stress_scale5",     B=1, H=2, N=16, D=32, input_scale=5.0),
+    TestConfig("stress_scale5",     B=1, H=2, N=32, D=32, input_scale=5.0),
     TestConfig("stress_N64_s2",     B=1, H=2, N=64, D=32, input_scale=2.0),
     TestConfig("stress_D64_s2",     B=1, H=2, N=32, D=64, input_scale=2.0),
+    TestConfig("stress_N64_D64_s2", B=1, H=2, N=64, D=64, input_scale=2.0),
 ]
 
+# Edge configs now only test valid multiples of 32, D max 64
 EDGE_CONFIGS = [
-    TestConfig("minimal",           B=1, H=1, N=8,  D=8),
-    TestConfig("B1_H1_N32",         B=1, H=1, N=32, D=32),
-    TestConfig("N17_D32",           B=1, H=2, N=17, D=32),
-    TestConfig("N23_D32",           B=1, H=2, N=23, D=32),
-    TestConfig("N31_D32",           B=1, H=2, N=31, D=32),
-    TestConfig("N33_D32",           B=1, H=2, N=33, D=32),
-    TestConfig("N47_D32",           B=1, H=2, N=47, D=32),
-    TestConfig("N63_D32",           B=1, H=2, N=63, D=32),
-    TestConfig("N65_D32",           B=1, H=2, N=65, D=32),
+    TestConfig("B1_H1_N32_D32",     B=1, H=1, N=32, D=32),
+    TestConfig("B1_H1_N64_D64",     B=1, H=1, N=64, D=64),
+    TestConfig("B1_H1_N96_D32",     B=1, H=1, N=96, D=32),
+    TestConfig("B1_H1_N128_D64",    B=1, H=1, N=128, D=64),
 ]
 
 
@@ -326,12 +308,24 @@ class KernelTester:
             inputs = self._create_inputs(config)
             grad_output = torch.randn(config.B, config.H, N, config.D, device=self.device) * config.input_scale
 
+            # Run forward pass first to get softmax stats needed by backward
+            fwd_out = self.cuda_ext.forward(
+                inputs['Q'].clone(), inputs['R'].clone(), inputs['S'].clone(),
+                inputs['Vq_1'].clone(), inputs['Vq_2'].clone(),
+                inputs['Vr_1'].clone(), inputs['Vr_2'].clone(),
+                inputs['Vs_1'].clone(), inputs['Vs_2'].clone(),
+                0.0
+            )
+            # Unpack: Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_, m_i, l_i, m_j, l_j, m_k, l_k
+            m_i, l_i, m_j, l_j, m_k, l_k = fwd_out[6], fwd_out[7], fwd_out[8], fwd_out[9], fwd_out[10], fwd_out[11]
+
             cuda_grads = self.cuda_ext.backward(
                 grad_output.clone(),
                 inputs['Q'].clone(), inputs['R'].clone(), inputs['S'].clone(),
                 inputs['Vq_1'].clone(), inputs['Vq_2'].clone(),
                 inputs['Vr_1'].clone(), inputs['Vr_2'].clone(),
                 inputs['Vs_1'].clone(), inputs['Vs_2'].clone(),
+                m_i, l_i, m_j, l_j, m_k, l_k,
                 0.0
             )
 
