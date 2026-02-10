@@ -34,8 +34,9 @@ def demo_basic_usage():
     from hypergraph_attention import HypergraphAttentionCPP
     
     # Create layer
+    # CUDA kernel requires head_dim (d_model/n_heads) to be a multiple of 4
     d_model = 64
-    n_heads = 4
+    n_heads = 4  # head_dim = 64/4 = 16
     layer = HypergraphAttentionCPP(d_model=d_model, n_heads=n_heads)
     
     print(f"\nLayer config: d_model={d_model}, n_heads={n_heads}")
@@ -92,8 +93,9 @@ def demo_memory_scaling():
     print(f"{'N':>6} | {'Actual (MB)':>12} | {'Naive O(N³)':>12} | {'Savings':>10}")
     print("-" * 50)
     
+    # CUDA kernel requires head_dim (d_model/n_heads) to be a multiple of 4
     d_model = 64
-    n_heads = 4
+    n_heads = 4  # head_dim = 64/4 = 16
     batch_size = 4
     
     for seq_len in [32, 64, 128, 256, 512]:
@@ -147,8 +149,12 @@ def generate_data(num_samples, modulo=19):
     
     This requires understanding 3-way relationships between operands
     and operators - exactly what hypergraph attention excels at.
+    
+    Note: Sequence length is 16 (padded from 12) to satisfy CUDA kernel
+    constraint that sequence length must be a multiple of 16.
     """
-    x = np.zeros((num_samples, 12, 32), dtype=np.float32)
+    # Use 16 tokens (padded from 12) to satisfy CUDA TILE_I=16 constraint
+    x = np.zeros((num_samples, 16, 32), dtype=np.float32)
     
     for b in range(num_samples):
         va = np.random.randint(modulo)
@@ -176,6 +182,7 @@ def generate_data(num_samples, modulo=19):
         x[b, 9, op3] = 1      # op3
         x[b, 10, vf + 4] = 1  # intermediate result 2
         x[b, 11, vg + 4] = 1  # final result (target)
+        # Positions 12-15 remain zero (padding)
     
     return x
 
@@ -183,7 +190,10 @@ def generate_data(num_samples, modulo=19):
 class ArithmeticModel(nn.Module):
     """Simple model using hypergraph attention for arithmetic reasoning."""
     
-    def __init__(self, hidden_dim=64, num_heads=4, n_layers=2, modulo=19):
+    # Target position in the sequence (position 11 contains the target, 12-15 are padding)
+    TARGET_POS = 11
+    
+    def __init__(self, hidden_dim=128, num_heads=4, n_layers=2, modulo=19):
         super().__init__()
         from hypergraph_attention import HypergraphAttentionCPP
         
@@ -212,8 +222,8 @@ class ArithmeticModel(nn.Module):
             x = layer['norm1'](x + layer['attention'](x))
             x = layer['norm2'](x + layer['ffn'](x))
         
-        # Predict from last position
-        return self.classifier(x[:, -1])
+        # Predict from target position (not last, since we have padding)
+        return self.classifier(x[:, self.TARGET_POS])
 
 
 def demo_training(epochs=200, batch_size=64):
@@ -231,17 +241,20 @@ def demo_training(epochs=200, batch_size=64):
     print(f"Device: {device}")
     
     modulo = 19
-    hidden_dim = 64
-    num_heads = 4
+    # CUDA kernel requires head_dim (hidden_dim/num_heads) to be a multiple of 4
+    hidden_dim = 128
+    num_heads = 4  # head_dim = 128/4 = 32
     
     # Generate data
     print(f"Generating {batch_size * 50} training samples...")
     data = generate_data(batch_size * 50, modulo)
     
     # Prepare dataset
+    # Target is at position 11 (positions 12-15 are padding)
+    TARGET_POS = 11
     inputs = data.copy()
-    inputs[:, -1, :] = 0  # Mask target
-    targets = np.argmax(data[:, -1, 4:4+modulo], axis=1)
+    inputs[:, TARGET_POS, :] = 0  # Mask target
+    targets = np.argmax(data[:, TARGET_POS, 4:4+modulo], axis=1)
     
     dataset = TensorDataset(
         torch.FloatTensor(inputs),
