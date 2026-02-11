@@ -231,7 +231,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 		gen_func = genData4
 	if task == 7:
 		gen_func = genData7
-		nsamples = 6000
+	nsamples = 6000
 
 	x, y = gen_func(batch_size * nsamples, do_print=False)
 	x_v, y_v = gen_func(batch_size * nsamples, do_print=False, validation=True)
