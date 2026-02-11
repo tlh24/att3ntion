@@ -391,14 +391,14 @@ class ExpressionGeneratorDepth:
 
 		return Expression(operator=op, left=left_child, right=right_child)
 
-def genData4(bs, do_print=False, validation=False):
+def genData4(bs, modulo, do_print=False):
 	'''
 	Task 4: from random arithmetic expressions,
 	generate parse trees & evaluate them
 	'''
 	ntok = 32
 	nbits = 4 # hardcoded in class expression
-	md = 64 - (5 + (nbits*2)*3) # 35
+	md = 64 - (5 + (nbits*2)*3) # modulo = 35
 
 	rng = np.random.default_rng()
 	x = np.zeros((bs, ntok, md + 5 + 8*3), dtype=np.float32)
