@@ -391,7 +391,7 @@ class ExpressionGeneratorDepth:
 
 		return Expression(operator=op, left=left_child, right=right_child)
 
-def genData4(bs, modulo, do_print=False):
+def genData4(bs, do_print=False, validation=False):
 	'''
 	Task 4: from random arithmetic expressions,
 	generate parse trees & evaluate them
