@@ -305,7 +305,7 @@ class Expression:
 		# recusively evaluate the expression
 		if self.op is None:
 			return self.value
-		c,_ = clipOp(self.left.evaluate(md), self.right.evaluate(md), self.op, md)
+		c,_ = modOp(self.left.evaluate(md), self.right.evaluate(md), self.op, md) # NOTE was clipOp for the pitch.
 		self.value = c # save for supervised learning
 		return c
 
