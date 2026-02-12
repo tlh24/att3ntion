@@ -224,6 +224,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	
 	print(f"Using device: {device}")
 	
+
 	if task == 3:
 		gen_func = genData3
 		nsamples = 1500
