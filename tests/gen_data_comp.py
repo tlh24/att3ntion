@@ -166,7 +166,7 @@ def genData3(bs, do_print=False, validation=False):
 	Task 3: from a list of ntok integers,
 	compute the op of two of them based on *pointers*
 	rather than positional arguments.
-	This ought to be easy.
+	This ought to be easy - ?
 	'''
 	ntok = 24
 	nbits = 4
@@ -189,10 +189,10 @@ def genData3(bs, do_print=False, validation=False):
 		x[b,nd+1,4 ] = 1 # result
 		# positional encoding
 		x[b,:,md+5:md+5+8] = pos_enc
-		x[b,nd,md+5+8:md+5+16] = pos_enc[ai,:]
-		x[b,nd,md+5+16:md+5+24] = pos_enc[bi,:]
+		x[b,nd,md+5+8:md+5+16] = pos_enc[ai,:] # point to arg A
+		x[b,nd,md+5+16:md+5+24] = pos_enc[bi,:] # point to arg B
 		x[b,nd+1,md+5+8:md+5+16] = pos_enc[8,:] # point to op
-		# y[b,nd+1, 5+d[ai]] = 1 # TEST - works super fast
+		# y[b,nd+1, 5+d[ai]] = 1 # TEST - extra label makes it work super fast
 		# y[b,nd+1, 5+d[bi]] = 1
 		# y[b,nd+1,md+5+8:md+5+16] = pos_enc[ai,:] # copy pointer
 		# y[b,nd+1,md+5+16:md+5+24] = pos_enc[bi,:]
@@ -398,7 +398,7 @@ def genData4(bs, do_print=False, validation=False):
 	'''
 	ntok = 32
 	nbits = 4 # hardcoded in class expression
-	md = 64 - (5 + (nbits*2)*3) # 35
+	md = 64 - (5 + (nbits*2)*3) # modulo = 35
 
 	rng = np.random.default_rng()
 	x = np.zeros((bs, ntok, md + 5 + 8*3), dtype=np.float32)

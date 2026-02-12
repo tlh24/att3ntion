@@ -224,11 +224,12 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	
 	print(f"Using device: {device}")
 	
-	nsamples = 1000
 	if task == 3:
 		gen_func = genData3
+		nsamples = 1500
 	if task == 4:
 		gen_func = genData4
+		nsamples = 1000
 	if task == 7:
 		gen_func = genData7
 		nsamples = 6000
