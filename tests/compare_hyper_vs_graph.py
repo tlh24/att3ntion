@@ -17,9 +17,9 @@ parent_dir_str = str(parent_dir)
 if parent_dir_str not in sys.path:
     sys.path.insert(0, parent_dir_str)
 
-from hyper_attn_pytorch import HypergraphAttention_Naive, GraphAttention_Naive, QuickGELU
+from pure_pytorch_reference import HypergraphAttention_Naive, GraphAttention_Naive, QuickGELU
 # from hyper_attn_cpp_wrapper import HypergraphAttentionCPP
-from gen_data_comp import genData3, genData4, genData7
+from compare_gen_data import genData3, genData4, genData7
 import pdb
 
 class SwiGLU(nn.Module):

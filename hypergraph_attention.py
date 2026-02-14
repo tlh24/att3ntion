@@ -1,0 +1,237 @@
+import torch
+import torch.nn as nn
+import math
+import hyper_attn_cpp_manual
+import hyper_attn_cpp_reference
+from torch.autograd import Function
+
+class HyperAttentionAutograd(Function):
+    """
+    Bridge between PyTorch autograd and the manual C++ forward/backward passes.
+    Saves softmax statistics from forward pass to avoid redundant computation in backward.
+    """
+
+    @staticmethod
+    def forward(ctx, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate=0.0):
+        """
+        Calls the C++ forward pass and saves necessary tensors for backward.
+        Args:
+            ctx: Context object to save tensors.
+            Q, R, S, V*_*: Input tensors for the attention mechanism.
+            dropout_rate: Dropout rate (passed to C++ if needed, but not differentiable).
+        Returns:
+            The output tensor from the C++ forward pass (summed).
+        """
+        Q = Q.contiguous()
+        R = R.contiguous()
+        S = S.contiguous()
+        Vq_1 = Vq_1.contiguous()
+        Vq_2 = Vq_2.contiguous()
+        Vr_1 = Vr_1.contiguous()
+        Vr_2 = Vr_2.contiguous()
+        Vs_1 = Vs_1.contiguous()
+        Vs_2 = Vs_2.contiguous()
+
+        outputs_tuple = hyper_attn_cpp_manual.forward(
+            Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
+        )
+
+        # Forward now returns 12 tensors: 6 outputs + 6 softmax stats
+        if isinstance(outputs_tuple, tuple) and len(outputs_tuple) == 12:
+            Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_, m_i, l_i, m_j, l_j, m_k, l_k = outputs_tuple
+            final_output = Y_q + Y_r + Y_s + Y_q_ + Y_r_ + Y_s_
+        else:
+            raise TypeError(f"C++ forward expected to return a tuple of 12 Tensors, but got {type(outputs_tuple)} with len {len(outputs_tuple) if isinstance(outputs_tuple, tuple) else 'N/A'}")
+
+        # Save input tensors AND softmax stats for backward pass
+        ctx.save_for_backward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
+                              m_i, l_i, m_j, l_j, m_k, l_k)
+        
+        return final_output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        Calls the C++ backward pass using saved tensors and pre-computed softmax stats.
+        This avoids redundant computation of softmax statistics.
+        Args:
+            ctx: Context object with saved tensors.
+            grad_output: Gradient of the loss w.r.t. the summed output.
+        Returns:
+            A tuple of gradients corresponding *exactly* to the inputs of the
+            forward function (Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate).
+        """
+        grad_output = grad_output.contiguous()
+
+        # Retrieve saved tensors including softmax stats
+        Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, \
+            m_i, l_i, m_j, l_j, m_k, l_k = ctx.saved_tensors
+
+        # Use backward with pre-computed softmax stats from forward pass
+        grad_tuple = hyper_attn_cpp_manual.backward(
+            grad_output, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
+            m_i, l_i, m_j, l_j, m_k, l_k
+        )
+
+        # Ensure grad_tuple from C++ has the correct number of elements (9 for the 9 tensor inputs)
+        if not (isinstance(grad_tuple, tuple) and len(grad_tuple) == 9):
+            raise ValueError(f"C++ backward expected to return a tuple of 9 gradients, got {len(grad_tuple) if isinstance(grad_tuple, tuple) else type(grad_tuple)}")
+
+        grad_Q, grad_R, grad_S, grad_Vq_1, grad_Vq_2, grad_Vr_1, grad_Vr_2, grad_Vs_1, grad_Vs_2 = grad_tuple
+
+        debug_names = [
+            "grad_Q", "grad_R", "grad_S",
+            "grad_Vq_1", "grad_Vq_2",
+            "grad_Vr_1", "grad_Vr_2",
+            "grad_Vs_1", "grad_Vs_2",
+        ]
+        for name, tensor in zip(debug_names, grad_tuple):
+            if tensor is not None and tensor.is_floating_point():
+                if not torch.isfinite(tensor).all():
+                    raise RuntimeError(f"{name} contains non-finite values")
+
+        return (
+            grad_Q,
+            grad_R,
+            grad_S,
+            grad_Vq_1,
+            grad_Vq_2,
+            grad_Vr_1,
+            grad_Vr_2,
+            grad_Vs_1,
+            grad_Vs_2,
+            None, #dropout doesn't need a gradient
+        )
+
+class QuickGELU(nn.Module):
+    def forward(self, x: torch.Tensor):
+        return x * torch.sigmoid(1.702 * x)
+
+class HypergraphAttentionCPP(nn.Module):
+    """
+    PyTorch wrapper for cpp/hyper_attn_cpp_manual.cpp.
+    """
+    def __init__(self, d_model, n_heads, dropout_rate=0):
+        super(HypergraphAttentionCPP, self).__init__()
+        
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
+
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        
+        self.Wq = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
+        self.Wr = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
+        self.Ws = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
+        
+        self.Wv_q = nn.Linear(d_model, n_heads * self.head_dim * 2, bias=True)
+        self.Wv_r = nn.Linear(d_model, n_heads * self.head_dim * 2, bias=True)
+        self.Wv_s = nn.Linear(d_model, n_heads * self.head_dim * 2, bias=True)
+        
+        self.Wo = nn.Linear(n_heads * self.head_dim, d_model, bias=True)
+       
+        self.dropout = nn.Dropout(dropout_rate)
+        self.gelu = QuickGELU()
+        
+    def forward(self, x):
+        batch_size, ntok, d_model = x.shape
+        
+        Q = self.Wq(x)
+        R = self.Wr(x)
+        S = self.Ws(x)
+        
+        Vq = self.Wv_q(x)
+        Vr = self.Wv_r(x)
+        Vs = self.Wv_s(x)
+        
+        Q = Q.reshape(batch_size, ntok, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+        R = R.reshape(batch_size, ntok, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+        S = S.reshape(batch_size, ntok, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+        
+        Vq_1, Vq_2 = Vq.reshape(batch_size, ntok, self.n_heads, self.head_dim*2).permute(0, 2, 1, 3).split(self.head_dim, dim=-1)
+        Vr_1, Vr_2 = Vr.reshape(batch_size, ntok, self.n_heads, self.head_dim*2).permute(0, 2, 1, 3).split(self.head_dim, dim=-1)
+        Vs_1, Vs_2 = Vs.reshape(batch_size, ntok, self.n_heads, self.head_dim*2).permute(0, 2, 1, 3).split(self.head_dim, dim=-1)
+        
+        # Core 3-way attention - returns summed output
+        y = HyperAttentionAutograd.apply( 
+            Q, R, S,
+            Vq_1, Vq_2,
+            Vr_1, Vr_2,
+            Vs_1, Vs_2,
+            self.dropout.p
+        )
+        
+        # Reshape: concatenate heads (CPP uses head_dim = d_model // n_heads)
+        y = y.permute(0, 2, 1, 3).contiguous().view(batch_size, ntok, self.n_heads * self.head_dim)
+        
+        y = self.Wo(y) 
+
+        return y 
+
+
+class HypergraphAttentionCPPReference(nn.Module):
+    """
+    PyTorch wrapper for cpp/torch_att3ntion.cpp (reference implementation).
+    Uses PyTorch autograd for backward pass.
+    """
+    def __init__(self, d_model, n_heads, dropout_rate=0):
+        super(HypergraphAttentionCPPReference, self).__init__()
+        
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
+
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        
+        self.Wq = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
+        self.Wr = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
+        self.Ws = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
+        
+        self.Wv_q = nn.Linear(d_model, n_heads * self.head_dim * 2, bias=True)
+        self.Wv_r = nn.Linear(d_model, n_heads * self.head_dim * 2, bias=True)
+        self.Wv_s = nn.Linear(d_model, n_heads * self.head_dim * 2, bias=True)
+        
+        self.Wo = nn.Linear(n_heads * self.head_dim, d_model, bias=True)
+       
+        self.dropout = nn.Dropout(dropout_rate)
+        self.gelu = QuickGELU()
+        
+    def forward(self, x):
+        batch_size, ntok, d_model = x.shape
+        
+        Q = self.Wq(x)
+        R = self.Wr(x)
+        S = self.Ws(x)
+        
+        Vq = self.Wv_q(x)
+        Vr = self.Wv_r(x)
+        Vs = self.Wv_s(x)
+        
+        Q = Q.reshape(batch_size, ntok, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+        R = R.reshape(batch_size, ntok, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+        S = S.reshape(batch_size, ntok, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+        
+        Vq_1, Vq_2 = Vq.reshape(batch_size, ntok, self.n_heads, self.head_dim*2).permute(0, 2, 1, 3).split(self.head_dim, dim=-1)
+        Vr_1, Vr_2 = Vr.reshape(batch_size, ntok, self.n_heads, self.head_dim*2).permute(0, 2, 1, 3).split(self.head_dim, dim=-1)
+        Vs_1, Vs_2 = Vs.reshape(batch_size, ntok, self.n_heads, self.head_dim*2).permute(0, 2, 1, 3).split(self.head_dim, dim=-1)
+        
+        # Core 3-way attention using C++ reference (uses autograd for backward)
+        outputs_tuple = hyper_attn_cpp_reference.forward(
+            Q.contiguous(), R.contiguous(), S.contiguous(),
+            Vq_1.contiguous(), Vq_2.contiguous(),
+            Vr_1.contiguous(), Vr_2.contiguous(),
+            Vs_1.contiguous(), Vs_2.contiguous(),
+            self.dropout.p
+        )
+        
+        # Sum the 6 output tensors
+        y = sum(outputs_tuple)
+        
+        # Reshape: concatenate heads
+        y = y.permute(0, 2, 1, 3).contiguous().view(batch_size, ntok, self.n_heads * self.head_dim)
+        
+        y = self.Wo(y) 
+
+        return y
