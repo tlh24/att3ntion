@@ -6,7 +6,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from torch.amp import autocast
 import torch.nn.functional as F
-from rotary_embedding_torch import RotaryEmbedding
+# from rotary_embedding_torch import RotaryEmbedding
 import matplotlib.pyplot as plt
 
 import sys
@@ -41,7 +41,7 @@ class SimpleCompModel(nn.Module):
 		super().__init__()
 		self.input_dim = input_dim
 		self.embedding_proj = nn.Linear(self.input_dim, hidden_dim)
-		self.rotary_emb = RotaryEmbedding(dim = hidden_dim)
+		# self.rotary_emb = RotaryEmbedding(dim = hidden_dim)
 		self.attn_impl = attn_impl
 		self.n_recurse = n_recurse
 		self.d_model = hidden_dim
@@ -212,6 +212,7 @@ def calcLoss(task, pred, targets):
 					* targets[:,:,0] ).item()
 			n_possible = torch.sum( targets[:,:,0] ).item()
 	return loss, n_correct, n_possible
+
 
 def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl="", log_name="", save_model=False, task=3, replicate=1):
 	
