@@ -917,10 +917,34 @@ __global__ void jacobian_corrections(
 
 
 
-// ===================== grad Q, R, S ====================== (TODO: optimize)
+// =============================================================================
+// Gradient Kernels for Q, R, S
+// =============================================================================
+//
+// Architecture: QS_grad_fused + R_grad (2 kernels instead of 3)
+//
+// Why fuse Q and S but not R?
+//   - Thread grid is (i, k), streaming j-tiles through shared memory
+//   - gradQ[i,:] reduces over (j,k) → i is "owned", k causes 16-way atomics
+//   - gradS[k,:] reduces over (i,j) → k is "owned", i causes 16-way atomics  
+//   - gradR[j,:] reduces over (i,k) → j is "streamed", would cause 256-way atomics
+//   - R_grad uses a (j,k) grid where j is owned, avoiding the contention
+//
+// Both kernels deduplicate the 9 dot products for gAq/gAr/gAs down to 6 unique
+// dot products computed in a single fused loop with the logit computation.
+//
+// =============================================================================
 
+/**
+ * QS_grad_fused - Computes gradQ and gradS in a single pass
+ * 
+ * Thread mapping: (i, k) grid, streams j-tiles in shared memory
+ * Shared computation: logits, Aq/Ar/As, grad_A (Jacobian-corrected)
+ * Separate accumulation: gradQ[i,d] += grad_A * R[j,d] * S[k,d]
+ *                        gradS[k,d] += grad_A * Q[i,d] * R[j,d]
+ */
 template<int BLOCK_I, int BLOCK_J, int BLOCK_K, int REG_CAP = MAX_D_REG>
-__global__ void Q_grad(
+__global__ void QS_grad_fused(
     /* ---- operands ---------------------------------------------------- */
     const float* __restrict__ Q,   // [B,H,N,D]
     const float* __restrict__ R,   // [B,H,N,D]
@@ -937,639 +961,314 @@ __global__ void Q_grad(
     const float* __restrict__ sum_q,
     const float* __restrict__ sum_r,
     const float* __restrict__ sum_s,
-    /* ---- output ------------------------------------------------------ */
+    /* ---- outputs ----------------------------------------------------- */
     float* __restrict__ gradQ,          // [B,H,N,D]
+    float* __restrict__ gradS,          // [B,H,N,D]
     /* ---- sizes ------------------------------------------------------- */
     int  N, int D, float scale)
 {
-    /* ---- decode indices --------------------------------------------- */
-    const int i0 = blockIdx.x * BLOCK_I + threadIdx.x;   // i-index owned by this lane
-    const int k0 = blockIdx.y * BLOCK_K + threadIdx.y;   // k-index owned by this lane
-    const int bh = blockIdx.z;                       // flattened (batch, head)
-
-    /* NOTE: Do NOT early return - all threads must participate in __syncthreads()
-       for cooperative loading. Use 'valid' flag to guard computation instead. */
+    const int i0 = blockIdx.x * BLOCK_I + threadIdx.x;
+    const int k0 = blockIdx.y * BLOCK_K + threadIdx.y;
+    const int bh = blockIdx.z;
     const bool valid = (i0 < N && k0 < N);
 
-    /* ---- per (B,H) base pointers & strides -------------------------- */
+    // Per (B,H) base pointers
     const int64_t stride_BH = (int64_t)N * D;
-    const float* Qbh   = Q   + (int64_t)bh * stride_BH;
-    const float* Rbh   = R   + (int64_t)bh * stride_BH;
-    const float* Sbh   = S   + (int64_t)bh * stride_BH;
-    const float* Vq1bh = Vq1 + (int64_t)bh * stride_BH;
-    const float* Vq2bh = Vq2 + (int64_t)bh * stride_BH;
-    const float* Vr1bh = Vr1 + (int64_t)bh * stride_BH;
-    const float* Vr2bh = Vr2 + (int64_t)bh * stride_BH;
-    const float* Vs1bh = Vs1 + (int64_t)bh * stride_BH;
-    const float* Vs2bh = Vs2 + (int64_t)bh * stride_BH;
-    const float* gYbh  = gradY + (int64_t)bh * stride_BH;
+    const float* Qbh   = Q   + bh * stride_BH;
+    const float* Rbh   = R   + bh * stride_BH;
+    const float* Sbh   = S   + bh * stride_BH;
+    const float* Vq1bh = Vq1 + bh * stride_BH;
+    const float* Vq2bh = Vq2 + bh * stride_BH;
+    const float* Vr1bh = Vr1 + bh * stride_BH;
+    const float* Vr2bh = Vr2 + bh * stride_BH;
+    const float* Vs1bh = Vs1 + bh * stride_BH;
+    const float* Vs2bh = Vs2 + bh * stride_BH;
+    const float* gYbh  = gradY + bh * stride_BH;
+    const float* miBH  = m_i + bh * N;
+    const float* liBH  = l_i + bh * N;
+    const float* mjBH  = m_j + bh * N;
+    const float* ljBH  = l_j + bh * N;
+    const float* mkBH  = m_k + bh * N;
+    const float* lkBH  = l_k + bh * N;
+    const float* sum_qBH = sum_q + bh * N;
+    const float* sum_rBH = sum_r + bh * N;
+    const float* sum_sBH = sum_s + bh * N;
+    float* gQbh = gradQ + bh * stride_BH;
+    float* gSbh = gradS + bh * stride_BH;
 
-    const float* miBH  = m_i + (int64_t)bh * N;
-    const float* liBH  = l_i + (int64_t)bh * N;
-    const float* mjBH  = m_j + (int64_t)bh * N;
-    const float* ljBH  = l_j + (int64_t)bh * N;
-    const float* mkBH  = m_k + (int64_t)bh * N;
-    const float* lkBH  = l_k + (int64_t)bh * N;
-
-    const float* sum_qBH = sum_q + (int64_t)bh * N;
-    const float* sum_rBH = sum_r + (int64_t)bh * N;
-    const float* sum_sBH = sum_s + (int64_t)bh * N;
-
-    float* gQbh = gradQ + (int64_t)bh * stride_BH;
-
-    /* ---- registers for i-/k-local vectors --------------------------- */
-    float Qi [REG_CAP] = {0.0f};
-    float Sk [REG_CAP] = {0.0f};
+    // Load i-indexed and k-indexed vectors into registers
+    float Qi[REG_CAP] = {0.0f}, Sk[REG_CAP] = {0.0f};
     float Vq1i[REG_CAP] = {0.0f}, Vq2i[REG_CAP] = {0.0f};
     float Vs1k[REG_CAP] = {0.0f}, Vs2k[REG_CAP] = {0.0f};
-    float dYi [REG_CAP] = {0.0f}, dYk [REG_CAP] = {0.0f};
-
+    float dYi[REG_CAP] = {0.0f}, dYk[REG_CAP] = {0.0f};
     float mi = 0.0f, li = 1.0f, mk = 0.0f, lk = 1.0f;
     float sumQi = 0.0f, sumSk = 0.0f;
 
-    /* Only load per-thread data if this thread owns a valid (i,k) pair */
     if (valid) {
-        #pragma unroll
-        for (int d=0; d<D; ++d){
-            Qi [d] = Qbh [i0*D + d];
-            Sk [d] = Sbh [k0*D + d];
+        for (int d = 0; d < D; ++d) {
+            Qi[d]   = Qbh[i0*D + d];
+            Sk[d]   = Sbh[k0*D + d];
             Vq1i[d] = Vq1bh[i0*D + d];
             Vq2i[d] = Vq2bh[i0*D + d];
             Vs1k[d] = Vs1bh[k0*D + d];
             Vs2k[d] = Vs2bh[k0*D + d];
-            dYi [d] = gYbh [i0*D + d];
-            dYk [d] = gYbh [k0*D + d];
+            dYi[d]  = gYbh[i0*D + d];
+            dYk[d]  = gYbh[k0*D + d];
         }
-
-        mi    = miBH [i0];
-        li    = liBH [i0];
-        mk    = mkBH [k0];
-        lk    = lkBH [k0];
+        mi = miBH[i0];  li = liBH[i0];
+        mk = mkBH[k0];  lk = lkBH[k0];
         sumQi = sum_qBH[i0];
         sumSk = sum_sBH[k0];
     }
 
-    /* ---- shared memory for J-tiles ---------------------------------- */
+    // Shared memory layout: [R | Vr1 | Vr2 | gYj | mj | lj | sumr]
     extern __shared__ float shmem[];
-    float* sh_R   = shmem;                    // BLOCK_J × D
-    float* sh_Vr1 = sh_R   + BLOCK_J * D;
-    float* sh_Vr2 = sh_Vr1 + BLOCK_J * D;
-    float* sh_gYj = sh_Vr2 + BLOCK_J * D;
-    float* sh_mj  = sh_gYj + BLOCK_J * D;         // BLOCK_J
-    float* sh_lj  = sh_mj  + BLOCK_J;             // BLOCK_J
-    float* sh_sumr= sh_lj  + BLOCK_J;             // BLOCK_J
+    float* sh_R    = shmem;
+    float* sh_Vr1  = sh_R   + BLOCK_J * D;
+    float* sh_Vr2  = sh_Vr1 + BLOCK_J * D;
+    float* sh_gYj  = sh_Vr2 + BLOCK_J * D;
+    float* sh_mj   = sh_gYj + BLOCK_J * D;
+    float* sh_lj   = sh_mj  + BLOCK_J;
+    float* sh_sumr = sh_lj  + BLOCK_J;
 
-    /* ---- accumulator for grad_Q[i,:] -------------------------------- */
-    float grad_acc[REG_CAP] = {0.0f};
+    float gradQ_acc[REG_CAP] = {0.0f};
+    float gradS_acc[REG_CAP] = {0.0f};
 
-
-    /* ---- iterate over J in tiles ------------------------------------ */
-    for (int jBase = 0; jBase < N; jBase += BLOCK_J)
-    {
-        /* cooperative load by all (i,k) threads ----------------------- */
-        /* NOTE: BLOCK_J may exceed BLOCK_K, so we loop to cover all rows */
+    // Stream j-tiles through shared memory
+    for (int jBase = 0; jBase < N; jBase += BLOCK_J) {
+        // Cooperative load of j-tile (all threads participate for __syncthreads)
         for (int ld = threadIdx.y; ld < BLOCK_J && (jBase + ld) < N; ld += BLOCK_K) {
             const int jGlob = jBase + ld;
-            #pragma unroll
-            for (int d = threadIdx.x; d < D; d += BLOCK_I){
-                sh_R   [ld*D + d] = Rbh  [jGlob*D + d];
-                sh_Vr1 [ld*D + d] = Vr1bh[jGlob*D + d];
-                sh_Vr2 [ld*D + d] = Vr2bh[jGlob*D + d];
-                sh_gYj [ld*D + d] = gYbh [jGlob*D + d];
+            for (int d = threadIdx.x; d < D; d += BLOCK_I) {
+                sh_R[ld*D + d]   = Rbh[jGlob*D + d];
+                sh_Vr1[ld*D + d] = Vr1bh[jGlob*D + d];
+                sh_Vr2[ld*D + d] = Vr2bh[jGlob*D + d];
+                sh_gYj[ld*D + d] = gYbh[jGlob*D + d];
             }
-            if (threadIdx.x == 0){
-                sh_mj [ld]  = mjBH  [jGlob];
-                sh_lj [ld]  = ljBH  [jGlob];
+            if (threadIdx.x == 0) {
+                sh_mj[ld]   = mjBH[jGlob];
+                sh_lj[ld]   = ljBH[jGlob];
                 sh_sumr[ld] = sum_rBH[jGlob];
             }
         }
         __syncthreads();
 
-        /* ---- loop inside loaded J-tile ------------------------------ */
-        for (int jOff = 0; jOff < BLOCK_J && (jBase + jOff) < N; ++jOff){
-            /* --- logits & softmax numerators ------------------------ */
-            float dot = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                dot += Qi[d] * sh_R[jOff*D + d] * Sk[d];
-            float logits = dot * scale;
+        // Process each j in the tile
+        for (int jOff = 0; jOff < BLOCK_J && (jBase + jOff) < N; ++jOff) {
+            // Fused computation: logit + 6 unique dot products (d1-d6)
+            float dot = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f, d4 = 0.f, d5 = 0.f, d6 = 0.f;
+            for (int d = 0; d < D; ++d) {
+                const float rj  = sh_R[jOff*D + d];
+                const float vr1 = sh_Vr1[jOff*D + d];
+                const float vr2 = sh_Vr2[jOff*D + d];
+                const float gyj = sh_gYj[jOff*D + d];
 
-            float Aq = __expf(fminf(logits - mi, EXP_CLIP))         / fmaxf(li, DENOM_EPS);
-            float Ar = __expf(fminf(logits - sh_mj[jOff], EXP_CLIP)) / fmaxf(sh_lj[jOff], DENOM_EPS);
-            float As = __expf(fminf(logits - mk, EXP_CLIP))         / fmaxf(lk, DENOM_EPS);
+                dot += Qi[d] * rj * Sk[d];
+                d1 += dYi[d] * vr1 * Vs1k[d];
+                d2 += gyj * Vq1i[d] * Vs1k[d];
+                d3 += dYk[d] * Vq1i[d] * vr1;
+                d4 += dYi[d] * vr2 * Vs2k[d];
+                d5 += gyj * Vq2i[d] * Vs2k[d];
+                d6 += dYk[d] * Vq2i[d] * vr2;
+            }
 
-            /* --- grad_Aq ------------------------------------------- */
-            float gAq = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                gAq += dYi[d] * sh_Vr1[jOff*D + d] * Vs1k[d];
-            float tmp = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                tmp += sh_gYj[jOff*D + d] * Vq2i[d] * Vs2k[d];
-            gAq += tmp * As;
-            tmp = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                tmp += dYk[d] * Vq2i[d] * sh_Vr2[jOff*D + d];
-            gAq += tmp * Ar;
+            // Softmax weights
+            const float logits = dot * scale;
+            const float Aq = __expf(fminf(logits - mi, EXP_CLIP)) / fmaxf(li, DENOM_EPS);
+            const float Ar = __expf(fminf(logits - sh_mj[jOff], EXP_CLIP)) / fmaxf(sh_lj[jOff], DENOM_EPS);
+            const float As = __expf(fminf(logits - mk, EXP_CLIP)) / fmaxf(lk, DENOM_EPS);
 
-            /* --- grad_Ar ------------------------------------------- */
-            float gAr = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                gAr += sh_gYj[jOff*D + d] * Vq1i[d] * Vs1k[d];
-            tmp = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                tmp += dYi[d] * sh_Vr2[jOff*D + d] * Vs2k[d];
-            gAr += tmp * As;
-            tmp = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                tmp += dYk[d] * Vq2i[d] * sh_Vr2[jOff*D + d];
-            gAr += tmp * Aq;
+            // Combine dot products into gradient components
+            const float gAq = d1 + d5 * As + d6 * Ar;
+            const float gAr = d2 + d4 * As + d6 * Aq;
+            const float gAs = d3 + d4 * Ar + d5 * Aq;
 
-            /* --- grad_As ------------------------------------------- */
-            float gAs = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                gAs += dYk[d] * Vq1i[d] * sh_Vr1[jOff*D + d];
-            tmp = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                tmp += dYi[d] * sh_Vr2[jOff*D + d] * Vs2k[d];
-            gAs += tmp * Ar;
-            tmp = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                tmp += sh_gYj[jOff*D + d] * Vq2i[d] * Vs2k[d];
-            gAs += tmp * Aq;
+            // Jacobian-corrected combined gradient
+            const float grad_A = (gAq - sumQi) * Aq
+                               + (gAr - sh_sumr[jOff]) * Ar
+                               + (gAs - sumSk) * As;
 
-            /* --- Jacobian-corrected grad_A ------------------------- */
-            float grad_A = (gAq -  sumQi          ) * Aq
-                         + (gAr -  sh_sumr[jOff]  ) * Ar
-                         + (gAs -  sumSk          ) * As;
-
-            /* --- accumulate contribution to grad_Q[i,:] ------------ */
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                grad_acc[d] += grad_A * sh_R[jOff*D + d] * Sk[d];
+            // Accumulate to both outputs
+            for (int d = 0; d < D; ++d) {
+                const float rj = sh_R[jOff*D + d];
+                gradQ_acc[d] += grad_A * rj * Sk[d];
+                gradS_acc[d] += grad_A * Qi[d] * rj;
+            }
         }
         __syncthreads();
     }
 
-    /* ---- atomic add to global grad_Q ------------------------------- */
+    // Write results (atomic due to k-dimension overlap for Q, i-dimension for S)
     if (valid) {
-        #pragma unroll
-        for (int d=0; d<D; ++d)
-            atomicAdd(&gQbh[i0*D + d], scale * grad_acc[d]);
+        for (int d = 0; d < D; ++d) {
+            atomicAdd(&gQbh[i0*D + d], scale * gradQ_acc[d]);
+            atomicAdd(&gSbh[k0*D + d], scale * gradS_acc[d]);
+        }
     }
 }
 
+/**
+ * R_grad - Computes gradR separately (cannot fuse with QS due to reduction pattern)
+ * 
+ * Thread mapping: (j, k) grid, streams i-tiles in shared memory
+ * This grid is necessary because gradR[j,:] reduces over (i,k), and j must be
+ * "owned" by threads to avoid 256-way atomic contention.
+ */
 template<int BLOCK_J, int BLOCK_I, int BLOCK_K, int REG_CAP = MAX_D_REG>
 __global__ void R_grad(
-    /* ---- operands ---------------------------------------------------- */
-    const float* __restrict__ Q,   // [B,H,N,D]
-    const float* __restrict__ R,   // [B,H,N,D]
-    const float* __restrict__ S,   // [B,H,N,D]
+    const float* __restrict__ Q, const float* __restrict__ R, const float* __restrict__ S,
     const float* __restrict__ Vq1, const float* __restrict__ Vq2,
     const float* __restrict__ Vr1, const float* __restrict__ Vr2,
     const float* __restrict__ Vs1, const float* __restrict__ Vs2,
-    const float* __restrict__ gradY,   // [B,H,N,D]   (∂L/∂Y)
-    /* ---- softmax statistics ----------------------------------------- */
+    const float* __restrict__ gradY,
     const float* __restrict__ m_i, const float* __restrict__ l_i,
     const float* __restrict__ m_j, const float* __restrict__ l_j,
     const float* __restrict__ m_k, const float* __restrict__ l_k,
-    /* ---- correction scalars from pass-1 ----------------------------- */
-    const float* __restrict__ sum_q,
-    const float* __restrict__ sum_r,
-    const float* __restrict__ sum_s,
-    /* ---- output ------------------------------------------------------ */
-    float* __restrict__ gradR,          // [B,H,N,D]
-    /* ---- sizes ------------------------------------------------------- */
-    int  N, int D, float scale)
+    const float* __restrict__ sum_q, const float* __restrict__ sum_r, const float* __restrict__ sum_s,
+    float* __restrict__ gradR,
+    int N, int D, float scale)
 {
-    /* ---- decode indices --------------------------------------------- */
-    const int j0 = blockIdx.x * BLOCK_J + threadIdx.x;   // j-index owned by this lane
-    const int k0 = blockIdx.y * BLOCK_K + threadIdx.y;   // k-index owned by this lane
-    const int bh = blockIdx.z;                           // flattened (batch, head)
-
-    /* NOTE: Do NOT early return here! All threads must participate in
-       __syncthreads() for cooperative loading. Use validity flag instead. */
+    const int j0 = blockIdx.x * BLOCK_J + threadIdx.x;
+    const int k0 = blockIdx.y * BLOCK_K + threadIdx.y;
+    const int bh = blockIdx.z;
     const bool valid = (j0 < N && k0 < N);
 
-    /* ---- per (B,H) base pointers & strides -------------------------- */
+    // Per (B,H) base pointers
     const int64_t stride_BH = (int64_t)N * D;
-    const float* Qbh   = Q   + (int64_t)bh * stride_BH;
-    const float* Rbh   = R   + (int64_t)bh * stride_BH;
-    const float* Sbh   = S   + (int64_t)bh * stride_BH;
-    const float* Vq1bh = Vq1 + (int64_t)bh * stride_BH;
-    const float* Vq2bh = Vq2 + (int64_t)bh * stride_BH;
-    const float* Vr1bh = Vr1 + (int64_t)bh * stride_BH;
-    const float* Vr2bh = Vr2 + (int64_t)bh * stride_BH;
-    const float* Vs1bh = Vs1 + (int64_t)bh * stride_BH;
-    const float* Vs2bh = Vs2 + (int64_t)bh * stride_BH;
-    const float* gYbh  = gradY + (int64_t)bh * stride_BH;
+    const float* Qbh   = Q   + bh * stride_BH;
+    const float* Rbh   = R   + bh * stride_BH;
+    const float* Sbh   = S   + bh * stride_BH;
+    const float* Vq1bh = Vq1 + bh * stride_BH;
+    const float* Vq2bh = Vq2 + bh * stride_BH;
+    const float* Vr1bh = Vr1 + bh * stride_BH;
+    const float* Vr2bh = Vr2 + bh * stride_BH;
+    const float* Vs1bh = Vs1 + bh * stride_BH;
+    const float* Vs2bh = Vs2 + bh * stride_BH;
+    const float* gYbh  = gradY + bh * stride_BH;
+    const float* miBH  = m_i + bh * N;
+    const float* liBH  = l_i + bh * N;
+    const float* mjBH  = m_j + bh * N;
+    const float* ljBH  = l_j + bh * N;
+    const float* mkBH  = m_k + bh * N;
+    const float* lkBH  = l_k + bh * N;
+    const float* sum_qBH = sum_q + bh * N;
+    const float* sum_rBH = sum_r + bh * N;
+    const float* sum_sBH = sum_s + bh * N;
+    float* gRbh = gradR + bh * stride_BH;
 
-    const float* miBH  = m_i + (int64_t)bh * N;
-    const float* liBH  = l_i + (int64_t)bh * N;
-    const float* mjBH  = m_j + (int64_t)bh * N;
-    const float* ljBH  = l_j + (int64_t)bh * N;
-    const float* mkBH  = m_k + (int64_t)bh * N;
-    const float* lkBH  = l_k + (int64_t)bh * N;
-
-    const float* sum_qBH = sum_q + (int64_t)bh * N;
-    const float* sum_rBH = sum_r + (int64_t)bh * N;
-    const float* sum_sBH = sum_s + (int64_t)bh * N;
-
-    float* gRbh = gradR + (int64_t)bh * stride_BH;
-
-    /* ---- registers for j-/k-local vectors --------------------------- */
-    float Rj [REG_CAP] = {0.0f};
-    float Sk [REG_CAP] = {0.0f};
+    // Load j-indexed and k-indexed vectors into registers
+    float Rj[REG_CAP] = {0.0f}, Sk[REG_CAP] = {0.0f};
     float Vr1j[REG_CAP] = {0.0f}, Vr2j[REG_CAP] = {0.0f};
     float Vs1k[REG_CAP] = {0.0f}, Vs2k[REG_CAP] = {0.0f};
-    float dYj [REG_CAP] = {0.0f}, dYk [REG_CAP] = {0.0f};
-
+    float dYj[REG_CAP] = {0.0f}, dYk[REG_CAP] = {0.0f};
     float mj = 0.0f, lj = 1.0f, mk = 0.0f, lk = 1.0f;
     float sumRj = 0.0f, sumSk = 0.0f;
 
-    /* Only load per-thread data if this thread owns a valid (j,k) pair */
     if (valid) {
-        #pragma unroll
-        for (int d=0; d<D; ++d){
-            Rj [d] = Rbh [j0*D + d];
-            Sk [d] = Sbh [k0*D + d];
+        for (int d = 0; d < D; ++d) {
+            Rj[d]   = Rbh[j0*D + d];
+            Sk[d]   = Sbh[k0*D + d];
             Vr1j[d] = Vr1bh[j0*D + d];
             Vr2j[d] = Vr2bh[j0*D + d];
             Vs1k[d] = Vs1bh[k0*D + d];
             Vs2k[d] = Vs2bh[k0*D + d];
-            dYj [d] = gYbh [j0*D + d];
-            dYk [d] = gYbh [k0*D + d];
+            dYj[d]  = gYbh[j0*D + d];
+            dYk[d]  = gYbh[k0*D + d];
         }
-
-        mj    = mjBH  [j0];
-        lj    = ljBH  [j0];
-        mk    = mkBH  [k0];
-        lk    = lkBH  [k0];
+        mj = mjBH[j0];  lj = ljBH[j0];
+        mk = mkBH[k0];  lk = lkBH[k0];
         sumRj = sum_rBH[j0];
         sumSk = sum_sBH[k0];
     }
 
-    /* ---- shared memory for I-tiles ---------------------------------- */
+    // Shared memory layout: [Q | Vq1 | Vq2 | dYi | mi | li | sumq]
     extern __shared__ float shmem[];
-    float* sh_Q    = shmem;                    // BLOCK_I × D
+    float* sh_Q    = shmem;
     float* sh_Vq1  = sh_Q    + BLOCK_I * D;
     float* sh_Vq2  = sh_Vq1  + BLOCK_I * D;
     float* sh_dYi  = sh_Vq2  + BLOCK_I * D;
-    float* sh_mi   = sh_dYi  + BLOCK_I * D;    // BLOCK_I
-    float* sh_li   = sh_mi   + BLOCK_I;        // BLOCK_I
-    float* sh_sumq = sh_li   + BLOCK_I;        // BLOCK_I
+    float* sh_mi   = sh_dYi  + BLOCK_I * D;
+    float* sh_li   = sh_mi   + BLOCK_I;
+    float* sh_sumq = sh_li   + BLOCK_I;
 
-    /* ---- accumulator for grad_R[j,:] -------------------------------- */
     float grad_acc[REG_CAP] = {0.0f};
 
-
-    /* ---- iterate over I in tiles ------------------------------------ */
-    for (int iBase = 0; iBase < N; iBase += BLOCK_I)
-    {
-        /* cooperative load by all (j,k) threads */
-        /* NOTE: BLOCK_I may exceed BLOCK_K, so we loop to cover all rows */
+    // Stream i-tiles through shared memory
+    for (int iBase = 0; iBase < N; iBase += BLOCK_I) {
+        // Cooperative load of i-tile
         for (int ld = threadIdx.y; ld < BLOCK_I && (iBase + ld) < N; ld += BLOCK_K) {
             const int iGlob = iBase + ld;
-            #pragma unroll
-            for (int d = threadIdx.x; d < D; d += BLOCK_J){
-                sh_Q   [ld*D + d] = Qbh  [iGlob*D + d];
-                sh_Vq1 [ld*D + d] = Vq1bh[iGlob*D + d];
-                sh_Vq2 [ld*D + d] = Vq2bh[iGlob*D + d];
-                sh_dYi [ld*D + d] = gYbh [iGlob*D + d];
+            for (int d = threadIdx.x; d < D; d += BLOCK_J) {
+                sh_Q[ld*D + d]   = Qbh[iGlob*D + d];
+                sh_Vq1[ld*D + d] = Vq1bh[iGlob*D + d];
+                sh_Vq2[ld*D + d] = Vq2bh[iGlob*D + d];
+                sh_dYi[ld*D + d] = gYbh[iGlob*D + d];
             }
-            if (threadIdx.x == 0){
-                sh_mi  [ld] = miBH  [iGlob];
-                sh_li  [ld] = liBH  [iGlob];
+            if (threadIdx.x == 0) {
+                sh_mi[ld]   = miBH[iGlob];
+                sh_li[ld]   = liBH[iGlob];
                 sh_sumq[ld] = sum_qBH[iGlob];
             }
         }
         __syncthreads();
 
-        /* ---- loop inside loaded I-tile ------------------------------ */
-        for (int iOff = 0; iOff < BLOCK_I && (iBase + iOff) < N; ++iOff){
+        // Process each i in the tile
+        for (int iOff = 0; iOff < BLOCK_I && (iBase + iOff) < N; ++iOff) {
             const float* Qi   = sh_Q   + iOff*D;
             const float* Vq1i = sh_Vq1 + iOff*D;
             const float* Vq2i = sh_Vq2 + iOff*D;
             const float* dYi  = sh_dYi + iOff*D;
-            const float mi    = sh_mi  [iOff];
-            const float li    = sh_li  [iOff];
+            const float mi    = sh_mi[iOff];
+            const float li    = sh_li[iOff];
             const float sumQi = sh_sumq[iOff];
 
-            /* --- logits & softmax numerators ------------------------ */
-            float dot = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                dot += Qi[d] * Rj[d] * Sk[d];
-            float logits = dot * scale;
+            // Fused computation: logit + 6 unique dot products
+            float dot = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f, d4 = 0.f, d5 = 0.f, d6 = 0.f;
+            for (int d = 0; d < D; ++d) {
+                const float qi  = Qi[d];
+                const float vq1 = Vq1i[d];
+                const float vq2 = Vq2i[d];
+                const float dyi = dYi[d];
 
-            float Aq = __expf(fminf(logits - mi, EXP_CLIP)) / fmaxf(li, DENOM_EPS);
-            float Ar = __expf(fminf(logits - mj, EXP_CLIP)) / fmaxf(lj, DENOM_EPS);
-            float As = __expf(fminf(logits - mk, EXP_CLIP)) / fmaxf(lk, DENOM_EPS);
+                dot += qi * Rj[d] * Sk[d];
+                d1 += dyi * Vr1j[d] * Vs1k[d];
+                d2 += dYj[d] * vq1 * Vs1k[d];
+                d3 += dYk[d] * vq1 * Vr1j[d];
+                d4 += dyi * Vr2j[d] * Vs2k[d];
+                d5 += dYj[d] * vq2 * Vs2k[d];
+                d6 += dYk[d] * vq2 * Vr2j[d];
+            }
 
-            /* --- grad_Aq ------------------------------------------- */
-            float gAq = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                gAq += dYi[d] * Vr1j[d] * Vs1k[d];
+            // Softmax weights
+            const float logits = dot * scale;
+            const float Aq = __expf(fminf(logits - mi, EXP_CLIP)) / fmaxf(li, DENOM_EPS);
+            const float Ar = __expf(fminf(logits - mj, EXP_CLIP)) / fmaxf(lj, DENOM_EPS);
+            const float As = __expf(fminf(logits - mk, EXP_CLIP)) / fmaxf(lk, DENOM_EPS);
 
-            float tmp = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                tmp += dYj[d] * Vq2i[d] * Vs2k[d];
-            gAq += tmp * As;
+            // Combine dot products into gradient components
+            const float gAq = d1 + d5 * As + d6 * Ar;
+            const float gAr = d2 + d4 * As + d6 * Aq;
+            const float gAs = d3 + d4 * Ar + d5 * Aq;
 
-            tmp = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                tmp += dYk[d] * Vq2i[d] * Vr2j[d];
-            gAq += tmp * Ar;
+            // Jacobian-corrected combined gradient
+            const float grad_A = (gAq - sumQi) * Aq
+                               + (gAr - sumRj) * Ar
+                               + (gAs - sumSk) * As;
 
-            /* --- grad_Ar ------------------------------------------- */
-            float gAr = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                gAr += dYj[d] * Vq1i[d] * Vs1k[d];
-
-            tmp = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                tmp += dYi[d] * Vr2j[d] * Vs2k[d];
-            gAr += tmp * As;
-
-            tmp = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                tmp += dYk[d] * Vq2i[d] * Vr2j[d];
-            gAr += tmp * Aq;
-
-            /* --- grad_As ------------------------------------------- */
-            float gAs = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                gAs += dYk[d] * Vq1i[d] * Vr1j[d];
-
-            tmp = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                tmp += dYi[d] * Vr2j[d] * Vs2k[d];
-            gAs += tmp * Ar;
-
-            tmp = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                tmp += dYj[d] * Vq2i[d] * Vs2k[d];
-            gAs += tmp * Aq;
-
-            /* --- Jacobian-corrected grad_A ------------------------- */
-            float grad_A = (gAq -  sumQi ) * Aq
-                         + (gAr -  sumRj ) * Ar
-                         + (gAs -  sumSk ) * As;
-
-            /* --- accumulate contribution to grad_R[j,:] ------------ */
-            #pragma unroll
-            for (int d=0; d<D; ++d)
+            // Accumulate to gradR
+            for (int d = 0; d < D; ++d)
                 grad_acc[d] += grad_A * Qi[d] * Sk[d];
         }
         __syncthreads();
     }
 
-    /* ---- atomic add to global grad_R ------------------------------- */
+    // Write result (atomic due to k-dimension overlap)
     if (valid) {
-        #pragma unroll
-        for (int d=0; d<D; ++d)
+        for (int d = 0; d < D; ++d)
             atomicAdd(&gRbh[j0*D + d], scale * grad_acc[d]);
     }
 }
 
-template<int BLOCK_K, int BLOCK_J, int BLOCK_I, int REG_CAP = MAX_D_REG>
-__global__ void S_grad(
-    /* ---- operands ---------------------------------------------------- */
-    const float* __restrict__ Q,   // [B,H,N,D]
-    const float* __restrict__ R,   // [B,H,N,D]
-    const float* __restrict__ S,   // [B,H,N,D]
-    const float* __restrict__ Vq1, const float* __restrict__ Vq2,
-    const float* __restrict__ Vr1, const float* __restrict__ Vr2,
-    const float* __restrict__ Vs1, const float* __restrict__ Vs2,
-    const float* __restrict__ gradY,   // [B,H,N,D]   (∂L/∂Y)
-    /* ---- softmax statistics ----------------------------------------- */
-    const float* __restrict__ m_i, const float* __restrict__ l_i,
-    const float* __restrict__ m_j, const float* __restrict__ l_j,
-    const float* __restrict__ m_k, const float* __restrict__ l_k,
-    /* ---- correction scalars from pass-1 ----------------------------- */
-    const float* __restrict__ sum_q,
-    const float* __restrict__ sum_r,
-    const float* __restrict__ sum_s,
-    /* ---- output ------------------------------------------------------ */
-    float* __restrict__ gradS,          // [B,H,N,D]
-    /* ---- sizes ------------------------------------------------------- */
-    int  N, int D, float scale)
-{
-    /* ---- decode indices --------------------------------------------- */
-    const int k0 = blockIdx.x * BLOCK_K + threadIdx.x;   // k-index owned by this lane
-    const int i0 = blockIdx.y * BLOCK_I + threadIdx.y;   // i-index owned by this lane
-    const int bh = blockIdx.z;                           // flattened (batch, head)
-
-    /* NOTE: Do NOT early return here! All threads must participate in
-       __syncthreads() for cooperative loading. Use validity flag instead. */
-    const bool valid = (k0 < N && i0 < N);
-
-    /* ---- per (B,H) base pointers & strides -------------------------- */
-    const int64_t stride_BH = (int64_t)N * D;
-    const float* Qbh   = Q   + (int64_t)bh * stride_BH;
-    const float* Rbh   = R   + (int64_t)bh * stride_BH;
-    const float* Sbh   = S   + (int64_t)bh * stride_BH;
-    const float* Vq1bh = Vq1 + (int64_t)bh * stride_BH;
-    const float* Vq2bh = Vq2 + (int64_t)bh * stride_BH;
-    const float* Vr1bh = Vr1 + (int64_t)bh * stride_BH;
-    const float* Vr2bh = Vr2 + (int64_t)bh * stride_BH;
-    const float* Vs1bh = Vs1 + (int64_t)bh * stride_BH;
-    const float* Vs2bh = Vs2 + (int64_t)bh * stride_BH;
-    const float* gYbh  = gradY + (int64_t)bh * stride_BH;
-
-    const float* miBH  = m_i + (int64_t)bh * N;
-    const float* liBH  = l_i + (int64_t)bh * N;
-    const float* mjBH  = m_j + (int64_t)bh * N;
-    const float* ljBH  = l_j + (int64_t)bh * N;
-    const float* mkBH  = m_k + (int64_t)bh * N;
-    const float* lkBH  = l_k + (int64_t)bh * N;
-
-    const float* sum_qBH = sum_q + (int64_t)bh * N;
-    const float* sum_rBH = sum_r + (int64_t)bh * N;
-    const float* sum_sBH = sum_s + (int64_t)bh * N;
-
-    float* gSbh = gradS + (int64_t)bh * stride_BH;
-
-    /* ---- registers for k-/i-local vectors --------------------------- */
-    float Sk [REG_CAP] = {0.0f};
-    float Qi [REG_CAP] = {0.0f};
-    float Vs1k[REG_CAP] = {0.0f}, Vs2k[REG_CAP] = {0.0f};
-    float Vq1i[REG_CAP] = {0.0f}, Vq2i[REG_CAP] = {0.0f};
-    float dYk [REG_CAP] = {0.0f}, dYi [REG_CAP] = {0.0f};
-
-    float mi = 0.0f, li = 1.0f, mk = 0.0f, lk = 1.0f;
-    float sumQi = 0.0f, sumSk = 0.0f;
-
-    /* Only load per-thread data if this thread owns a valid (k,i) pair */
-    if (valid) {
-        #pragma unroll
-        for (int d=0; d<D; ++d){
-            Sk [d] = Sbh [k0*D + d];
-            Qi [d] = Qbh [i0*D + d];
-            Vs1k[d] = Vs1bh[k0*D + d];
-            Vs2k[d] = Vs2bh[k0*D + d];
-            Vq1i[d] = Vq1bh[i0*D + d];
-            Vq2i[d] = Vq2bh[i0*D + d];
-            dYk [d] = gYbh [k0*D + d];
-            dYi [d] = gYbh [i0*D + d];
-        }
-
-        mi    = miBH  [i0];
-        li    = liBH  [i0];
-        mk    = mkBH  [k0];
-        lk    = lkBH  [k0];
-        sumQi = sum_qBH[i0];
-        sumSk = sum_sBH[k0];
-    }
-
-    /* ---- shared memory for J-tiles ---------------------------------- */
-    extern __shared__ float shmem[];
-    float* sh_R    = shmem;                    // BLOCK_J × D
-    float* sh_Vr1  = sh_R    + BLOCK_J * D;
-    float* sh_Vr2  = sh_Vr1  + BLOCK_J * D;
-    float* sh_dYj  = sh_Vr2  + BLOCK_J * D;
-    float* sh_mj   = sh_dYj  + BLOCK_J * D;    // BLOCK_J
-    float* sh_lj   = sh_mj   + BLOCK_J;        // BLOCK_J
-    float* sh_sumr = sh_lj   + BLOCK_J;        // BLOCK_J
-
-    /* ---- accumulator for grad_S[k,:] -------------------------------- */
-    float grad_acc[REG_CAP] = {0.0f};
-
-
-    /* ---- iterate over J in tiles ------------------------------------ */
-    for (int jBase = 0; jBase < N; jBase += BLOCK_J)
-    {
-        /* cooperative load by all (k,i) threads */
-        /* NOTE: BLOCK_J may exceed BLOCK_I, so we loop to cover all rows */
-        for (int ld = threadIdx.y; ld < BLOCK_J && (jBase + ld) < N; ld += BLOCK_I) {
-            const int jGlob = jBase + ld;
-            #pragma unroll
-            for (int d = threadIdx.x; d < D; d += BLOCK_K){
-                sh_R   [ld*D + d] = Rbh  [jGlob*D + d];
-                sh_Vr1 [ld*D + d] = Vr1bh[jGlob*D + d];
-                sh_Vr2 [ld*D + d] = Vr2bh[jGlob*D + d];
-                sh_dYj [ld*D + d] = gYbh [jGlob*D + d];
-            }
-            if (threadIdx.x == 0){
-                sh_mj  [ld] = mjBH  [jGlob];
-                sh_lj  [ld] = ljBH  [jGlob];
-                sh_sumr[ld] = sum_rBH[jGlob];
-            }
-        }
-        __syncthreads();
-
-        /* ---- loop inside loaded J-tile ------------------------------ */
-        for (int jOff = 0; jOff < BLOCK_J && (jBase + jOff) < N; ++jOff){
-            const float* Rj   = sh_R   + jOff*D;
-            const float* Vr1j = sh_Vr1 + jOff*D;
-            const float* Vr2j = sh_Vr2 + jOff*D;
-            const float* dYj  = sh_dYj + jOff*D;
-            const float mj    = sh_mj  [jOff];
-            const float lj    = sh_lj  [jOff];
-            const float sumRj = sh_sumr[jOff];
-
-            /* --- logits & softmax numerators ------------------------ */
-            float dot = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                dot += Qi[d] * Rj[d] * Sk[d];
-            float logits = dot * scale;
-
-            float Aq = __expf(fminf(logits - mi, EXP_CLIP)) / fmaxf(li, DENOM_EPS);
-            float Ar = __expf(fminf(logits - mj, EXP_CLIP)) / fmaxf(lj, DENOM_EPS);
-            float As = __expf(fminf(logits - mk, EXP_CLIP)) / fmaxf(lk, DENOM_EPS);
-
-            /* --- grad_Aq ------------------------------------------- */
-            float gAq = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                gAq += dYi[d] * Vr1j[d] * Vs1k[d];
-
-            float tmp = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                tmp += dYj[d] * Vq2i[d] * Vs2k[d];
-            gAq += tmp * As;
-
-            tmp = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                tmp += dYk[d] * Vq2i[d] * Vr2j[d];
-            gAq += tmp * Ar;
-
-            /* --- grad_Ar ------------------------------------------- */
-            float gAr = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                gAr += dYj[d] * Vq1i[d] * Vs1k[d];
-
-            tmp = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                tmp += dYi[d] * Vr2j[d] * Vs2k[d];
-            gAr += tmp * As;
-
-            tmp = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                tmp += dYk[d] * Vq2i[d] * Vr2j[d];
-            gAr += tmp * Aq;
-
-            /* --- grad_As ------------------------------------------- */
-            float gAs = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                gAs += dYk[d] * Vq1i[d] * Vr1j[d];
-
-            tmp = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                tmp += dYi[d] * Vr2j[d] * Vs2k[d];
-            gAs += tmp * Ar;
-
-            tmp = 0.f;
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                tmp += dYj[d] * Vq2i[d] * Vs2k[d];
-            gAs += tmp * Aq;
-
-            /* --- Jacobian-corrected grad_A ------------------------- */
-            float grad_A = (gAq -  sumQi ) * Aq
-                         + (gAr -  sumRj ) * Ar
-                         + (gAs -  sumSk ) * As;
-
-            /* --- accumulate contribution to grad_S[k,:] ------------ */
-            #pragma unroll
-            for (int d=0; d<D; ++d)
-                grad_acc[d] += grad_A * Qi[d] * Rj[d];
-        }
-        __syncthreads();
-    }
-
-    /* ---- atomic add to global grad_S ------------------------------- */
-    if (valid) {
-        #pragma unroll
-        for (int d=0; d<D; ++d)
-            atomicAdd(&gSbh[k0*D + d], scale * grad_acc[d]);
-    }
-}
 
 
 // =============================================================================
@@ -1844,17 +1543,19 @@ backward_impl(torch::Tensor grad_output,
   }
 
   // ===========================================================================
-  // 8. COMPUTE grad_Q, R, S
+  // 8. COMPUTE grad_Q + grad_S (fused) and grad_R
   // ============================================================================   
 
   {
-    // --- grad_Q accumulation ---
-    constexpr int tileI = TILE_I;  // reuse existing macro defaults (8)
+    // --- grad_Q + grad_S fused accumulation ---
+    // Single kernel pass computes both gradQ and gradS, sharing logit
+    // computation, softmax weights, and Jacobian-corrected grad_A.
+    constexpr int tileI = TILE_I;
     constexpr int tileK = TILE_K;
     constexpr int tileJ = 16;      // independent knob for J streaming
 
     TORCH_CHECK(D <= MAX_D_REG,
-                "Q_grad requires D <= ",
+                "QS_grad_fused requires D <= ",
                 MAX_D_REG,
                 ", but got D = ",
                 D);
@@ -1868,7 +1569,7 @@ backward_impl(torch::Tensor grad_output,
         4 * tileJ * D * sizeof(float) +  // R, Vr1, Vr2, gYj
         3 * tileJ * sizeof(float);       // mj, lj, sum_r
 
-    Q_grad<tileI, tileJ, tileK>
+    QS_grad_fused<tileI, tileJ, tileK>
         <<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
             Q.data_ptr<float>(),
             R.data_ptr<float>(),
@@ -1890,11 +1591,12 @@ backward_impl(torch::Tensor grad_output,
             sum_r.data_ptr<float>(),
             sum_s.data_ptr<float>(),
             grad_Q.data_ptr<float>(),
+            grad_S.data_ptr<float>(),
             N, D, scale);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-      fprintf(stderr, "CUDA error in Q_grad launch: %s\n", cudaGetErrorString(err));
+      fprintf(stderr, "CUDA error in QS_grad_fused launch: %s\n", cudaGetErrorString(err));
     }
 
   }
@@ -1946,57 +1648,6 @@ backward_impl(torch::Tensor grad_output,
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
       fprintf(stderr, "CUDA error in R_grad launch: %s\n", cudaGetErrorString(err));
-    }
-
-  }
-
-  {
-    // --- grad_S accumulation ---
-    constexpr int tileK = TILE_K;
-    constexpr int tileI = TILE_I;
-    constexpr int tileJ = 16;      // stream over J independently
-
-    TORCH_CHECK(D <= MAX_D_REG,
-                "S_grad requires D <= ",
-                MAX_D_REG,
-                ", but got D = ",
-                D);
-
-    dim3 block_dim(tileK, tileI);
-    dim3 grid_dim((N + tileK - 1) / tileK,
-                  (N + tileI - 1) / tileI,
-                  B * H);
-
-    const size_t shmem_bytes =
-        4 * tileJ * D * sizeof(float) + 3 * tileJ * sizeof(float);
-
-    S_grad<tileK, tileJ, tileI>
-        <<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
-            Q.data_ptr<float>(),
-            R.data_ptr<float>(),
-            S.data_ptr<float>(),
-            Vq_1.data_ptr<float>(),
-            Vq_2.data_ptr<float>(),
-            Vr_1.data_ptr<float>(),
-            Vr_2.data_ptr<float>(),
-            Vs_1.data_ptr<float>(),
-            Vs_2.data_ptr<float>(),
-            grad_output.data_ptr<float>(),
-            m_i.data_ptr<float>(),
-            l_i.data_ptr<float>(),
-            m_j.data_ptr<float>(),
-            l_j.data_ptr<float>(),
-            m_k.data_ptr<float>(),
-            l_k.data_ptr<float>(),
-            sum_q.data_ptr<float>(),
-            sum_r.data_ptr<float>(),
-            sum_s.data_ptr<float>(),
-            grad_S.data_ptr<float>(),
-            N, D, scale);
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-      fprintf(stderr, "CUDA error in S_grad launch: %s\n", cudaGetErrorString(err));
     }
 
   }
