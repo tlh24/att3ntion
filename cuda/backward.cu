@@ -753,7 +753,7 @@ __global__ void Vs_scatter_grad(
 
 template<int Bq, int Br, int Bk>
 __global__ void jacobian_corrections(
-    // Inputs
+    // Inputs - full [B,H,N,D] tensors
     const float* Q,   const float* R,   const float* S,
     const float* Vq1, const float* Vq2,
     const float* Vr1, const float* Vr2,
@@ -765,7 +765,9 @@ __global__ void jacobian_corrections(
     // Outputs
     float* sum_q, float* sum_r, float* sum_s,
     // Dimensions & Scale
-    int N, int D, float scale
+    int N, int D, float scale,
+    // Grid encoding parameter: number of k-tiles per (B,H)
+    int num_k_tiles
 ) {
     // Shared memory for tensor tiles
     extern __shared__ float smem[];
@@ -782,15 +784,42 @@ __global__ void jacobian_corrections(
     float* dYj_smem  = dYi_smem  + Bq * D;                    // Br x D
     float* dYk_smem  = dYj_smem  + Br * D;                    // Bk x D
 
+    // Decode grid: blockIdx.z encodes (bh, k_tile) where bh = b*H + h
+    const int bh = blockIdx.z / num_k_tiles;
+    const int k_tile = blockIdx.z % num_k_tiles;
+
     // Tile base indices
     const int i0 = blockIdx.x * Bq;
     const int j0 = blockIdx.y * Br;
-    const int k0 = blockIdx.z * Bk;
+    const int k0 = k_tile * Bk;
 
     // Thread indices within the tile
     const int ti = threadIdx.x;
     const int tj = threadIdx.y;
     const int tk = threadIdx.z;
+
+    // Per (B,H) base pointers & strides
+    const int64_t stride_BH = (int64_t)N * D;
+    const int64_t stride_N  = (int64_t)N;
+    const float* Qbh   = Q   + (int64_t)bh * stride_BH;
+    const float* Rbh   = R   + (int64_t)bh * stride_BH;
+    const float* Sbh   = S   + (int64_t)bh * stride_BH;
+    const float* Vq1bh = Vq1 + (int64_t)bh * stride_BH;
+    const float* Vq2bh = Vq2 + (int64_t)bh * stride_BH;
+    const float* Vr1bh = Vr1 + (int64_t)bh * stride_BH;
+    const float* Vr2bh = Vr2 + (int64_t)bh * stride_BH;
+    const float* Vs1bh = Vs1 + (int64_t)bh * stride_BH;
+    const float* Vs2bh = Vs2 + (int64_t)bh * stride_BH;
+    const float* gYbh  = grad_out + (int64_t)bh * stride_BH;
+    const float* miBH  = m_i + (int64_t)bh * stride_N;
+    const float* liBH  = l_i + (int64_t)bh * stride_N;
+    const float* mjBH  = m_j + (int64_t)bh * stride_N;
+    const float* ljBH  = l_j + (int64_t)bh * stride_N;
+    const float* mkBH  = m_k + (int64_t)bh * stride_N;
+    const float* lkBH  = l_k + (int64_t)bh * stride_N;
+    float* sum_qBH = sum_q + (int64_t)bh * stride_N;
+    float* sum_rBH = sum_r + (int64_t)bh * stride_N;
+    float* sum_sBH = sum_s + (int64_t)bh * stride_N;
 
     // Linear thread ID for cooperative loading
     const int lid = tk * (Bq * Br) + tj * Bq + ti;
@@ -802,10 +831,10 @@ __global__ void jacobian_corrections(
         int row = i / D;
         int col = i % D;
         if (i0 + row < N) {
-            Qi_smem[i]   = Q[(i0 + row) * D + col];
-            Vq1i_smem[i] = Vq1[(i0 + row) * D + col];
-            Vq2i_smem[i] = Vq2[(i0 + row) * D + col];
-            dYi_smem[i]  = grad_out[(i0 + row) * D + col];
+            Qi_smem[i]   = Qbh[(i0 + row) * D + col];
+            Vq1i_smem[i] = Vq1bh[(i0 + row) * D + col];
+            Vq2i_smem[i] = Vq2bh[(i0 + row) * D + col];
+            dYi_smem[i]  = gYbh[(i0 + row) * D + col];
         } else {
             // Zero padding if tile extends beyond N
             Qi_smem[i] = 0.0f; Vq1i_smem[i] = 0.0f; Vq2i_smem[i] = 0.0f; dYi_smem[i] = 0.0f;
@@ -815,10 +844,10 @@ __global__ void jacobian_corrections(
         int row = i / D;
         int col = i % D;
         if (j0 + row < N) {
-            Rj_smem[i]   = R[(j0 + row) * D + col];
-            Vr1j_smem[i] = Vr1[(j0 + row) * D + col];
-            Vr2j_smem[i] = Vr2[(j0 + row) * D + col];
-            dYj_smem[i]  = grad_out[(j0 + row) * D + col];
+            Rj_smem[i]   = Rbh[(j0 + row) * D + col];
+            Vr1j_smem[i] = Vr1bh[(j0 + row) * D + col];
+            Vr2j_smem[i] = Vr2bh[(j0 + row) * D + col];
+            dYj_smem[i]  = gYbh[(j0 + row) * D + col];
         } else {
             Rj_smem[i] = 0.0f; Vr1j_smem[i] = 0.0f; Vr2j_smem[i] = 0.0f; dYj_smem[i] = 0.0f;
         }
@@ -827,17 +856,17 @@ __global__ void jacobian_corrections(
         int row = i / D;
         int col = i % D;
         if (k0 + row < N) {
-            Sk_smem[i]   = S[(k0 + row) * D + col];
-            Vs1k_smem[i] = Vs1[(k0 + row) * D + col];
-            Vs2k_smem[i] = Vs2[(k0 + row) * D + col];
-            dYk_smem[i]  = grad_out[(k0 + row) * D + col];
+            Sk_smem[i]   = Sbh[(k0 + row) * D + col];
+            Vs1k_smem[i] = Vs1bh[(k0 + row) * D + col];
+            Vs2k_smem[i] = Vs2bh[(k0 + row) * D + col];
+            dYk_smem[i]  = gYbh[(k0 + row) * D + col];
         } else {
             Sk_smem[i] = 0.0f; Vs1k_smem[i] = 0.0f; Vs2k_smem[i] = 0.0f; dYk_smem[i] = 0.0f;
         }
     }
     __syncthreads();
 
-    // Global indices for this thread's (i, j, k) point
+    // Global indices for this thread's (i, j, k) point within this (B,H)
     const int i = i0 + ti;
     const int j = j0 + tj;
     const int k = k0 + tk;
@@ -858,12 +887,12 @@ __global__ void jacobian_corrections(
 
         // ---> Logits & Numerators
         float logits = dot3(Qi_vec, Rj_vec, Sk_vec, D) * scale;
-        float Aq_num = expf(fminf(logits - m_i[i], EXP_CLIP));
-        float Ar_num = expf(fminf(logits - m_j[j], EXP_CLIP));
-        float As_num = expf(fminf(logits - m_k[k], EXP_CLIP));
-        float Aq = Aq_num / fmaxf(l_i[i], DENOM_EPS);
-        float Ar = Ar_num / fmaxf(l_j[j], DENOM_EPS);
-        float As = As_num / fmaxf(l_k[k], DENOM_EPS);
+        float Aq_num = expf(fminf(logits - miBH[i], EXP_CLIP));
+        float Ar_num = expf(fminf(logits - mjBH[j], EXP_CLIP));
+        float As_num = expf(fminf(logits - mkBH[k], EXP_CLIP));
+        float Aq = Aq_num / fmaxf(liBH[i], DENOM_EPS);
+        float Ar = Ar_num / fmaxf(ljBH[j], DENOM_EPS);
+        float As = As_num / fmaxf(lkBH[k], DENOM_EPS);
 
         // ---> Compute grad_A components
         // --- grad_Aq ---
@@ -880,9 +909,9 @@ __global__ void jacobian_corrections(
               gAs += dot3(dYj_vec, Vq2i_vec, Vs2k_vec, D) * Aq;
 
         // ---> Accumulate dot products
-        atomicAdd(&sum_q[i], gAq * Aq);
-        atomicAdd(&sum_r[j], gAr * Ar);
-        atomicAdd(&sum_s[k], gAs * As);
+        atomicAdd(&sum_qBH[i], gAq * Aq);
+        atomicAdd(&sum_rBH[j], gAr * Ar);
+        atomicAdd(&sum_sBH[k], gAs * As);
     }
 }
 
@@ -1772,7 +1801,9 @@ backward_impl(torch::Tensor grad_output,
     constexpr int Br = 8;
     constexpr int Bk = 8;
 
-    dim3 grid(ceil_div(N, Bq), ceil_div(N, Br), ceil_div(N, Bk));
+    // Fold B*H into grid z-dimension along with k-tiles
+    const int num_k_tiles = ceil_div(N, Bk);
+    dim3 grid(ceil_div(N, Bq), ceil_div(N, Br), num_k_tiles * B * H);
     dim3 threads(Bq, Br, Bk);
 
     const size_t shmem_bytes =
@@ -1783,31 +1814,28 @@ backward_impl(torch::Tensor grad_output,
          Bq * D + Br * D + Bk * D)    // dY
         * sizeof(float);
 
-    for (int b = 0; b < B; ++b) {
-      for (int h = 0; h < H; ++h) {
-        jacobian_corrections<Bq, Br, Bk><<<grid, threads, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
-            Q.select(0, b).select(0, h).data_ptr<float>(),
-            R.select(0, b).select(0, h).data_ptr<float>(),
-            S.select(0, b).select(0, h).data_ptr<float>(),
-            Vq_1.select(0, b).select(0, h).data_ptr<float>(),
-            Vq_2.select(0, b).select(0, h).data_ptr<float>(),
-            Vr_1.select(0, b).select(0, h).data_ptr<float>(),
-            Vr_2.select(0, b).select(0, h).data_ptr<float>(),
-            Vs_1.select(0, b).select(0, h).data_ptr<float>(),
-            Vs_2.select(0, b).select(0, h).data_ptr<float>(),
-            grad_output.select(0, b).select(0, h).data_ptr<float>(),
-            m_i.select(0, b).select(0, h).data_ptr<float>(),
-            l_i.select(0, b).select(0, h).data_ptr<float>(),
-            m_j.select(0, b).select(0, h).data_ptr<float>(),
-            l_j.select(0, b).select(0, h).data_ptr<float>(),
-            m_k.select(0, b).select(0, h).data_ptr<float>(),
-            l_k.select(0, b).select(0, h).data_ptr<float>(),
-            sum_q.select(0, b).select(0, h).data_ptr<float>(),
-            sum_r.select(0, b).select(0, h).data_ptr<float>(),
-            sum_s.select(0, b).select(0, h).data_ptr<float>(),
-            N, D, scale);
-      }
-    }
+    jacobian_corrections<Bq, Br, Bk><<<grid, threads, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+        Q.data_ptr<float>(),
+        R.data_ptr<float>(),
+        S.data_ptr<float>(),
+        Vq_1.data_ptr<float>(),
+        Vq_2.data_ptr<float>(),
+        Vr_1.data_ptr<float>(),
+        Vr_2.data_ptr<float>(),
+        Vs_1.data_ptr<float>(),
+        Vs_2.data_ptr<float>(),
+        grad_output.data_ptr<float>(),
+        m_i.data_ptr<float>(),
+        l_i.data_ptr<float>(),
+        m_j.data_ptr<float>(),
+        l_j.data_ptr<float>(),
+        m_k.data_ptr<float>(),
+        l_k.data_ptr<float>(),
+        sum_q.data_ptr<float>(),
+        sum_r.data_ptr<float>(),
+        sum_s.data_ptr<float>(),
+        N, D, scale,
+        num_k_tiles);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
