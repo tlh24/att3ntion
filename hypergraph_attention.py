@@ -5,6 +5,22 @@ import hyper_attn_cpp_manual
 import hyper_attn_cpp_reference
 from torch.autograd import Function
 
+def _pad_to_multiple(tensor, multiple, dim=2):
+    """Pad tensor along specified dimension to be a multiple of `multiple`."""
+    size = tensor.size(dim)
+    if size % multiple == 0:
+        return tensor, 0
+    pad_size = multiple - (size % multiple)
+    # Create padding tuple: (last_dim_left, last_dim_right, ..., dim_left, dim_right)
+    # For 4D tensor [B, H, N, D] and dim=2, we need to pad N
+    ndim = tensor.ndim
+    pad = [0] * (2 * ndim)
+    # PyTorch pad works from last dim backwards
+    pad_idx = 2 * (ndim - 1 - dim)
+    pad[pad_idx + 1] = pad_size  # pad on the right side
+    return torch.nn.functional.pad(tensor, pad), pad_size
+
+
 class HyperAttentionAutograd(Function):
     """
     Bridge between PyTorch autograd and the manual C++ forward/backward passes.
@@ -22,15 +38,19 @@ class HyperAttentionAutograd(Function):
         Returns:
             The output tensor from the C++ forward pass (summed).
         """
-        Q = Q.contiguous()
-        R = R.contiguous()
-        S = S.contiguous()
-        Vq_1 = Vq_1.contiguous()
-        Vq_2 = Vq_2.contiguous()
-        Vr_1 = Vr_1.contiguous()
-        Vr_2 = Vr_2.contiguous()
-        Vs_1 = Vs_1.contiguous()
-        Vs_2 = Vs_2.contiguous()
+        # CUDA kernels require sequence length to be a multiple of 16 (TILE_I)
+        TILE_SIZE = 16
+        orig_seq_len = Q.size(2)
+        
+        Q, pad_q = _pad_to_multiple(Q.contiguous(), TILE_SIZE, dim=2)
+        R, pad_r = _pad_to_multiple(R.contiguous(), TILE_SIZE, dim=2)
+        S, pad_s = _pad_to_multiple(S.contiguous(), TILE_SIZE, dim=2)
+        Vq_1, _ = _pad_to_multiple(Vq_1.contiguous(), TILE_SIZE, dim=2)
+        Vq_2, _ = _pad_to_multiple(Vq_2.contiguous(), TILE_SIZE, dim=2)
+        Vr_1, _ = _pad_to_multiple(Vr_1.contiguous(), TILE_SIZE, dim=2)
+        Vr_2, _ = _pad_to_multiple(Vr_2.contiguous(), TILE_SIZE, dim=2)
+        Vs_1, _ = _pad_to_multiple(Vs_1.contiguous(), TILE_SIZE, dim=2)
+        Vs_2, _ = _pad_to_multiple(Vs_2.contiguous(), TILE_SIZE, dim=2)
 
         outputs_tuple = hyper_attn_cpp_manual.forward(
             Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
@@ -43,9 +63,15 @@ class HyperAttentionAutograd(Function):
         else:
             raise TypeError(f"C++ forward expected to return a tuple of 12 Tensors, but got {type(outputs_tuple)} with len {len(outputs_tuple) if isinstance(outputs_tuple, tuple) else 'N/A'}")
 
+        # Remove padding from output to match original sequence length
+        if orig_seq_len != final_output.size(2):
+            final_output = final_output[:, :, :orig_seq_len, :]
+
         # Save input tensors AND softmax stats for backward pass
+        # Also save original sequence length for backward padding
         ctx.save_for_backward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
                               m_i, l_i, m_j, l_j, m_k, l_k)
+        ctx.orig_seq_len = orig_seq_len
         
         return final_output
 
@@ -61,11 +87,14 @@ class HyperAttentionAutograd(Function):
             A tuple of gradients corresponding *exactly* to the inputs of the
             forward function (Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate).
         """
-        grad_output = grad_output.contiguous()
-
-        # Retrieve saved tensors including softmax stats
+        # Retrieve saved tensors including softmax stats (these are already padded)
         Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, \
             m_i, l_i, m_j, l_j, m_k, l_k = ctx.saved_tensors
+        orig_seq_len = ctx.orig_seq_len
+        
+        # Pad grad_output to match the padded sequence length used in forward
+        TILE_SIZE = 16
+        grad_output, _ = _pad_to_multiple(grad_output.contiguous(), TILE_SIZE, dim=2)
 
         # Use backward with pre-computed softmax stats from forward pass
         grad_tuple = hyper_attn_cpp_manual.backward(
@@ -79,13 +108,26 @@ class HyperAttentionAutograd(Function):
 
         grad_Q, grad_R, grad_S, grad_Vq_1, grad_Vq_2, grad_Vr_1, grad_Vr_2, grad_Vs_1, grad_Vs_2 = grad_tuple
 
+        # Remove padding from gradients to match original sequence length
+        if orig_seq_len != grad_Q.size(2):
+            grad_Q = grad_Q[:, :, :orig_seq_len, :]
+            grad_R = grad_R[:, :, :orig_seq_len, :]
+            grad_S = grad_S[:, :, :orig_seq_len, :]
+            grad_Vq_1 = grad_Vq_1[:, :, :orig_seq_len, :]
+            grad_Vq_2 = grad_Vq_2[:, :, :orig_seq_len, :]
+            grad_Vr_1 = grad_Vr_1[:, :, :orig_seq_len, :]
+            grad_Vr_2 = grad_Vr_2[:, :, :orig_seq_len, :]
+            grad_Vs_1 = grad_Vs_1[:, :, :orig_seq_len, :]
+            grad_Vs_2 = grad_Vs_2[:, :, :orig_seq_len, :]
+
         debug_names = [
             "grad_Q", "grad_R", "grad_S",
             "grad_Vq_1", "grad_Vq_2",
             "grad_Vr_1", "grad_Vr_2",
             "grad_Vs_1", "grad_Vs_2",
         ]
-        for name, tensor in zip(debug_names, grad_tuple):
+        grads = (grad_Q, grad_R, grad_S, grad_Vq_1, grad_Vq_2, grad_Vr_1, grad_Vr_2, grad_Vs_1, grad_Vs_2)
+        for name, tensor in zip(debug_names, grads):
             if tensor is not None and tensor.is_floating_point():
                 if not torch.isfinite(tensor).all():
                     raise RuntimeError(f"{name} contains non-finite values")
