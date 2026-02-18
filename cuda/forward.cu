@@ -1120,7 +1120,8 @@ void Yq_scatter_launcher_with_stats(
     const at::Tensor& Vr_2, const at::Tensor& Vs_2,
     const at::Tensor& m_j, const at::Tensor& l_j,
     const at::Tensor& m_k, const at::Tensor& l_k,
-    at::Tensor& Y_q_, float scale
+    at::Tensor& Y_q_, float scale,
+    cudaStream_t stream = 0
 ) {
     const auto B = Q.size(0);
     const auto H = Q.size(1);
@@ -1150,7 +1151,7 @@ void Yq_scatter_launcher_with_stats(
         TILE_K + TILE_K                 // mk_tile, lk_tile
     );
 
-    Yq_scatter<<<grid, block, smem_size>>>(
+    Yq_scatter<<<grid, block, smem_size, stream>>>(
         Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
         Vr_2.data_ptr<float>(), Vs_2.data_ptr<float>(),
         m_j.data_ptr<float>(), l_j.data_ptr<float>(),
@@ -1421,7 +1422,8 @@ void Yr_scatter_launcher_with_stats(
     const at::Tensor& Vq_2, const at::Tensor& Vs_2,
     const at::Tensor& m_i, const at::Tensor& l_i,
     const at::Tensor& m_k, const at::Tensor& l_k,
-    at::Tensor& Y_r_, float scale
+    at::Tensor& Y_r_, float scale,
+    cudaStream_t stream = 0
 ) {
     const auto B = Q.size(0);
     const auto H = Q.size(1);
@@ -1451,7 +1453,7 @@ void Yr_scatter_launcher_with_stats(
         TILE_K + TILE_K                 // mk_tile, lk_tile
     );
 
-    Yr_scatter<<<grid, block, smem_size>>>(
+    Yr_scatter<<<grid, block, smem_size, stream>>>(
         Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
         Vq_2.data_ptr<float>(), Vs_2.data_ptr<float>(),
         m_i.data_ptr<float>(), l_i.data_ptr<float>(),
@@ -1723,7 +1725,8 @@ void Ys_scatter_launcher_with_stats(
     const at::Tensor& Vq_2, const at::Tensor& Vr_2,
     const at::Tensor& m_i, const at::Tensor& l_i,
     const at::Tensor& m_j, const at::Tensor& l_j,
-    at::Tensor& Y_s_, float scale
+    at::Tensor& Y_s_, float scale,
+    cudaStream_t stream = 0
 ) {
     const auto B = Q.size(0);
     const auto H = Q.size(1);
@@ -1753,7 +1756,7 @@ void Ys_scatter_launcher_with_stats(
         TILE_J + TILE_J                 // mj_tile, lj_tile
     );
 
-    Ys_scatter<<<grid, block, smem_size>>>(
+    Ys_scatter<<<grid, block, smem_size, stream>>>(
         Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
         Vq_2.data_ptr<float>(), Vr_2.data_ptr<float>(),
         m_i.data_ptr<float>(), l_i.data_ptr<float>(),
@@ -1810,7 +1813,22 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     const int TpB = 128;
     dim3 block(TpB);
 
-    // GATHER: Y_q (also computes m_i, l_i stats)
+    // Create 3 streams for parallel kernel execution
+    cudaStream_t streams[3];
+    for (int i = 0; i < 3; i++) {
+        AT_CUDA_CHECK(cudaStreamCreate(&streams[i]));
+    }
+    
+    // Create events for synchronization barrier between gather and scatter
+    cudaEvent_t gather_done[3];
+    for (int i = 0; i < 3; i++) {
+        AT_CUDA_CHECK(cudaEventCreate(&gather_done[i]));
+    }
+
+    TORCH_CHECK(Q.scalar_type() == at::kFloat, "Only float32 is supported.");
+    TORCH_CHECK(D % 4 == 0, "D must be multiple of 4 for FP32 float4 path.");
+
+    // GATHER: Y_q on stream 0 (also computes m_i, l_i stats)
     // Use tensor core kernel when D is multiple of 16 and USE_TENSOR_CORES is enabled
     {
         dim3 grid(I, H, B);
@@ -1834,7 +1852,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
             size_t smem_size_tc = sizeof(half) * (D + TILE_J*D + TILE_K*D + TILE_J*D + TILE_K*D + TILE_J*TILE_K)
                                 + sizeof(float) * (TILE_J*TILE_K + TILE_J*D + TpB + 2 + D);
             
-            Yq_gather_tensor_core<<<grid, block, smem_size_tc>>>(
+            Yq_gather_tensor_core<<<grid, block, smem_size_tc, streams[0]>>>(
                 reinterpret_cast<const half*>(Q_h.data_ptr<at::Half>()),
                 reinterpret_cast<const half*>(R_h.data_ptr<at::Half>()),
                 reinterpret_cast<const half*>(S_h.data_ptr<at::Half>()),
@@ -1845,16 +1863,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
                 l_i.data_ptr<float>(),
                 B, H, I, J, K, D, scale
             );
-            AT_CUDA_CHECK(cudaGetLastError());
         } else
 #endif
         {
             // Original FP32 CUDA core path
             size_t smem_size = sizeof(float) * (D + TILE_J*D + TILE_K*D + TILE_J*D + TILE_K*D + TILE_J*TILE_K + TpB + 2 + D);
 
-            TORCH_CHECK(Q.scalar_type() == at::kFloat, "Only float32 is supported.");
-            TORCH_CHECK(D % 4 == 0, "D must be multiple of 4 for FP32 float4 path.");
-            Yq_gather<<<grid, block, smem_size>>>(
+            Yq_gather<<<grid, block, smem_size, streams[0]>>>(
                 reinterpret_cast<const float4*>(Q.data_ptr<float>()),
                 reinterpret_cast<const float4*>(R.data_ptr<float>()),
                 reinterpret_cast<const float4*>(S.data_ptr<float>()),
@@ -1865,20 +1880,16 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
                 l_i.data_ptr<float>(),  // output: softmax stats
                 B, H, I, J, K, D, scale
             );
-            AT_CUDA_CHECK(cudaGetLastError());
         }
     }
-    cudaDeviceSynchronize();
-    AT_CUDA_CHECK(cudaGetLastError());
+    AT_CUDA_CHECK(cudaEventRecord(gather_done[0], streams[0]));
     
-   // GATHER: Y_r (also computes m_j, l_j stats)
+    // GATHER: Y_r on stream 1 (also computes m_j, l_j stats)
     {
         dim3 grid(J, H, B);
         size_t smem_size = sizeof(float) * (D + TILE_I*D + TILE_K*D + TILE_I*D + TILE_K*D + TILE_I*TILE_K + TpB + 2 + D);
 
-        TORCH_CHECK(Q.scalar_type() == at::kFloat, "Only float32 is supported.");
-        TORCH_CHECK(D % 4 == 0, "D must be multiple of 4 for FP32 float4 path.");
-        Yr_gather<<<grid, block, smem_size>>>(
+        Yr_gather<<<grid, block, smem_size, streams[1]>>>(
             reinterpret_cast<const float4*>(R.data_ptr<float>()),
             reinterpret_cast<const float4*>(Q.data_ptr<float>()),
             reinterpret_cast<const float4*>(S.data_ptr<float>()),
@@ -1889,19 +1900,15 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
             l_j.data_ptr<float>(),  // output: softmax stats
             B, H, I, J, K, D, scale
         );
-        AT_CUDA_CHECK(cudaGetLastError());
     }
-    cudaDeviceSynchronize();
-    AT_CUDA_CHECK(cudaGetLastError());
+    AT_CUDA_CHECK(cudaEventRecord(gather_done[1], streams[1]));
 
-    // GATHER: Y_s (also computes m_k, l_k stats)
+    // GATHER: Y_s on stream 2 (also computes m_k, l_k stats)
     {
         dim3 grid(K, H, B);
         size_t smem_size = sizeof(float) * (D + TILE_I*D + TILE_J*D + TILE_I*D + TILE_J*D + TILE_I*TILE_J + TpB + 2 + D);
 
-        TORCH_CHECK(Q.scalar_type() == at::kFloat, "Only float32 is supported.");
-        TORCH_CHECK(D % 4 == 0, "D must be multiple of 4 for FP32 float4 path.");
-        Ys_gather<<<grid, block, smem_size>>>(
+        Ys_gather<<<grid, block, smem_size, streams[2]>>>(
             reinterpret_cast<const float4*>(S.data_ptr<float>()),
             reinterpret_cast<const float4*>(Q.data_ptr<float>()),
             reinterpret_cast<const float4*>(R.data_ptr<float>()),
@@ -1912,22 +1919,34 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
             l_k.data_ptr<float>(),  // output: softmax stats
             B, H, I, J, K, D, scale
         );
-        AT_CUDA_CHECK(cudaGetLastError());
     }
-    cudaDeviceSynchronize();
-    AT_CUDA_CHECK(cudaGetLastError());
+    AT_CUDA_CHECK(cudaEventRecord(gather_done[2], streams[2]));
+
+    // Barrier: all scatter kernels wait for all gather kernels to complete
+    // Each scatter stream waits on all gather events
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            AT_CUDA_CHECK(cudaStreamWaitEvent(streams[i], gather_done[j], 0));
+        }
+    }
 
     // SCATTER - softmax stats were computed by gather kernels above, reuse them
-    Yq_scatter_launcher_with_stats(Q, R, S, Vr_2, Vs_2, m_j, l_j, m_k, l_k, Y_q_, scale);
-    cudaDeviceSynchronize();
-    AT_CUDA_CHECK(cudaGetLastError());
+    // Run scatter kernels on 3 streams in parallel
+    Yq_scatter_launcher_with_stats(Q, R, S, Vr_2, Vs_2, m_j, l_j, m_k, l_k, Y_q_, scale, streams[0]);
+    Yr_scatter_launcher_with_stats(Q, R, S, Vq_2, Vs_2, m_i, l_i, m_k, l_k, Y_r_, scale, streams[1]);
+    Ys_scatter_launcher_with_stats(Q, R, S, Vq_2, Vr_2, m_i, l_i, m_j, l_j, Y_s_, scale, streams[2]);
 
-    Yr_scatter_launcher_with_stats(Q, R, S, Vq_2, Vs_2, m_i, l_i, m_k, l_k, Y_r_, scale);
-    cudaDeviceSynchronize();
-    AT_CUDA_CHECK(cudaGetLastError());
+    // Synchronize all streams before returning to Python
+    for (int i = 0; i < 3; i++) {
+        AT_CUDA_CHECK(cudaStreamSynchronize(streams[i]));
+    }
+    
+    // Cleanup
+    for (int i = 0; i < 3; i++) {
+        AT_CUDA_CHECK(cudaEventDestroy(gather_done[i]));
+        AT_CUDA_CHECK(cudaStreamDestroy(streams[i]));
+    }
 
-    Ys_scatter_launcher_with_stats(Q, R, S, Vq_2, Vr_2, m_i, l_i, m_j, l_j, Y_s_, scale);
-    cudaDeviceSynchronize(); 
     // Return outputs + softmax stats (for reuse in backward pass)
     return std::make_tuple(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_,
                            m_i, l_i, m_j, l_j, m_k, l_k);
