@@ -94,7 +94,7 @@ class HypergraphAttention_Naive(nn.Module):
 		# self.dropout_mask_r = torch.ones_like(Ar)
 		# self.dropout_mask_s = torch.ones_like(As)
 		gather = True
-		scatter = True
+		scatter = False
 		# Gather operations
 		# hence the 'diamond' operation is multiply.
 		if gather:

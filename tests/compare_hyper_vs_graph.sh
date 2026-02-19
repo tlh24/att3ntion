@@ -26,7 +26,7 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 ATTN_TYPES=("hypergraph" "graph")
-TASKS=(3 4 7)
+TASKS=(4)
 
 for attn in "${ATTN_TYPES[@]}"; do
 	for task in "${TASKS[@]}"; do
