@@ -435,14 +435,14 @@ def genData4(bs, do_print=False, validation=False):
 				result = tree.evaluate(md) # sets internal values of the ops
 				if do_print:
 					print(f"[{b}] res: ", result)
-				tree.encode(md, y, b, pos_enc)
+				tree.encode(md, y, b, pos_enc) # note!  calling with Y not X
 				cnt += n
 				x[b, cnt, 4] = 1
-				x[b, cnt, md+5:md+5+8] = pos_enc[cnt]
+				x[b, cnt, md+5:md+5+8] = pos_enc[cnt] # so X only has this trrivial posenc
 				y[b, cnt, 4] = 1
 				y[b, cnt, result+5] = 1
 				y[b, cnt, md+5:md+5+8] = pos_enc[cnt]
-				y[b, cnt, md+5+8:md+5+16] = pos_enc[tree.getLoc()] # predict this!
+				# y[b, cnt, md+5+8:md+5+16] = pos_enc[tree.getLoc()] # predict this!
 				cnt += 1
 			else:
 				tries -= 1

@@ -14,17 +14,17 @@ def get_grad_output_cuda(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_):
     B, H, I, D = Y_q.shape
     _, _, J, _ = Y_r.shape
     _, _, K, _ = Y_s.shape
-    
+
     max_len = max(I, J, K)
-    
+
     # The backward pass expects a single gradient tensor, so we create one
     # that is large enough and accumulate dummy gradients into it.
     grad_output_combined = torch.zeros(B, H, max_len, D, device=Y_q.device, dtype=Y_q.dtype)
-    
+
     grad_output_combined[:, :, :I, :] += 1.0
     grad_output_combined[:, :, :J, :] += 1.0
     grad_output_combined[:, :, :K, :] += 1.0
-    
+
     return grad_output_combined
 
 def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim):
@@ -41,7 +41,7 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim):
 
     dropout_rate = 0.0
     dtype = torch.float32
-    
+
     # --- Tensor Initialization ---
     Q = torch.rand(B, H, I_dim, D_dim, device='cuda', dtype=dtype)
     R = torch.rand(B, H, J_dim, D_dim, device='cuda', dtype=dtype)
@@ -61,10 +61,10 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim):
 
     # Create dummy gradient for the backward pass
     grad_output_cuda = get_grad_output_cuda(Y_q_mc, Y_r_mc, Y_s_mc, Y_q__mc, Y_r__mc, Y_s__mc)
-    
+
     # Backward Pass
     hyper_attn_cpp_manual.backward(
-        grad_output_cuda, 
+        grad_output_cuda,
         Q, R, S,
         Vq_1, Vq_2,
         Vr_1, Vr_2,
@@ -83,7 +83,7 @@ def launch_profiler(report_filename=None):
     # You can now change these values directly in the script for a new run
     B, H, I_dim, J_dim, K_dim, D_dim = (1, 2, 128, 128, 128, 64)
     KERNEL_NAME = "grad_Q_kernel"
-    
+
     # Dynamically generate the report filename
     if report_filename is None:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")

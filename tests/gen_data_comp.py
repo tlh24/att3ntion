@@ -160,14 +160,14 @@ def graycodePosEnc(ntok, nbits, rand_phase=False):
 			pos_enc[:, 2*i+1] = np.sin(indx / period + phase_offset) < 0
 	return pos_enc
 
-def genData3(bs, do_print=False):
+def genData3(bs, do_print=False, validation=False):
 	'''
-	Task 3: from a list of 8 integers,
+	Task 3: from a list of ntok integers,
 	compute the op of two of them based on *pointers*
 	rather than positional arguments.
-	This ought to be easy.
+	This ought to be easy - ?
 	'''
-	ntok = 16
+	ntok = 24
 	nbits = 4
 	md = 64 - (5 + (nbits*2)*3) # 35
 
@@ -188,10 +188,10 @@ def genData3(bs, do_print=False):
 		x[b,nd+1,4 ] = 1 # result
 		# positional encoding
 		x[b,:,md+5:md+5+8] = pos_enc
-		x[b,nd,md+5+8:md+5+16] = pos_enc[ai,:]
-		x[b,nd,md+5+16:md+5+24] = pos_enc[bi,:]
+		x[b,nd,md+5+8:md+5+16] = pos_enc[ai,:] # point to arg A
+		x[b,nd,md+5+16:md+5+24] = pos_enc[bi,:] # point to arg B
 		x[b,nd+1,md+5+8:md+5+16] = pos_enc[8,:] # point to op
-		# y[b,nd+1, 5+d[ai]] = 1 # TEST - works super fast
+		# y[b,nd+1, 5+d[ai]] = 1 # TEST - extra label makes it work super fast
 		# y[b,nd+1, 5+d[bi]] = 1
 		# y[b,nd+1,md+5+8:md+5+16] = pos_enc[ai,:] # copy pointer
 		# y[b,nd+1,md+5+16:md+5+24] = pos_enc[bi,:]
@@ -304,7 +304,7 @@ class Expression:
 		# recusively evaluate the expression
 		if self.op is None:
 			return self.value
-		c,_ = clipOp(self.left.evaluate(md), self.right.evaluate(md), self.op, md)
+		c,_ = modOp(self.left.evaluate(md), self.right.evaluate(md), self.op, md) # NOTE was clipOp for the pitch.
 		self.value = c # save for supervised learning
 		return c
 
@@ -390,20 +390,57 @@ class ExpressionGeneratorDepth:
 
 		return Expression(operator=op, left=left_child, right=right_child)
 
-def genData4(bs, do_print=False):
+def genData4(bs, do_print=False, validation=False):
 	'''
 	Task 4: from random arithmetic expressions,
 	generate parse trees & evaluate them
 	'''
 	ntok = 32
 	nbits = 4 # hardcoded in class expression
-	md = 64 - (5 + (nbits*2)*3) # 35
+	md = 64 - (5 + (nbits*2)*3) # modulo = 35
 
 	rng = np.random.default_rng()
 	x = np.zeros((bs, ntok, md + 5 + 8*3), dtype=np.float32)
 	y = np.zeros_like(x)
-	exp_gen = ExpressionGeneratorDepth(4, 7) # NOTE!!!
+	exp_gen = ExpressionGeneratorDepth(5, 7) # NOTE!!!
 	for b in range(bs):
+<<<<<<< HEAD
+		pos_enc = graycodePosEnc(ntok, nbits, rand_phase=True)
+		tries = 16
+		cnt = 0
+		while tries > 0:
+			# could do a much better packing alg ..meh
+			val = 0
+			while val == 0:
+				tree = exp_gen.generate()
+				val = tree.evaluate(md)
+			# pos_enc_permute = rng.permutation(pos_enc, axis=0)
+			# pos_enc_permute = np.copy(pos_enc)
+			n = tree.count()
+			result = tree.evaluate(md) # sets internal values of the ops
+			if n + 1 + cnt < 32 and result > 0 and result < md-1: # one spot for the result
+				tree.setLocRec(cnt) # also resets eval.
+				if do_print:
+					print(f"[{b}] expr:", tree)
+					print(f"[{b}] res loc :", tree.printLoc())
+					print(f"[{b}] ploc:", tree.printParentLoc(tree.getLoc()))
+				tree.encode(md, x, b, pos_enc)
+				# encode the result
+				result = tree.evaluate(md) # sets internal values of the ops
+				if do_print:
+					print(f"[{b}] res: ", result)
+				tree.encode(md, y, b, pos_enc)
+				cnt += n
+				x[b, cnt, 4] = 1
+				x[b, cnt, md+5:md+5+8] = pos_enc[cnt]
+				y[b, cnt, 4] = 1
+				y[b, cnt, result+5] = 1
+				y[b, cnt, md+5:md+5+8] = pos_enc[cnt]
+				y[b, cnt, md+5+8:md+5+16] = pos_enc[tree.getLoc()] # predict this!
+				cnt += 1
+			else:
+				tries -= 1
+=======
 		tree = exp_gen.generate()
 		tree.setLocRec(0)
 		if do_print:
@@ -426,6 +463,7 @@ def genData4(bs, do_print=False):
 		x[b, -1, result+5] = 1
 		x[b, -1, md+5:md+5+8] = pos_enc[-1]
 		x[b, -1, md+5+8:md+5+16] = pos_enc[tree.getLoc()]
+>>>>>>> d000bb9c033a4f40bde6c0ae7ab7a0ed626e34a4
 
 	return x
 
@@ -615,6 +653,22 @@ def genData8(bs, do_print=False):
 			encodeList(y, [vc0,vc1,vc2,vc3])
 		if do_print:
 			print("num_tok", tok_ctr)
+
+# genData9(bs, do_print=False):
+# 	''' replicate http://arxiv.org/abs/2505.20896
+# 	'''
+# 	md = 8 + 16 + 8 # one-hot indicators, digits, pointer, [posenc]
+# 	ntok = 24
+# 	nbits = 8
+#
+# 	pos_enc = graycodePosEnc(ntok, nbits, rand_phase=False)
+# 	x = np.zeros((bs, ntok, md + nbits*2), dtype=np.float32)
+# 	y = np.zeros_like(x)
+# 	x[:, :, -nbits*2:] = pos_enc
+# 	y[:, :, -nbits*2:] = pos_enc # this will be overwritten
+#
+# 	for b in range(bs):
+
 
 if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='generate compositional data for training graph/hypergraph transformers')
