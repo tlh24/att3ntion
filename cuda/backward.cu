@@ -1023,17 +1023,13 @@ __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
 }
 
 /**
- * R_grad_kernel - Two-mode kernel for Jacobian correction sum_r + gradR
- * 
- * CORRECTION_ONLY=true:  Computes sum_r[j] correction sum
- *                        using 2D block reduction (replaces 3D jacobian_corrections)
- * CORRECTION_ONLY=false: Computes gradR using precomputed corrections
- *                        (same as the original R_grad)
+ * R_grad_kernel - Computes gradR with Jacobian corrections.
  *
- * Thread mapping: (j, k) grid, streams i-tiles in shared memory
+ * CORRECTION_ONLY=true:  Computes correction sum sum_r[j]
+ * CORRECTION_ONLY=false: Computes gradR using precomputed corrections
  */
 template<bool CORRECTION_ONLY, int BLOCK_J, int BLOCK_I, int BLOCK_K, int REG_CAP = MAX_D_REG>
-__global__ void R_grad_kernel(
+__global__ void __launch_bounds__(256, 1) R_grad_kernel(
     const float* __restrict__ Q, const float* __restrict__ R, const float* __restrict__ S,
     const float* __restrict__ Vq1, const float* __restrict__ Vq2,
     const float* __restrict__ Vr1, const float* __restrict__ Vr2,
@@ -1071,32 +1067,76 @@ __global__ void R_grad_kernel(
     const float* lkBH  = l_k + bh * N;
     float* sum_rBH = sum_r + bh * N;
 
-    // Load j-indexed and k-indexed vectors into registers
-    float Rj[REG_CAP] = {0.0f}, Sk[REG_CAP] = {0.0f};
-    float Vr1j[REG_CAP] = {0.0f}, Vr2j[REG_CAP] = {0.0f};
-    float Vs1k[REG_CAP] = {0.0f}, Vs2k[REG_CAP] = {0.0f};
-    float dYj[REG_CAP] = {0.0f}, dYk[REG_CAP] = {0.0f};
-    float mj = 0.0f, lj = 1.0f, mk = 0.0f, lk = 1.0f;
+    const int D_PAD = D + 1;  // bank-conflict-free stride
+    extern __shared__ float shmem[];
 
-    if (valid) {
-        for (int d = 0; d < D; ++d) {
-            Rj[d]   = Rbh[j0*D + d];
-            Sk[d]   = Sbh[k0*D + d];
-            Vr1j[d] = Vr1bh[j0*D + d];
-            Vr2j[d] = Vr2bh[j0*D + d];
-            Vs1k[d] = Vs1bh[k0*D + d];
-            Vs2k[d] = Vs2bh[k0*D + d];
-            dYj[d]  = gYbh[j0*D + d];
-            dYk[d]  = gYbh[k0*D + d];
+    // Persistent j/k data (padded stride)
+    float* sh_Rj   = shmem;
+    float* sh_Vr1j = sh_Rj   + BLOCK_J * D_PAD;
+    float* sh_Vr2j = sh_Vr1j + BLOCK_J * D_PAD;
+    float* sh_dYj  = sh_Vr2j + BLOCK_J * D_PAD;
+    float* sh_Sk   = sh_dYj  + BLOCK_J * D_PAD;
+    float* sh_Vs1k = sh_Sk   + BLOCK_K * D_PAD;
+    float* sh_Vs2k = sh_Vs1k + BLOCK_K * D_PAD;
+    float* sh_dYk  = sh_Vs2k + BLOCK_K * D_PAD;
+    // I-tile data (streamed)
+    float* sh_Q    = sh_dYk  + BLOCK_K * D_PAD;
+    float* sh_Vq1  = sh_Q    + BLOCK_I * D;
+    float* sh_Vq2  = sh_Vq1  + BLOCK_I * D;
+    float* sh_dYi  = sh_Vq2  + BLOCK_I * D;
+    float* sh_mi   = sh_dYi  + BLOCK_I * D;
+    float* sh_li   = sh_mi   + BLOCK_I;
+    float* sh_sumq = sh_li   + BLOCK_I;
+
+    // Cooperative load of j-indexed and k-indexed data into shared memory
+    {
+        const int tid = threadIdx.x + threadIdx.y * BLOCK_J;
+        const int nThreads = BLOCK_J * BLOCK_K;
+        for (int idx = tid; idx < BLOCK_J * D; idx += nThreads) {
+            const int jj = idx / D;
+            const int dd = idx % D;
+            const int jGlob = blockIdx.x * BLOCK_J + jj;
+            if (jGlob < N) {
+                sh_Rj  [jj * D_PAD + dd] = Rbh  [jGlob * D + dd];
+                sh_Vr1j[jj * D_PAD + dd] = Vr1bh[jGlob * D + dd];
+                sh_Vr2j[jj * D_PAD + dd] = Vr2bh[jGlob * D + dd];
+                sh_dYj [jj * D_PAD + dd] = gYbh [jGlob * D + dd];
+            } else {
+                sh_Rj  [jj * D_PAD + dd] = 0.0f;
+                sh_Vr1j[jj * D_PAD + dd] = 0.0f;
+                sh_Vr2j[jj * D_PAD + dd] = 0.0f;
+                sh_dYj [jj * D_PAD + dd] = 0.0f;
+            }
         }
+        for (int idx = tid; idx < BLOCK_K * D; idx += nThreads) {
+            const int kk = idx / D;
+            const int dd = idx % D;
+            const int kGlob = blockIdx.y * BLOCK_K + kk;
+            if (kGlob < N) {
+                sh_Sk  [kk * D_PAD + dd] = Sbh  [kGlob * D + dd];
+                sh_Vs1k[kk * D_PAD + dd] = Vs1bh[kGlob * D + dd];
+                sh_Vs2k[kk * D_PAD + dd] = Vs2bh[kGlob * D + dd];
+                sh_dYk [kk * D_PAD + dd] = gYbh [kGlob * D + dd];
+            } else {
+                sh_Sk  [kk * D_PAD + dd] = 0.0f;
+                sh_Vs1k[kk * D_PAD + dd] = 0.0f;
+                sh_Vs2k[kk * D_PAD + dd] = 0.0f;
+                sh_dYk [kk * D_PAD + dd] = 0.0f;
+            }
+        }
+    }
+
+    float mj = 0.0f, lj = 1.0f, mk = 0.0f, lk = 1.0f;
+    if (valid) {
         mj = mjBH[j0];  lj = ljBH[j0];
         mk = mkBH[k0];  lk = lkBH[k0];
     }
 
-    // Mode-dependent state
-    float reg_sum_r = 0.0f;                   // correction mode accumulator
-    float sumRj = 0.0f, sumSk = 0.0f;         // gradient mode: precomputed corrections
-    float grad_acc[REG_CAP];                   // gradient mode: output accumulator
+    __syncthreads();
+
+    float reg_sum_r = 0.0f;
+    float sumRj = 0.0f, sumSk = 0.0f;
+    float grad_acc[REG_CAP];
     if constexpr (!CORRECTION_ONLY) {
         if (valid) {
             sumRj = sum_rBH[j0];
@@ -1105,15 +1145,8 @@ __global__ void R_grad_kernel(
         for (int d = 0; d < REG_CAP; ++d) grad_acc[d] = 0.0f;
     }
 
-    // Shared memory layout: [Q | Vq1 | Vq2 | dYi | mi | li | (sumq)]
-    extern __shared__ float shmem[];
-    float* sh_Q    = shmem;
-    float* sh_Vq1  = sh_Q    + BLOCK_I * D;
-    float* sh_Vq2  = sh_Vq1  + BLOCK_I * D;
-    float* sh_dYi  = sh_Vq2  + BLOCK_I * D;
-    float* sh_mi   = sh_dYi  + BLOCK_I * D;
-    float* sh_li   = sh_mi   + BLOCK_I;
-    float* sh_sumq = sh_li   + BLOCK_I;  // only used when !CORRECTION_ONLY
+    const int sh_j_off = threadIdx.x * D_PAD;
+    const int sh_k_off = threadIdx.y * D_PAD;
 
     // Stream i-tiles through shared memory
     for (int iBase = 0; iBase < N; iBase += BLOCK_I) {
@@ -1136,64 +1169,64 @@ __global__ void R_grad_kernel(
         }
         __syncthreads();
 
-        // Process each i in the tile
         for (int iOff = 0; iOff < BLOCK_I && (iBase + iOff) < N; ++iOff) {
             const float* Qi   = sh_Q   + iOff*D;
             const float* Vq1i = sh_Vq1 + iOff*D;
             const float* Vq2i = sh_Vq2 + iOff*D;
-            const float* dYi  = sh_dYi + iOff*D;
+            const float* dYi_p = sh_dYi + iOff*D;
             const float mi    = sh_mi[iOff];
             const float li    = sh_li[iOff];
 
-            // Fused computation: logit + dot products
-            // In correction mode, skip d1, d3, d5 (only needed for gAq/gAs, not gAr)
             float dot = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f, d4 = 0.f, d5 = 0.f, d6 = 0.f;
             for (int d = 0; d < D; ++d) {
                 const float qi  = Qi[d];
                 const float vq1 = Vq1i[d];
                 const float vq2 = Vq2i[d];
-                const float dyi = dYi[d];
+                const float dyi = dYi_p[d];
+                const float rj   = sh_Rj  [sh_j_off + d];
+                const float sk   = sh_Sk  [sh_k_off + d];
+                const float vr1j = sh_Vr1j[sh_j_off + d];
+                const float vr2j = sh_Vr2j[sh_j_off + d];
+                const float vs1k = sh_Vs1k[sh_k_off + d];
+                const float vs2k = sh_Vs2k[sh_k_off + d];
+                const float dyj  = sh_dYj [sh_j_off + d];
+                const float dyk  = sh_dYk [sh_k_off + d];
 
-                dot += qi * Rj[d] * Sk[d];
+                dot += qi * rj * sk;
                 if constexpr (!CORRECTION_ONLY) {
-                    d1 += dyi * Vr1j[d] * Vs1k[d];
+                    d1 += dyi * vr1j * vs1k;
                 }
-                d2 += dYj[d] * vq1 * Vs1k[d];
+                d2 += dyj * vq1 * vs1k;
                 if constexpr (!CORRECTION_ONLY) {
-                    d3 += dYk[d] * vq1 * Vr1j[d];
+                    d3 += dyk * vq1 * vr1j;
                 }
-                d4 += dyi * Vr2j[d] * Vs2k[d];
+                d4 += dyi * vr2j * vs2k;
                 if constexpr (!CORRECTION_ONLY) {
-                    d5 += dYj[d] * vq2 * Vs2k[d];
+                    d5 += dyj * vq2 * vs2k;
                 }
-                d6 += dYk[d] * vq2 * Vr2j[d];
+                d6 += dyk * vq2 * vr2j;
             }
 
-            // Softmax weights
             const float logits = dot * scale;
             const float Aq = __expf(fminf(logits - mi, EXP_CLIP)) / fmaxf(li, DENOM_EPS);
             const float Ar = __expf(fminf(logits - mj, EXP_CLIP)) / fmaxf(lj, DENOM_EPS);
             const float As = __expf(fminf(logits - mk, EXP_CLIP)) / fmaxf(lk, DENOM_EPS);
 
-            // gAr is needed in both modes
             const float gAr = d2 + d4 * As + d6 * Aq;
 
             if constexpr (CORRECTION_ONLY) {
-                // Accumulate correction sum (scalar — no D-loop)
                 reg_sum_r += gAr * Ar;
             } else {
                 const float sumQi = sh_sumq[iOff];
                 const float gAq = d1 + d5 * As + d6 * Ar;
                 const float gAs = d3 + d4 * Ar + d5 * Aq;
 
-                // Jacobian-corrected combined gradient
                 const float grad_A = (gAq - sumQi) * Aq
                                    + (gAr - sumRj) * Ar
                                    + (gAs - sumSk) * As;
 
-                // Accumulate to gradR
                 for (int d = 0; d < D; ++d)
-                    grad_acc[d] += grad_A * Qi[d] * Sk[d];
+                    grad_acc[d] += grad_A * Qi[d] * sh_Sk[sh_k_off + d];
             }
         }
         __syncthreads();
@@ -1560,7 +1593,6 @@ backward_impl(torch::Tensor grad_output,
   }
 
   {
-    // --- grad_R accumulation ---
     constexpr int tileJ = TILE_J;
     constexpr int tileK = TILE_K;
     constexpr int tileI = 16;
@@ -1570,8 +1602,17 @@ backward_impl(torch::Tensor grad_output,
                   (N + tileK - 1) / tileK,
                   B * H);
 
+    const int D_PAD_r = D + 1;
     const size_t shmem_bytes =
-        (4 * tileI * D + 3 * tileI) * sizeof(float);  // Q, Vq1, Vq2, dY + stats
+        4 * tileJ * D_PAD_r * sizeof(float) +
+        4 * tileK * D_PAD_r * sizeof(float) +
+        4 * tileI * D * sizeof(float) +
+        3 * tileI * sizeof(float);
+
+    cudaFuncSetAttribute(
+        R_grad_kernel<false, tileJ, tileI, tileK>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        shmem_bytes);
 
     R_grad_kernel<false, tileJ, tileI, tileK>
         <<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
