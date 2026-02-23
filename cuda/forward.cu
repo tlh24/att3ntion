@@ -36,200 +36,207 @@ constexpr int WMMA_K = 16;  // Inner dimension for accumulation
 
 // ===================== gather kernels ======================
 
+constexpr int N_I_GATHER = 4;  // i-values per block in multi-i gather
+constexpr int SMEM_PAD = 1;    // Padding to eliminate bank conflicts
+
+// Multi-i warp-parallel gather: 4 output vectors per block, warp-shuffle softmax
 __global__
 void Yq_gather(
     const float4* __restrict__ Q_f4,
     const float4* __restrict__ R_f4,
     const float4* __restrict__ S_f4,
-    const float4* __restrict__ V1_f4, // Vr_1
-    const float4* __restrict__ V2_f4, // Vs_1
-    float*       __restrict__ Y,  // Y_q
-    float*       __restrict__ m_i_out,  // softmax stats output (can be nullptr)
-    float*       __restrict__ l_i_out,  // softmax stats output (can be nullptr)
+    const float4* __restrict__ V1_f4,
+    const float4* __restrict__ V2_f4,
+    float*       __restrict__ Y,
+    float*       __restrict__ m_i_out,
+    float*       __restrict__ l_i_out,
     int B, int H, int I, int J, int K, int D, float scale)
 {
-    // --- Grid Mapping and Block Setup ---
-    // Each block computes one output vector Y[b,h,i,:]
-    const int i = blockIdx.x;
+    const int i_base = blockIdx.x * N_I_GATHER;
     const int h = blockIdx.y;
     const int b = blockIdx.z;
 
     const int tid = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
     const int block_size = blockDim.x;
+    const int DP = D + SMEM_PAD;
 
-    // --- Shared Memory Allocation ---
     extern __shared__ float smem[];
-    float* q_vec   = smem;                               // D
-    float* r_tile  = q_vec + D;                          // TILE_J * D
-    float* s_tile  = r_tile + TILE_J * D;                // TILE_K * D
-    float* v1_tile = s_tile + TILE_K * D;                // TILE_J * D
-    float* v2_tile = v1_tile + TILE_J * D;               // TILE_K * D
-    float* p_tile  = v2_tile + TILE_K * D;               // TILE_J * TILE_K
-    float* red_buf = p_tile + TILE_J * TILE_K;           // block_size
-    // Shared memory for block-wide softmax stats and output vector
-    float* m_l_sh  = red_buf + block_size;               // 2 floats for m_i, l_i
-    float* o_sh    = m_l_sh + 2;                         // D floats for the output vector
+    float* q_vecs  = smem;
+    float* r_tile  = q_vecs + N_I_GATHER * D;
+    float* s_tile  = r_tile + TILE_J * DP;
+    float* v1_tile = s_tile + TILE_K * DP;
+    float* v2_tile = v1_tile + TILE_J * DP;
+    float* p_tiles = v2_tile + TILE_K * DP;
+    float* m_l_sh  = p_tiles + N_I_GATHER * TILE_J * TILE_K;
+    float* o_sh    = m_l_sh + N_I_GATHER * 2;
+    
+    const int my_i = i_base + warp_id;
+    const bool my_i_valid = (my_i < I);
+    float* my_q = q_vecs + warp_id * D;
+    float* my_p = p_tiles + warp_id * TILE_J * TILE_K;
+    float* my_o = o_sh + warp_id * D;
+    float* my_ml = m_l_sh + warp_id * 2;
 
-    // --- Load Q[b,h,i,:] to Shared Memory using float4---
-    const int64_t q_base_off = (((int64_t)b * H + h) * I + i) * D;
-    const int64_t q_base_off_d4 = q_base_off / 4;
-    for (int d4 = tid; d4 < D / 4; d4 += block_size) {
-        ((float4*)q_vec)[d4] = Q_f4[q_base_off_d4 + d4];
+    for (int n = 0; n < N_I_GATHER; n++) {
+        int i_global = i_base + n;
+        if (i_global < I) {
+            const int64_t q_off = (((int64_t)b * H + h) * I + i_global) * D;
+            for (int d = tid; d < D; d += block_size) {
+                q_vecs[n * D + d] = ((const float*)Q_f4)[q_off + d];
+            }
+        }
     }
 
-    // --- Initialize Online Softmax State in Shared Memory ---
-    if (tid == 0) {
-        m_l_sh[0] = NEG_INF; // m_i
-        m_l_sh[1] = 0.0f;   // l_i
+    if (tid < N_I_GATHER * 2) {
+        m_l_sh[tid] = (tid % 2 == 0) ? NEG_INF : 0.0f;
     }
-    // Each thread initializes its portion of the output vector in shared memory
-    for (int d = tid; d < D; d += block_size) {
-        o_sh[d] = 0.0f;
+    for (int idx = tid; idx < N_I_GATHER * D; idx += block_size) {
+        o_sh[idx] = 0.0f;
     }
     __syncthreads();
 
-    // --- Main Loop over R and S tiles ---
     for (int j0 = 0; j0 < J; j0 += TILE_J) {
         for (int k0 = 0; k0 < K; k0 += TILE_K) {
             
-            // --- Load R, S, V1, V2 tiles into Shared Memory using float4 ---
-            for (int j_loop_d4 = tid; j_loop_d4 < TILE_J * (D / 4); j_loop_d4 += block_size) {
-                int jt = j_loop_d4 / (D / 4);
-                int d4 = j_loop_d4 % (D / 4);
-                int j = j0 + jt;
-                if (j < J) {
-                    const int64_t r_base_off_d4 = (((int64_t)b * H + h) * J + j) * (D / 4);
-                    ((float4*)r_tile)[jt*(D/4) + d4] = R_f4[r_base_off_d4 + d4];
-                    ((float4*)v1_tile)[jt*(D/4) + d4] = V1_f4[r_base_off_d4 + d4];
+            for (int idx = tid; idx < TILE_J * D; idx += block_size) {
+                int jt = idx / D;
+                int d = idx % D;
+                int j_global = j0 + jt;
+                if (j_global < J) {
+                    const int64_t r_off = (((int64_t)b * H + h) * J + j_global) * D + d;
+                    r_tile[jt * DP + d] = ((const float*)R_f4)[r_off];
+                    v1_tile[jt * DP + d] = ((const float*)V1_f4)[r_off];
                 }
             }
-            for (int k_loop_d4 = tid; k_loop_d4 < TILE_K * (D / 4); k_loop_d4 += block_size) {
-                int kt = k_loop_d4 / (D/4);
-                int d4 = k_loop_d4 % (D/4);
-                int k = k0 + kt;
-                if (k < K) {
-                    const int64_t s_base_off_d4 = (((int64_t)b * H + h) * K + k) * (D/4);
-                    ((float4*)s_tile)[kt*(D/4) + d4] = S_f4[s_base_off_d4 + d4];
-                    ((float4*)v2_tile)[kt*(D/4) + d4] = V2_f4[s_base_off_d4 + d4];
-                }
-            }
-            __syncthreads();
-
-            // --- Compute Dot Products for the Tile ---
-           // Each thread computes (TILE_J*TILE_K)/block_size dots
-            for (int flat_idx = tid; flat_idx < TILE_J * TILE_K; flat_idx += block_size) {
-                int jt = flat_idx / TILE_K;
-                int kt = flat_idx % TILE_K;
-                float dot = 0.0f;
-                if (j0 + jt < J && k0 + kt < K) {
-                    // Unroll the dot product loop to increase ILP
-                    float d_accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                    for (int d = 0; d < D; d += 4) {
-                        d_accum[0] += q_vec[d+0] * r_tile[jt*D+(d+0)] * s_tile[kt*D+(d+0)];
-                        d_accum[1] += q_vec[d+1] * r_tile[jt*D+(d+1)] * s_tile[kt*D+(d+1)];
-                        d_accum[2] += q_vec[d+2] * r_tile[jt*D+(d+2)] * s_tile[kt*D+(d+2)];
-                        d_accum[3] += q_vec[d+3] * r_tile[jt*D+(d+3)] * s_tile[kt*D+(d+3)];
-                    }
-                    dot = d_accum[0] + d_accum[1] + d_accum[2] + d_accum[3];
-                    p_tile[flat_idx] = dot; // Use p_tile as temporary storage for dots
-                } else {
-                    p_tile[flat_idx] = NEG_INF; // Make sure padding doesn't affect max
-                }
-            }
-            __syncthreads();
-
-            // --- Find Tile Max (m_ij) ---
-            float m_ij = NEG_INF;
-            for (int flat_idx = tid; flat_idx < TILE_J * TILE_K; flat_idx += block_size) {
-                m_ij = fmaxf(m_ij, p_tile[flat_idx] * scale);
-            }
-            red_buf[tid] = m_ij;
-            __syncthreads();
-            for (int s = block_size / 2; s > 0; s >>= 1) {
-                if (tid < s) red_buf[tid] = fmaxf(red_buf[tid], red_buf[tid+s]);
-                __syncthreads();
-            }
-            m_ij = red_buf[0];
-            __syncthreads(); // Ensure all threads have read m_ij before red_buf is reused for sum
-
-            // --- Compute Softmax Numerator (p_ij) and Denominator (l_ij) for the tile ---
-            float l_ij = 0.0f;
-            for (int flat_idx = tid; flat_idx < TILE_J * TILE_K; flat_idx += block_size) {
-                int jt = flat_idx / TILE_K;
-                int kt = flat_idx % TILE_K;
-                if (j0 + jt < J && k0 + kt < K) {
-                    float p_val = expf(p_tile[flat_idx] * scale - m_ij);
-                    p_tile[flat_idx] = p_val;
-                    l_ij += p_val;
-                } else {
-                    p_tile[flat_idx] = 0.0f;
-                }
-            }
-            red_buf[tid] = l_ij;
-            __syncthreads();
-            for (int s = block_size / 2; s > 0; s >>= 1) {
-                if (tid < s) red_buf[tid] += red_buf[tid+s];
-                __syncthreads();
-            }
-            l_ij = red_buf[0];
-            __syncthreads(); // Ensure all threads have read l_ij before red_buf is reused
             
-            // --- Update Online Softmax State (Done by thread 0) ---
-            float m_i_old, l_i_old, m_new, alpha, beta, l_new;
-            if (tid == 0) {
-                m_i_old = m_l_sh[0];
-                l_i_old = m_l_sh[1];
-                m_new = fmaxf(m_i_old, m_ij);
-                alpha = expf(m_i_old - m_new);
-                beta = expf(m_ij - m_new);
-                l_new = alpha * l_i_old + beta * l_ij;
-                m_l_sh[0] = m_new;
-                m_l_sh[1] = l_new;
-                // Store scaling factors for other threads to use
-                red_buf[1] = alpha;
-                red_buf[2] = beta;
-                red_buf[3] = l_i_old;
+            for (int idx = tid; idx < TILE_K * D; idx += block_size) {
+                int kt = idx / D;
+                int d = idx % D;
+                int k_global = k0 + kt;
+                if (k_global < K) {
+                    const int64_t s_off = (((int64_t)b * H + h) * K + k_global) * D + d;
+                    s_tile[kt * DP + d] = ((const float*)S_f4)[s_off];
+                    v2_tile[kt * DP + d] = ((const float*)V2_f4)[s_off];
+                }
             }
             __syncthreads();
 
-            // All threads read the scaling factors
-            alpha = red_buf[1];
-            beta = red_buf[2];
-            l_i_old = red_buf[3];
-            l_new = m_l_sh[1];
+            #pragma unroll 1
+            for (int cell = 0; cell < 8; cell++) {
+                int cell_idx = lane_id + cell * 32;
+                if (cell_idx < TILE_J * TILE_K) {
+                    int jt = cell_idx / TILE_K;
+                    int kt = cell_idx % TILE_K;
+                    
+                    float dot = 0.0f;
+                    if (my_i_valid && j0 + jt < J && k0 + kt < K) {
+                        float d_accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                        #pragma unroll 4
+                        for (int d = 0; d < D; d += 4) {
+                            d_accum[0] += my_q[d+0] * r_tile[jt*DP + d+0] * s_tile[kt*DP + d+0];
+                            d_accum[1] += my_q[d+1] * r_tile[jt*DP + d+1] * s_tile[kt*DP + d+1];
+                            d_accum[2] += my_q[d+2] * r_tile[jt*DP + d+2] * s_tile[kt*DP + d+2];
+                            d_accum[3] += my_q[d+3] * r_tile[jt*DP + d+3] * s_tile[kt*DP + d+3];
+                        }
+                        dot = d_accum[0] + d_accum[1] + d_accum[2] + d_accum[3];
+                        my_p[cell_idx] = dot;
+                    } else {
+                        my_p[cell_idx] = NEG_INF;
+                    }
+                }
+            }
+            __syncthreads();
 
-            // --- Update Output Vector O ---
-            // Each thread updates its portion of O in shared memory
-            for(int d = tid; d < D; d += block_size) {
+            float m_ij = NEG_INF;
+            #pragma unroll
+            for (int cell = 0; cell < 8; cell++) {
+                int cell_idx = lane_id + cell * 32;
+                if (cell_idx < TILE_J * TILE_K) {
+                    m_ij = fmaxf(m_ij, my_p[cell_idx] * scale);
+                }
+            }
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                m_ij = fmaxf(m_ij, __shfl_down_sync(0xFFFFFFFF, m_ij, offset));
+            }
+            m_ij = __shfl_sync(0xFFFFFFFF, m_ij, 0);
+            
+            float l_ij = 0.0f;
+            #pragma unroll
+            for (int cell = 0; cell < 8; cell++) {
+                int cell_idx = lane_id + cell * 32;
+                if (cell_idx < TILE_J * TILE_K) {
+                    int jt = cell_idx / TILE_K;
+                    int kt = cell_idx % TILE_K;
+                    if (my_i_valid && j0 + jt < J && k0 + kt < K) {
+                        float p_val = expf(my_p[cell_idx] * scale - m_ij);
+                        my_p[cell_idx] = p_val;
+                        l_ij += p_val;
+                    } else {
+                        my_p[cell_idx] = 0.0f;
+                    }
+                }
+            }
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                l_ij += __shfl_down_sync(0xFFFFFFFF, l_ij, offset);
+            }
+            l_ij = __shfl_sync(0xFFFFFFFF, l_ij, 0);
+
+            float m_old = my_ml[0];
+            float l_old = my_ml[1];
+            float m_new = fmaxf(m_old, m_ij);
+            float alpha = expf(m_old - m_new);
+            float beta = expf(m_ij - m_new);
+            float l_new = alpha * l_old + beta * l_ij;
+            
+            if (lane_id == 0) {
+                my_ml[0] = m_new;
+                my_ml[1] = l_new;
+            }
+            alpha = __shfl_sync(0xFFFFFFFF, alpha, 0);
+            beta = __shfl_sync(0xFFFFFFFF, beta, 0);
+            l_old = __shfl_sync(0xFFFFFFFF, l_old, 0);
+            l_new = __shfl_sync(0xFFFFFFFF, l_new, 0);
+
+            for (int d = lane_id; d < D; d += 32) {
                 float new_o_d = 0.0f;
-                // Accumulate new value contribution from the tile
-                for (int jt = 0; jt < TILE_J; ++jt) {
-                    if (j0 + jt >= J) continue;
-                    for (int kt = 0; kt < TILE_K; ++kt) {
-                        if (k0 + kt >= K) continue;
-                        new_o_d += p_tile[jt*TILE_K + kt] * v1_tile[jt*D + d] * v2_tile[kt*D + d];
+                if (my_i_valid) {
+                    for (int jt = 0; jt < TILE_J; jt++) {
+                        if (j0 + jt >= J) continue;
+                        float v1_val = v1_tile[jt * DP + d];
+                        for (int kt = 0; kt < TILE_K; kt++) {
+                            if (k0 + kt >= K) continue;
+                            new_o_d += my_p[jt * TILE_K + kt] * v1_val * v2_tile[kt * DP + d];
+                        }
                     }
                 }
                 
-                // Rescale old O value and add new contribution
                 if (l_new > 1e-20f) {
-                    o_sh[d] = (alpha * l_i_old * o_sh[d] + beta * new_o_d) / l_new;
+                    my_o[d] = (alpha * l_old * my_o[d] + beta * new_o_d) / l_new;
                 }
             }
+            
             __syncthreads();
         }
     }
-    
-    // --- Write Final Output from Shared to Global Memory ---
-    for(int d = tid; d < D; d += block_size) {
-        Y[q_base_off + d] = o_sh[d];
+
+    for (int n = 0; n < N_I_GATHER; n++) {
+        int i_global = i_base + n;
+        if (i_global < I) {
+            const int64_t out_off = (((int64_t)b * H + h) * I + i_global) * D;
+            for (int d = tid; d < D; d += block_size) {
+                Y[out_off + d] = o_sh[n * D + d];
+            }
+        }
     }
-    
-    // --- Write Softmax Stats (if output pointers provided) ---
-    if (tid == 0 && m_i_out != nullptr && l_i_out != nullptr) {
-        int64_t stats_idx = ((int64_t)b * H + h) * I + i;
-        m_i_out[stats_idx] = m_l_sh[0];
-        l_i_out[stats_idx] = m_l_sh[1];
+
+    if (lane_id == 0 && m_i_out != nullptr && l_i_out != nullptr && my_i_valid) {
+        int64_t stats_idx = ((int64_t)b * H + h) * I + my_i;
+        m_i_out[stats_idx] = my_ml[0];
+        l_i_out[stats_idx] = my_ml[1];
     }
 }
 
@@ -524,332 +531,406 @@ void Yq_gather_tensor_core(
 }
 
 
+// Multi-j warp-parallel gather: 4 output vectors per block, warp-shuffle softmax
 __global__
 void Yr_gather(
     const float4* __restrict__ R_query_f4,
     const float4* __restrict__ Q_f4,
     const float4* __restrict__ S_f4,
-    const float4* __restrict__ V1_f4, // Vq_1
-    const float4* __restrict__ V2_f4, // Vs_1
-    float*       __restrict__ Y,      // Y_r
-    float*       __restrict__ m_j_out,  // softmax stats output (can be nullptr)
-    float*       __restrict__ l_j_out,  // softmax stats output (can be nullptr)
+    const float4* __restrict__ V1_f4,
+    const float4* __restrict__ V2_f4,
+    float*       __restrict__ Y,
+    float*       __restrict__ m_j_out,
+    float*       __restrict__ l_j_out,
     int B, int H, int I, int J, int K, int D, float scale)
 {
-    // --- Grid Mapping and Block Setup ---
-    // Each block computes one output vector Y[b,h,j,:]
-    const int j = blockIdx.x;
+    const int j_base = blockIdx.x * N_I_GATHER;
     const int h = blockIdx.y;
     const int b = blockIdx.z;
 
     const int tid = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
     const int block_size = blockDim.x;
+    const int DP = D + SMEM_PAD;
 
-    // --- Shared Memory Allocation ---
     extern __shared__ float smem[];
-    float* query_vec = smem;                             // D
-    float* i_tile    = query_vec + D;                    // TILE_I * D
-    float* k_tile    = i_tile + TILE_I * D;              // TILE_K * D
-    float* v1_tile   = k_tile + TILE_K * D;              // TILE_I * D
-    float* v2_tile   = v1_tile + TILE_I * D;             // TILE_K * D
-    float* p_tile    = v2_tile + TILE_K * D;             // TILE_I * TILE_K
-    float* red_buf   = p_tile + TILE_I * TILE_K;         // block_size
-    float* m_l_sh    = red_buf + block_size;             // 2 floats for m_i, l_i
-    float* o_sh      = m_l_sh + 2;                       // D floats for the output vector
+    float* q_vecs  = smem;
+    float* i_tile  = q_vecs + N_I_GATHER * D;
+    float* k_tile  = i_tile + TILE_I * DP;
+    float* v1_tile = k_tile + TILE_K * DP;
+    float* v2_tile = v1_tile + TILE_I * DP;
+    float* p_tiles = v2_tile + TILE_K * DP;
+    float* m_l_sh  = p_tiles + N_I_GATHER * TILE_I * TILE_K;
+    float* o_sh    = m_l_sh + N_I_GATHER * 2;
+    
+    const int my_j = j_base + warp_id;
+    const bool my_j_valid = (my_j < J);
+    float* my_q = q_vecs + warp_id * D;
+    float* my_p = p_tiles + warp_id * TILE_I * TILE_K;
+    float* my_o = o_sh + warp_id * D;
+    float* my_ml = m_l_sh + warp_id * 2;
 
-    // --- Load R_query[b,h,j,:] to Shared Memory ---
-    const int64_t query_base_off = (((int64_t)b * H + h) * J + j) * D;
-    const int64_t query_base_off_d4 = query_base_off / 4;
-    for (int d4 = tid; d4 < D / 4; d4 += block_size) {
-        ((float4*)query_vec)[d4] = R_query_f4[query_base_off_d4 + d4];
+    for (int n = 0; n < N_I_GATHER; n++) {
+        int j_global = j_base + n;
+        if (j_global < J) {
+            const int64_t q_off = (((int64_t)b * H + h) * J + j_global) * D;
+            for (int d = tid; d < D; d += block_size) {
+                q_vecs[n * D + d] = ((const float*)R_query_f4)[q_off + d];
+            }
+        }
     }
 
-    // --- Initialize ---
-    if (tid == 0) {
-        m_l_sh[0] = NEG_INF; // m_i
-        m_l_sh[1] = 0.0f;   // l_i
+    if (tid < N_I_GATHER * 2) {
+        m_l_sh[tid] = (tid % 2 == 0) ? NEG_INF : 0.0f;
     }
-    for (int d = tid; d < D; d += block_size) o_sh[d] = 0.0f;
+    for (int idx = tid; idx < N_I_GATHER * D; idx += block_size) {
+        o_sh[idx] = 0.0f;
+    }
     __syncthreads();
 
-    // --- Main Loop over Q and S tiles ---
     for (int i0 = 0; i0 < I; i0 += TILE_I) {
         for (int k0 = 0; k0 < K; k0 += TILE_K) {
             
-            // --- Load Q, S, Vq_1, Vs_1 tiles ---
-            for (int i_loop_d4 = tid; i_loop_d4 < TILE_I * (D / 4); i_loop_d4 += block_size) {
-                int it = i_loop_d4 / (D / 4);
-                int d4 = i_loop_d4 % (D / 4);
-                int i_ = i0 + it;
-                if (i_ < I) {
-                    const int64_t i_base_off_d4 = (((int64_t)b * H + h) * I + i_) * (D / 4);
-                    ((float4*)i_tile)[it*(D/4) + d4] = Q_f4[i_base_off_d4 + d4];
-                    ((float4*)v1_tile)[it*(D/4) + d4] = V1_f4[i_base_off_d4 + d4];
+            for (int idx = tid; idx < TILE_I * D; idx += block_size) {
+                int it = idx / D;
+                int d = idx % D;
+                int i_global = i0 + it;
+                if (i_global < I) {
+                    const int64_t i_off = (((int64_t)b * H + h) * I + i_global) * D + d;
+                    i_tile[it * DP + d] = ((const float*)Q_f4)[i_off];
+                    v1_tile[it * DP + d] = ((const float*)V1_f4)[i_off];
                 }
             }
-            for (int k_loop_d4 = tid; k_loop_d4 < TILE_K * (D / 4); k_loop_d4 += block_size) {
-                int kt = k_loop_d4 / (D/4);
-                int d4 = k_loop_d4 % (D/4);
-                int k = k0 + kt;
-                if (k < K) {
-                    const int64_t k_base_off_d4 = (((int64_t)b * H + h) * K + k) * (D/4);
-                    ((float4*)k_tile)[kt*(D/4) + d4] = S_f4[k_base_off_d4 + d4];
-                    ((float4*)v2_tile)[kt*(D/4) + d4] = V2_f4[k_base_off_d4 + d4];
-                }
-            }
-            __syncthreads();
-
-            // --- Compute Dot Products ---
-            for (int flat_idx = tid; flat_idx < TILE_I * TILE_K; flat_idx += block_size) {
-                int it = flat_idx / TILE_K;
-                int kt = flat_idx % TILE_K;
-                float dot = 0.0f;
-                if (i0 + it < I && k0 + kt < K) {
-                    for (int d = 0; d < D; ++d) dot += query_vec[d] * i_tile[it*D+d] * k_tile[kt*D+d];
-                    p_tile[flat_idx] = dot;
-                } else {
-                    p_tile[flat_idx] = NEG_INF;
-                }
-            }
-            __syncthreads();
-
-            // --- Find Tile Max (m_ij) ---
-            float m_ij = NEG_INF;
-            for (int flat_idx = tid; flat_idx < TILE_I * TILE_K; flat_idx += block_size) {
-                m_ij = fmaxf(m_ij, p_tile[flat_idx] * scale);
-            }
-            red_buf[tid] = m_ij;
-            __syncthreads();
-            for (int s = block_size / 2; s > 0; s >>= 1) {
-                if (tid < s) red_buf[tid] = fmaxf(red_buf[tid], red_buf[tid+s]);
-                __syncthreads();
-            }
-            m_ij = red_buf[0];
-            __syncthreads(); // Ensure all threads have read m_ij before red_buf is reused
-
-            // --- Compute Softmax Numerator & Denominator ---
-            float l_ij = 0.0f;
-            for (int flat_idx = tid; flat_idx < TILE_I * TILE_K; flat_idx += block_size) {
-                if (i0 + (flat_idx/TILE_K) < I && k0 + (flat_idx%TILE_K) < K) {
-                    float p_val = expf(p_tile[flat_idx] * scale - m_ij);
-                    p_tile[flat_idx] = p_val;
-                    l_ij += p_val;
-                } else {
-                    p_tile[flat_idx] = 0.0f;
-                }
-            }
-            red_buf[tid] = l_ij;
-            __syncthreads();
-            for (int s = block_size / 2; s > 0; s >>= 1) {
-                if (tid < s) red_buf[tid] += red_buf[tid+s];
-                __syncthreads();
-            }
-            l_ij = red_buf[0];
-            __syncthreads(); // Ensure all threads have read l_ij before red_buf is reused
             
-            // --- Update Online Softmax State ---
-            float m_i_old, l_i_old, m_new, alpha, beta, l_new;
-            if (tid == 0) {
-                m_i_old = m_l_sh[0]; l_i_old = m_l_sh[1];
-                m_new = fmaxf(m_i_old, m_ij);
-                alpha = expf(m_i_old - m_new); beta = expf(m_ij - m_new);
-                l_new = alpha * l_i_old + beta * l_ij;
-                m_l_sh[0] = m_new; m_l_sh[1] = l_new;
-                red_buf[1] = alpha; red_buf[2] = beta; red_buf[3] = l_i_old;
+            for (int idx = tid; idx < TILE_K * D; idx += block_size) {
+                int kt = idx / D;
+                int d = idx % D;
+                int k_global = k0 + kt;
+                if (k_global < K) {
+                    const int64_t k_off = (((int64_t)b * H + h) * K + k_global) * D + d;
+                    k_tile[kt * DP + d] = ((const float*)S_f4)[k_off];
+                    v2_tile[kt * DP + d] = ((const float*)V2_f4)[k_off];
+                }
             }
             __syncthreads();
-            alpha = red_buf[1]; beta = red_buf[2]; l_i_old = red_buf[3]; l_new = m_l_sh[1];
 
-            // --- Update Output Vector O ---
-            for(int d = tid; d < D; d += block_size) {
-                float new_o_d = 0.0f;
-                for (int it = 0; it < TILE_I; ++it) {
-                    if (i0+it >= I) continue;
-                    for (int kt = 0; kt < TILE_K; ++kt) {
-                        if (k0+kt < K) new_o_d += p_tile[it*TILE_K+kt] * v1_tile[it*D+d] * v2_tile[kt*D+d];
+            #pragma unroll 1
+            for (int cell = 0; cell < 8; cell++) {
+                int cell_idx = lane_id + cell * 32;
+                if (cell_idx < TILE_I * TILE_K) {
+                    int it = cell_idx / TILE_K;
+                    int kt = cell_idx % TILE_K;
+                    
+                    float dot = 0.0f;
+                    if (my_j_valid && i0 + it < I && k0 + kt < K) {
+                        float d_accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                        #pragma unroll 4
+                        for (int d = 0; d < D; d += 4) {
+                            d_accum[0] += my_q[d+0] * i_tile[it*DP + d+0] * k_tile[kt*DP + d+0];
+                            d_accum[1] += my_q[d+1] * i_tile[it*DP + d+1] * k_tile[kt*DP + d+1];
+                            d_accum[2] += my_q[d+2] * i_tile[it*DP + d+2] * k_tile[kt*DP + d+2];
+                            d_accum[3] += my_q[d+3] * i_tile[it*DP + d+3] * k_tile[kt*DP + d+3];
+                        }
+                        dot = d_accum[0] + d_accum[1] + d_accum[2] + d_accum[3];
+                        my_p[cell_idx] = dot;
+                    } else {
+                        my_p[cell_idx] = NEG_INF;
                     }
                 }
-                if (l_new > 1e-20f) o_sh[d] = (alpha * l_i_old * o_sh[d] + beta * new_o_d) / l_new;
             }
+            __syncthreads();
+
+            float m_ij = NEG_INF;
+            #pragma unroll
+            for (int cell = 0; cell < 8; cell++) {
+                int cell_idx = lane_id + cell * 32;
+                if (cell_idx < TILE_I * TILE_K) {
+                    m_ij = fmaxf(m_ij, my_p[cell_idx] * scale);
+                }
+            }
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                m_ij = fmaxf(m_ij, __shfl_down_sync(0xFFFFFFFF, m_ij, offset));
+            }
+            m_ij = __shfl_sync(0xFFFFFFFF, m_ij, 0);
+            
+            float l_ij = 0.0f;
+            #pragma unroll
+            for (int cell = 0; cell < 8; cell++) {
+                int cell_idx = lane_id + cell * 32;
+                if (cell_idx < TILE_I * TILE_K) {
+                    int it = cell_idx / TILE_K;
+                    int kt = cell_idx % TILE_K;
+                    if (my_j_valid && i0 + it < I && k0 + kt < K) {
+                        float p_val = expf(my_p[cell_idx] * scale - m_ij);
+                        my_p[cell_idx] = p_val;
+                        l_ij += p_val;
+                    } else {
+                        my_p[cell_idx] = 0.0f;
+                    }
+                }
+            }
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                l_ij += __shfl_down_sync(0xFFFFFFFF, l_ij, offset);
+            }
+            l_ij = __shfl_sync(0xFFFFFFFF, l_ij, 0);
+
+            float m_old = my_ml[0];
+            float l_old = my_ml[1];
+            float m_new = fmaxf(m_old, m_ij);
+            float alpha = expf(m_old - m_new);
+            float beta = expf(m_ij - m_new);
+            float l_new = alpha * l_old + beta * l_ij;
+            
+            if (lane_id == 0) {
+                my_ml[0] = m_new;
+                my_ml[1] = l_new;
+            }
+            alpha = __shfl_sync(0xFFFFFFFF, alpha, 0);
+            beta = __shfl_sync(0xFFFFFFFF, beta, 0);
+            l_old = __shfl_sync(0xFFFFFFFF, l_old, 0);
+            l_new = __shfl_sync(0xFFFFFFFF, l_new, 0);
+
+            for (int d = lane_id; d < D; d += 32) {
+                float new_o_d = 0.0f;
+                if (my_j_valid) {
+                    for (int it = 0; it < TILE_I; it++) {
+                        if (i0 + it >= I) continue;
+                        float v1_val = v1_tile[it * DP + d];
+                        for (int kt = 0; kt < TILE_K; kt++) {
+                            if (k0 + kt >= K) continue;
+                            new_o_d += my_p[it * TILE_K + kt] * v1_val * v2_tile[kt * DP + d];
+                        }
+                    }
+                }
+                
+                if (l_new > 1e-20f) {
+                    my_o[d] = (alpha * l_old * my_o[d] + beta * new_o_d) / l_new;
+                }
+            }
+            
             __syncthreads();
         }
     }
-    
-    // --- Write Final Output to Global Memory ---
-    for(int d = tid; d < D; d += block_size) {
-        Y[query_base_off + d] = o_sh[d];
+
+    for (int n = 0; n < N_I_GATHER; n++) {
+        int j_global = j_base + n;
+        if (j_global < J) {
+            const int64_t out_off = (((int64_t)b * H + h) * J + j_global) * D;
+            for (int d = tid; d < D; d += block_size) {
+                Y[out_off + d] = o_sh[n * D + d];
+            }
+        }
     }
-    
-    // --- Write Softmax Stats (if output pointers provided) ---
-    if (tid == 0 && m_j_out != nullptr && l_j_out != nullptr) {
-        int64_t stats_idx = ((int64_t)b * H + h) * J + j;
-        m_j_out[stats_idx] = m_l_sh[0];
-        l_j_out[stats_idx] = m_l_sh[1];
+
+    if (lane_id == 0 && m_j_out != nullptr && l_j_out != nullptr && my_j_valid) {
+        int64_t stats_idx = ((int64_t)b * H + h) * J + my_j;
+        m_j_out[stats_idx] = my_ml[0];
+        l_j_out[stats_idx] = my_ml[1];
     }
 }
 
 
+// Multi-k warp-parallel gather: 4 output vectors per block, warp-shuffle softmax
 __global__
 void Ys_gather(
     const float4* __restrict__ S_query_f4,
     const float4* __restrict__ Q_f4,
     const float4* __restrict__ R_f4,
-    const float4* __restrict__ V1_f4, // Vq_1
-    const float4* __restrict__ V2_f4, // Vr_1
-    float*       __restrict__ Y,      // Y_s
-    float*       __restrict__ m_k_out,  // softmax stats output (can be nullptr)
-    float*       __restrict__ l_k_out,  // softmax stats output (can be nullptr)
+    const float4* __restrict__ V1_f4,
+    const float4* __restrict__ V2_f4,
+    float*       __restrict__ Y,
+    float*       __restrict__ m_k_out,
+    float*       __restrict__ l_k_out,
     int B, int H, int I, int J, int K, int D, float scale)
 {
-    // --- Grid Mapping and Block Setup ---
-    // Each block computes one output vector Y[b,h,k,:]
-    const int k = blockIdx.x;
+    const int k_base = blockIdx.x * N_I_GATHER;
     const int h = blockIdx.y;
     const int b = blockIdx.z;
 
     const int tid = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
     const int block_size = blockDim.x;
+    const int DP = D + SMEM_PAD;
 
-    // --- Shared Memory Allocation ---
     extern __shared__ float smem[];
-    float* query_vec = smem;                             // D
-    float* i_tile    = query_vec + D;                    // TILE_I * D
-    float* j_tile    = i_tile + TILE_I * D;              // TILE_J * D
-    float* v1_tile   = j_tile + TILE_J * D;              // TILE_I * D
-    float* v2_tile   = v1_tile + TILE_I * D;             // TILE_J * D
-    float* p_tile    = v2_tile + TILE_J * D;             // TILE_I * TILE_J
-    float* red_buf   = p_tile + TILE_I * TILE_J;         // block_size
-    float* m_l_sh    = red_buf + block_size;             // 2 floats for m_i, l_i
-    float* o_sh      = m_l_sh + 2;                       // D floats for the output vector
+    float* q_vecs  = smem;
+    float* i_tile  = q_vecs + N_I_GATHER * D;
+    float* j_tile  = i_tile + TILE_I * DP;
+    float* v1_tile = j_tile + TILE_J * DP;
+    float* v2_tile = v1_tile + TILE_I * DP;
+    float* p_tiles = v2_tile + TILE_J * DP;
+    float* m_l_sh  = p_tiles + N_I_GATHER * TILE_I * TILE_J;
+    float* o_sh    = m_l_sh + N_I_GATHER * 2;
+    
+    const int my_k = k_base + warp_id;
+    const bool my_k_valid = (my_k < K);
+    float* my_q = q_vecs + warp_id * D;
+    float* my_p = p_tiles + warp_id * TILE_I * TILE_J;
+    float* my_o = o_sh + warp_id * D;
+    float* my_ml = m_l_sh + warp_id * 2;
 
-    // --- Load S_query[b,h,k,:] to Shared Memory ---
-    const int64_t query_base_off = (((int64_t)b * H + h) * K + k) * D;
-    const int64_t query_base_off_d4 = query_base_off / 4;
-    for (int d4 = tid; d4 < D / 4; d4 += block_size) {
-        ((float4*)query_vec)[d4] = S_query_f4[query_base_off_d4 + d4];
+    for (int n = 0; n < N_I_GATHER; n++) {
+        int k_global = k_base + n;
+        if (k_global < K) {
+            const int64_t q_off = (((int64_t)b * H + h) * K + k_global) * D;
+            for (int d = tid; d < D; d += block_size) {
+                q_vecs[n * D + d] = ((const float*)S_query_f4)[q_off + d];
+            }
+        }
     }
 
-    // --- Initialize ---
-    if (tid == 0) {
-        m_l_sh[0] = NEG_INF; // m_i
-        m_l_sh[1] = 0.0f;   // l_i
+    if (tid < N_I_GATHER * 2) {
+        m_l_sh[tid] = (tid % 2 == 0) ? NEG_INF : 0.0f;
     }
-    for (int d = tid; d < D; d += block_size) o_sh[d] = 0.0f;
+    for (int idx = tid; idx < N_I_GATHER * D; idx += block_size) {
+        o_sh[idx] = 0.0f;
+    }
     __syncthreads();
 
-    // --- Main Loop over Q and R tiles ---
     for (int i0 = 0; i0 < I; i0 += TILE_I) {
         for (int j0 = 0; j0 < J; j0 += TILE_J) {
             
-            // --- Load Q, R, Vq_1, Vr_1 tiles ---
-            for (int i_loop_d4 = tid; i_loop_d4 < TILE_I * (D / 4); i_loop_d4 += block_size) {
-                int it = i_loop_d4 / (D / 4);
-                int d4 = i_loop_d4 % (D / 4);
-                int i_ = i0 + it;
-                if (i_ < I) {
-                    const int64_t i_base_off_d4 = (((int64_t)b * H + h) * I + i_) * (D / 4);
-                    ((float4*)i_tile)[it*(D/4) + d4] = Q_f4[i_base_off_d4 + d4];
-                    ((float4*)v1_tile)[it*(D/4) + d4] = V1_f4[i_base_off_d4 + d4];
+            for (int idx = tid; idx < TILE_I * D; idx += block_size) {
+                int it = idx / D;
+                int d = idx % D;
+                int i_global = i0 + it;
+                if (i_global < I) {
+                    const int64_t i_off = (((int64_t)b * H + h) * I + i_global) * D + d;
+                    i_tile[it * DP + d] = ((const float*)Q_f4)[i_off];
+                    v1_tile[it * DP + d] = ((const float*)V1_f4)[i_off];
                 }
             }
-            for (int j_loop_d4 = tid; j_loop_d4 < TILE_J * (D / 4); j_loop_d4 += block_size) {
-                int jt = j_loop_d4 / (D/4);
-                int d4 = j_loop_d4 % (D/4);
-                int j = j0 + jt;
-                if (j < J) {
-                    const int64_t j_base_off_d4 = (((int64_t)b * H + h) * J + j) * (D/4);
-                    ((float4*)j_tile)[jt*(D/4) + d4] = R_f4[j_base_off_d4 + d4];
-                    ((float4*)v2_tile)[jt*(D/4) + d4] = V2_f4[j_base_off_d4 + d4];
-                }
-            }
-            __syncthreads();
-
-            // --- Compute Dot Products ---
-            for (int flat_idx = tid; flat_idx < TILE_I * TILE_J; flat_idx += block_size) {
-                int it = flat_idx / TILE_J;
-                int jt = flat_idx % TILE_J;
-                float dot = 0.0f;
-                if (i0 + it < I && j0 + jt < J) {
-                    for (int d = 0; d < D; ++d) dot += query_vec[d] * i_tile[it*D+d] * j_tile[jt*D+d];
-                    p_tile[flat_idx] = dot;
-                } else {
-                    p_tile[flat_idx] = NEG_INF;
-                }
-            }
-            __syncthreads();
-
-            // --- Find Tile Max (m_ij) ---
-            float m_ij = NEG_INF;
-            for (int flat_idx = tid; flat_idx < TILE_I * TILE_J; flat_idx += block_size) {
-                m_ij = fmaxf(m_ij, p_tile[flat_idx] * scale);
-            }
-            red_buf[tid] = m_ij;
-            __syncthreads();
-            for (int s = block_size / 2; s > 0; s >>= 1) {
-                if (tid < s) red_buf[tid] = fmaxf(red_buf[tid], red_buf[tid+s]);
-                __syncthreads();
-            }
-            m_ij = red_buf[0];
-            __syncthreads(); // Ensure all threads have read m_ij before red_buf is reused
-
-            // --- Compute Softmax Numerator & Denominator ---
-            float l_ij = 0.0f;
-            for (int flat_idx = tid; flat_idx < TILE_I * TILE_J; flat_idx += block_size) {
-                if (i0 + (flat_idx/TILE_J) < I && j0 + (flat_idx%TILE_J) < J) {
-                    float p_val = expf(p_tile[flat_idx] * scale - m_ij);
-                    p_tile[flat_idx] = p_val;
-                    l_ij += p_val;
-                } else {
-                    p_tile[flat_idx] = 0.0f;
-                }
-            }
-            red_buf[tid] = l_ij;
-            __syncthreads();
-            for (int s = block_size / 2; s > 0; s >>= 1) {
-                if (tid < s) red_buf[tid] += red_buf[tid+s];
-                __syncthreads();
-            }
-            l_ij = red_buf[0];
-            __syncthreads(); // Ensure all threads have read l_ij before red_buf is reused
             
-            // --- Update Online Softmax State ---
-            float m_i_old, l_i_old, m_new, alpha, beta, l_new;
-            if (tid == 0) {
-                m_i_old = m_l_sh[0]; l_i_old = m_l_sh[1];
-                m_new = fmaxf(m_i_old, m_ij);
-                alpha = expf(m_i_old - m_new); beta = expf(m_ij - m_new);
-                l_new = alpha * l_i_old + beta * l_ij;
-                m_l_sh[0] = m_new; m_l_sh[1] = l_new;
-                red_buf[1] = alpha; red_buf[2] = beta; red_buf[3] = l_i_old;
+            for (int idx = tid; idx < TILE_J * D; idx += block_size) {
+                int jt = idx / D;
+                int d = idx % D;
+                int j_global = j0 + jt;
+                if (j_global < J) {
+                    const int64_t j_off = (((int64_t)b * H + h) * J + j_global) * D + d;
+                    j_tile[jt * DP + d] = ((const float*)R_f4)[j_off];
+                    v2_tile[jt * DP + d] = ((const float*)V2_f4)[j_off];
+                }
             }
             __syncthreads();
-            alpha = red_buf[1]; beta = red_buf[2]; l_i_old = red_buf[3]; l_new = m_l_sh[1];
 
-            // --- Update Output Vector O ---
-            for(int d = tid; d < D; d += block_size) {
-                float new_o_d = 0.0f;
-                for (int it = 0; it < TILE_I; ++it) {
-                    if (i0+it >= I) continue;
-                    for (int jt = 0; jt < TILE_J; ++jt) {
-                        if (j0+jt < J) new_o_d += p_tile[it*TILE_J+jt] * v1_tile[it*D+d] * v2_tile[jt*D+d];
+            #pragma unroll 1
+            for (int cell = 0; cell < 8; cell++) {
+                int cell_idx = lane_id + cell * 32;
+                if (cell_idx < TILE_I * TILE_J) {
+                    int it = cell_idx / TILE_J;
+                    int jt = cell_idx % TILE_J;
+                    
+                    float dot = 0.0f;
+                    if (my_k_valid && i0 + it < I && j0 + jt < J) {
+                        float d_accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                        #pragma unroll 4
+                        for (int d = 0; d < D; d += 4) {
+                            d_accum[0] += my_q[d+0] * i_tile[it*DP + d+0] * j_tile[jt*DP + d+0];
+                            d_accum[1] += my_q[d+1] * i_tile[it*DP + d+1] * j_tile[jt*DP + d+1];
+                            d_accum[2] += my_q[d+2] * i_tile[it*DP + d+2] * j_tile[jt*DP + d+2];
+                            d_accum[3] += my_q[d+3] * i_tile[it*DP + d+3] * j_tile[jt*DP + d+3];
+                        }
+                        dot = d_accum[0] + d_accum[1] + d_accum[2] + d_accum[3];
+                        my_p[cell_idx] = dot;
+                    } else {
+                        my_p[cell_idx] = NEG_INF;
                     }
                 }
-                if (l_new > 1e-20f) o_sh[d] = (alpha * l_i_old * o_sh[d] + beta * new_o_d) / l_new;
             }
+            __syncthreads();
+
+            float m_ij = NEG_INF;
+            #pragma unroll
+            for (int cell = 0; cell < 8; cell++) {
+                int cell_idx = lane_id + cell * 32;
+                if (cell_idx < TILE_I * TILE_J) {
+                    m_ij = fmaxf(m_ij, my_p[cell_idx] * scale);
+                }
+            }
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                m_ij = fmaxf(m_ij, __shfl_down_sync(0xFFFFFFFF, m_ij, offset));
+            }
+            m_ij = __shfl_sync(0xFFFFFFFF, m_ij, 0);
+            
+            float l_ij = 0.0f;
+            #pragma unroll
+            for (int cell = 0; cell < 8; cell++) {
+                int cell_idx = lane_id + cell * 32;
+                if (cell_idx < TILE_I * TILE_J) {
+                    int it = cell_idx / TILE_J;
+                    int jt = cell_idx % TILE_J;
+                    if (my_k_valid && i0 + it < I && j0 + jt < J) {
+                        float p_val = expf(my_p[cell_idx] * scale - m_ij);
+                        my_p[cell_idx] = p_val;
+                        l_ij += p_val;
+                    } else {
+                        my_p[cell_idx] = 0.0f;
+                    }
+                }
+            }
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                l_ij += __shfl_down_sync(0xFFFFFFFF, l_ij, offset);
+            }
+            l_ij = __shfl_sync(0xFFFFFFFF, l_ij, 0);
+
+            float m_old = my_ml[0];
+            float l_old = my_ml[1];
+            float m_new = fmaxf(m_old, m_ij);
+            float alpha = expf(m_old - m_new);
+            float beta = expf(m_ij - m_new);
+            float l_new = alpha * l_old + beta * l_ij;
+            
+            if (lane_id == 0) {
+                my_ml[0] = m_new;
+                my_ml[1] = l_new;
+            }
+            alpha = __shfl_sync(0xFFFFFFFF, alpha, 0);
+            beta = __shfl_sync(0xFFFFFFFF, beta, 0);
+            l_old = __shfl_sync(0xFFFFFFFF, l_old, 0);
+            l_new = __shfl_sync(0xFFFFFFFF, l_new, 0);
+
+            for (int d = lane_id; d < D; d += 32) {
+                float new_o_d = 0.0f;
+                if (my_k_valid) {
+                    for (int it = 0; it < TILE_I; it++) {
+                        if (i0 + it >= I) continue;
+                        float v1_val = v1_tile[it * DP + d];
+                        for (int jt = 0; jt < TILE_J; jt++) {
+                            if (j0 + jt >= J) continue;
+                            new_o_d += my_p[it * TILE_J + jt] * v1_val * v2_tile[jt * DP + d];
+                        }
+                    }
+                }
+                
+                if (l_new > 1e-20f) {
+                    my_o[d] = (alpha * l_old * my_o[d] + beta * new_o_d) / l_new;
+                }
+            }
+            
             __syncthreads();
         }
     }
-    
-    // --- Write Final Output to Global Memory ---
-    for(int d = tid; d < D; d += block_size) {
-        Y[query_base_off + d] = o_sh[d];
+
+    for (int n = 0; n < N_I_GATHER; n++) {
+        int k_global = k_base + n;
+        if (k_global < K) {
+            const int64_t out_off = (((int64_t)b * H + h) * K + k_global) * D;
+            for (int d = tid; d < D; d += block_size) {
+                Y[out_off + d] = o_sh[n * D + d];
+            }
+        }
     }
-    
-    // --- Write Softmax Stats (if output pointers provided) ---
-    if (tid == 0 && m_k_out != nullptr && l_k_out != nullptr) {
-        int64_t stats_idx = ((int64_t)b * H + h) * K + k;
-        m_k_out[stats_idx] = m_l_sh[0];
-        l_k_out[stats_idx] = m_l_sh[1];
+
+    if (lane_id == 0 && m_k_out != nullptr && l_k_out != nullptr && my_k_valid) {
+        int64_t stats_idx = ((int64_t)b * H + h) * K + my_k;
+        m_k_out[stats_idx] = my_ml[0];
+        l_k_out[stats_idx] = my_ml[1];
     }
 }
 
@@ -1828,10 +1909,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     TORCH_CHECK(Q.scalar_type() == at::kFloat, "Only float32 is supported.");
     TORCH_CHECK(D % 4 == 0, "D must be multiple of 4 for FP32 float4 path.");
 
-    // GATHER: Y_q on stream 0 (also computes m_i, l_i stats)
-    // Use tensor core kernel when D is multiple of 16 and USE_TENSOR_CORES is enabled
+    // GATHER: Y_q on stream 0
     {
-        dim3 grid(I, H, B);
+        dim3 grid_yq((I + N_I_GATHER - 1) / N_I_GATHER, H, B);
         
 #if USE_TENSOR_CORES
         // Check if tensor core path is viable
@@ -1852,7 +1932,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
             size_t smem_size_tc = sizeof(half) * (D + TILE_J*D + TILE_K*D + TILE_J*D + TILE_K*D + TILE_J*TILE_K)
                                 + sizeof(float) * (TILE_J*TILE_K + TILE_J*D + TpB + 2 + D);
             
-            Yq_gather_tensor_core<<<grid, block, smem_size_tc, streams[0]>>>(
+            // Note: tensor core kernel still uses old grid (I, H, B) - not updated
+            dim3 grid_tc(I, H, B);
+            Yq_gather_tensor_core<<<grid_tc, block, smem_size_tc, streams[0]>>>(
                 reinterpret_cast<const half*>(Q_h.data_ptr<at::Half>()),
                 reinterpret_cast<const half*>(R_h.data_ptr<at::Half>()),
                 reinterpret_cast<const half*>(S_h.data_ptr<at::Half>()),
@@ -1866,10 +1948,19 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
         } else
 #endif
         {
-            // Original FP32 CUDA core path
-            size_t smem_size = sizeof(float) * (D + TILE_J*D + TILE_K*D + TILE_J*D + TILE_K*D + TILE_J*TILE_K + TpB + 2 + D);
+            const int DP = D + SMEM_PAD;
+            size_t smem_size = sizeof(float) * (
+                N_I_GATHER * D +              // q_vecs
+                TILE_J * DP +                 // r_tile (padded)
+                TILE_K * DP +                 // s_tile (padded)
+                TILE_J * DP +                 // v1_tile (padded)
+                TILE_K * DP +                 // v2_tile (padded)
+                N_I_GATHER * TILE_J * TILE_K +// p_tiles
+                N_I_GATHER * 2 +              // m_l_sh
+                N_I_GATHER * D                // o_sh
+            );
 
-            Yq_gather<<<grid, block, smem_size, streams[0]>>>(
+            Yq_gather<<<grid_yq, block, smem_size, streams[0]>>>(
                 reinterpret_cast<const float4*>(Q.data_ptr<float>()),
                 reinterpret_cast<const float4*>(R.data_ptr<float>()),
                 reinterpret_cast<const float4*>(S.data_ptr<float>()),
@@ -1884,10 +1975,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     }
     AT_CUDA_CHECK(cudaEventRecord(gather_done[0], streams[0]));
     
-    // GATHER: Y_r on stream 1 (also computes m_j, l_j stats)
+    // GATHER: Y_r on stream 1
     {
-        dim3 grid(J, H, B);
-        size_t smem_size = sizeof(float) * (D + TILE_I*D + TILE_K*D + TILE_I*D + TILE_K*D + TILE_I*TILE_K + TpB + 2 + D);
+        dim3 grid((J + N_I_GATHER - 1) / N_I_GATHER, H, B);
+        size_t smem_size = sizeof(float) * (
+            N_I_GATHER * D + TILE_I * (D + SMEM_PAD) + TILE_K * (D + SMEM_PAD) +
+            TILE_I * (D + SMEM_PAD) + TILE_K * (D + SMEM_PAD) +
+            N_I_GATHER * TILE_I * TILE_K + N_I_GATHER * 2 + N_I_GATHER * D
+        );
 
         Yr_gather<<<grid, block, smem_size, streams[1]>>>(
             reinterpret_cast<const float4*>(R.data_ptr<float>()),
@@ -1903,10 +1998,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     }
     AT_CUDA_CHECK(cudaEventRecord(gather_done[1], streams[1]));
 
-    // GATHER: Y_s on stream 2 (also computes m_k, l_k stats)
+    // GATHER: Y_s on stream 2
     {
-        dim3 grid(K, H, B);
-        size_t smem_size = sizeof(float) * (D + TILE_I*D + TILE_J*D + TILE_I*D + TILE_J*D + TILE_I*TILE_J + TpB + 2 + D);
+        dim3 grid((K + N_I_GATHER - 1) / N_I_GATHER, H, B);
+        size_t smem_size = sizeof(float) * (
+            N_I_GATHER * D + TILE_I * (D + SMEM_PAD) + TILE_J * (D + SMEM_PAD) +
+            TILE_I * (D + SMEM_PAD) + TILE_J * (D + SMEM_PAD) +
+            N_I_GATHER * TILE_I * TILE_J + N_I_GATHER * 2 + N_I_GATHER * D
+        );
 
         Ys_gather<<<grid, block, smem_size, streams[2]>>>(
             reinterpret_cast<const float4*>(S.data_ptr<float>()),
