@@ -5,10 +5,17 @@
 ## Quick Start
 Clone this repository, then: 
 ```bash
-# Install
+# Install (see NOTE)
 cd att3ntion
 pip install -r requirements.txt
 pip install -e .   
+
+# NOTE: if you have CUDA 13.0 (see nvcc --version), then first do one of:
+pip install torch --extra-index-url https://download.pytorch.org/whl/cu130
+pip install --force-reinstall torch --extra-index-url https://download.pytorch.org/whl/cu130
+
+# and, use --no-build-isolation to ensure the compilation uses your installed torch
+pip install -e . --no-build-isolation
 
 # Run demo
 python demo.py              # Basic usage
