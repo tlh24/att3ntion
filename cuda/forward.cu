@@ -40,6 +40,7 @@ constexpr int N_I_GATHER = 4;  // i-values per block in multi-i gather
 constexpr int SMEM_PAD = 1;    // Padding to eliminate bank conflicts
 
 // Multi-i warp-parallel gather: 4 output vectors per block, warp-shuffle softmax
+template<int D_CONST>
 __global__
 void Yq_gather(
     const float4* __restrict__ Q_f4,
@@ -50,7 +51,7 @@ void Yq_gather(
     float*       __restrict__ Y,
     float*       __restrict__ m_i_out,
     float*       __restrict__ l_i_out,
-    int B, int H, int I, int J, int K, int D, float scale)
+    int B, int H, int I, int J, int K, float scale)
 {
     const int i_base = blockIdx.x * N_I_GATHER;
     const int h = blockIdx.y;
@@ -60,11 +61,11 @@ void Yq_gather(
     const int warp_id = tid / 32;
     const int lane_id = tid % 32;
     const int block_size = blockDim.x;
-    const int DP = D + SMEM_PAD;
+    constexpr int DP = D_CONST + SMEM_PAD;
 
     extern __shared__ float smem[];
     float* q_vecs  = smem;
-    float* r_tile  = q_vecs + N_I_GATHER * D;
+    float* r_tile  = q_vecs + N_I_GATHER * D_CONST;
     float* s_tile  = r_tile + TILE_J * DP;
     float* v1_tile = s_tile + TILE_K * DP;
     float* v2_tile = v1_tile + TILE_J * DP;
@@ -74,17 +75,17 @@ void Yq_gather(
     
     const int my_i = i_base + warp_id;
     const bool my_i_valid = (my_i < I);
-    float* my_q = q_vecs + warp_id * D;
+    float* my_q = q_vecs + warp_id * D_CONST;
     float* my_p = p_tiles + warp_id * TILE_J * TILE_K;
-    float* my_o = o_sh + warp_id * D;
+    float* my_o = o_sh + warp_id * D_CONST;
     float* my_ml = m_l_sh + warp_id * 2;
 
     for (int n = 0; n < N_I_GATHER; n++) {
         int i_global = i_base + n;
         if (i_global < I) {
-            const int64_t q_off = (((int64_t)b * H + h) * I + i_global) * D;
-            for (int d = tid; d < D; d += block_size) {
-                q_vecs[n * D + d] = ((const float*)Q_f4)[q_off + d];
+            const int64_t q_off = (((int64_t)b * H + h) * I + i_global) * D_CONST;
+            for (int d = tid; d < D_CONST; d += block_size) {
+                q_vecs[n * D_CONST + d] = ((const float*)Q_f4)[q_off + d];
             }
         }
     }
@@ -92,7 +93,7 @@ void Yq_gather(
     if (tid < N_I_GATHER * 2) {
         m_l_sh[tid] = (tid % 2 == 0) ? NEG_INF : 0.0f;
     }
-    for (int idx = tid; idx < N_I_GATHER * D; idx += block_size) {
+    for (int idx = tid; idx < N_I_GATHER * D_CONST; idx += block_size) {
         o_sh[idx] = 0.0f;
     }
     __syncthreads();
@@ -100,23 +101,23 @@ void Yq_gather(
     for (int j0 = 0; j0 < J; j0 += TILE_J) {
         for (int k0 = 0; k0 < K; k0 += TILE_K) {
             
-            for (int idx = tid; idx < TILE_J * D; idx += block_size) {
-                int jt = idx / D;
-                int d = idx % D;
+            for (int idx = tid; idx < TILE_J * D_CONST; idx += block_size) {
+                int jt = idx / D_CONST;
+                int d = idx % D_CONST;
                 int j_global = j0 + jt;
                 if (j_global < J) {
-                    const int64_t r_off = (((int64_t)b * H + h) * J + j_global) * D + d;
+                    const int64_t r_off = (((int64_t)b * H + h) * J + j_global) * D_CONST + d;
                     r_tile[jt * DP + d] = ((const float*)R_f4)[r_off];
                     v1_tile[jt * DP + d] = ((const float*)V1_f4)[r_off];
                 }
             }
             
-            for (int idx = tid; idx < TILE_K * D; idx += block_size) {
-                int kt = idx / D;
-                int d = idx % D;
+            for (int idx = tid; idx < TILE_K * D_CONST; idx += block_size) {
+                int kt = idx / D_CONST;
+                int d = idx % D_CONST;
                 int k_global = k0 + kt;
                 if (k_global < K) {
-                    const int64_t s_off = (((int64_t)b * H + h) * K + k_global) * D + d;
+                    const int64_t s_off = (((int64_t)b * H + h) * K + k_global) * D_CONST + d;
                     s_tile[kt * DP + d] = ((const float*)S_f4)[s_off];
                     v2_tile[kt * DP + d] = ((const float*)V2_f4)[s_off];
                 }
@@ -134,7 +135,7 @@ void Yq_gather(
                     if (my_i_valid && j0 + jt < J && k0 + kt < K) {
                         float d_accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                         #pragma unroll 4
-                        for (int d = 0; d < D; d += 4) {
+                        for (int d = 0; d < D_CONST; d += 4) {
                             d_accum[0] += my_q[d+0] * r_tile[jt*DP + d+0] * s_tile[kt*DP + d+0];
                             d_accum[1] += my_q[d+1] * r_tile[jt*DP + d+1] * s_tile[kt*DP + d+1];
                             d_accum[2] += my_q[d+2] * r_tile[jt*DP + d+2] * s_tile[kt*DP + d+2];
@@ -201,7 +202,7 @@ void Yq_gather(
             l_old = __shfl_sync(0xFFFFFFFF, l_old, 0);
             l_new = __shfl_sync(0xFFFFFFFF, l_new, 0);
 
-            for (int d = lane_id; d < D; d += 32) {
+            for (int d = lane_id; d < D_CONST; d += 32) {
                 float new_o_d = 0.0f;
                 if (my_i_valid) {
                     for (int jt = 0; jt < TILE_J; jt++) {
@@ -226,9 +227,9 @@ void Yq_gather(
     for (int n = 0; n < N_I_GATHER; n++) {
         int i_global = i_base + n;
         if (i_global < I) {
-            const int64_t out_off = (((int64_t)b * H + h) * I + i_global) * D;
-            for (int d = tid; d < D; d += block_size) {
-                Y[out_off + d] = o_sh[n * D + d];
+            const int64_t out_off = (((int64_t)b * H + h) * I + i_global) * D_CONST;
+            for (int d = tid; d < D_CONST; d += block_size) {
+                Y[out_off + d] = o_sh[n * D_CONST + d];
             }
         }
     }
@@ -532,6 +533,7 @@ void Yq_gather_tensor_core(
 
 
 // Multi-j warp-parallel gather: 4 output vectors per block, warp-shuffle softmax
+template<int D_CONST>
 __global__
 void Yr_gather(
     const float4* __restrict__ R_query_f4,
@@ -542,7 +544,7 @@ void Yr_gather(
     float*       __restrict__ Y,
     float*       __restrict__ m_j_out,
     float*       __restrict__ l_j_out,
-    int B, int H, int I, int J, int K, int D, float scale)
+    int B, int H, int I, int J, int K, float scale)
 {
     const int j_base = blockIdx.x * N_I_GATHER;
     const int h = blockIdx.y;
@@ -552,11 +554,11 @@ void Yr_gather(
     const int warp_id = tid / 32;
     const int lane_id = tid % 32;
     const int block_size = blockDim.x;
-    const int DP = D + SMEM_PAD;
+    constexpr int DP = D_CONST + SMEM_PAD;
 
     extern __shared__ float smem[];
     float* q_vecs  = smem;
-    float* i_tile  = q_vecs + N_I_GATHER * D;
+    float* i_tile  = q_vecs + N_I_GATHER * D_CONST;
     float* k_tile  = i_tile + TILE_I * DP;
     float* v1_tile = k_tile + TILE_K * DP;
     float* v2_tile = v1_tile + TILE_I * DP;
@@ -566,17 +568,17 @@ void Yr_gather(
     
     const int my_j = j_base + warp_id;
     const bool my_j_valid = (my_j < J);
-    float* my_q = q_vecs + warp_id * D;
+    float* my_q = q_vecs + warp_id * D_CONST;
     float* my_p = p_tiles + warp_id * TILE_I * TILE_K;
-    float* my_o = o_sh + warp_id * D;
+    float* my_o = o_sh + warp_id * D_CONST;
     float* my_ml = m_l_sh + warp_id * 2;
 
     for (int n = 0; n < N_I_GATHER; n++) {
         int j_global = j_base + n;
         if (j_global < J) {
-            const int64_t q_off = (((int64_t)b * H + h) * J + j_global) * D;
-            for (int d = tid; d < D; d += block_size) {
-                q_vecs[n * D + d] = ((const float*)R_query_f4)[q_off + d];
+            const int64_t q_off = (((int64_t)b * H + h) * J + j_global) * D_CONST;
+            for (int d = tid; d < D_CONST; d += block_size) {
+                q_vecs[n * D_CONST + d] = ((const float*)R_query_f4)[q_off + d];
             }
         }
     }
@@ -584,7 +586,7 @@ void Yr_gather(
     if (tid < N_I_GATHER * 2) {
         m_l_sh[tid] = (tid % 2 == 0) ? NEG_INF : 0.0f;
     }
-    for (int idx = tid; idx < N_I_GATHER * D; idx += block_size) {
+    for (int idx = tid; idx < N_I_GATHER * D_CONST; idx += block_size) {
         o_sh[idx] = 0.0f;
     }
     __syncthreads();
@@ -592,23 +594,23 @@ void Yr_gather(
     for (int i0 = 0; i0 < I; i0 += TILE_I) {
         for (int k0 = 0; k0 < K; k0 += TILE_K) {
             
-            for (int idx = tid; idx < TILE_I * D; idx += block_size) {
-                int it = idx / D;
-                int d = idx % D;
+            for (int idx = tid; idx < TILE_I * D_CONST; idx += block_size) {
+                int it = idx / D_CONST;
+                int d = idx % D_CONST;
                 int i_global = i0 + it;
                 if (i_global < I) {
-                    const int64_t i_off = (((int64_t)b * H + h) * I + i_global) * D + d;
+                    const int64_t i_off = (((int64_t)b * H + h) * I + i_global) * D_CONST + d;
                     i_tile[it * DP + d] = ((const float*)Q_f4)[i_off];
                     v1_tile[it * DP + d] = ((const float*)V1_f4)[i_off];
                 }
             }
             
-            for (int idx = tid; idx < TILE_K * D; idx += block_size) {
-                int kt = idx / D;
-                int d = idx % D;
+            for (int idx = tid; idx < TILE_K * D_CONST; idx += block_size) {
+                int kt = idx / D_CONST;
+                int d = idx % D_CONST;
                 int k_global = k0 + kt;
                 if (k_global < K) {
-                    const int64_t k_off = (((int64_t)b * H + h) * K + k_global) * D + d;
+                    const int64_t k_off = (((int64_t)b * H + h) * K + k_global) * D_CONST + d;
                     k_tile[kt * DP + d] = ((const float*)S_f4)[k_off];
                     v2_tile[kt * DP + d] = ((const float*)V2_f4)[k_off];
                 }
@@ -626,7 +628,7 @@ void Yr_gather(
                     if (my_j_valid && i0 + it < I && k0 + kt < K) {
                         float d_accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                         #pragma unroll 4
-                        for (int d = 0; d < D; d += 4) {
+                        for (int d = 0; d < D_CONST; d += 4) {
                             d_accum[0] += my_q[d+0] * i_tile[it*DP + d+0] * k_tile[kt*DP + d+0];
                             d_accum[1] += my_q[d+1] * i_tile[it*DP + d+1] * k_tile[kt*DP + d+1];
                             d_accum[2] += my_q[d+2] * i_tile[it*DP + d+2] * k_tile[kt*DP + d+2];
@@ -693,7 +695,7 @@ void Yr_gather(
             l_old = __shfl_sync(0xFFFFFFFF, l_old, 0);
             l_new = __shfl_sync(0xFFFFFFFF, l_new, 0);
 
-            for (int d = lane_id; d < D; d += 32) {
+            for (int d = lane_id; d < D_CONST; d += 32) {
                 float new_o_d = 0.0f;
                 if (my_j_valid) {
                     for (int it = 0; it < TILE_I; it++) {
@@ -718,9 +720,9 @@ void Yr_gather(
     for (int n = 0; n < N_I_GATHER; n++) {
         int j_global = j_base + n;
         if (j_global < J) {
-            const int64_t out_off = (((int64_t)b * H + h) * J + j_global) * D;
-            for (int d = tid; d < D; d += block_size) {
-                Y[out_off + d] = o_sh[n * D + d];
+            const int64_t out_off = (((int64_t)b * H + h) * J + j_global) * D_CONST;
+            for (int d = tid; d < D_CONST; d += block_size) {
+                Y[out_off + d] = o_sh[n * D_CONST + d];
             }
         }
     }
@@ -734,6 +736,7 @@ void Yr_gather(
 
 
 // Multi-k warp-parallel gather: 4 output vectors per block, warp-shuffle softmax
+template<int D_CONST>
 __global__
 void Ys_gather(
     const float4* __restrict__ S_query_f4,
@@ -744,7 +747,7 @@ void Ys_gather(
     float*       __restrict__ Y,
     float*       __restrict__ m_k_out,
     float*       __restrict__ l_k_out,
-    int B, int H, int I, int J, int K, int D, float scale)
+    int B, int H, int I, int J, int K, float scale)
 {
     const int k_base = blockIdx.x * N_I_GATHER;
     const int h = blockIdx.y;
@@ -754,11 +757,11 @@ void Ys_gather(
     const int warp_id = tid / 32;
     const int lane_id = tid % 32;
     const int block_size = blockDim.x;
-    const int DP = D + SMEM_PAD;
+    constexpr int DP = D_CONST + SMEM_PAD;
 
     extern __shared__ float smem[];
     float* q_vecs  = smem;
-    float* i_tile  = q_vecs + N_I_GATHER * D;
+    float* i_tile  = q_vecs + N_I_GATHER * D_CONST;
     float* j_tile  = i_tile + TILE_I * DP;
     float* v1_tile = j_tile + TILE_J * DP;
     float* v2_tile = v1_tile + TILE_I * DP;
@@ -768,17 +771,17 @@ void Ys_gather(
     
     const int my_k = k_base + warp_id;
     const bool my_k_valid = (my_k < K);
-    float* my_q = q_vecs + warp_id * D;
+    float* my_q = q_vecs + warp_id * D_CONST;
     float* my_p = p_tiles + warp_id * TILE_I * TILE_J;
-    float* my_o = o_sh + warp_id * D;
+    float* my_o = o_sh + warp_id * D_CONST;
     float* my_ml = m_l_sh + warp_id * 2;
 
     for (int n = 0; n < N_I_GATHER; n++) {
         int k_global = k_base + n;
         if (k_global < K) {
-            const int64_t q_off = (((int64_t)b * H + h) * K + k_global) * D;
-            for (int d = tid; d < D; d += block_size) {
-                q_vecs[n * D + d] = ((const float*)S_query_f4)[q_off + d];
+            const int64_t q_off = (((int64_t)b * H + h) * K + k_global) * D_CONST;
+            for (int d = tid; d < D_CONST; d += block_size) {
+                q_vecs[n * D_CONST + d] = ((const float*)S_query_f4)[q_off + d];
             }
         }
     }
@@ -786,7 +789,7 @@ void Ys_gather(
     if (tid < N_I_GATHER * 2) {
         m_l_sh[tid] = (tid % 2 == 0) ? NEG_INF : 0.0f;
     }
-    for (int idx = tid; idx < N_I_GATHER * D; idx += block_size) {
+    for (int idx = tid; idx < N_I_GATHER * D_CONST; idx += block_size) {
         o_sh[idx] = 0.0f;
     }
     __syncthreads();
@@ -794,23 +797,23 @@ void Ys_gather(
     for (int i0 = 0; i0 < I; i0 += TILE_I) {
         for (int j0 = 0; j0 < J; j0 += TILE_J) {
             
-            for (int idx = tid; idx < TILE_I * D; idx += block_size) {
-                int it = idx / D;
-                int d = idx % D;
+            for (int idx = tid; idx < TILE_I * D_CONST; idx += block_size) {
+                int it = idx / D_CONST;
+                int d = idx % D_CONST;
                 int i_global = i0 + it;
                 if (i_global < I) {
-                    const int64_t i_off = (((int64_t)b * H + h) * I + i_global) * D + d;
+                    const int64_t i_off = (((int64_t)b * H + h) * I + i_global) * D_CONST + d;
                     i_tile[it * DP + d] = ((const float*)Q_f4)[i_off];
                     v1_tile[it * DP + d] = ((const float*)V1_f4)[i_off];
                 }
             }
             
-            for (int idx = tid; idx < TILE_J * D; idx += block_size) {
-                int jt = idx / D;
-                int d = idx % D;
+            for (int idx = tid; idx < TILE_J * D_CONST; idx += block_size) {
+                int jt = idx / D_CONST;
+                int d = idx % D_CONST;
                 int j_global = j0 + jt;
                 if (j_global < J) {
-                    const int64_t j_off = (((int64_t)b * H + h) * J + j_global) * D + d;
+                    const int64_t j_off = (((int64_t)b * H + h) * J + j_global) * D_CONST + d;
                     j_tile[jt * DP + d] = ((const float*)R_f4)[j_off];
                     v2_tile[jt * DP + d] = ((const float*)V2_f4)[j_off];
                 }
@@ -828,7 +831,7 @@ void Ys_gather(
                     if (my_k_valid && i0 + it < I && j0 + jt < J) {
                         float d_accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                         #pragma unroll 4
-                        for (int d = 0; d < D; d += 4) {
+                        for (int d = 0; d < D_CONST; d += 4) {
                             d_accum[0] += my_q[d+0] * i_tile[it*DP + d+0] * j_tile[jt*DP + d+0];
                             d_accum[1] += my_q[d+1] * i_tile[it*DP + d+1] * j_tile[jt*DP + d+1];
                             d_accum[2] += my_q[d+2] * i_tile[it*DP + d+2] * j_tile[jt*DP + d+2];
@@ -895,7 +898,7 @@ void Ys_gather(
             l_old = __shfl_sync(0xFFFFFFFF, l_old, 0);
             l_new = __shfl_sync(0xFFFFFFFF, l_new, 0);
 
-            for (int d = lane_id; d < D; d += 32) {
+            for (int d = lane_id; d < D_CONST; d += 32) {
                 float new_o_d = 0.0f;
                 if (my_k_valid) {
                     for (int it = 0; it < TILE_I; it++) {
@@ -920,9 +923,9 @@ void Ys_gather(
     for (int n = 0; n < N_I_GATHER; n++) {
         int k_global = k_base + n;
         if (k_global < K) {
-            const int64_t out_off = (((int64_t)b * H + h) * K + k_global) * D;
-            for (int d = tid; d < D; d += block_size) {
-                Y[out_off + d] = o_sh[n * D + d];
+            const int64_t out_off = (((int64_t)b * H + h) * K + k_global) * D_CONST;
+            for (int d = tid; d < D_CONST; d += block_size) {
+                Y[out_off + d] = o_sh[n * D_CONST + d];
             }
         }
     }
@@ -957,6 +960,7 @@ void Ys_gather(
  * - I, J, K must be equal and multiples of TILE_I (16)
  * - I, J, K must be >= TILE_I
  */
+template<int D_CONST>
 __global__
 __launch_bounds__(256, 2)
 void Yq_scatter(
@@ -970,7 +974,7 @@ void Yq_scatter(
     const float* __restrict__ m_k_in,
     const float* __restrict__ l_k_in,
     float* __restrict__ Y_q_,
-    int B, int H, int I, int J, int K, int D, float scale
+    int B, int H, int I, int J, int K, float scale
 ) {
     // --- Grid/Block Mapping ---
     const int b = blockIdx.z;
@@ -981,30 +985,31 @@ void Yq_scatter(
     const int tpb = blockDim.x;
 
     // --- Memory Offsets ---
-    const int64_t q_bh_offset = (int64_t)(b * H + h) * I * D;
-    const int64_t r_bh_offset = (int64_t)(b * H + h) * J * D;
-    const int64_t s_bh_offset = (int64_t)(b * H + h) * K * D;
+    const int64_t q_bh_offset = (int64_t)(b * H + h) * I * D_CONST;
+    const int64_t r_bh_offset = (int64_t)(b * H + h) * J * D_CONST;
+    const int64_t s_bh_offset = (int64_t)(b * H + h) * K * D_CONST;
     const int64_t mj_bh_offset = (int64_t)(b * H + h) * J;
     const int64_t mk_bh_offset = (int64_t)(b * H + h) * K;
 
     // --- Shared Memory Layout ---
     extern __shared__ float smem[];
     float* q_tile = smem;
-    float* r_tile = q_tile + TILE_I * D;
-    float* s_tile = r_tile + TILE_J * D;
-    float* vr_tile = s_tile + TILE_K * D;
-    float* vs_tile = vr_tile + TILE_J * D;
-    float* attn_tile = vs_tile + TILE_K * D;
+    float* r_tile = q_tile + TILE_I * D_CONST;
+    float* s_tile = r_tile + TILE_J * D_CONST;
+    float* vr_tile = s_tile + TILE_K * D_CONST;
+    float* vs_tile = vr_tile + TILE_J * D_CONST;
+    float* attn_tile = vs_tile + TILE_K * D_CONST;
     float* mj_tile = attn_tile + TILE_I * TILE_J * TILE_K;
     float* lj_tile = mj_tile + TILE_J;
     float* mk_tile = lj_tile + TILE_J;
     float* lk_tile = mk_tile + TILE_K;
 
     // --- Thread Indexing for Cooperative Loads ---
-    const int i_load = tid / D;
-    const int d_load = tid % D;
-    const int load_iters = (TILE_I * D + tpb - 1) / tpb;
-    const int load_step = tpb / D;
+    constexpr int i_load_D = D_CONST;  // compile-time for efficient div/mod
+    const int i_load = tid / i_load_D;
+    const int d_load = tid % i_load_D;
+    constexpr int load_iters = (TILE_I * D_CONST + 256 - 1) / 256;
+    constexpr int load_step = 256 / D_CONST;
 
     // --- Per-Thread Output Accumulators (registers) ---
     float yq_acc[8];
@@ -1017,7 +1022,7 @@ void Yq_scatter(
     for (int n = 0; n < TILE_I; n += load_step) {
         int i_global = i_start + n + i_load;
         if (n + i_load < TILE_I && i_global < I) {
-            q_tile[(n + i_load) * D + d_load] = Q[q_bh_offset + i_global * D + d_load];
+            q_tile[(n + i_load) * D_CONST + d_load] = Q[q_bh_offset + i_global * D_CONST + d_load];
         }
     }
     __syncthreads();
@@ -1027,13 +1032,13 @@ void Yq_scatter(
         for (int n = 0; n < TILE_J; n += load_step) {
             int j_global = jt + n + i_load;
             if (n + i_load < TILE_J && j_global < J) {
-                r_tile[(n + i_load) * D + d_load] = R[r_bh_offset + j_global * D + d_load];
+                r_tile[(n + i_load) * D_CONST + d_load] = R[r_bh_offset + j_global * D_CONST + d_load];
             }
         }
         for (int n = 0; n < TILE_J; n += load_step) {
             int j_global = jt + n + i_load;
             if (n + i_load < TILE_J && j_global < J) {
-                vr_tile[(n + i_load) * D + d_load] = Vr_2[r_bh_offset + j_global * D + d_load];
+                vr_tile[(n + i_load) * D_CONST + d_load] = Vr_2[r_bh_offset + j_global * D_CONST + d_load];
             }
         }
         if (tid < TILE_J && jt + tid < J) {
@@ -1046,7 +1051,7 @@ void Yq_scatter(
             for (int n = 0; n < TILE_K; n += load_step) {
                 int k_global = kt + n + i_load;
                 if (n + i_load < TILE_K && k_global < K) {
-                    s_tile[(n + i_load) * D + d_load] = S[s_bh_offset + k_global * D + d_load];
+                    s_tile[(n + i_load) * D_CONST + d_load] = S[s_bh_offset + k_global * D_CONST + d_load];
                 }
             }
             if (tid < TILE_K && kt + tid < K) {
@@ -1074,15 +1079,15 @@ void Yq_scatter(
             const int ka = tid % (TILE_K / 4);
 
             float qa[4], ra[4], sa[4];
-            const int d_per_slice = D / 4;
+            constexpr int d_per_slice = D_CONST / 4;
 
             for (int db = 0; db < d_per_slice; db++) {
                 const int d_idx = da * d_per_slice + db;
                 #pragma unroll
                 for (int u = 0; u < 4; u++) {
-                    qa[u] = q_tile[(ia * 4 + u) * D + d_idx];
-                    ra[u] = r_tile[(ja * 4 + u) * D + d_idx];
-                    sa[u] = s_tile[(ka * 4 + u) * D + d_idx];
+                    qa[u] = q_tile[(ia * 4 + u) * D_CONST + d_idx];
+                    ra[u] = r_tile[(ja * 4 + u) * D_CONST + d_idx];
+                    sa[u] = s_tile[(ka * 4 + u) * D_CONST + d_idx];
                 }
                 #pragma unroll
                 for (int i0 = 0; i0 < 4; i0++) {
@@ -1156,7 +1161,7 @@ void Yq_scatter(
             for (int n = 0; n < TILE_K; n += load_step) {
                 int k_global = kt + n + i_load;
                 if (n + i_load < TILE_K && k_global < K) {
-                    vs_tile[(n + i_load) * D + d_load] = Vs_2[s_bh_offset + k_global * D + d_load];
+                    vs_tile[(n + i_load) * D_CONST + d_load] = Vs_2[s_bh_offset + k_global * D_CONST + d_load];
                 }
             }
             __syncthreads();
@@ -1164,15 +1169,15 @@ void Yq_scatter(
             // --- Accumulate Output ---
             for (int n = 0; n < load_iters; n++) {
                 int tid_n = tid + n * tpb;
-                if (tid_n < TILE_I * D) {
-                    int iy = tid_n / D;
-                    int dy = tid_n % D;
+                if (tid_n < TILE_I * D_CONST) {
+                    int iy = tid_n / D_CONST;
+                    int dy = tid_n % D_CONST;
 
                     float f = 0.0f;
                     for (int jy = 0; jy < TILE_J; jy++) {
-                        float vrt = vr_tile[jy * D + dy];
+                        float vrt = vr_tile[jy * D_CONST + dy];
                         for (int ky = 0; ky < TILE_K; ky++) {
-                            f += attn_tile[iy * TILE_J * TILE_K + jy * TILE_K + ky] * vrt * vs_tile[ky * D + dy];
+                            f += attn_tile[iy * TILE_J * TILE_K + jy * TILE_K + ky] * vrt * vs_tile[ky * D_CONST + dy];
                         }
                     }
                     yq_acc[n] += f;
@@ -1185,17 +1190,18 @@ void Yq_scatter(
     // --- Write Output to Global Memory ---
     for (int n = 0; n < load_iters; n++) {
         int tid_n = tid + n * tpb;
-        if (tid_n < TILE_I * D) {
-            int iy = tid_n / D;
-            int dy = tid_n % D;
+        if (tid_n < TILE_I * D_CONST) {
+            int iy = tid_n / D_CONST;
+            int dy = tid_n % D_CONST;
             int i_global = i_start + iy;
             if (i_global < I) {
-                Y_q_[q_bh_offset + i_global * D + dy] = yq_acc[n];
+                Y_q_[q_bh_offset + i_global * D_CONST + dy] = yq_acc[n];
             }
         }
     }
 }
 
+template<int D_CONST>
 void Yq_scatter_launcher_with_stats(
     const at::Tensor& Q, const at::Tensor& R, const at::Tensor& S,
     const at::Tensor& Vr_2, const at::Tensor& Vs_2,
@@ -1209,36 +1215,33 @@ void Yq_scatter_launcher_with_stats(
     const auto I = Q.size(2);
     const auto J = R.size(2);
     const auto K = S.size(2);
-    const auto D = Q.size(3);
 
-    TORCH_CHECK(D % 4 == 0, "Yq_scatter requires D to be a multiple of 4");
     TORCH_CHECK(I == J && J == K, "Yq_scatter requires I == J == K");
     TORCH_CHECK(I % TILE_I == 0, "Yq_scatter requires I to be a multiple of TILE_I (16)");
     TORCH_CHECK(I >= TILE_I, "Yq_scatter requires I >= TILE_I (16)");
-    TORCH_CHECK((TILE_I * D) / 256 <= 8, "Yq_scatter: D too large (max 8 load iterations)");
 
     const int TPB = 256;
     dim3 grid((I + TILE_I - 1) / TILE_I, H, B);
     dim3 block(TPB);
 
     size_t smem_size = sizeof(float) * (
-        TILE_I * D +                    // q_tile
-        TILE_J * D +                    // r_tile
-        TILE_K * D +                    // s_tile
-        TILE_J * D +                    // vr_tile
-        TILE_K * D +                    // vs_tile
+        TILE_I * D_CONST +              // q_tile
+        TILE_J * D_CONST +              // r_tile
+        TILE_K * D_CONST +              // s_tile
+        TILE_J * D_CONST +              // vr_tile
+        TILE_K * D_CONST +              // vs_tile
         TILE_I * TILE_J * TILE_K +      // attn_tile
         TILE_J + TILE_J +               // mj_tile, lj_tile
         TILE_K + TILE_K                 // mk_tile, lk_tile
     );
 
-    Yq_scatter<<<grid, block, smem_size, stream>>>(
+    Yq_scatter<D_CONST><<<grid, block, smem_size, stream>>>(
         Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
         Vr_2.data_ptr<float>(), Vs_2.data_ptr<float>(),
         m_j.data_ptr<float>(), l_j.data_ptr<float>(),
         m_k.data_ptr<float>(), l_k.data_ptr<float>(),
         Y_q_.data_ptr<float>(),
-        B, H, I, J, K, D, scale
+        B, H, I, J, K, scale
     );
 }
 
@@ -1259,6 +1262,7 @@ void Yq_scatter_launcher_with_stats(
  * - I, J, K must be equal and multiples of TILE_I (16)
  * - I, J, K must be >= TILE_I
  */
+template<int D_CONST>
 __global__
 __launch_bounds__(256, 2)
 void Yr_scatter(
@@ -1272,7 +1276,7 @@ void Yr_scatter(
     const float* __restrict__ m_k_in,
     const float* __restrict__ l_k_in,
     float* __restrict__ Y_r_,
-    int B, int H, int I, int J, int K, int D, float scale
+    int B, int H, int I, int J, int K, float scale
 ) {
     // --- Grid/Block Mapping ---
     const int b = blockIdx.z;
@@ -1283,30 +1287,30 @@ void Yr_scatter(
     const int tpb = blockDim.x;
 
     // --- Memory Offsets ---
-    const int64_t r_bh_offset = (int64_t)(b * H + h) * J * D;
-    const int64_t q_bh_offset = (int64_t)(b * H + h) * I * D;
-    const int64_t s_bh_offset = (int64_t)(b * H + h) * K * D;
+    const int64_t r_bh_offset = (int64_t)(b * H + h) * J * D_CONST;
+    const int64_t q_bh_offset = (int64_t)(b * H + h) * I * D_CONST;
+    const int64_t s_bh_offset = (int64_t)(b * H + h) * K * D_CONST;
     const int64_t mi_bh_offset = (int64_t)(b * H + h) * I;
     const int64_t mk_bh_offset = (int64_t)(b * H + h) * K;
 
     // --- Shared Memory Layout ---
     extern __shared__ float smem[];
     float* r_tile = smem;
-    float* q_tile = r_tile + TILE_J * D;
-    float* s_tile = q_tile + TILE_I * D;
-    float* vq_tile = s_tile + TILE_K * D;
-    float* vs_tile = vq_tile + TILE_I * D;
-    float* attn_tile = vs_tile + TILE_K * D;
+    float* q_tile = r_tile + TILE_J * D_CONST;
+    float* s_tile = q_tile + TILE_I * D_CONST;
+    float* vq_tile = s_tile + TILE_K * D_CONST;
+    float* vs_tile = vq_tile + TILE_I * D_CONST;
+    float* attn_tile = vs_tile + TILE_K * D_CONST;
     float* mi_tile = attn_tile + TILE_I * TILE_J * TILE_K;
     float* li_tile = mi_tile + TILE_I;
     float* mk_tile = li_tile + TILE_I;
     float* lk_tile = mk_tile + TILE_K;
 
     // --- Thread Indexing for Cooperative Loads ---
-    const int j_load = tid / D;
-    const int d_load = tid % D;
-    const int load_iters = (TILE_J * D + tpb - 1) / tpb;
-    const int load_step = tpb / D;
+    const int j_load = tid / D_CONST;
+    const int d_load = tid % D_CONST;
+    constexpr int load_iters = (TILE_J * D_CONST + 256 - 1) / 256;
+    constexpr int load_step = 256 / D_CONST;
 
     // --- Per-Thread Output Accumulators (registers) ---
     float yr_acc[8];
@@ -1319,7 +1323,7 @@ void Yr_scatter(
     for (int n = 0; n < TILE_J; n += load_step) {
         int j_global = j_start + n + j_load;
         if (n + j_load < TILE_J && j_global < J) {
-            r_tile[(n + j_load) * D + d_load] = R[r_bh_offset + j_global * D + d_load];
+            r_tile[(n + j_load) * D_CONST + d_load] = R[r_bh_offset + j_global * D_CONST + d_load];
         }
     }
     __syncthreads();
@@ -1329,13 +1333,13 @@ void Yr_scatter(
         for (int n = 0; n < TILE_I; n += load_step) {
             int i_global = it + n + j_load;
             if (n + j_load < TILE_I && i_global < I) {
-                q_tile[(n + j_load) * D + d_load] = Q[q_bh_offset + i_global * D + d_load];
+                q_tile[(n + j_load) * D_CONST + d_load] = Q[q_bh_offset + i_global * D_CONST + d_load];
             }
         }
         for (int n = 0; n < TILE_I; n += load_step) {
             int i_global = it + n + j_load;
             if (n + j_load < TILE_I && i_global < I) {
-                vq_tile[(n + j_load) * D + d_load] = Vq_2[q_bh_offset + i_global * D + d_load];
+                vq_tile[(n + j_load) * D_CONST + d_load] = Vq_2[q_bh_offset + i_global * D_CONST + d_load];
             }
         }
         if (tid < TILE_I && it + tid < I) {
@@ -1348,7 +1352,7 @@ void Yr_scatter(
             for (int n = 0; n < TILE_K; n += load_step) {
                 int k_global = kt + n + j_load;
                 if (n + j_load < TILE_K && k_global < K) {
-                    s_tile[(n + j_load) * D + d_load] = S[s_bh_offset + k_global * D + d_load];
+                    s_tile[(n + j_load) * D_CONST + d_load] = S[s_bh_offset + k_global * D_CONST + d_load];
                 }
             }
             if (tid < TILE_K && kt + tid < K) {
@@ -1376,15 +1380,15 @@ void Yr_scatter(
             const int ka = tid % (TILE_K / 4);
 
             float qa[4], ra[4], sa[4];
-            const int d_per_slice = D / 4;
+            constexpr int d_per_slice = D_CONST / 4;
 
             for (int db = 0; db < d_per_slice; db++) {
                 const int d_idx = da * d_per_slice + db;
                 #pragma unroll
                 for (int u = 0; u < 4; u++) {
-                    qa[u] = q_tile[(ia * 4 + u) * D + d_idx];
-                    ra[u] = r_tile[(ja * 4 + u) * D + d_idx];
-                    sa[u] = s_tile[(ka * 4 + u) * D + d_idx];
+                    qa[u] = q_tile[(ia * 4 + u) * D_CONST + d_idx];
+                    ra[u] = r_tile[(ja * 4 + u) * D_CONST + d_idx];
+                    sa[u] = s_tile[(ka * 4 + u) * D_CONST + d_idx];
                 }
                 #pragma unroll
                 for (int i0 = 0; i0 < 4; i0++) {
@@ -1458,7 +1462,7 @@ void Yr_scatter(
             for (int n = 0; n < TILE_K; n += load_step) {
                 int k_global = kt + n + j_load;
                 if (n + j_load < TILE_K && k_global < K) {
-                    vs_tile[(n + j_load) * D + d_load] = Vs_2[s_bh_offset + k_global * D + d_load];
+                    vs_tile[(n + j_load) * D_CONST + d_load] = Vs_2[s_bh_offset + k_global * D_CONST + d_load];
                 }
             }
             __syncthreads();
@@ -1466,15 +1470,15 @@ void Yr_scatter(
             // --- Accumulate Output ---
             for (int n = 0; n < load_iters; n++) {
                 int tid_n = tid + n * tpb;
-                if (tid_n < TILE_J * D) {
-                    int jy = tid_n / D;
-                    int dy = tid_n % D;
+                if (tid_n < TILE_J * D_CONST) {
+                    int jy = tid_n / D_CONST;
+                    int dy = tid_n % D_CONST;
 
                     float f = 0.0f;
                     for (int iy = 0; iy < TILE_I; iy++) {
-                        float vqt = vq_tile[iy * D + dy];
+                        float vqt = vq_tile[iy * D_CONST + dy];
                         for (int ky = 0; ky < TILE_K; ky++) {
-                            f += attn_tile[iy * TILE_J * TILE_K + jy * TILE_K + ky] * vqt * vs_tile[ky * D + dy];
+                            f += attn_tile[iy * TILE_J * TILE_K + jy * TILE_K + ky] * vqt * vs_tile[ky * D_CONST + dy];
                         }
                     }
                     yr_acc[n] += f;
@@ -1487,17 +1491,18 @@ void Yr_scatter(
     // --- Write Output to Global Memory ---
     for (int n = 0; n < load_iters; n++) {
         int tid_n = tid + n * tpb;
-        if (tid_n < TILE_J * D) {
-            int jy = tid_n / D;
-            int dy = tid_n % D;
+        if (tid_n < TILE_J * D_CONST) {
+            int jy = tid_n / D_CONST;
+            int dy = tid_n % D_CONST;
             int j_global = j_start + jy;
             if (j_global < J) {
-                Y_r_[r_bh_offset + j_global * D + dy] = yr_acc[n];
+                Y_r_[r_bh_offset + j_global * D_CONST + dy] = yr_acc[n];
             }
         }
     }
 }
 
+template<int D_CONST>
 void Yr_scatter_launcher_with_stats(
     const at::Tensor& Q, const at::Tensor& R, const at::Tensor& S,
     const at::Tensor& Vq_2, const at::Tensor& Vs_2,
@@ -1511,36 +1516,33 @@ void Yr_scatter_launcher_with_stats(
     const auto I = Q.size(2);
     const auto J = R.size(2);
     const auto K = S.size(2);
-    const auto D = Q.size(3);
 
-    TORCH_CHECK(D % 4 == 0, "Yr_scatter requires D to be a multiple of 4");
     TORCH_CHECK(I == J && J == K, "Yr_scatter requires I == J == K");
     TORCH_CHECK(J % TILE_J == 0, "Yr_scatter requires J to be a multiple of TILE_J (16)");
     TORCH_CHECK(J >= TILE_J, "Yr_scatter requires J >= TILE_J (16)");
-    TORCH_CHECK((TILE_J * D) / 256 <= 8, "Yr_scatter: D too large (max 8 load iterations)");
 
     const int TPB = 256;
     dim3 grid((J + TILE_J - 1) / TILE_J, H, B);
     dim3 block(TPB);
 
     size_t smem_size = sizeof(float) * (
-        TILE_J * D +                    // r_tile
-        TILE_I * D +                    // q_tile
-        TILE_K * D +                    // s_tile
-        TILE_I * D +                    // vq_tile
-        TILE_K * D +                    // vs_tile
+        TILE_J * D_CONST +              // r_tile
+        TILE_I * D_CONST +              // q_tile
+        TILE_K * D_CONST +              // s_tile
+        TILE_I * D_CONST +              // vq_tile
+        TILE_K * D_CONST +              // vs_tile
         TILE_I * TILE_J * TILE_K +      // attn_tile
         TILE_I + TILE_I +               // mi_tile, li_tile
         TILE_K + TILE_K                 // mk_tile, lk_tile
     );
 
-    Yr_scatter<<<grid, block, smem_size, stream>>>(
+    Yr_scatter<D_CONST><<<grid, block, smem_size, stream>>>(
         Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
         Vq_2.data_ptr<float>(), Vs_2.data_ptr<float>(),
         m_i.data_ptr<float>(), l_i.data_ptr<float>(),
         m_k.data_ptr<float>(), l_k.data_ptr<float>(),
         Y_r_.data_ptr<float>(),
-        B, H, I, J, K, D, scale
+        B, H, I, J, K, scale
     );
 }
 
@@ -1561,6 +1563,7 @@ void Yr_scatter_launcher_with_stats(
  * - I, J, K must be equal and multiples of TILE_I (16)
  * - I, J, K must be >= TILE_I
  */
+template<int D_CONST>
 __global__
 __launch_bounds__(256, 2)
 void Ys_scatter(
@@ -1574,7 +1577,7 @@ void Ys_scatter(
     const float* __restrict__ m_j_in,
     const float* __restrict__ l_j_in,
     float* __restrict__ Y_s_,
-    int B, int H, int I, int J, int K, int D, float scale
+    int B, int H, int I, int J, int K, float scale
 ) {
     // --- Grid/Block Mapping ---
     const int b = blockIdx.z;
@@ -1585,30 +1588,30 @@ void Ys_scatter(
     const int tpb = blockDim.x;
 
     // --- Memory Offsets ---
-    const int64_t s_bh_offset = (int64_t)(b * H + h) * K * D;
-    const int64_t q_bh_offset = (int64_t)(b * H + h) * I * D;
-    const int64_t r_bh_offset = (int64_t)(b * H + h) * J * D;
+    const int64_t s_bh_offset = (int64_t)(b * H + h) * K * D_CONST;
+    const int64_t q_bh_offset = (int64_t)(b * H + h) * I * D_CONST;
+    const int64_t r_bh_offset = (int64_t)(b * H + h) * J * D_CONST;
     const int64_t mi_bh_offset = (int64_t)(b * H + h) * I;
     const int64_t mj_bh_offset = (int64_t)(b * H + h) * J;
 
     // --- Shared Memory Layout ---
     extern __shared__ float smem[];
     float* s_tile = smem;
-    float* q_tile = s_tile + TILE_K * D;
-    float* r_tile = q_tile + TILE_I * D;
-    float* vq_tile = r_tile + TILE_J * D;
-    float* vr_tile = vq_tile + TILE_I * D;
-    float* attn_tile = vr_tile + TILE_J * D;
+    float* q_tile = s_tile + TILE_K * D_CONST;
+    float* r_tile = q_tile + TILE_I * D_CONST;
+    float* vq_tile = r_tile + TILE_J * D_CONST;
+    float* vr_tile = vq_tile + TILE_I * D_CONST;
+    float* attn_tile = vr_tile + TILE_J * D_CONST;
     float* mi_tile = attn_tile + TILE_I * TILE_J * TILE_K;
     float* li_tile = mi_tile + TILE_I;
     float* mj_tile = li_tile + TILE_I;
     float* lj_tile = mj_tile + TILE_J;
 
     // --- Thread Indexing for Cooperative Loads ---
-    const int k_load = tid / D;
-    const int d_load = tid % D;
-    const int load_iters = (TILE_K * D + tpb - 1) / tpb;
-    const int load_step = tpb / D;
+    const int k_load = tid / D_CONST;
+    const int d_load = tid % D_CONST;
+    constexpr int load_iters = (TILE_K * D_CONST + 256 - 1) / 256;
+    constexpr int load_step = 256 / D_CONST;
 
     // --- Per-Thread Output Accumulators (registers) ---
     float ys_acc[8];
@@ -1621,7 +1624,7 @@ void Ys_scatter(
     for (int n = 0; n < TILE_K; n += load_step) {
         int k_global = k_start + n + k_load;
         if (n + k_load < TILE_K && k_global < K) {
-            s_tile[(n + k_load) * D + d_load] = S[s_bh_offset + k_global * D + d_load];
+            s_tile[(n + k_load) * D_CONST + d_load] = S[s_bh_offset + k_global * D_CONST + d_load];
         }
     }
     __syncthreads();
@@ -1631,13 +1634,13 @@ void Ys_scatter(
         for (int n = 0; n < TILE_I; n += load_step) {
             int i_global = it + n + k_load;
             if (n + k_load < TILE_I && i_global < I) {
-                q_tile[(n + k_load) * D + d_load] = Q[q_bh_offset + i_global * D + d_load];
+                q_tile[(n + k_load) * D_CONST + d_load] = Q[q_bh_offset + i_global * D_CONST + d_load];
             }
         }
         for (int n = 0; n < TILE_I; n += load_step) {
             int i_global = it + n + k_load;
             if (n + k_load < TILE_I && i_global < I) {
-                vq_tile[(n + k_load) * D + d_load] = Vq_2[q_bh_offset + i_global * D + d_load];
+                vq_tile[(n + k_load) * D_CONST + d_load] = Vq_2[q_bh_offset + i_global * D_CONST + d_load];
             }
         }
         if (tid < TILE_I && it + tid < I) {
@@ -1650,13 +1653,13 @@ void Ys_scatter(
             for (int n = 0; n < TILE_J; n += load_step) {
                 int j_global = jt + n + k_load;
                 if (n + k_load < TILE_J && j_global < J) {
-                    r_tile[(n + k_load) * D + d_load] = R[r_bh_offset + j_global * D + d_load];
+                    r_tile[(n + k_load) * D_CONST + d_load] = R[r_bh_offset + j_global * D_CONST + d_load];
                 }
             }
             for (int n = 0; n < TILE_J; n += load_step) {
                 int j_global = jt + n + k_load;
                 if (n + k_load < TILE_J && j_global < J) {
-                    vr_tile[(n + k_load) * D + d_load] = Vr_2[r_bh_offset + j_global * D + d_load];
+                    vr_tile[(n + k_load) * D_CONST + d_load] = Vr_2[r_bh_offset + j_global * D_CONST + d_load];
                 }
             }
             if (tid < TILE_J && jt + tid < J) {
@@ -1684,15 +1687,15 @@ void Ys_scatter(
             const int ka = tid % (TILE_K / 4);
 
             float qa[4], ra[4], sa[4];
-            const int d_per_slice = D / 4;
+            constexpr int d_per_slice = D_CONST / 4;
 
             for (int db = 0; db < d_per_slice; db++) {
                 const int d_idx = da * d_per_slice + db;
                 #pragma unroll
                 for (int u = 0; u < 4; u++) {
-                    qa[u] = q_tile[(ia * 4 + u) * D + d_idx];
-                    ra[u] = r_tile[(ja * 4 + u) * D + d_idx];
-                    sa[u] = s_tile[(ka * 4 + u) * D + d_idx];
+                    qa[u] = q_tile[(ia * 4 + u) * D_CONST + d_idx];
+                    ra[u] = r_tile[(ja * 4 + u) * D_CONST + d_idx];
+                    sa[u] = s_tile[(ka * 4 + u) * D_CONST + d_idx];
                 }
                 #pragma unroll
                 for (int i0 = 0; i0 < 4; i0++) {
@@ -1768,15 +1771,15 @@ void Ys_scatter(
             // --- Accumulate Output ---
             for (int n = 0; n < load_iters; n++) {
                 int tid_n = tid + n * tpb;
-                if (tid_n < TILE_K * D) {
-                    int ky = tid_n / D;
-                    int dy = tid_n % D;
+                if (tid_n < TILE_K * D_CONST) {
+                    int ky = tid_n / D_CONST;
+                    int dy = tid_n % D_CONST;
 
                     float f = 0.0f;
                     for (int iy = 0; iy < TILE_I; iy++) {
-                        float vqt = vq_tile[iy * D + dy];
+                        float vqt = vq_tile[iy * D_CONST + dy];
                         for (int jy = 0; jy < TILE_J; jy++) {
-                            f += attn_tile[iy * TILE_J * TILE_K + jy * TILE_K + ky] * vqt * vr_tile[jy * D + dy];
+                            f += attn_tile[iy * TILE_J * TILE_K + jy * TILE_K + ky] * vqt * vr_tile[jy * D_CONST + dy];
                         }
                     }
                     ys_acc[n] += f;
@@ -1789,18 +1792,19 @@ void Ys_scatter(
     // --- Write Output to Global Memory ---
     for (int n = 0; n < load_iters; n++) {
         int tid_n = tid + n * tpb;
-        if (tid_n < TILE_K * D) {
-            int ky = tid_n / D;
-            int dy = tid_n % D;
+        if (tid_n < TILE_K * D_CONST) {
+            int ky = tid_n / D_CONST;
+            int dy = tid_n % D_CONST;
             int k_global = k_start + ky;
             if (k_global < K) {
-                Y_s_[s_bh_offset + k_global * D + dy] = ys_acc[n];
+                Y_s_[s_bh_offset + k_global * D_CONST + dy] = ys_acc[n];
             }
         }
     }
 }
 
 
+template<int D_CONST>
 void Ys_scatter_launcher_with_stats(
     const at::Tensor& Q, const at::Tensor& R, const at::Tensor& S,
     const at::Tensor& Vq_2, const at::Tensor& Vr_2,
@@ -1814,36 +1818,33 @@ void Ys_scatter_launcher_with_stats(
     const auto I = Q.size(2);
     const auto J = R.size(2);
     const auto K = S.size(2);
-    const auto D = Q.size(3);
 
-    TORCH_CHECK(D % 4 == 0, "Ys_scatter requires D to be a multiple of 4");
     TORCH_CHECK(I == J && J == K, "Ys_scatter requires I == J == K");
     TORCH_CHECK(K % TILE_K == 0, "Ys_scatter requires K to be a multiple of TILE_K (16)");
     TORCH_CHECK(K >= TILE_K, "Ys_scatter requires K >= TILE_K (16)");
-    TORCH_CHECK((TILE_K * D) / 256 <= 8, "Ys_scatter: D too large (max 8 load iterations)");
 
     const int TPB = 256;
     dim3 grid((K + TILE_K - 1) / TILE_K, H, B);
     dim3 block(TPB);
 
     size_t smem_size = sizeof(float) * (
-        TILE_K * D +                    // s_tile
-        TILE_I * D +                    // q_tile
-        TILE_J * D +                    // r_tile
-        TILE_I * D +                    // vq_tile
-        TILE_J * D +                    // vr_tile
+        TILE_K * D_CONST +              // s_tile
+        TILE_I * D_CONST +              // q_tile
+        TILE_J * D_CONST +              // r_tile
+        TILE_I * D_CONST +              // vq_tile
+        TILE_J * D_CONST +              // vr_tile
         TILE_I * TILE_J * TILE_K +      // attn_tile
         TILE_I + TILE_I +               // mi_tile, li_tile
         TILE_J + TILE_J                 // mj_tile, lj_tile
     );
 
-    Ys_scatter<<<grid, block, smem_size, stream>>>(
+    Ys_scatter<D_CONST><<<grid, block, smem_size, stream>>>(
         Q.data_ptr<float>(), R.data_ptr<float>(), S.data_ptr<float>(),
         Vq_2.data_ptr<float>(), Vr_2.data_ptr<float>(),
         m_i.data_ptr<float>(), l_i.data_ptr<float>(),
         m_j.data_ptr<float>(), l_j.data_ptr<float>(),
         Y_s_.data_ptr<float>(),
-        B, H, I, J, K, D, scale
+        B, H, I, J, K, scale
     );
 }
 
@@ -1908,68 +1909,46 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
 
     TORCH_CHECK(Q.scalar_type() == at::kFloat, "Only float32 is supported.");
     TORCH_CHECK(D % 4 == 0, "D must be multiple of 4 for FP32 float4 path.");
+    TORCH_CHECK(D == 16 || D == 32 || D == 64, "forward: unsupported D=", D, ". Supported: 16, 32, 64");
 
+    // =============================================================================
+    // D-dispatch: routes to D_TMPL=16, 32 or 64 template instantiation
+    // =============================================================================
+    #define FWD_DISPATCH_D(D_VAL, ...) \
+      [&] { \
+        if ((D_VAL) == 16)      { constexpr int D_TMPL = 16; __VA_ARGS__; } \
+        else if ((D_VAL) == 32) { constexpr int D_TMPL = 32; __VA_ARGS__; } \
+        else if ((D_VAL) == 64) { constexpr int D_TMPL = 64; __VA_ARGS__; } \
+      }()
+
+    FWD_DISPATCH_D(D, {
     // GATHER: Y_q on stream 0
     {
         dim3 grid_yq((I + N_I_GATHER - 1) / N_I_GATHER, H, B);
         
-#if USE_TENSOR_CORES
-        // Check if tensor core path is viable
-        const bool use_tc = (D % 16 == 0) && (TILE_J == 16) && (TILE_K == 16);
-        
-        if (use_tc) {
-            // Tensor core path: requires FP16 inputs
-            // Convert FP32 tensors to FP16 for tensor core operations
-            auto Q_h = Q.to(at::kHalf);
-            auto R_h = R.to(at::kHalf);
-            auto S_h = S.to(at::kHalf);
-            auto Vr_1_h = Vr_1.to(at::kHalf);
-            auto Vs_1_h = Vs_1.to(at::kHalf);
-            
-            // Shared memory for tensor core kernel:
-            // FP16: q_vec(D) + qr_tile(J*D) + s_tile(K*D) + v1_tile(J*D) + v2_tile(K*D) + p_tile(J*K)
-            // FP32: p_tile_f(J*K) + m_tile_f(J*D) + red_buf(TpB) + m_l_sh(2) + o_sh(D)
-            size_t smem_size_tc = sizeof(half) * (D + TILE_J*D + TILE_K*D + TILE_J*D + TILE_K*D + TILE_J*TILE_K)
-                                + sizeof(float) * (TILE_J*TILE_K + TILE_J*D + TpB + 2 + D);
-            
-            // Note: tensor core kernel still uses old grid (I, H, B) - not updated
-            dim3 grid_tc(I, H, B);
-            Yq_gather_tensor_core<<<grid_tc, block, smem_size_tc, streams[0]>>>(
-                reinterpret_cast<const half*>(Q_h.data_ptr<at::Half>()),
-                reinterpret_cast<const half*>(R_h.data_ptr<at::Half>()),
-                reinterpret_cast<const half*>(S_h.data_ptr<at::Half>()),
-                reinterpret_cast<const half*>(Vr_1_h.data_ptr<at::Half>()),
-                reinterpret_cast<const half*>(Vs_1_h.data_ptr<at::Half>()),
-                Y_q.data_ptr<float>(),
-                m_i.data_ptr<float>(),
-                l_i.data_ptr<float>(),
-                B, H, I, J, K, D, scale
-            );
-        } else
-#endif
         {
-            const int DP = D + SMEM_PAD;
+            constexpr int DP = D_TMPL + SMEM_PAD;
             size_t smem_size = sizeof(float) * (
-                N_I_GATHER * D +              // q_vecs
+                N_I_GATHER * D_TMPL +         // q_vecs
                 TILE_J * DP +                 // r_tile (padded)
                 TILE_K * DP +                 // s_tile (padded)
                 TILE_J * DP +                 // v1_tile (padded)
                 TILE_K * DP +                 // v2_tile (padded)
                 N_I_GATHER * TILE_J * TILE_K +// p_tiles
                 N_I_GATHER * 2 +              // m_l_sh
-                N_I_GATHER * D                // o_sh
+                N_I_GATHER * D_TMPL           // o_sh
             );
 
-            Yq_gather<<<grid_yq, block, smem_size, streams[0]>>>(
+            Yq_gather<D_TMPL><<<grid_yq, block, smem_size, streams[0]>>>(
                 reinterpret_cast<const float4*>(Q.data_ptr<float>()),
                 reinterpret_cast<const float4*>(R.data_ptr<float>()),
                 reinterpret_cast<const float4*>(S.data_ptr<float>()),
                 reinterpret_cast<const float4*>(Vr_1.data_ptr<float>()),
                 reinterpret_cast<const float4*>(Vs_1.data_ptr<float>()),
                 Y_q.data_ptr<float>(),
-                m_i.data_ptr<float>(),  // output: softmax stats
-                l_i.data_ptr<float>(),  // output: softmax stats
-                B, H, I, J, K, D, scale
+                m_i.data_ptr<float>(),
+                l_i.data_ptr<float>(),
+                B, H, I, J, K, scale
             );
         }
     }
@@ -1978,22 +1957,23 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     // GATHER: Y_r on stream 1
     {
         dim3 grid((J + N_I_GATHER - 1) / N_I_GATHER, H, B);
+        constexpr int DP = D_TMPL + SMEM_PAD;
         size_t smem_size = sizeof(float) * (
-            N_I_GATHER * D + TILE_I * (D + SMEM_PAD) + TILE_K * (D + SMEM_PAD) +
-            TILE_I * (D + SMEM_PAD) + TILE_K * (D + SMEM_PAD) +
-            N_I_GATHER * TILE_I * TILE_K + N_I_GATHER * 2 + N_I_GATHER * D
+            N_I_GATHER * D_TMPL + TILE_I * DP + TILE_K * DP +
+            TILE_I * DP + TILE_K * DP +
+            N_I_GATHER * TILE_I * TILE_K + N_I_GATHER * 2 + N_I_GATHER * D_TMPL
         );
 
-        Yr_gather<<<grid, block, smem_size, streams[1]>>>(
+        Yr_gather<D_TMPL><<<grid, block, smem_size, streams[1]>>>(
             reinterpret_cast<const float4*>(R.data_ptr<float>()),
             reinterpret_cast<const float4*>(Q.data_ptr<float>()),
             reinterpret_cast<const float4*>(S.data_ptr<float>()),
             reinterpret_cast<const float4*>(Vq_1.data_ptr<float>()),
             reinterpret_cast<const float4*>(Vs_1.data_ptr<float>()),
             Y_r.data_ptr<float>(),
-            m_j.data_ptr<float>(),  // output: softmax stats
-            l_j.data_ptr<float>(),  // output: softmax stats
-            B, H, I, J, K, D, scale
+            m_j.data_ptr<float>(),
+            l_j.data_ptr<float>(),
+            B, H, I, J, K, scale
         );
     }
     AT_CUDA_CHECK(cudaEventRecord(gather_done[1], streams[1]));
@@ -2001,28 +1981,28 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     // GATHER: Y_s on stream 2
     {
         dim3 grid((K + N_I_GATHER - 1) / N_I_GATHER, H, B);
+        constexpr int DP = D_TMPL + SMEM_PAD;
         size_t smem_size = sizeof(float) * (
-            N_I_GATHER * D + TILE_I * (D + SMEM_PAD) + TILE_J * (D + SMEM_PAD) +
-            TILE_I * (D + SMEM_PAD) + TILE_J * (D + SMEM_PAD) +
-            N_I_GATHER * TILE_I * TILE_J + N_I_GATHER * 2 + N_I_GATHER * D
+            N_I_GATHER * D_TMPL + TILE_I * DP + TILE_J * DP +
+            TILE_I * DP + TILE_J * DP +
+            N_I_GATHER * TILE_I * TILE_J + N_I_GATHER * 2 + N_I_GATHER * D_TMPL
         );
 
-        Ys_gather<<<grid, block, smem_size, streams[2]>>>(
+        Ys_gather<D_TMPL><<<grid, block, smem_size, streams[2]>>>(
             reinterpret_cast<const float4*>(S.data_ptr<float>()),
             reinterpret_cast<const float4*>(Q.data_ptr<float>()),
             reinterpret_cast<const float4*>(R.data_ptr<float>()),
             reinterpret_cast<const float4*>(Vq_1.data_ptr<float>()),
             reinterpret_cast<const float4*>(Vr_1.data_ptr<float>()),
             Y_s.data_ptr<float>(),
-            m_k.data_ptr<float>(),  // output: softmax stats
-            l_k.data_ptr<float>(),  // output: softmax stats
-            B, H, I, J, K, D, scale
+            m_k.data_ptr<float>(),
+            l_k.data_ptr<float>(),
+            B, H, I, J, K, scale
         );
     }
     AT_CUDA_CHECK(cudaEventRecord(gather_done[2], streams[2]));
 
     // Barrier: all scatter kernels wait for all gather kernels to complete
-    // Each scatter stream waits on all gather events
     for (int i = 0; i < 3; i++) {
         for (int j = 0; j < 3; j++) {
             AT_CUDA_CHECK(cudaStreamWaitEvent(streams[i], gather_done[j], 0));
@@ -2030,10 +2010,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     }
 
     // SCATTER - softmax stats were computed by gather kernels above, reuse them
-    // Run scatter kernels on 3 streams in parallel
-    Yq_scatter_launcher_with_stats(Q, R, S, Vr_2, Vs_2, m_j, l_j, m_k, l_k, Y_q_, scale, streams[0]);
-    Yr_scatter_launcher_with_stats(Q, R, S, Vq_2, Vs_2, m_i, l_i, m_k, l_k, Y_r_, scale, streams[1]);
-    Ys_scatter_launcher_with_stats(Q, R, S, Vq_2, Vr_2, m_i, l_i, m_j, l_j, Y_s_, scale, streams[2]);
+    Yq_scatter_launcher_with_stats<D_TMPL>(Q, R, S, Vr_2, Vs_2, m_j, l_j, m_k, l_k, Y_q_, scale, streams[0]);
+    Yr_scatter_launcher_with_stats<D_TMPL>(Q, R, S, Vq_2, Vs_2, m_i, l_i, m_k, l_k, Y_r_, scale, streams[1]);
+    Ys_scatter_launcher_with_stats<D_TMPL>(Q, R, S, Vq_2, Vr_2, m_i, l_i, m_j, l_j, Y_s_, scale, streams[2]);
+    }); // end FWD_DISPATCH_D
 
     // Synchronize all streams before returning to Python
     for (int i = 0; i < 3; i++) {
