@@ -890,14 +890,17 @@ __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
 
     float reg_sum_q = 0.0f, reg_sum_s = 0.0f;
     float sumQi = 0.0f, sumSk = 0.0f;
-    float gradQ_acc[REG_CAP];
-    float gradS_acc[REG_CAP];
+    // Algebraic factoring: accumulate rj_weighted[d] = Σⱼ grad_A_j * R[j,d]
+    // Then gradQ[d] = rj_weighted[d] * S[k,d], gradS[d] = rj_weighted[d] * Q[i,d]
+    // This replaces two D-sized accumulators with one, saving 64 registers and
+    // reducing the hot inner loop from 3 shmem loads/d to 1 shmem load/d.
+    float rj_weighted[REG_CAP];
     if constexpr (!CORRECTION_ONLY) {
         if (valid) {
             sumQi = sum_qBH[i0];
             sumSk = sum_sBH[k0];
         }
-        for (int d = 0; d < REG_CAP; ++d) { gradQ_acc[d] = 0.0f; gradS_acc[d] = 0.0f; }
+        for (int d = 0; d < REG_CAP; ++d) rj_weighted[d] = 0.0f;
     }
 
     const int sh_i_off = threadIdx.x * D_PAD;
@@ -927,52 +930,108 @@ __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
         }
         __syncthreads();
 
-        for (int jOff = 0; jOff < BLOCK_J && (jBase + jOff) < N; ++jOff) {
-            float dot = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f, d4 = 0.f, d5 = 0.f, d6 = 0.f;
-            for (int d = 0; d < D; ++d) {
-                const float rj   = sh_R[jOff*D + d];
-                const float vr1  = sh_Vr1[jOff*D + d];
-                const float vr2  = sh_Vr2[jOff*D + d];
-                const float gyj  = sh_gYj[jOff*D + d];
-                const float qi   = sh_Qi  [sh_i_off + d];
-                const float sk   = sh_Sk  [sh_k_off + d];
-                const float vq1i = sh_Vq1i[sh_i_off + d];
-                const float vq2i = sh_Vq2i[sh_i_off + d];
-                const float vs1k = sh_Vs1k[sh_k_off + d];
-                const float vs2k = sh_Vs2k[sh_k_off + d];
-                const float dyi  = sh_dYi [sh_i_off + d];
-                const float dyk  = sh_dYk [sh_k_off + d];
+        // ============================================================
+        // D-tiled dot products with j sub-tiling.
+        // Precomputes i/k pairwise products per D_TILE, then sweeps j.
+        // i/k values are loaded once per D_TILE instead of once per
+        // (j, d) pair, eliminating 50% of shmem loads.
+        //
+        // Shmem loads per j-tile: 6,144 (was 12,288).
+        // Register cost: 7 × J_SUB = 28 per-j accumulators (was 7 scalar).
+        // ============================================================
+        constexpr int J_SUB  = 4;  // j sub-tile size
+        constexpr int D_TILE = 4;  // d tile size
 
-                dot += qi * rj * sk;
-                d1 += dyi * vr1 * vs1k;
-                d2 += gyj * vq1i * vs1k;
-                d3 += dyk * vq1i * vr1;
-                d4 += dyi * vr2 * vs2k;
-                d5 += gyj * vq2i * vs2k;
-                d6 += dyk * vq2i * vr2;
+        for (int jSub = 0; jSub < BLOCK_J && (jBase + jSub) < N; jSub += J_SUB) {
+            // Per-j accumulators for this sub-tile
+            float dot_j[J_SUB], d1_j[J_SUB], d2_j[J_SUB], d3_j[J_SUB];
+            float d4_j[J_SUB], d5_j[J_SUB], d6_j[J_SUB];
+            #pragma unroll
+            for (int jj = 0; jj < J_SUB; jj++) {
+                dot_j[jj] = 0.f; d1_j[jj] = 0.f; d2_j[jj] = 0.f; d3_j[jj] = 0.f;
+                d4_j[jj] = 0.f; d5_j[jj] = 0.f; d6_j[jj] = 0.f;
             }
 
-            const float logits = dot * scale;
-            const float Aq = __expf(fminf(logits - mi, EXP_CLIP)) / fmaxf(li, DENOM_EPS);
-            const float Ar = __expf(fminf(logits - sh_mj[jOff], EXP_CLIP)) / fmaxf(sh_lj[jOff], DENOM_EPS);
-            const float As = __expf(fminf(logits - mk, EXP_CLIP)) / fmaxf(lk, DENOM_EPS);
+            // D-tiled precomputation: d-outer, j-inner
+            for (int d_base = 0; d_base < D; d_base += D_TILE) {
+                // Precompute 7 i/k pairwise products (8 shmem loads × D_TILE)
+                float p_dot[D_TILE], p_d1[D_TILE], p_d2[D_TILE], p_d3[D_TILE];
+                float p_d4[D_TILE], p_d5[D_TILE], p_d6[D_TILE];
+                #pragma unroll
+                for (int dd = 0; dd < D_TILE; dd++) {
+                    const int d = d_base + dd;
+                    const float qi   = sh_Qi  [sh_i_off + d];
+                    const float sk   = sh_Sk  [sh_k_off + d];
+                    const float vq1i = sh_Vq1i[sh_i_off + d];
+                    const float vq2i = sh_Vq2i[sh_i_off + d];
+                    const float vs1k = sh_Vs1k[sh_k_off + d];
+                    const float vs2k = sh_Vs2k[sh_k_off + d];
+                    const float dyi  = sh_dYi [sh_i_off + d];
+                    const float dyk  = sh_dYk [sh_k_off + d];
 
-            const float gAq = d1 + d5 * As + d6 * Ar;
-            const float gAr = d2 + d4 * As + d6 * Aq;
-            const float gAs = d3 + d4 * Ar + d5 * Aq;
+                    p_dot[dd] = qi * sk;
+                    p_d1[dd]  = dyi * vs1k;
+                    p_d2[dd]  = vq1i * vs1k;
+                    p_d3[dd]  = vq1i * dyk;
+                    p_d4[dd]  = dyi * vs2k;
+                    p_d5[dd]  = vq2i * vs2k;
+                    p_d6[dd]  = vq2i * dyk;
+                }
 
-            if constexpr (CORRECTION_ONLY) {
-                reg_sum_q += gAq * Aq;
-                reg_sum_s += gAs * As;
-                if (valid) atomicAdd(&sh_sumr[jOff], gAr * Ar);
-            } else {
-                const float grad_A = (gAq - sumQi) * Aq
-                                   + (gAr - sh_sumr[jOff]) * Ar
-                                   + (gAs - sumSk) * As;
-                for (int d = 0; d < D; ++d) {
-                    const float rj = sh_R[jOff*D + d];
-                    gradQ_acc[d] += grad_A * rj * sh_Sk[sh_k_off + d];
-                    gradS_acc[d] += grad_A * sh_Qi[sh_i_off + d] * rj;
+                // Accumulate over j sub-tile (4 broadcast loads per d per j)
+                #pragma unroll
+                for (int jj = 0; jj < J_SUB; jj++) {
+                    const int jOff = jSub + jj;
+                    if (jBase + jOff >= N) break;
+                    #pragma unroll
+                    for (int dd = 0; dd < D_TILE; dd++) {
+                        const float rj  = sh_R  [jOff*D + d_base + dd];
+                        const float vr1 = sh_Vr1[jOff*D + d_base + dd];
+                        const float vr2 = sh_Vr2[jOff*D + d_base + dd];
+                        const float gyj = sh_gYj[jOff*D + d_base + dd];
+
+                        dot_j[jj] += p_dot[dd] * rj;
+                        d1_j[jj]  += p_d1[dd]  * vr1;
+                        d2_j[jj]  += p_d2[dd]  * gyj;
+                        d3_j[jj]  += p_d3[dd]  * vr1;   // reuses vr1
+                        d4_j[jj]  += p_d4[dd]  * vr2;
+                        d5_j[jj]  += p_d5[dd]  * gyj;   // reuses gyj
+                        d6_j[jj]  += p_d6[dd]  * vr2;   // reuses vr2
+                    }
+                }
+            }
+
+            // Process accumulated dot products for this sub-tile
+            #pragma unroll
+            for (int jj = 0; jj < J_SUB; jj++) {
+                const int jOff = jSub + jj;
+                if (jBase + jOff >= N) break;
+
+                const float logits = dot_j[jj] * scale;
+                const float Aq = __expf(fminf(logits - mi, EXP_CLIP)) / fmaxf(li, DENOM_EPS);
+                const float Ar = __expf(fminf(logits - sh_mj[jOff], EXP_CLIP)) / fmaxf(sh_lj[jOff], DENOM_EPS);
+                const float As = __expf(fminf(logits - mk, EXP_CLIP)) / fmaxf(lk, DENOM_EPS);
+
+                const float gAq = d1_j[jj] + d5_j[jj] * As + d6_j[jj] * Ar;
+                const float gAr = d2_j[jj] + d4_j[jj] * As + d6_j[jj] * Aq;
+                const float gAs = d3_j[jj] + d4_j[jj] * Ar + d5_j[jj] * Aq;
+
+                if constexpr (CORRECTION_ONLY) {
+                    reg_sum_q += gAq * Aq;
+                    reg_sum_s += gAs * As;
+                    if (valid) atomicAdd(&sh_sumr[jOff], gAr * Ar);
+                } else {
+                    const float grad_A = (gAq - sumQi) * Aq
+                                       + (gAr - sh_sumr[jOff]) * Ar
+                                       + (gAs - sumSk) * As;
+                    // Factored accumulation: only 1 shmem load per d (was 3).
+                    #pragma unroll 4
+                    for (int d = 0; d < D; d += 4) {
+                        rj_weighted[d+0] += grad_A * sh_R[jOff*D + d+0];
+                        rj_weighted[d+1] += grad_A * sh_R[jOff*D + d+1];
+                        rj_weighted[d+2] += grad_A * sh_R[jOff*D + d+2];
+                        rj_weighted[d+3] += grad_A * sh_R[jOff*D + d+3];
+                    }
                 }
             }
         }
@@ -1010,13 +1069,17 @@ __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
         if (threadIdx.x == 0 && k0 < N)
             atomicAdd(&sum_sBH[k0], reduce_buf[threadIdx.y]);
     } else {
-        // Write results (atomic due to k-dimension overlap for Q, i-dimension for S)
+        // Algebraic factoring epilogue:
+        //   gradQ[i,d] = scale * rj_weighted[d] * S[k,d]
+        //   gradS[k,d] = scale * rj_weighted[d] * Q[i,d]
+        // S[k,d] and Q[i,d] are still in shared memory (loaded before j-loop).
         float* gQbh = gradQ + bh * stride_BH;
         float* gSbh = gradS + bh * stride_BH;
         if (valid) {
             for (int d = 0; d < D; ++d) {
-                atomicAdd(&gQbh[i0*D + d], scale * gradQ_acc[d]);
-                atomicAdd(&gSbh[k0*D + d], scale * gradS_acc[d]);
+                const float rw = scale * rj_weighted[d];
+                atomicAdd(&gQbh[i0*D + d], rw * sh_Sk[sh_k_off + d]);
+                atomicAdd(&gSbh[k0*D + d], rw * sh_Qi[sh_i_off + d]);
             }
         }
     }
