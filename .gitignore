@@ -48,6 +48,5 @@ profiling_reports/
 
 # Output directories
 comparison_plots/
-# Benchmark results (machine-specific)
-benchmark_history.jsonl
+# Benchmark results (ad-hoc, machine-specific)
 results_*.json
