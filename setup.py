@@ -51,7 +51,7 @@ setup(
                 'nvcc': [
                     '-O3',
                     *get_cuda_arch_flags(),
-                    # '-lineinfo' # uncomment for debugging
+                    '-lineinfo' # uncomment for debugging
                 ]
             }
         ),
