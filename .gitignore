@@ -48,3 +48,5 @@ profiling_reports/
 
 # Output directories
 comparison_plots/
+# Benchmark results (ad-hoc, machine-specific)
+results_*.json

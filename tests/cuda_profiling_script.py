@@ -6,6 +6,23 @@ import datetime
 import os
 import argparse
 
+# ── Complete list of all CUDA kernels in the project ──
+ALL_KERNELS = [
+    # Forward gather
+    "Yq_gather", "Yq_gather_tensor_core", "Yr_gather", "Ys_gather",
+    # Forward scatter
+    "Yq_scatter", "Yr_scatter", "Ys_scatter",
+    # Backward V gradients (gather)
+    "Vq_gather_grad", "Vr_gather_grad", "Vs_gather_grad",
+    # Backward V gradients (scatter)
+    "Vq_scatter_grad", "Vr_scatter_grad", "Vs_scatter_grad",
+    # Backward Jacobian + query/key gradients
+    "jacobian_corrections", "QS_grad_fused", "R_grad",
+]
+
+DEFAULT_DIMS = (1, 2, 128, 128, 128, 64)
+
+
 def get_grad_output_cuda(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_):
     """
     Creates a gradient tensor with the correct shape to drive the backward pass.
@@ -17,20 +34,18 @@ def get_grad_output_cuda(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_):
 
     max_len = max(I, J, K)
 
-    # The backward pass expects a single gradient tensor, so we create one
-    # that is large enough and accumulate dummy gradients into it.
     grad_output_combined = torch.zeros(B, H, max_len, D, device=Y_q.device, dtype=Y_q.dtype)
-
     grad_output_combined[:, :, :I, :] += 1.0
     grad_output_combined[:, :, :J, :] += 1.0
     grad_output_combined[:, :, :K, :] += 1.0
 
     return grad_output_combined
 
-def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim):
+
+def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim,
+                    forward_only=False, backward_only=False):
     """
-    Contains the core logic for running the CUDA kernels.
-    This is what the profiler will measure.
+    Core logic for running the CUDA kernels. This is what ncu measures.
     """
     if not torch.cuda.is_available():
         print("CUDA is not available. Aborting.")
@@ -43,9 +58,9 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim):
     dtype = torch.float32
 
     # --- Tensor Initialization ---
-    Q = torch.rand(B, H, I_dim, D_dim, device='cuda', dtype=dtype)
-    R = torch.rand(B, H, J_dim, D_dim, device='cuda', dtype=dtype)
-    S = torch.rand(B, H, K_dim, D_dim, device='cuda', dtype=dtype)
+    Q    = torch.rand(B, H, I_dim, D_dim, device='cuda', dtype=dtype)
+    R    = torch.rand(B, H, J_dim, D_dim, device='cuda', dtype=dtype)
+    S    = torch.rand(B, H, K_dim, D_dim, device='cuda', dtype=dtype)
     Vq_1 = torch.rand(B, H, I_dim, D_dim, device='cuda', dtype=dtype)
     Vq_2 = torch.rand(B, H, I_dim, D_dim, device='cuda', dtype=dtype)
     Vr_1 = torch.rand(B, H, J_dim, D_dim, device='cuda', dtype=dtype)
@@ -53,91 +68,184 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim):
     Vs_1 = torch.rand(B, H, K_dim, D_dim, device='cuda', dtype=dtype)
     Vs_2 = torch.rand(B, H, K_dim, D_dim, device='cuda', dtype=dtype)
 
-    # --- Execution ---
-    # Forward Pass
-    Y_q_mc, Y_r_mc, Y_s_mc, Y_q__mc, Y_r__mc, Y_s__mc = hyper_attn_cpp_manual.forward(
-        Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
-    )
+    # --- Forward Pass ---
+    # forward returns 12 values: Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_,
+    #                             m_i, l_i, m_j, l_j, m_k, l_k
+    if not backward_only:
+        print("Running forward pass...")
+        (Y_q_mc, Y_r_mc, Y_s_mc, Y_q__mc, Y_r__mc, Y_s__mc,
+         m_i, l_i, m_j, l_j, m_k, l_k) = \
+            hyper_attn_cpp_manual.forward(
+                Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
+            )
+    else:
+        # Still need forward outputs to feed backward
+        with torch.no_grad():
+            (Y_q_mc, Y_r_mc, Y_s_mc, Y_q__mc, Y_r__mc, Y_s__mc,
+             m_i, l_i, m_j, l_j, m_k, l_k) = \
+                hyper_attn_cpp_manual.forward(
+                    Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
+                )
 
-    # Create dummy gradient for the backward pass
-    grad_output_cuda = get_grad_output_cuda(Y_q_mc, Y_r_mc, Y_s_mc, Y_q__mc, Y_r__mc, Y_s__mc)
+    # --- Backward Pass ---
+    if not forward_only:
+        print("Running backward pass...")
+        grad_output_cuda = get_grad_output_cuda(
+            Y_q_mc, Y_r_mc, Y_s_mc, Y_q__mc, Y_r__mc, Y_s__mc
+        )
+        hyper_attn_cpp_manual.backward(
+            grad_output_cuda,
+            Q, R, S,
+            Vq_1, Vq_2,
+            Vr_1, Vr_2,
+            Vs_1, Vs_2,
+            m_i, l_i,
+            m_j, l_j,
+            m_k, l_k,
+            dropout_rate
+        )
 
-    # Backward Pass
-    hyper_attn_cpp_manual.backward(
-        grad_output_cuda,
-        Q, R, S,
-        Vq_1, Vq_2,
-        Vr_1, Vr_2,
-        Vs_1, Vs_2,
-        dropout_rate
-    )
     torch.cuda.synchronize()
     print("\nCUDA kernel run finished successfully.")
 
 
-def launch_profiler(report_filename=None):
+def launch_profiler(args):
     """
     Constructs and launches the ncu profiling command.
     """
-    # --- Configuration ---
-    # You can now change these values directly in the script for a new run
-    B, H, I_dim, J_dim, K_dim, D_dim = (1, 2, 128, 128, 128, 64)
-    KERNEL_NAME = "grad_Q_kernel"
+    B, H, I_dim, J_dim, K_dim, D_dim = args.dims
 
-    # Dynamically generate the report filename
-    if report_filename is None:
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_filename = f"profiling_reports/{KERNEL_NAME}_B{B}_H{H}_I{I_dim}_J{J_dim}_K{K_dim}_D{D_dim}_{timestamp}.ncu-rep"
+    # ── Build output filename ──
+    if args.output_file:
+        output_filename = args.output_file
     else:
-        output_filename = report_filename
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        kernel_tag = args.kernel if args.kernel else "all_kernels"
+        output_filename = (
+            f"profiling_reports/"
+            f"{kernel_tag}_B{B}_H{H}_I{I_dim}_J{J_dim}_K{K_dim}_D{D_dim}_{timestamp}"
+        )
 
-    dirpath = os.path.dirname(output_filename)
-    if dirpath == "":
-        dirpath = "profiling_reports"
-        output_filename = os.path.join(dirpath, output_filename)
+    # Ensure it lives under profiling_reports/ if no directory was given
+    if not os.path.dirname(output_filename):
+        output_filename = os.path.join("profiling_reports", output_filename)
 
-    os.makedirs(dirpath, exist_ok=True)
+    # Strip .ncu-rep if user added it (ncu adds it automatically with -o)
+    if output_filename.endswith(".ncu-rep"):
+        output_filename = output_filename[:-len(".ncu-rep")]
 
-    # Construct the ncu command
+    os.makedirs(os.path.dirname(output_filename), exist_ok=True)
+
+    # ── Build ncu command ──
     ncu_command = [
         "ncu",
         "--set", "full",
-        "-k", KERNEL_NAME,
         "--section", "SchedulerStats",
         "--section", "InstructionStats",
         "--section", "MemoryWorkloadAnalysis",
         "-o", output_filename,
-        sys.executable,  # Use the current python executable
-        __file__,       # Pass the script itself as the target
-        "--no-profile"  # Flag to tell the script not to launch ncu again
     ]
 
-    print(f"Executing profiling command: {' '.join(ncu_command)}")
-    # Use subprocess to run the command
+    # Only filter to a specific kernel if one was requested
+    if args.kernel:
+        ncu_command += ["-k", args.kernel]
+
+    # Target python script + passthrough args
+    ncu_command += [
+        sys.executable,
+        __file__,
+        "--no-profile",
+        "--dims", ",".join(str(x) for x in args.dims),
+    ]
+    if args.forward_only:
+        ncu_command.append("--forward-only")
+    if args.backward_only:
+        ncu_command.append("--backward-only")
+
+    print(f"\n{'='*70}")
+    print(f"  NCU Profiling Command")
+    print(f"{'='*70}")
+    print(f"  {' '.join(ncu_command)}")
+    print(f"  Report will be saved to: {output_filename}.ncu-rep")
+    print(f"{'='*70}\n")
+
     subprocess.run(ncu_command, check=True)
-    print("\nCUDA profiling script finished successfully.")
+    print(f"\n✅ Profiling complete! Report: {output_filename}.ncu-rep")
+    print(f"   Open on your laptop with:  ncu-ui {output_filename}.ncu-rep")
+
+
+def parse_dims(s):
+    """Parse 'B,H,I,J,K,D' string into a tuple of 6 ints."""
+    parts = [int(x) for x in s.split(",")]
+    if len(parts) != 6:
+        raise argparse.ArgumentTypeError("--dims must be 6 comma-separated ints: B,H,I,J,K,D")
+    return tuple(parts)
 
 
 if __name__ == '__main__':
     try:
-        parser = argparse.ArgumentParser(description="Run CUDA profiling script.")
+        parser = argparse.ArgumentParser(
+            description="Profile CUDA hypergraph attention kernels with NVIDIA Nsight Compute.",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog="""
+Examples:
+  # Profile ALL kernels (forward + backward), auto-named report:
+  python %(prog)s
+
+  # Profile a single kernel:
+  python %(prog)s --kernel QS_grad_fused
+
+  # Custom report name:
+  python %(prog)s --output-file my_experiment_v2
+
+  # Custom dimensions:
+  python %(prog)s --dims 2,4,256,256,256,64
+
+  # Forward-only profiling:
+  python %(prog)s --forward-only
+
+  # Combine options:
+  python %(prog)s --kernel Yq_gather --dims 1,8,512,512,512,64 --output-file big_gather_test
+
+Available kernels:
+  Forward:  Yq_gather, Yq_gather_tensor_core, Yr_gather, Ys_gather,
+            Yq_scatter, Yr_scatter, Ys_scatter
+  Backward: Vq_gather_grad, Vr_gather_grad, Vs_gather_grad,
+            Vq_scatter_grad, Vr_scatter_grad, Vs_scatter_grad,
+            jacobian_corrections, QS_grad_fused, R_grad
+""")
+
         parser.add_argument("--no-profile", action="store_true",
-                            help="Run kernels directly without launching ncu profiler.")
-        parser.add_argument("--output-file", type=str, default=None,
-                            help="Specify the output filename for the ncu report.")
+                            help="(Internal) Run kernels directly without launching ncu.")
+        parser.add_argument("--kernel", "-k", type=str, default=None,
+                            help="Profile only this kernel. Omit to profile ALL kernels.")
+        parser.add_argument("--output-file", "-o", type=str, default=None,
+                            help="Custom report filename (without .ncu-rep extension).")
+        parser.add_argument("--dims", type=parse_dims,
+                            default=DEFAULT_DIMS,
+                            help="Tensor dimensions as B,H,I,J,K,D (default: 1,2,128,128,128,64)")
+        parser.add_argument("--forward-only", action="store_true",
+                            help="Only run forward pass kernels.")
+        parser.add_argument("--backward-only", action="store_true",
+                            help="Only run backward pass kernels.")
+
         args = parser.parse_args()
 
-        # Check if we should run the kernels directly or launch the profiler
+        if args.forward_only and args.backward_only:
+            parser.error("Cannot use --forward-only and --backward-only together.")
+
         if args.no_profile:
             # This branch is executed when ncu calls the script
-            B, H, I_dim, J_dim, K_dim, D_dim = (1, 2, 128, 128, 128, 64)
-            run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim)
+            B, H, I_dim, J_dim, K_dim, D_dim = args.dims
+            run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim,
+                            forward_only=args.forward_only,
+                            backward_only=args.backward_only)
         else:
-            # This is the main branch that launches the profiler
-            launch_profiler(report_filename=args.output_file)
+            launch_profiler(args)
 
     except ImportError:
         print("\nImportError: Could not import 'hyper_attn_cpp_manual'.")
         print("Please ensure the extension is compiled via 'python setup.py install' or 'develop'.")
     except Exception as e:
         print(f"\nAn unexpected error occurred: {e}")
+        raise
