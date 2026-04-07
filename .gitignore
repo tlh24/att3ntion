@@ -1,52 +1,25 @@
 myenv
 
 *.pt
-*.pyc
-*.pyo
-*.pyd
-*.pyw
-*.pyz
-*.pywz
-*.pywzc
-losslog.txt
 
 # Build artifacts
 build/
-dist/
 *.so
-*.pyd
-*.dll
-*.dylib
 *.egg-info/
-
-# LibTorch
-libtorch/
-libtorch.zip
 
 # Python cache
 __pycache__/
 *.py[cod]
-*$py.class
-
-# Temporary files
-*.log
-.DS_Store
 
 # Profiling reports
 *.ncu-rep
 profiling_reports/
 
-# IDE and editor files
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
+# Benchmark results (machine-specific)
+benchmark_history.jsonl
 
-# Jupyter notebooks
-.ipynb_checkpoints/
+# Python tooling caches
+.pytest_cache/
 
-# Output directories
-comparison_plots/
-# Benchmark results (ad-hoc, machine-specific)
-results_*.json
+.claude
+.cursor
