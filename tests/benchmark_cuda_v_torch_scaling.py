@@ -103,8 +103,8 @@ def _benchmark_backward_times(ext_fn, warmup, iters):
 def run_scaling_benchmark(N_values: List[int], B=1, H=2, D=32,
                           include_backward=True, max_n_backward=1024):
     """Run scaling benchmark. Handles Torch OOM separately from CUDA OOM."""
-    import hyper_attn_cpp_manual as cuda_ext
-    import hyper_attn_cpp_reference as ref_ext
+    import att3ntion._cuda_kernels as cuda_ext
+    import att3ntion._torch_kernels as ref_ext
 
     results = []
     torch_oom_started = False

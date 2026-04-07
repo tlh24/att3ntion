@@ -260,8 +260,8 @@ def main():
         sys.exit(1)
 
     try:
-        import hyper_attn_cpp_manual as cuda_ext
-        import hyper_attn_cpp_reference as ref_ext
+        import att3ntion._cuda_kernels as cuda_ext
+        import att3ntion._torch_kernels as ref_ext
     except ImportError as e:
         print(f"Import error: {e}\nRun: python setup.py develop")
         sys.exit(1)

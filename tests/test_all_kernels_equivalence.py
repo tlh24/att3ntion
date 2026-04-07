@@ -191,21 +191,21 @@ class KernelTester:
         self.verbose = verbose
 
         try:
-            import hyper_attn_cpp_manual as cuda_ext
+            import att3ntion._cuda_kernels as cuda_ext
             self.cuda_ext = cuda_ext
         except ImportError as e:
             raise ImportError(
-                f"Could not import 'hyper_attn_cpp_manual': {e}\n"
-                "Run: python setup.py develop"
+                f"Could not import 'att3ntion._cuda_kernels': {e}\n"
+                "Run: pip install -e ."
             )
 
         try:
-            import hyper_attn_cpp_reference as ref_ext
+            import att3ntion._torch_kernels as ref_ext
             self.ref_ext = ref_ext
         except ImportError as e:
             raise ImportError(
-                f"Could not import 'hyper_attn_cpp_reference': {e}\n"
-                "Run: python setup.py develop"
+                f"Could not import 'att3ntion._torch_kernels': {e}\n"
+                "Run: pip install -e ."
             )
 
     def _create_inputs(self, config: TestConfig, requires_grad: bool = False) -> Dict[str, torch.Tensor]:

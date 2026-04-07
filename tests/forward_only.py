@@ -13,11 +13,11 @@ parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, parent_dir)
 
 try:
-    import hyper_attn_cpp_manual as manual_att3ntion
-    import hyper_attn_cpp_reference
+    import att3ntion._cuda_kernels as manual_att3ntion
+    import att3ntion._torch_kernels
     print("Successfully imported C++/CUDA extensions.")
 except ImportError:
-    print("\nError: Failed to import the C++/CUDA extension 'hyper_attn_cpp_manual' or 'hyper_attn_cpp_reference'.")
+    print("\nError: Failed to import 'att3ntion._cuda_kernels' or 'att3ntion._torch_kernels'.")
     print("Please ensure the extensions have been compiled successfully and the names match setup.py.")
     sys.exit(1)
 
@@ -374,7 +374,7 @@ def benchmark():
             start_time = time.perf_counter()
 
             # Only run and measure for Yq_scatter
-            Y_q_ref, _, _, Y_q__ref, _, _ = hyper_attn_cpp_reference.forward(
+            Y_q_ref, _, _, Y_q__ref, _, _ = att3ntion._torch_kernels.forward(
                 Q_ref, R_ref, S_ref, Vq_1_ref, Vq_2_ref, Vr_1_ref, Vr_2_ref, Vs_1_ref, Vs_2_ref, dropout_rate)
             
             torch.cuda.synchronize()

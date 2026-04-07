@@ -28,7 +28,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-RESULTS_FILE = os.path.join(PROJECT_ROOT, "benchmark_history.jsonl")
+RESULTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark_history.jsonl")
 
 
 # --- Configuration ---
@@ -510,13 +510,13 @@ def main():
         sys.exit(1)
 
     try:
-        import hyper_attn_cpp_manual as cuda_ext
+        import att3ntion._cuda_kernels as cuda_ext
     except ImportError as e:
         print(f"ERROR: Could not import CUDA extension: {e}")
         sys.exit(1)
 
     try:
-        import hyper_attn_cpp_reference as ref_ext
+        import att3ntion._torch_kernels as ref_ext
     except ImportError as e:
         print(f"ERROR: Could not import reference extension: {e}")
         sys.exit(1)

@@ -9,11 +9,11 @@ parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, parent_dir)
 
 try:
-    import hyper_attn_cpp_manual
-    print("Successfully imported hyper_attn_cpp_manual")
+    import att3ntion._cuda_kernels as _cuda_kernels
+    print("Successfully imported att3ntion._cuda_kernels")
 except ImportError as e:
-    print(f"Error: Could not import 'hyper_attn_cpp_manual': {e}")
-    print("Please ensure the extension is compiled via 'python setup.py develop'")
+    print(f"Error: Could not import 'att3ntion._cuda_kernels': {e}")
+    print("Please ensure the extension is compiled via 'pip install -e .'")
     sys.exit(1)
 
 def get_grad_output(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_):
@@ -57,7 +57,7 @@ def benchmark_with_memory(B, H, I, J, K, D, num_iterations=10):
             torch.cuda.synchronize()
             start = time.perf_counter()
             
-            Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_ = hyper_attn_cpp_manual.forward(
+            Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_ = _cuda_kernels.forward(
                 Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
             )
             
@@ -77,7 +77,7 @@ def benchmark_with_memory(B, H, I, J, K, D, num_iterations=10):
         try:
             for _ in range(num_iterations):
                 # Run forward pass (not timed)
-                Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_ = hyper_attn_cpp_manual.forward(
+                Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_ = _cuda_kernels.forward(
                     Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
                 )
                 grad_output = get_grad_output(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_)
@@ -86,7 +86,7 @@ def benchmark_with_memory(B, H, I, J, K, D, num_iterations=10):
                 torch.cuda.synchronize()
                 start = time.perf_counter()
                 
-                hyper_attn_cpp_manual.backward(
+                _cuda_kernels.backward(
                     grad_output, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
                 )
                 

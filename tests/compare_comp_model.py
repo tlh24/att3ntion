@@ -20,7 +20,7 @@ parent_dir_str = str(parent_dir)
 if parent_dir_str not in sys.path:
     sys.path.insert(0, parent_dir_str)
 
-from hypergraph_attention import HypergraphAttentionCPP, HypergraphAttentionCPPReference, QuickGELU
+from att3ntion import HypergraphAttention, _HypergraphAttentionTorch, QuickGELU
 
 
 # Data generation functions (copied from gen_data_comp.py to avoid matplotlib import)
@@ -120,9 +120,9 @@ class CompModelComparison(nn.Module):
         for _ in range(n_layers):
             # Select attention implementation
             if attn_impl == 'cuda':
-                attention_layer = HypergraphAttentionCPP(hidden_dim, num_heads)
+                attention_layer = HypergraphAttention(hidden_dim, num_heads)
             elif attn_impl == 'torch_cpp':
-                attention_layer = HypergraphAttentionCPPReference(hidden_dim, num_heads)
+                attention_layer = _HypergraphAttentionTorch(hidden_dim, num_heads)
             else:
                 raise ValueError(f"Unknown attention implementation: {attn_impl}")
 

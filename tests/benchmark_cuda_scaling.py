@@ -219,7 +219,7 @@ def adaptive_iters(N: int, base_warmup: int, base_iters: int):
 
 def run_scaling_analysis(N_values: List[int], B=1, H=2, D=32,
                          include_backward=True, warmup=5, iters=20):
-    import hyper_attn_cpp_manual as cuda_ext
+    import att3ntion._cuda_kernels as cuda_ext
 
     results = []
     prev_point = None

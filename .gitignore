@@ -16,7 +16,7 @@ __pycache__/
 profiling_reports/
 
 # Benchmark results (machine-specific)
-benchmark_history.jsonl
+tests/benchmark_history.jsonl
 
 # Python tooling caches
 .pytest_cache/
