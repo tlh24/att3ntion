@@ -25,7 +25,7 @@
 // Using 16x16x16 tiles which map perfectly to TILE_J=16, TILE_K=16
 
 constexpr int WMMA_M = 16;  // Rows of output tile
-constexpr int WMMA_N = 16;  // Cols of output tile  
+constexpr int WMMA_N = 16;  // Cols of output tile
 constexpr int WMMA_K = 16;  // Inner dimension for accumulation
 
 // DISABLED: WMMA tensor core path has issues on sm_120+ (Blackwell).
@@ -279,279 +279,279 @@ void Yq_gather(
 
 __global__
 void Yq_gather_tensor_core(
-    const half* __restrict__ Q_h,      // [B,H,I,D] - FP16 input
-    const half* __restrict__ R_h,      // [B,H,J,D]
-    const half* __restrict__ S_h,      // [B,H,K,D]
-    const half* __restrict__ V1_h,     // [B,H,J,D] - Vr_1
-    const half* __restrict__ V2_h,     // [B,H,K,D] - Vs_1
-    float*      __restrict__ Y,        // [B,H,I,D] - FP32 output
-    float*      __restrict__ m_i_out,  // softmax stats output
-    float*      __restrict__ l_i_out,  // softmax stats output
-    int B, int H, int I, int J, int K, int D, float scale)
+	const half* __restrict__ Q_h,      // [B,H,I,D] - FP16 input
+	const half* __restrict__ R_h,      // [B,H,J,D]
+	const half* __restrict__ S_h,      // [B,H,K,D]
+	const half* __restrict__ V1_h,     // [B,H,J,D] - Vr_1
+	const half* __restrict__ V2_h,     // [B,H,K,D] - Vs_1
+	float*      __restrict__ Y,        // [B,H,I,D] - FP32 output
+	float*      __restrict__ m_i_out,  // softmax stats output
+	float*      __restrict__ l_i_out,  // softmax stats output
+	int B, int H, int I, int J, int K, int D, float scale)
 {
-    using namespace nvcuda::wmma;
-    
-    // --- Grid Mapping ---
-    // Each block computes one output vector Y[b,h,i,:]
-    const int i = blockIdx.x;
-    const int h = blockIdx.y;
-    const int b = blockIdx.z;
-    
-    const int tid = threadIdx.x;
-    const int block_size = blockDim.x;  // Expected: 128
-    const int warp_id = tid / 32;
-    const int num_warps = block_size / 32;  // Expected: 4
-    (void)num_warps;  // May be unused in simple single-warp WMMA path
-    
-    // --- Shared Memory Layout ---
-    // We need FP16 tiles for WMMA and FP32 buffers for softmax/output
-    extern __shared__ char smem_raw[];
-    
-    // FP16 tiles for tensor core operations
-    half* q_vec_h    = (half*)smem_raw;                              // D halfs
-    half* qr_tile_h  = q_vec_h + D;                                  // TILE_J * D halfs
-    half* s_tile_h   = qr_tile_h + TILE_J * D;                       // TILE_K * D halfs
-    half* v1_tile_h  = s_tile_h + TILE_K * D;                        // TILE_J * D halfs
-    half* v2_tile_h  = v1_tile_h + TILE_J * D;                       // TILE_K * D halfs
-    half* p_tile_h   = v2_tile_h + TILE_K * D;                       // TILE_J * TILE_K halfs
-    
-    // FP32 buffers for softmax and output accumulation
-    float* p_tile_f  = (float*)(p_tile_h + TILE_J * TILE_K);         // TILE_J * TILE_K floats
-    float* m_tile_f  = p_tile_f + TILE_J * TILE_K;                   // TILE_J * D floats (intermediate)
-    float* red_buf   = m_tile_f + TILE_J * D;                        // block_size floats
-    float* m_l_sh    = red_buf + block_size;                         // 2 floats
-    float* o_sh      = m_l_sh + 2;                                   // D floats
-    
-    // --- Load Q[b,h,i,:] to Shared Memory (FP16) ---
-    const int64_t q_base_off = (((int64_t)b * H + h) * I + i) * D;
-    for (int d = tid; d < D; d += block_size) {
-        q_vec_h[d] = Q_h[q_base_off + d];
-    }
-    
-    // --- Initialize Online Softmax State ---
-    if (tid == 0) {
-        m_l_sh[0] = NEG_INF;  // m_i
-        m_l_sh[1] = 0.0f;     // l_i
-    }
-    for (int d = tid; d < D; d += block_size) {
-        o_sh[d] = 0.0f;
-    }
-    __syncthreads();
-    
-    // --- Main Loop over R and S tiles ---
-    for (int j0 = 0; j0 < J; j0 += TILE_J) {
-        for (int k0 = 0; k0 < K; k0 += TILE_K) {
-            const int tile_j_size = min(TILE_J, J - j0);
-            const int tile_k_size = min(TILE_K, K - k0);
-            
-            // =========================================================
-            // PHASE 1: Load R, S, V1, V2 tiles (FP16) and compute QR
-            // =========================================================
-            
-            // Load R tile and compute QR = Q ⊙ R (element-wise broadcast)
-            for (int idx = tid; idx < TILE_J * D; idx += block_size) {
-                int jt = idx / D;
-                int d = idx % D;
-                int j = j0 + jt;
-                if (j < J) {
-                    int64_t r_off = (((int64_t)b * H + h) * J + j) * D + d;
-                    half r_val = R_h[r_off];
-                    half q_val = q_vec_h[d];
-                    // QR[jt,d] = Q[d] * R[jt,d]
-                    qr_tile_h[jt * D + d] = __hmul(q_val, r_val);
-                    // Also load V1
-                    v1_tile_h[jt * D + d] = V1_h[r_off];
-                } else {
-                    qr_tile_h[jt * D + d] = __float2half(0.0f);
-                    v1_tile_h[jt * D + d] = __float2half(0.0f);
-                }
-            }
-            
-            // Load S and V2 tiles
-            for (int idx = tid; idx < TILE_K * D; idx += block_size) {
-                int kt = idx / D;
-                int d = idx % D;
-                int k = k0 + kt;
-                if (k < K) {
-                    int64_t s_off = (((int64_t)b * H + h) * K + k) * D + d;
-                    s_tile_h[kt * D + d] = S_h[s_off];
-                    v2_tile_h[kt * D + d] = V2_h[s_off];
-                } else {
-                    s_tile_h[kt * D + d] = __float2half(0.0f);
-                    v2_tile_h[kt * D + d] = __float2half(0.0f);
-                }
-            }
-            __syncthreads();
-            
-            // =========================================================
-            // PHASE 2: TENSOR CORE GEMM - Attention Scores
-            // A[j,k] = QR[j,:] @ S[k,:]^T = (TILE_J x D) @ (D x TILE_K)
-            // =========================================================
-            
-            // Only warp 0 performs the WMMA for attention scores
-            // (Other warps could handle different tiles in a more advanced impl)
-            if (warp_id == 0) {
-                // Declare WMMA fragments
-                fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major> qr_frag;
-                fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, col_major> s_frag;
-                fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
-                
-                // Initialize accumulator
-                fill_fragment(acc_frag, 0.0f);
-                
-                // Accumulate over D dimension in chunks of WMMA_K=16
-                for (int d0 = 0; d0 < D; d0 += WMMA_K) {
-                    // Load QR[0:16, d0:d0+16] - row major, stride = D
-                    load_matrix_sync(qr_frag, qr_tile_h + d0, D);
-                    
-                    // Load S[0:16, d0:d0+16]^T - col major means transposed
-                    load_matrix_sync(s_frag, s_tile_h + d0, D);
-                    
-                    // C += A @ B^T
-                    mma_sync(acc_frag, qr_frag, s_frag, acc_frag);
-                }
-                
-                // Store result to FP32 shared memory for softmax
-                store_matrix_sync(p_tile_f, acc_frag, TILE_K, mem_row_major);
-            }
-            __syncthreads();
-            
-            // =========================================================
-            // PHASE 3: Softmax (FP32 for numerical stability)
-            // =========================================================
-            
-            // Find tile max (m_ij)
-            float m_ij = NEG_INF;
-            for (int flat_idx = tid; flat_idx < TILE_J * TILE_K; flat_idx += block_size) {
-                int jt = flat_idx / TILE_K;
-                int kt = flat_idx % TILE_K;
-                if (j0 + jt < J && k0 + kt < K) {
-                    m_ij = fmaxf(m_ij, p_tile_f[flat_idx] * scale);
-                }
-            }
-            red_buf[tid] = m_ij;
-            __syncthreads();
-            for (int s = block_size / 2; s > 0; s >>= 1) {
-                if (tid < s) red_buf[tid] = fmaxf(red_buf[tid], red_buf[tid + s]);
-                __syncthreads();
-            }
-            m_ij = red_buf[0];
-            __syncthreads();
-            
-            // Compute softmax numerator and denominator
-            float l_ij = 0.0f;
-            for (int flat_idx = tid; flat_idx < TILE_J * TILE_K; flat_idx += block_size) {
-                int jt = flat_idx / TILE_K;
-                int kt = flat_idx % TILE_K;
-                if (j0 + jt < J && k0 + kt < K) {
-                    float p_val = expf(p_tile_f[flat_idx] * scale - m_ij);
-                    p_tile_f[flat_idx] = p_val;
-                    l_ij += p_val;
-                } else {
-                    p_tile_f[flat_idx] = 0.0f;
-                }
-            }
-            red_buf[tid] = l_ij;
-            __syncthreads();
-            for (int s = block_size / 2; s > 0; s >>= 1) {
-                if (tid < s) red_buf[tid] += red_buf[tid + s];
-                __syncthreads();
-            }
-            l_ij = red_buf[0];
-            __syncthreads();
-            
-            // Update online softmax state
-            float m_i_old, l_i_old, m_new, alpha, beta, l_new;
-            if (tid == 0) {
-                m_i_old = m_l_sh[0];
-                l_i_old = m_l_sh[1];
-                m_new = fmaxf(m_i_old, m_ij);
-                alpha = expf(m_i_old - m_new);
-                beta = expf(m_ij - m_new);
-                l_new = alpha * l_i_old + beta * l_ij;
-                m_l_sh[0] = m_new;
-                m_l_sh[1] = l_new;
-                red_buf[1] = alpha;
-                red_buf[2] = beta;
-                red_buf[3] = l_i_old;
-            }
-            __syncthreads();
-            
-            alpha = red_buf[1];
-            beta = red_buf[2];
-            l_i_old = red_buf[3];
-            l_new = m_l_sh[1];
-            
-            // Convert softmax result to FP16 for next WMMA
-            for (int idx = tid; idx < TILE_J * TILE_K; idx += block_size) {
-                p_tile_h[idx] = __float2half(p_tile_f[idx]);
-            }
-            __syncthreads();
-            
-            // =========================================================
-            // PHASE 4: TENSOR CORE GEMM - Output Intermediate
-            // M[j,d] = P[j,k] @ V2[k,d] = (TILE_J x TILE_K) @ (TILE_K x D)
-            // =========================================================
-            
-            // Process D in chunks of WMMA_N=16, distribute across warps
-            // Each warp handles one or more D-chunks
-            const int d_chunks = D / WMMA_N;
-            
-            for (int d_chunk = warp_id; d_chunk < d_chunks; d_chunk += num_warps) {
-                int d0 = d_chunk * WMMA_N;
-                
-                fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major> p_frag;
-                fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, row_major> v2_frag;
-                fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> m_frag;
-                
-                fill_fragment(m_frag, 0.0f);
-                
-                // P is (TILE_J x TILE_K) = (16 x 16), V2 chunk is (TILE_K x 16)
-                // This is a single WMMA operation since TILE_K = WMMA_K = 16
-                load_matrix_sync(p_frag, p_tile_h, TILE_K);
-                load_matrix_sync(v2_frag, v2_tile_h + d0, D);
-                mma_sync(m_frag, p_frag, v2_frag, m_frag);
-                
-                // Store M[0:16, d0:d0+16] to shared memory
-                store_matrix_sync(m_tile_f + d0, m_frag, D, mem_row_major);
-            }
-            __syncthreads();
-            
-            // =========================================================
-            // PHASE 5: Final Output - Element-wise V1 * M + Reduction
-            // O[d] = Σ_j V1[j,d] * M[j,d]
-            // =========================================================
-            
-            for (int d = tid; d < D; d += block_size) {
-                float new_o_d = 0.0f;
-                for (int jt = 0; jt < TILE_J; ++jt) {
-                    if (j0 + jt < J) {
-                        float v1_val = __half2float(v1_tile_h[jt * D + d]);
-                        float m_val = m_tile_f[jt * D + d];
-                        new_o_d += v1_val * m_val;
-                    }
-                }
-                
-                // Online softmax rescaling
-                if (l_new > 1e-20f) {
-                    o_sh[d] = (alpha * l_i_old * o_sh[d] + beta * new_o_d) / l_new;
-                }
-            }
-            __syncthreads();
-        }
-    }
-    
-    // --- Write Final Output ---
-    for (int d = tid; d < D; d += block_size) {
-        Y[q_base_off + d] = o_sh[d];
-    }
-    
-    // --- Write Softmax Stats ---
-    if (tid == 0 && m_i_out != nullptr && l_i_out != nullptr) {
-        int64_t stats_idx = ((int64_t)b * H + h) * I + i;
-        m_i_out[stats_idx] = m_l_sh[0];
-        l_i_out[stats_idx] = m_l_sh[1];
-    }
+	using namespace nvcuda::wmma;
+
+	// --- Grid Mapping ---
+	// Each block computes one output vector Y[b,h,i,:]
+	const int i = blockIdx.x;
+	const int h = blockIdx.y;
+	const int b = blockIdx.z;
+
+	const int tid = threadIdx.x;
+	const int block_size = blockDim.x;  // Expected: 128
+	const int warp_id = tid / 32;
+	const int num_warps = block_size / 32;  // Expected: 4
+	(void)num_warps;  // May be unused in simple single-warp WMMA path
+
+	// --- Shared Memory Layout ---
+	// We need FP16 tiles for WMMA and FP32 buffers for softmax/output
+	extern __shared__ char smem_raw[];
+
+	// FP16 tiles for tensor core operations
+	half* q_vec_h    = (half*)smem_raw;                              // D halfs
+	half* qr_tile_h  = q_vec_h + D;                                  // TILE_J * D halfs
+	half* s_tile_h   = qr_tile_h + TILE_J * D;                       // TILE_K * D halfs
+	half* v1_tile_h  = s_tile_h + TILE_K * D;                        // TILE_J * D halfs
+	half* v2_tile_h  = v1_tile_h + TILE_J * D;                       // TILE_K * D halfs
+	half* p_tile_h   = v2_tile_h + TILE_K * D;                       // TILE_J * TILE_K halfs
+
+	// FP32 buffers for softmax and output accumulation
+	float* p_tile_f  = (float*)(p_tile_h + TILE_J * TILE_K);         // TILE_J * TILE_K floats
+	float* m_tile_f  = p_tile_f + TILE_J * TILE_K;                   // TILE_J * D floats (intermediate)
+	float* red_buf   = m_tile_f + TILE_J * D;                        // block_size floats
+	float* m_l_sh    = red_buf + block_size;                         // 2 floats
+	float* o_sh      = m_l_sh + 2;                                   // D floats
+
+	// --- Load Q[b,h,i,:] to Shared Memory (FP16) ---
+	const int64_t q_base_off = (((int64_t)b * H + h) * I + i) * D;
+	for (int d = tid; d < D; d += block_size) {
+		q_vec_h[d] = Q_h[q_base_off + d];
+	}
+
+	// --- Initialize Online Softmax State ---
+	if (tid == 0) {
+		m_l_sh[0] = NEG_INF;  // m_i
+		m_l_sh[1] = 0.0f;     // l_i
+	}
+	for (int d = tid; d < D; d += block_size) {
+		o_sh[d] = 0.0f;
+	}
+	__syncthreads();
+
+	// --- Main Loop over R and S tiles ---
+	for (int j0 = 0; j0 < J; j0 += TILE_J) {
+		for (int k0 = 0; k0 < K; k0 += TILE_K) {
+			const int tile_j_size = min(TILE_J, J - j0);
+			const int tile_k_size = min(TILE_K, K - k0);
+
+			// =========================================================
+			// PHASE 1: Load R, S, V1, V2 tiles (FP16) and compute QR
+			// =========================================================
+
+			// Load R tile and compute QR = Q ⊙ R (element-wise broadcast)
+			for (int idx = tid; idx < TILE_J * D; idx += block_size) {
+				int jt = idx / D;
+				int d = idx % D;
+				int j = j0 + jt;
+				if (j < J) {
+					int64_t r_off = (((int64_t)b * H + h) * J + j) * D + d;
+					half r_val = R_h[r_off];
+					half q_val = q_vec_h[d];
+					// QR[jt,d] = Q[d] * R[jt,d]
+					qr_tile_h[jt * D + d] = __hmul(q_val, r_val);
+					// Also load V1
+					v1_tile_h[jt * D + d] = V1_h[r_off];
+				} else {
+					qr_tile_h[jt * D + d] = __float2half(0.0f);
+					v1_tile_h[jt * D + d] = __float2half(0.0f);
+				}
+			}
+
+			// Load S and V2 tiles
+			for (int idx = tid; idx < TILE_K * D; idx += block_size) {
+				int kt = idx / D;
+				int d = idx % D;
+				int k = k0 + kt;
+				if (k < K) {
+					int64_t s_off = (((int64_t)b * H + h) * K + k) * D + d;
+					s_tile_h[kt * D + d] = S_h[s_off];
+					v2_tile_h[kt * D + d] = V2_h[s_off];
+				} else {
+					s_tile_h[kt * D + d] = __float2half(0.0f);
+					v2_tile_h[kt * D + d] = __float2half(0.0f);
+				}
+			}
+			__syncthreads();
+
+			// =========================================================
+			// PHASE 2: TENSOR CORE GEMM - Attention Scores
+			// A[j,k] = QR[j,:] @ S[k,:]^T = (TILE_J x D) @ (D x TILE_K)
+			// =========================================================
+
+			// Only warp 0 performs the WMMA for attention scores
+			// (Other warps could handle different tiles in a more advanced impl)
+			if (warp_id == 0) {
+				// Declare WMMA fragments
+				fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major> qr_frag;
+				fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, col_major> s_frag;
+				fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
+
+				// Initialize accumulator
+				fill_fragment(acc_frag, 0.0f);
+
+				// Accumulate over D dimension in chunks of WMMA_K=16
+				for (int d0 = 0; d0 < D; d0 += WMMA_K) {
+					// Load QR[0:16, d0:d0+16] - row major, stride = D
+					load_matrix_sync(qr_frag, qr_tile_h + d0, D);
+
+					// Load S[0:16, d0:d0+16]^T - col major means transposed
+					load_matrix_sync(s_frag, s_tile_h + d0, D);
+
+					// C += A @ B^T
+					mma_sync(acc_frag, qr_frag, s_frag, acc_frag);
+				}
+
+				// Store result to FP32 shared memory for softmax
+				store_matrix_sync(p_tile_f, acc_frag, TILE_K, mem_row_major);
+			}
+			__syncthreads();
+
+			// =========================================================
+			// PHASE 3: Softmax (FP32 for numerical stability)
+			// =========================================================
+
+			// Find tile max (m_ij)
+			float m_ij = NEG_INF;
+			for (int flat_idx = tid; flat_idx < TILE_J * TILE_K; flat_idx += block_size) {
+				int jt = flat_idx / TILE_K;
+				int kt = flat_idx % TILE_K;
+				if (j0 + jt < J && k0 + kt < K) {
+					m_ij = fmaxf(m_ij, p_tile_f[flat_idx] * scale);
+				}
+			}
+			red_buf[tid] = m_ij;
+			__syncthreads();
+			for (int s = block_size / 2; s > 0; s >>= 1) {
+				if (tid < s) red_buf[tid] = fmaxf(red_buf[tid], red_buf[tid + s]);
+				__syncthreads();
+			}
+			m_ij = red_buf[0];
+			__syncthreads();
+
+			// Compute softmax numerator and denominator
+			float l_ij = 0.0f;
+			for (int flat_idx = tid; flat_idx < TILE_J * TILE_K; flat_idx += block_size) {
+				int jt = flat_idx / TILE_K;
+				int kt = flat_idx % TILE_K;
+				if (j0 + jt < J && k0 + kt < K) {
+					float p_val = expf(p_tile_f[flat_idx] * scale - m_ij);
+					p_tile_f[flat_idx] = p_val;
+					l_ij += p_val;
+				} else {
+					p_tile_f[flat_idx] = 0.0f;
+				}
+			}
+			red_buf[tid] = l_ij;
+			__syncthreads();
+			for (int s = block_size / 2; s > 0; s >>= 1) {
+				if (tid < s) red_buf[tid] += red_buf[tid + s];
+				__syncthreads();
+			}
+			l_ij = red_buf[0];
+			__syncthreads();
+
+			// Update online softmax state
+			float m_i_old, l_i_old, m_new, alpha, beta, l_new;
+			if (tid == 0) {
+				m_i_old = m_l_sh[0];
+				l_i_old = m_l_sh[1];
+				m_new = fmaxf(m_i_old, m_ij);
+				alpha = expf(m_i_old - m_new);
+				beta = expf(m_ij - m_new);
+				l_new = alpha * l_i_old + beta * l_ij;
+				m_l_sh[0] = m_new;
+				m_l_sh[1] = l_new;
+				red_buf[1] = alpha;
+				red_buf[2] = beta;
+				red_buf[3] = l_i_old;
+			}
+			__syncthreads();
+
+			alpha = red_buf[1];
+			beta = red_buf[2];
+			l_i_old = red_buf[3];
+			l_new = m_l_sh[1];
+
+			// Convert softmax result to FP16 for next WMMA
+			for (int idx = tid; idx < TILE_J * TILE_K; idx += block_size) {
+				p_tile_h[idx] = __float2half(p_tile_f[idx]);
+			}
+			__syncthreads();
+
+			// =========================================================
+			// PHASE 4: TENSOR CORE GEMM - Output Intermediate
+			// M[j,d] = P[j,k] @ V2[k,d] = (TILE_J x TILE_K) @ (TILE_K x D)
+			// =========================================================
+
+			// Process D in chunks of WMMA_N=16, distribute across warps
+			// Each warp handles one or more D-chunks
+			const int d_chunks = D / WMMA_N;
+
+			for (int d_chunk = warp_id; d_chunk < d_chunks; d_chunk += num_warps) {
+				int d0 = d_chunk * WMMA_N;
+
+				fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major> p_frag;
+				fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, row_major> v2_frag;
+				fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> m_frag;
+
+				fill_fragment(m_frag, 0.0f);
+
+				// P is (TILE_J x TILE_K) = (16 x 16), V2 chunk is (TILE_K x 16)
+				// This is a single WMMA operation since TILE_K = WMMA_K = 16
+				load_matrix_sync(p_frag, p_tile_h, TILE_K);
+				load_matrix_sync(v2_frag, v2_tile_h + d0, D);
+				mma_sync(m_frag, p_frag, v2_frag, m_frag);
+
+				// Store M[0:16, d0:d0+16] to shared memory
+				store_matrix_sync(m_tile_f + d0, m_frag, D, mem_row_major);
+			}
+			__syncthreads();
+
+			// =========================================================
+			// PHASE 5: Final Output - Element-wise V1 * M + Reduction
+			// O[d] = Σ_j V1[j,d] * M[j,d]
+			// =========================================================
+
+			for (int d = tid; d < D; d += block_size) {
+				float new_o_d = 0.0f;
+				for (int jt = 0; jt < TILE_J; ++jt) {
+					if (j0 + jt < J) {
+						float v1_val = __half2float(v1_tile_h[jt * D + d]);
+						float m_val = m_tile_f[jt * D + d];
+						new_o_d += v1_val * m_val;
+					}
+				}
+
+				// Online softmax rescaling
+				if (l_new > 1e-20f) {
+					o_sh[d] = (alpha * l_i_old * o_sh[d] + beta * new_o_d) / l_new;
+				}
+			}
+			__syncthreads();
+		}
+	}
+
+	// --- Write Final Output ---
+	for (int d = tid; d < D; d += block_size) {
+		Y[q_base_off + d] = o_sh[d];
+	}
+
+	// --- Write Softmax Stats ---
+	if (tid == 0 && m_i_out != nullptr && l_i_out != nullptr) {
+		int64_t stats_idx = ((int64_t)b * H + h) * I + i;
+		m_i_out[stats_idx] = m_l_sh[0];
+		l_i_out[stats_idx] = m_l_sh[1];
+	}
 }
 
 

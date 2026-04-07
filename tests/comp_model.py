@@ -273,8 +273,8 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 		device = torch.device(device)
 	
 	print(f"Using device: {device}")
-	
-	data = genData4(batch_size * 1000, modulo, do_print=False)
+	pdb.set_trace()
+	data = genData4(batch_size * 100, modulo, do_print=False)
 	dataset = TensorDataset(torch.tensor(data))
 	train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 

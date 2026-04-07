@@ -93,43 +93,54 @@ class HypergraphAttention_Naive(nn.Module):
 		# self.dropout_mask_q = torch.ones_like(Aq)
 		# self.dropout_mask_r = torch.ones_like(Ar)
 		# self.dropout_mask_s = torch.ones_like(As)
-		
+		gather = True
+		scatter = False
 		# Gather operations
 		# hence the 'diamond' operation is multiply.
-		Y_q = torch.einsum('bhijk,bhjd,bhkd->bhid', Aq, Vr, Vs)
-		Y_r = torch.einsum('bhijk,bhid,bhkd->bhjd', Ar, Vq, Vs)
-		Y_s = torch.einsum('bhijk,bhid,bhjd->bhkd', As, Vq, Vr)
+		if gather:
+			Y_q = torch.einsum('bhijk,bhjd,bhkd->bhid', Aq, Vr, Vs)
+			Y_r = torch.einsum('bhijk,bhid,bhkd->bhjd', Ar, Vq, Vs)
+			Y_s = torch.einsum('bhijk,bhid,bhjd->bhkd', As, Vq, Vr)
+			Y_q = self.gelu(Y_q) # test!
+			Y_r = self.gelu(Y_r) # is this better?
+			Y_s = self.gelu(Y_s) # doesn't seem like much.
 		
-		# Scatter operations
-		if True:
-			# NOTE optional softmax-transpose: redo A_q, A_r, A_s
-			Aq = torch.softmax(dot_product, dim=2) # softmax over i
-			Ar = torch.softmax(dot_product, dim=3) # softmax over j
-			As = torch.softmax(dot_product, dim=4) # softmax over k
+		if scatter:
+			# Scatter operations
+			if False:
+				# NOTE optional softmax-transpose: redo A_q, A_r, A_s
+				Aq = torch.softmax(dot_product, dim=2) # softmax over i
+				Ar = torch.softmax(dot_product, dim=3) # softmax over j
+				As = torch.softmax(dot_product, dim=4) # softmax over k
 
-		if False:
-		# 'diamond' op is add; this seems very slightly slower to converge
-		# in some tasks, it does not converge.
-			Y_q_ = torch.einsum('bhijk,bhjd->bhid', Ar, Vr_) + \
-					torch.einsum('bhijk,bhkd->bhid', As, Vs_)
-			Y_r_ = torch.einsum('bhijk,bhid->bhjd', Aq, Vq_) + \
-					torch.einsum('bhijk,bhkd->bhjd', As, Vs_)
-			Y_s_ = torch.einsum('bhijk,bhid->bhkd', Aq, Vq_) + \
-					torch.einsum('bhijk,bhjd->bhkd', Ar, Vr_)
+			if False:
+			# 'diamond' op is add; this seems very slightly slower to converge
+			# in some tasks, it does not converge.
+				Y_q_ = torch.einsum('bhijk,bhjd->bhid', Ar, Vr_) + \
+						torch.einsum('bhijk,bhkd->bhid', As, Vs_)
+				Y_r_ = torch.einsum('bhijk,bhid->bhjd', Aq, Vq_) + \
+						torch.einsum('bhijk,bhkd->bhjd', As, Vs_)
+				Y_s_ = torch.einsum('bhijk,bhid->bhkd', Aq, Vq_) + \
+						torch.einsum('bhijk,bhjd->bhkd', Ar, Vr_)
+			else:
+				# 'diamond' op is mul
+				Y_q_ = torch.einsum('bhijk,bhjd,bhijk,bhkd->bhid', Ar, Vr_, As, Vs_)
+				Y_r_ = torch.einsum('bhijk,bhid,bhijk,bhkd->bhjd', Aq, Vq_, As, Vs_)
+				Y_s_ = torch.einsum('bhijk,bhid,bhijk,bhjd->bhkd', Aq, Vq_, Ar, Vr_)
+
+			Y_q_ = self.gelu(Y_q_)
+			Y_r_ = self.gelu(Y_r_)
+			Y_s_ = self.gelu(Y_s_)
+			if gather:
+				y = Y_q + Y_r + Y_s + Y_q_ + Y_r_ + Y_s_
+			else:
+				y = Y_q_ + Y_r_ + Y_s_
+
 		else:
-			# 'diamond' op is mul
-			Y_q_ = torch.einsum('bhijk,bhjd,bhijk,bhkd->bhid', Ar, Vr_, As, Vs_)
-			Y_r_ = torch.einsum('bhijk,bhid,bhijk,bhkd->bhjd', Aq, Vq_, As, Vs_)
-			Y_s_ = torch.einsum('bhijk,bhid,bhijk,bhjd->bhkd', Aq, Vq_, Ar, Vr_)
-		
-		# Skip GELU for testing
-		# Y_q = self.gelu(Y_q)
-		# Y_r = self.gelu(Y_r)
-		# Y_s = self.gelu(Y_s)
-		# Y_q_ = self.gelu(Y_q_)
-		# Y_r_ = self.gelu(Y_r_)
-		# Y_s_ = self.gelu(Y_s_)
-		y = Y_q + Y_r + Y_s + Y_q_ + Y_r_ + Y_s_
+			Y_q = self.gelu(Y_q) # test!
+			Y_r = self.gelu(Y_r) # is this better?
+			Y_s = self.gelu(Y_s) # doesn't seem like much.
+			y = Y_q + Y_r + Y_s
 		
 		# Handle heads based on head_subspaces setting
 		if self.head_subspaces:

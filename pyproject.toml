@@ -6,3 +6,12 @@ requires = [
 ]
 
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "att3ntion"
+version = "0.1.0"
+
+
+[tool.setuptools]
+py-modules = ["hypergraph_attention", "pure_pytorch_reference"]
+
