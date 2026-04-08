@@ -2,14 +2,17 @@
 # att3ntion Makefile
 #
 # Usage:
-#   make build              Build/install the extension
-#   make test               Run quick correctness tests
-#   make bench              Benchmark (build + test + run)
-#   make bench NOBUILD=1    Benchmark without rebuilding
+#   make build              			  Build/install the extension
+#   make test               		      Run quick correctness tests
+#   make test-full        				  Run detailed correctness tests
+#   make bench              			  Benchmark (test + run)
+#   make bench BUILD=1                    Rebuild before benchmarking
 #   make bench-save NOTE="desc"           Save benchmark with note
-#   make bench-save NOTE="desc" NOBUILD=1 Save without rebuilding
-#   make history            Show benchmark history with deltas
-#   make clean              Clean build artifacts
+#   make bench-save NOTE="desc" BUILD=1   Rebuild before saving
+#   make bench-scaling                    CUDA scaling analysis
+#   make bench-compare                    CUDA vs Torch comparison
+#   make history                          Show benchmark history with deltas
+#   make clean                            Clean build artifacts
 
 PYTHON ?= python
 
@@ -20,7 +23,7 @@ build:
 
 .PHONY: maybe-build
 maybe-build:
-ifndef NOBUILD
+ifdef BUILD
 	@$(MAKE) build
 endif
 
@@ -39,41 +42,55 @@ test-quiet: maybe-build
 test-full: maybe-build
 	$(PYTHON) tests/test_kernel_correctness.py --continue-on-failure -v
 
-# --- Benchmarks ---
+# --- Benchmarks: Regression Tracking ---
 
 bench: test-quiet
-	$(PYTHON) benchmarks/bench_optimizations.py
+	$(PYTHON) benchmarks/bench_regression.py
 
 bench-save: test-quiet
 ifndef NOTE
 	$(error NOTE is required. Usage: make bench-save NOTE="description")
 endif
-	$(PYTHON) benchmarks/bench_optimizations.py --save --note "$(NOTE)"
+	$(PYTHON) benchmarks/bench_regression.py --save --note "$(NOTE)"
 
 bench-quick: maybe-build
-	$(PYTHON) benchmarks/bench_optimizations.py --quick --forward-only
+	$(PYTHON) benchmarks/bench_regression.py --quick --forward-only
 
 bench-large: test-quiet
 ifndef NOTE
 	$(error NOTE is required. Usage: make bench-large NOTE="description")
 endif
-	$(PYTHON) benchmarks/bench_optimizations.py --large --save --note "$(NOTE)"
+	$(PYTHON) benchmarks/bench_regression.py --large --save --note "$(NOTE)"
 
 bench-forward: maybe-build
-	$(PYTHON) benchmarks/bench_optimizations.py --forward-only
+	$(PYTHON) benchmarks/bench_regression.py --forward-only
 
 bench-backward: maybe-build
-	$(PYTHON) benchmarks/bench_optimizations.py --backward-only
+	$(PYTHON) benchmarks/bench_regression.py --backward-only
 
 bench-complexity:
-	$(PYTHON) benchmarks/bench_optimizations.py --quick --forward-only --warmup 1 --iters 1 --complexity
+	$(PYTHON) benchmarks/bench_regression.py --quick --forward-only --warmup 1 --iters 1 --complexity
+
+# --- Benchmarks: Scaling & Comparison ---
+
+bench-scaling: maybe-build
+	$(PYTHON) benchmarks/bench_cuda_scaling.py
+
+bench-scaling-quick: maybe-build
+	$(PYTHON) benchmarks/bench_cuda_scaling.py --n-values 32,64,128,256 --no-backward
+
+bench-compare: maybe-build
+	$(PYTHON) benchmarks/bench_cuda_vs_torch.py
+
+bench-compare-quick: maybe-build
+	$(PYTHON) benchmarks/bench_cuda_vs_torch.py --n-values 32,64,128,256 --no-backward
 
 # --- Profiling ---
 
 profile-timeline: maybe-build
 	@mkdir -p profiling_reports
 	nsys profile -o profiling_reports/timeline_$$(date +%Y%m%d_%H%M%S) \
-		$(PYTHON) benchmarks/bench_optimizations.py --quick --forward-only --warmup 1 --iters 1
+		$(PYTHON) benchmarks/bench_regression.py --quick --forward-only --warmup 1 --iters 1
 
 profile-kernel: maybe-build
 	$(PYTHON) benchmarks/profile_kernels.py
@@ -81,7 +98,7 @@ profile-kernel: maybe-build
 # --- History ---
 
 history:
-	@$(PYTHON) benchmarks/bench_optimizations.py --show-history
+	@$(PYTHON) benchmarks/bench_regression.py --show-history
 
 # --- Combined ---
 
@@ -99,4 +116,5 @@ clean:
 
 .PHONY: build maybe-build test test-quiet test-full \
         bench bench-save bench-quick bench-large bench-forward bench-backward bench-complexity \
+        bench-scaling bench-scaling-quick bench-compare bench-compare-quick \
         profile-timeline profile-kernel history all iterate clean

@@ -6,12 +6,12 @@ Tracks performance over time in benchmark_history.jsonl, showing deltas
 between runs so you can see the impact of each kernel change.
 
 Usage:
-    python tests/benchmark_optimizations.py                              # Standard benchmark
-    python tests/benchmark_optimizations.py --quick                      # Fast smoke test
-    python tests/benchmark_optimizations.py --save --note "description"  # Save with note
-    python tests/benchmark_optimizations.py --forward-only               # Forward pass only
-    python tests/benchmark_optimizations.py --roofline                   # Roofline analysis
-    python tests/benchmark_optimizations.py --show-history               # Show saved history
+    python benchmarks/bench_regression.py                              # Standard benchmark
+    python benchmarks/bench_regression.py --quick                      # Fast smoke test
+    python benchmarks/bench_regression.py --save --note "description"  # Save with note
+    python benchmarks/bench_regression.py --forward-only               # Forward pass only
+    python benchmarks/bench_regression.py --roofline                   # Roofline analysis
+    python benchmarks/bench_regression.py --show-history               # Show saved history
 """
 
 import os
@@ -27,6 +27,11 @@ import torch
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
+
+from benchmarks._bench_utils import (
+    create_inputs, benchmark_fn, get_gpu_specs,
+    calc_forward_flops, calc_backward_flops, estimate_forward_bytes,
+)
 
 RESULTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark_history.jsonl")
 
@@ -61,111 +66,6 @@ LARGE_CONFIGS = [
 ]
 
 
-# --- GPU Specs ---
-
-def get_gpu_specs() -> Dict:
-    """Get GPU specs for roofline analysis. Falls back to estimation from device properties."""
-    if not torch.cuda.is_available():
-        return {}
-
-    props = torch.cuda.get_device_properties(0)
-    name = props.name
-
-    known_gpus = {
-        "NVIDIA GeForce RTX 4080":       {"fp32_tflops": 48.7,  "mem_bw_gbs": 716.8},
-        "NVIDIA GeForce RTX 4080 SUPER": {"fp32_tflops": 52.0,  "mem_bw_gbs": 736.3},
-        "NVIDIA GeForce RTX 4090":       {"fp32_tflops": 82.6,  "mem_bw_gbs": 1008.0},
-        "NVIDIA GeForce RTX 3090":       {"fp32_tflops": 35.6,  "mem_bw_gbs": 936.2},
-        "NVIDIA GeForce RTX 3080":       {"fp32_tflops": 29.8,  "mem_bw_gbs": 760.3},
-        "NVIDIA A100-SXM4-40GB":         {"fp32_tflops": 19.5,  "mem_bw_gbs": 1555.0},
-        "NVIDIA A100-SXM4-80GB":         {"fp32_tflops": 19.5,  "mem_bw_gbs": 2039.0},
-        "NVIDIA H100":                   {"fp32_tflops": 51.2,  "mem_bw_gbs": 3350.0},
-    }
-
-    specs = known_gpus.get(name)
-    if specs is None:
-        for gpu_name, gpu_specs in known_gpus.items():
-            if gpu_name in name or name in gpu_name:
-                specs = gpu_specs
-                break
-
-    if specs is None:
-        clock_ghz = props.clock_rate / 1e6
-        cuda_cores = props.multi_processor_count * 128
-        fp32_tflops = cuda_cores * 2 * clock_ghz / 1000
-        mem_bw_gbs = props.total_memory / 1e9 * 10
-        specs = {"fp32_tflops": round(fp32_tflops, 1), "mem_bw_gbs": round(mem_bw_gbs, 1)}
-
-    return {
-        "name": name,
-        "sm_count": props.multi_processor_count,
-        "total_memory_gb": round(props.total_memory / 1e9, 2),
-        "fp32_tflops": specs["fp32_tflops"],
-        "mem_bw_gbs": specs["mem_bw_gbs"],
-    }
-
-
-# --- FLOP / Bandwidth Estimation ---
-
-def estimate_forward_flops(B: int, H: int, N: int, D: int) -> Dict:
-    gather = B * H * N**3 * (4 * D + 3)
-    scatter = B * H * N**3 * (4 * D + 5)
-    total = 3 * gather + 3 * scatter
-    return {"total": total, "total_gflops": total / 1e9}
-
-
-def estimate_backward_flops(B: int, H: int, N: int, D: int) -> Dict:
-    v_grad = 6 * B * H * N**3 * 4 * D
-    jacobian = B * H * N**3 * 24 * D
-    qrs_grad = 3 * B * H * N**3 * 24 * D
-    total = v_grad + jacobian + qrs_grad
-    return {"total": total, "total_gflops": total / 1e9}
-
-
-def estimate_forward_bytes(B: int, H: int, N: int, D: int) -> Dict:
-    input_bytes = 9 * B * H * N * D * 4
-    output_bytes = 6 * B * H * N * D * 4 + 6 * B * H * N * 4
-    total = input_bytes + output_bytes
-    return {"total_bytes": total, "total_mb": total / 1e6}
-
-
-# --- Timing ---
-
-def benchmark_fn(fn, args, warmup=5, iters=20):
-    """Benchmark using CUDA events. Returns (median_ms, all_times_ms)."""
-    for _ in range(warmup):
-        fn(*args)
-    torch.cuda.synchronize()
-
-    times = []
-    for _ in range(iters):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        fn(*args)
-        end.record()
-        torch.cuda.synchronize()
-        times.append(start.elapsed_time(end))
-
-    times.sort()
-    return times[len(times) // 2], times
-
-
-def create_inputs(B, H, N, D, device="cuda"):
-    torch.manual_seed(42)
-    return {
-        "Q":    torch.randn(B, H, N, D, device=device, dtype=torch.float32),
-        "R":    torch.randn(B, H, N, D, device=device, dtype=torch.float32),
-        "S":    torch.randn(B, H, N, D, device=device, dtype=torch.float32),
-        "Vq_1": torch.randn(B, H, N, D, device=device, dtype=torch.float32),
-        "Vq_2": torch.randn(B, H, N, D, device=device, dtype=torch.float32),
-        "Vr_1": torch.randn(B, H, N, D, device=device, dtype=torch.float32),
-        "Vr_2": torch.randn(B, H, N, D, device=device, dtype=torch.float32),
-        "Vs_1": torch.randn(B, H, N, D, device=device, dtype=torch.float32),
-        "Vs_2": torch.randn(B, H, N, D, device=device, dtype=torch.float32),
-    }
-
-
 # --- Benchmark Runners ---
 
 def benchmark_forward(cuda_ext, ref_ext, config: BenchConfig, warmup=5, iters=20):
@@ -173,26 +73,8 @@ def benchmark_forward(cuda_ext, ref_ext, config: BenchConfig, warmup=5, iters=20
     B, H, N, D = config.B, config.H, config.N, config.D
     inputs = create_inputs(B, H, N, D)
 
-    def run_cuda():
-        return cuda_ext.forward(
-            inputs["Q"], inputs["R"], inputs["S"],
-            inputs["Vq_1"], inputs["Vq_2"],
-            inputs["Vr_1"], inputs["Vr_2"],
-            inputs["Vs_1"], inputs["Vs_2"],
-            0.0
-        )
-
-    def run_ref():
-        return ref_ext.forward(
-            inputs["Q"], inputs["R"], inputs["S"],
-            inputs["Vq_1"], inputs["Vq_2"],
-            inputs["Vr_1"], inputs["Vr_2"],
-            inputs["Vs_1"], inputs["Vs_2"],
-            0.0
-        )
-
-    cuda_ms, cuda_times = benchmark_fn(run_cuda, [], warmup=warmup, iters=iters)
-    ref_ms, ref_times = benchmark_fn(run_ref, [], warmup=warmup, iters=iters)
+    cuda_ms, cuda_times = benchmark_fn(lambda: cuda_ext.forward(*inputs, 0.0), warmup=warmup, iters=iters)
+    ref_ms, ref_times = benchmark_fn(lambda: ref_ext.forward(*inputs, 0.0), warmup=warmup, iters=iters)
 
     return {
         "cuda_median_ms": round(cuda_ms, 3),
@@ -209,40 +91,23 @@ def benchmark_backward(cuda_ext, ref_ext, config: BenchConfig, warmup=5, iters=2
     inputs = create_inputs(B, H, N, D)
     grad_output = torch.randn(B, H, N, D, device="cuda", dtype=torch.float32)
 
-    fwd_out = cuda_ext.forward(
-        inputs["Q"], inputs["R"], inputs["S"],
-        inputs["Vq_1"], inputs["Vq_2"],
-        inputs["Vr_1"], inputs["Vr_2"],
-        inputs["Vs_1"], inputs["Vs_2"],
-        0.0
-    )
+    fwd_out = cuda_ext.forward(*inputs, 0.0)
     m_i, l_i, m_j, l_j, m_k, l_k = fwd_out[6:12]
 
     def run_cuda_backward():
         return cuda_ext.backward(
-            grad_output,
-            inputs["Q"], inputs["R"], inputs["S"],
-            inputs["Vq_1"], inputs["Vq_2"],
-            inputs["Vr_1"], inputs["Vr_2"],
-            inputs["Vs_1"], inputs["Vs_2"],
-            m_i, l_i, m_j, l_j, m_k, l_k,
-            0.0
+            grad_output, *inputs,
+            m_i, l_i, m_j, l_j, m_k, l_k, 0.0
         )
 
     def run_ref_backward():
-        ref_inputs = {k: v.detach().clone().requires_grad_(True) for k, v in inputs.items()}
-        ref_out = ref_ext.forward(
-            ref_inputs["Q"], ref_inputs["R"], ref_inputs["S"],
-            ref_inputs["Vq_1"], ref_inputs["Vq_2"],
-            ref_inputs["Vr_1"], ref_inputs["Vr_2"],
-            ref_inputs["Vs_1"], ref_inputs["Vs_2"],
-            0.0
-        )
+        ref_inputs = [t.detach().clone().requires_grad_(True) for t in inputs]
+        ref_out = ref_ext.forward(*ref_inputs, 0.0)
         total = sum(o.sum() for o in ref_out)
         total.backward()
 
-    cuda_ms, cuda_times = benchmark_fn(run_cuda_backward, [], warmup=warmup, iters=iters)
-    ref_ms, ref_times = benchmark_fn(run_ref_backward, [], warmup=warmup, iters=iters)
+    cuda_ms, cuda_times = benchmark_fn(run_cuda_backward, warmup=warmup, iters=iters)
+    ref_ms, ref_times = benchmark_fn(run_ref_backward, warmup=warmup, iters=iters)
 
     return {
         "cuda_median_ms": round(cuda_ms, 3),
@@ -259,29 +124,29 @@ def roofline_analysis(config: BenchConfig, actual_fwd_ms: float, actual_bwd_ms: 
                       gpu_specs: Dict) -> Dict:
     B, H, N, D = config.B, config.H, config.N, config.D
 
-    fwd_flops = estimate_forward_flops(B, H, N, D)
-    bwd_flops = estimate_backward_flops(B, H, N, D)
+    fwd_flops = calc_forward_flops(B, H, N, D)
+    bwd_flops = calc_backward_flops(B, H, N, D)
     fwd_bytes = estimate_forward_bytes(B, H, N, D)
 
     peak_flops = gpu_specs["fp32_tflops"] * 1e12
     peak_bw = gpu_specs["mem_bw_gbs"] * 1e9
 
-    fwd_compute_min_s = fwd_flops["total"] / peak_flops
+    fwd_compute_min_s = fwd_flops / peak_flops
     fwd_memory_min_s = fwd_bytes["total_bytes"] / peak_bw
     fwd_roofline_ms = max(fwd_compute_min_s, fwd_memory_min_s) * 1000
 
-    bwd_compute_min_s = bwd_flops["total"] / peak_flops
+    bwd_compute_min_s = bwd_flops / peak_flops
     bwd_roofline_ms = bwd_compute_min_s * 1000
 
     return {
         "forward": {
-            "total_gflops": fwd_flops["total_gflops"],
+            "total_gflops": fwd_flops / 1e9,
             "roofline_ms": round(fwd_roofline_ms, 4),
             "actual_ms": round(actual_fwd_ms, 3),
             "efficiency_pct": round(fwd_roofline_ms / max(actual_fwd_ms, 0.001) * 100, 1),
         },
         "backward": {
-            "total_gflops": bwd_flops["total_gflops"],
+            "total_gflops": bwd_flops / 1e9,
             "roofline_ms": round(bwd_roofline_ms, 4),
             "actual_ms": round(actual_bwd_ms, 3),
             "efficiency_pct": round(bwd_roofline_ms / max(actual_bwd_ms, 0.001) * 100, 1),
