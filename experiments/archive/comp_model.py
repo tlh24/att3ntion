@@ -11,16 +11,14 @@ import sys
 from pathlib import Path
 current_script_path = Path(__file__).resolve()
 script_dir = str(current_script_path.parent)
-parent_dir_str = str(current_script_path.parent.parent)
-if script_dir not in sys.path:
-    sys.path.insert(0, script_dir)
-if parent_dir_str not in sys.path:
-    sys.path.insert(0, parent_dir_str)
+compositional_dir = str(current_script_path.parent.parent / 'compositional')
+project_root = str(current_script_path.parent.parent.parent)
+for d in [script_dir, compositional_dir, project_root]:
+    if d not in sys.path:
+        sys.path.insert(0, d)
 
 from att3ntion import _HypergraphAttentionNaive, _GraphAttentionNaive, QuickGELU
-# from att3ntion import HypergraphAttention
 from gen_data_comp import genData1, genData2, genData3, genData5
-import pdb
 
 class SimpleCompModel(nn.Module):
 	"""Model with hypergraph attention layer."""
@@ -275,8 +273,7 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 		device = torch.device(device)
 	
 	print(f"Using device: {device}")
-	pdb.set_trace()
-	data = genData4(batch_size * 100, modulo, do_print=False)
+	data = genData1(batch_size * 100, modulo, do_print=False)
 	dataset = TensorDataset(torch.tensor(data))
 	train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 

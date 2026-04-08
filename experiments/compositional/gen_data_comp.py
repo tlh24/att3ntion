@@ -1,8 +1,6 @@
 import numpy as np
-import matplotlib.pyplot as plt
 import random
 import math
-import pdb
 
 def randint(k):
 	return np.random.randint(k)
@@ -204,6 +202,7 @@ def genData3(bs, do_print=False, validation=False):
 	return x,y
 
 def plotData3():
+	import matplotlib.pyplot as plt
 	x,y = genData3(800, do_print=False) # Test
 	bs = 3
 	x,y = genData3(bs, do_print=True)
@@ -404,29 +403,24 @@ def genData4(bs, do_print=False, validation=False):
 	y = np.zeros_like(x)
 	exp_gen = ExpressionGeneratorDepth(5, 7) # NOTE!!!
 	for b in range(bs):
-<<<<<<< HEAD
 		pos_enc = graycodePosEnc(ntok, nbits, rand_phase=True)
 		tries = 16
 		cnt = 0
 		while tries > 0:
-			# could do a much better packing alg ..meh
 			val = 0
 			while val == 0:
 				tree = exp_gen.generate()
 				val = tree.evaluate(md)
-			# pos_enc_permute = rng.permutation(pos_enc, axis=0)
-			# pos_enc_permute = np.copy(pos_enc)
 			n = tree.count()
-			result = tree.evaluate(md) # sets internal values of the ops
-			if n + 1 + cnt < 32 and result > 0 and result < md-1: # one spot for the result
-				tree.setLocRec(cnt) # also resets eval.
+			result = tree.evaluate(md)
+			if n + 1 + cnt < 32 and result > 0 and result < md-1:
+				tree.setLocRec(cnt)
 				if do_print:
 					print(f"[{b}] expr:", tree)
 					print(f"[{b}] res loc :", tree.printLoc())
 					print(f"[{b}] ploc:", tree.printParentLoc(tree.getLoc()))
 				tree.encode(md, x, b, pos_enc)
-				# encode the result
-				result = tree.evaluate(md) # sets internal values of the ops
+				result = tree.evaluate(md)
 				if do_print:
 					print(f"[{b}] res: ", result)
 				tree.encode(md, y, b, pos_enc)
@@ -436,36 +430,12 @@ def genData4(bs, do_print=False, validation=False):
 				y[b, cnt, 4] = 1
 				y[b, cnt, result+5] = 1
 				y[b, cnt, md+5:md+5+8] = pos_enc[cnt]
-				y[b, cnt, md+5+8:md+5+16] = pos_enc[tree.getLoc()] # predict this!
 				cnt += 1
 			else:
 				tries -= 1
-=======
-		tree = exp_gen.generate()
-		tree.setLocRec(0)
-		if do_print:
-			print("expr:", tree)
-			print("loc :", tree.printLoc())
-			print("ploc:", tree.printParentLoc(ntok-1))
-		# pos_enc_permute = rng.permutation(pos_enc, axis=0)
-		# pos_enc_permute = np.copy(pos_enc)
-		for i in range(4):
-			freq = 2**(i/3)
-			rand_phase = np.random.uniform(0, 3.1415926*2)
-			pos_enc[:, 2*i  ] = np.sin(indx * freq + rand_phase)
-			pos_enc[:, 2*i+1] = np.cos(indx * freq + rand_phase)
-		tree.encode(md, x, b, pos_enc)
-		# encode the result
-		result = tree.evaluate(md)
-		if do_print:
-			print("res: ", result)
-		x[b, -1, 4] = 1
-		x[b, -1, result+5] = 1
-		x[b, -1, md+5:md+5+8] = pos_enc[-1]
-		x[b, -1, md+5+8:md+5+16] = pos_enc[tree.getLoc()]
->>>>>>> d000bb9c033a4f40bde6c0ae7ab7a0ed626e34a4
 
-	return x
+	x[:, :, md+5+8:] = 0
+	return x,y
 
 def genData5(bs,md, do_print):
 	'''
@@ -528,29 +498,268 @@ def genData5(bs,md, do_print):
 		y[b, :, 8:16] += noizp
 	return x, y
 
+def genData6(bs, do_print):
+	'''
+	train the network to accurately multiply two one-digit
+	base 16 numbers.  Yes, the computer can do trillions of these things per sec .. this is super inefficient.  But.
+	'''
+	md = 8 + 16 + 8 # one-hot indicators, digits, pointer, [posenc]
+	ntok = 8
+	nbits = 4
+
+	pos_enc = graycodePosEnc(ntok, nbits, rand_phase=False)
+	x = np.zeros((bs, ntok, md + nbits*2), dtype=np.float32)
+	y = np.zeros_like(x)
+	x[:, :, -nbits*2:] = pos_enc
+	y[:, :, -nbits*2:] = pos_enc
+
+	for b in range(bs):
+		va = randint(16)
+		vb = randint(16)
+		op = randint(2)
+		if op == 0:
+			vc = va + vb
+		else:
+			vc = va*vb
+		vc0 = vc % 16
+		vc1 = vc // 16
+		def encode(tok, val):
+			x[b, tok, 0] = 1.0
+			x[b, tok, val] += 1.0
+		encode(0, va + 8)
+		encode(1, 1+op*2) # +-*/=?() -> 12345678
+		encode(2, vb + 8)
+		encode(3, 5) # =
+		encode(4, 6) # ? (result)
+
+		def encodeY(tok, val):
+			y[b, tok, 0] = 1.0
+			y[b, tok, val] += 1.0
+		encodeY(4, vc0 + 8)
+		if vc1 > 0:
+			y[b, 4, 24:32] = y[b, 5, 32:40]
+			encodeY(5, vc1 + 8)
+		if do_print:
+			print(f"{va} * {vb} = {vc} = 0x{vc1:x}{vc0:x}")
+	return x, y
+
+class Encoder:
+	'''
+	Helper class for genData7: encodes individual values/symbols
+	or encodes lists of values with optional parent pointers.
+	'''
+	def __init__(self, ntok, nbits, do_print):
+		self.tok_ctr = 0
+		self.vert_ctr = 0
+		self.horiz_ctr = np.zeros(16, dtype=int)
+		self.pos_enc = graycodePosEnc(ntok, nbits, rand_phase=False)
+		self.nbits = nbits
+		self.do_print = do_print
+
+	def encode(self, z, b, val, pos_space):
+		if type(val) == str:
+			dic = [' ','+','-','*','/','=','?','(',')','sl1','sl2','$']
+			v = dic.index(val)
+		else:
+			v = val + 16
+		z[b, self.tok_ctr, 0] = 1.0
+		z[b, self.tok_ctr, v] = 1.0
+		pos = self.horiz_ctr[pos_space]
+		nb = self.nbits
+		z[b, self.tok_ctr, -nb*2:] = self.pos_enc[pos, :]
+		z[b, self.tok_ctr, -nb*4:-nb*2] = self.pos_enc[pos_space, :]
+		self.tok_ctr += 1
+		self.horiz_ctr[pos_space] += 1
+		if self.do_print:
+			if type(val) == str:
+				print(val, end=' ')
+			else:
+				print(f'{val:x}', end=' ')
+
+	def encodePtr(self, z, b, val, lparent, rparent, pos_space):
+		if type(val) == str:
+			dic = [' ','+','-','*','/','=','?','(',')','sl1','sl2','$']
+			v = dic.index(val)
+		else:
+			v = val + 16
+		z[b, self.tok_ctr, 0] = 1.0
+		z[b, self.tok_ctr, v] = 1.0
+		pos = self.horiz_ctr[pos_space]
+		nb = self.nbits
+		z[b, self.tok_ctr, -nb*2:] = self.pos_enc[pos, :]
+		z[b, self.tok_ctr, -nb*4:-nb*2] = self.pos_enc[pos_space, :]
+		z[b, self.tok_ctr, -nb*6 :-nb*4 ] = self.pos_enc[lparent[0], :]
+		z[b, self.tok_ctr, -nb*8 :-nb*6 ] = self.pos_enc[lparent[1], :]
+		z[b, self.tok_ctr, -nb*10:-nb*8 ] = self.pos_enc[rparent[0], :]
+		z[b, self.tok_ctr, -nb*12:-nb*10] = self.pos_enc[rparent[1], :]
+		self.tok_ctr += 1
+		self.horiz_ctr[pos_space] += 1
+		if self.do_print:
+			if type(val) == str:
+				print(val, end=' ')
+			else:
+				print(f'{val:x}', end=' ')
+
+	def encodeList(self, z, b, val_list):
+		if self.do_print:
+			print(f"{self.vert_ctr}: ", end='')
+		for val in val_list:
+			self.encode(z, b, val, self.vert_ctr)
+		if self.do_print:
+			print(" ")
+		self.vert_ctr += 1
+
+	def encodeListPtrs(self, z, b, val_list, lparents, rparents):
+		if self.do_print:
+			print(f"{self.vert_ctr}: ", end='')
+		for i in range(len(val_list)):
+			self.encodePtr(z, b, val_list[i], lparents[i], rparents[i], self.vert_ctr)
+		if self.do_print:
+			print(lparents, rparents)
+		self.vert_ctr += 1
+
+def genData7(bs, do_print=False, validation=False):
+	'''
+	Train a network to do long addition with carries,
+	writing multiple tokens per pass (multiple single-digit adds in parallel),
+	followed by ripple carry accumulation over multiple steps.
+	Uses argument pointers (absolute token locations).
+	Train with arguments 1-4 hex digits, test on 4 digit arithmetic.
+	'''
+	nop = 16
+	ntok = 52
+	nbits = 8
+
+	md = nop + 16 + (nbits*2)*2*(1+2)
+	x = np.zeros((bs, ntok, md), dtype=np.float32)
+	y = np.zeros_like(x)
+
+	def encHex(lst, val, ndigits=0):
+		va0 = val & 0xf
+		va1 = (val >> 4) & 0xf
+		va2 = (val >> 8) & 0xf
+		va3 = (val >> 12) & 0xf
+		va4 = (val >> 16) & 0xf
+		va5 = (val >> 20) & 0xf
+		pos = len(lst)
+		lst_pos = []
+		lst.append(va0)
+		lst_pos.append(pos)
+		pos += 1
+		if val >= 16 or ndigits >= 2:
+			lst.append(va1)
+			lst_pos.append(pos)
+			pos += 1
+		if val >= 256 or ndigits >= 3:
+			lst.append(va2)
+			lst_pos.append(pos)
+			pos += 1
+		if val >= 4096 or ndigits >= 4:
+			lst.append(va3)
+			lst_pos.append(pos)
+			pos += 1
+		if val >= 65536 or ndigits >= 5:
+			lst.append(va4)
+			lst_pos.append(pos)
+			pos += 1
+		if val >= 65536*16 or ndigits >= 6:
+			lst.append(va5)
+			lst_pos.append(pos)
+			pos += 1
+		return lst
+
+	for b in range(bs):
+		enc = Encoder(ntok, nbits, do_print)
+		x[b, :, -nbits*2:] = enc.pos_enc
+		x[b, :, -nbits*4:-nbits*2] = enc.pos_enc[0,:]
+
+		na = randint(4) + 1
+		nb = randint(4) + 1
+		if validation:
+			na = 4
+			nb = 4
+		va = randint(16**na)
+		vb = randint(16**nb)
+		lst = []
+		lst = [0]
+		lst = encHex(lst, va, ndigits=na)
+		lst.append('+')
+		lst = encHex(lst, vb, ndigits=nb)
+		lst.append('=')
+		enc.encodeList(x, b, lst)
+		ndigits = max(na, nb)
+		numsteps = 4 + 2*(ndigits-1)
+		step = b % numsteps
+
+		vc0 = []
+		vc1 = []
+		vo = []
+		def encodeStep(enc, z, i):
+			nonlocal x, y, b, vc0, vc1, vo
+			if i == 0:
+				ops = ['+' for _ in range(ndigits)]
+				lparent = [(0,i+1) for i in range(na)]
+				lparent.extend([(0,0) for _ in range(ndigits-na)])
+				rparent = [(0,na+i+2) for i in range(nb)]
+				rparent.extend([(0,0) for _ in range(ndigits-nb)])
+				enc.encodeListPtrs(z, b, ops, lparent, rparent)
+			if i == 1:
+				vc0_ = []
+				vc1_ = []
+				for j in range(ndigits):
+					vc = ((va >> 4*j) & 0xf) + ((vb >> 4*j) & 0xf)
+					vc0_.append(vc & 0xf)
+					vc1_.append((vc >> 4) & 0xf)
+				lparent = [(1,i) for i in range(ndigits)]
+				rparent = [(0,0) for _ in range(ndigits)]
+				enc.encodeListPtrs(z, b, vc0_, lparent, rparent)
+				rparent = [(2,i) for i in range(ndigits)]
+				enc.encodeListPtrs(z, b, vc1_, lparent, rparent)
+				vc0.append(vc0_)
+				vc1.append(vc1_)
+			if i >= 2 and i < 2 + 2*(ndigits-1):
+				vc0_ = []
+				vc1_ = []
+				ci = (i - 2)//2
+				if i % 2 == 0:
+					ops = ['+' for _ in range(ndigits-ci-1)]
+					lparent = [(2+3*ci,i+1) for i in range(ndigits-ci-1)]
+					rparent = [(3+3*ci,i) for i in range(ndigits-ci-1)]
+					enc.encodeListPtrs(z, b, ops, lparent, rparent)
+				else:
+					for j in range(ndigits-ci-1):
+						vc = vc0[ci][j+1] + vc1[ci][j]
+						vc0_.append(vc & 0xf)
+						vc1_.append((vc >> 4) & 0xf)
+					lparent = [(4+3*ci,i) for i in range(ndigits-ci-1)]
+					rparent = [(0,0) for _ in range(ndigits-ci-1)]
+					enc.encodeListPtrs(z, b, vc0_, lparent, rparent)
+					rparent = [(5+3*ci,i) for i in range(ndigits-ci-1)]
+					enc.encodeListPtrs(z, b, vc1_, lparent, rparent)
+					vc0.append(vc0_)
+					vc1.append(vc1_)
+			if i == 2 + 2*(ndigits-1):
+				ops = ['$' for _ in range(ndigits+1)]
+				lparent = [(2+i*3,0) for i in range(ndigits)]
+				lparent.append((3,ndigits-1))
+				rparent = [(0,0) for _ in range(ndigits+1)]
+				enc.encodeListPtrs(z, b, ops, lparent, rparent)
+			if i == 3 + 2*(ndigits-1):
+				vo = [vc0[i][0] for i in range(ndigits)]
+				vo.append(vc1[0][ndigits-1])
+				lparent = [(ndigits*3+1,i) for i in range(ndigits+1)]
+				rparent = [(0,0) for _ in range(ndigits+1)]
+				enc.encodeListPtrs(z, b, vo, lparent, rparent)
+
+		for i in range(step):
+			encodeStep(enc, x, i)
+		encodeStep(enc, y, step)
+
+	return x, y
+
 
 if __name__ == '__main__':
-	# genData1(15, 19, True)
-	# genData2(15, 19, True)
-
-	# x = genData3(4, 19)
-	# print(x.shape)
-	# fig,axs = plt.subplots(2,2)
-	# for i in range(4):
-	# 	j = i // 2
-	# 	k = i % 2
-	# 	axs[j,k].imshow(np.squeeze(x[i,...]))
-	# plt.show()
-
-	# x = genData4(800, 11, do_print=False) # Test
-	# x = genData4(8, 11, do_print=True)
-	# print(x.shape)
-	# fig,axs = plt.subplots(4,2)
-	# for i in range(8):
-	# 	j = i // 2
-	# 	k = i % 2
-	# 	axs[j,k].imshow(np.squeeze(x[i,...]))
-	# plt.show()
+	import matplotlib.pyplot as plt
 
 	x,y = genData5(2, 24-8, do_print=True)
 	print(x.shape)

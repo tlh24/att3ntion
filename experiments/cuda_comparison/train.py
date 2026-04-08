@@ -13,100 +13,17 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from pathlib import Path
 
-# Add parent directory to path
+# Add script dir, compositional dir, and project root to path
 current_script_path = Path(__file__).resolve()
 script_dir = str(current_script_path.parent)
-parent_dir_str = str(current_script_path.parent.parent)
-if script_dir not in sys.path:
-    sys.path.insert(0, script_dir)
-if parent_dir_str not in sys.path:
-    sys.path.insert(0, parent_dir_str)
+experiments_dir = str(current_script_path.parent.parent)
+project_root = str(current_script_path.parent.parent.parent)
+for d in [script_dir, experiments_dir, project_root]:
+    if d not in sys.path:
+        sys.path.insert(0, d)
 
 from att3ntion import HypergraphAttention, _HypergraphAttentionTorch, QuickGELU
-
-
-# Data generation functions (copied from gen_data_comp.py to avoid matplotlib import)
-def randint(k):
-    return np.random.randint(k)
-
-def modOp(va, vb, op, md):
-    vc0 = (va + vb) % md
-    vc1 = (va - vb) % md
-    vc2 = (va * vb) % md
-    if vb == 0:
-        vc3 = 0
-    else:
-        vc3 = (va // vb) % md
-    
-    match op:
-        case 0:
-            vc = vc0
-            ops = '+'
-        case 1:
-            vc = vc1
-            ops = '-'
-        case 2:
-            vc = vc2
-            ops = '*'
-        case 3:
-            vc = vc3
-            ops = '/'
-    return vc, ops
-
-def genData1(bs, md, do_print=False):
-    '''Task 1: learn the rules of modulo arithmetic.'''
-    assert(md < 32-4)
-    x = np.zeros((bs, 4, 32), dtype=int)
-    
-    for b in range(bs):
-        va = randint(md)
-        vb = randint(md)
-        op = np.random.randint(4)
-        vc, ops = modOp(va, vb, op, md)
-        
-        x[b,0,va+4] = 1
-        x[b,1,op  ] = 1
-        x[b,2,vb+4] = 1
-        x[b,3,vc+4] = 1
-        
-        if do_print:
-            print(f"{va} {ops} {vb} = {vc}")
-    return x
-
-def genData2(bs, md, do_print=False):
-    '''Task 2: learn to compose arithmetic. out = (a op b) op (c op d)'''
-    assert(md < 32-4)
-    x = np.zeros((bs, 12, 32), dtype=int)
-    
-    for b in range(bs):
-        va = randint(md)
-        vb = randint(md)
-        vc = randint(md)
-        vd = randint(md)
-        op1 = np.random.randint(4)
-        op2 = np.random.randint(4)
-        op3 = np.random.randint(4)
-        
-        ve, ops1 = modOp(va, vb, op1, md)
-        vf, ops2 = modOp(vc, vd, op2, md)
-        vg, ops3 = modOp(ve, vf, op3, md)
-        
-        x[b,0,va+4] = 1
-        x[b,1,op1 ] = 1
-        x[b,2,vb+4] = 1
-        x[b,3,ve+4] = 1
-        x[b,4,vc+4] = 1
-        x[b,5,op2 ] = 1
-        x[b,6,vd+4] = 1
-        x[b,7,vf+4] = 1
-        x[b,8,ve+4] = 1
-        x[b,9,op3 ] = 1
-        x[b,10,vf+4] = 1
-        x[b,11,vg+4] = 1
-        
-        if do_print:
-            print(f"({va} {ops1} {vb}) {ops3} ({vc} {ops2} {vd}) = {ve} {ops3} {vf} = {vg}")
-    return x
+from compositional.gen_data_comp import genData1, genData2
 
 
 class CompModelComparison(nn.Module):

@@ -6,23 +6,17 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from torch.amp import autocast
 import torch.nn.functional as F
-from rotary_embedding_torch import RotaryEmbedding
-import matplotlib.pyplot as plt
-
 import sys
 from pathlib import Path
 current_script_path = Path(__file__).resolve()
 script_dir = str(current_script_path.parent)
-parent_dir_str = str(current_script_path.parent.parent)
-if script_dir not in sys.path:
-    sys.path.insert(0, script_dir)
-if parent_dir_str not in sys.path:
-    sys.path.insert(0, parent_dir_str)
+project_root = str(current_script_path.parent.parent.parent)
+for d in [script_dir, project_root]:
+    if d not in sys.path:
+        sys.path.insert(0, d)
 
 from att3ntion import _HypergraphAttentionNaive, _GraphAttentionNaive, QuickGELU
-# from att3ntion import HypergraphAttention
 from gen_data_comp import genData3, genData4, genData7
-import pdb
 
 class SwiGLU(nn.Module):
 	"""
@@ -43,7 +37,6 @@ class SimpleCompModel(nn.Module):
 		super().__init__()
 		self.input_dim = input_dim
 		self.embedding_proj = nn.Linear(self.input_dim, hidden_dim)
-		self.rotary_emb = RotaryEmbedding(dim = hidden_dim)
 		self.attn_impl = attn_impl
 		self.n_recurse = n_recurse
 		self.d_model = hidden_dim

@@ -11,22 +11,20 @@ import sys
 from pathlib import Path
 current_script_path = Path(__file__).resolve()
 script_dir = str(current_script_path.parent)
-parent_dir_str = str(current_script_path.parent.parent)
-if script_dir not in sys.path:
-    sys.path.insert(0, script_dir)
-if parent_dir_str not in sys.path:
-    sys.path.insert(0, parent_dir_str)
+compositional_dir = str(current_script_path.parent.parent / 'compositional')
+project_root = str(current_script_path.parent.parent.parent)
+for d in [script_dir, compositional_dir, project_root]:
+    if d not in sys.path:
+        sys.path.insert(0, d)
 
 from att3ntion import _HypergraphAttentionNaive, _GraphAttentionNaive, QuickGELU
-# from att3ntion import HypergraphAttention
-from gen_data_comp import genData6
-import pdb
+from gen_data_comp import genData5
 
 class SimpleCompModel(nn.Module):
 	"""Model with hypergraph attention layer."""
 	def __init__(self, hidden_dim:int, num_heads:int, n_layers:int, attn_impl:str='', n_recurse:int=1, modulo:int=11):
 		super().__init__()
-		self.input_dim = 40
+		self.input_dim = 24
 		self.embedding_proj = nn.Linear(self.input_dim, hidden_dim)
 		self.rotary_emb = RotaryEmbedding(dim = hidden_dim)
 		self.attn_impl = attn_impl
@@ -63,16 +61,6 @@ class SimpleCompModel(nn.Module):
 		x = self.embedding_proj(x)
 
 		for r in range(self.n_recurse):
-			'''allocation module:
-			each token has access to one extra token per
-			full pass through the network.
-			'''
-			with torch.no_grad():
-				decode = self.output_proj(x)
-				# decode the least active tokens from the first index
-				# of the decoded latents.
-				indx = torch.sort(decode[:,:,0].squeeze(), dim=-1, descending=False)
-				indx = indx
 			for layer_block in self.repeated_layers:
 				# attn_output = layer_block['attention'](x, self.rotary_emb)
 				attn_output = layer_block['attention'](x, None)
@@ -125,11 +113,11 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 	
 	print(f"Using device: {device}")
 	
-	x, y = genData6(batch_size * 1000, do_print=False)
+	x, y = genData5(batch_size * 1000, modulo, do_print=False)
 	dataset = TensorDataset(torch.tensor(x), torch.tensor(y))
 	train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-	x_v, y_v = genData6(batch_size * 1000, do_print=False)
+	x_v, y_v = genData5(batch_size * 1000, modulo, do_print=False)
 	dataset_v = TensorDataset(torch.tensor(x_v), torch.tensor(y_v))
 	loader_v = DataLoader(dataset_v, batch_size=batch_size, shuffle=True)
 
@@ -144,17 +132,16 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 	except:
 		print("train_model1: could not load the saved model weights")
 	optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, amsgrad=True)
-	criterion_ce = nn.CrossEntropyLoss(reduction='none')
+	criterion_ce = nn.CrossEntropyLoss() # NOTE
 	criterion_mse = nn.MSELoss()
 	model.printParamCount()
-	model = torch.compile(model) # mode="max-autotune"
 
 	bf16_supported = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
 	print(f"Bfloat16 supported: {bf16_supported}")
 	print("--- Running with Automatic Mixed Precision ---")
 
 
-	fd_losslog = open(f'losslog_{attn_impl}.txt', 'w')
+	fd_losslog = open(f'losslog_trainModel1_{attn_impl}.txt', 'w')
 
 	print("\ntrain_model1 started...")
 	uu = 0
@@ -171,8 +158,6 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 		for batch_indx, (inputs_np,outputs_np) in enumerate(train_loader):
 			inputs = torch.FloatTensor(inputs_np).to(device)
 			targets = torch.FloatTensor(outputs_np).to(device)
-			value_targets = torch.FloatTensor(outputs_np[:, 4:6, 8:24]).to(device)
-			value_targets = value_targets.permute(0, 2, 1) # for cross eentropy loss - it measures CE over axis 1
 
 			if batch_indx % 100 == 0:
 				start_event.record()
@@ -180,8 +165,7 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 
 			with autocast('cuda', dtype=torch.bfloat16):
 				pred = model(inputs)
-				loss = criterion_mse(pred[:,4:6,-16:], targets[:,4:6,-16:])
-				loss += torch.mean(criterion_ce(pred[:,4:6,8:24].permute(0,2,1), value_targets) * targets[:, 4:6, 0]) # mask off unused tokens
+				loss = criterion_mse(pred, targets)
 
 			loss.backward()
 			optimizer.step()
@@ -227,7 +211,7 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 			plt.show()
 
 		# save after each epoch
-		model.save_model(f"comp_model_{args.attn}.pt")
+		model.save_model(f"comp_model_{args.attn_impl}.pt")
 
 	# validation!
 	total_loss = 0
@@ -235,16 +219,13 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 		for batch_indx, (inputs_np,outputs_np) in enumerate(loader_v):
 			inputs = torch.FloatTensor(inputs_np).to(device)
 			targets = torch.FloatTensor(outputs_np).to(device)
-			value_targets = torch.FloatTensor(outputs_np[:, 4:6, 8:24]).to(device)
-			value_targets = value_targets.permute(0, 2, 1) # for cross eentropy loss - it measures CE over axis 1
 
 			if batch_indx % 100 == 0:
 				start_event.record()
 
 			with autocast('cuda', dtype=torch.bfloat16):
 				pred = model(inputs)
-				loss = criterion_mse(pred[:,4:6,-16:], targets[:,4:6,-16:])
-				loss += torch.mean(criterion_ce(pred[:,4:6,8:24].permute(0,2,1), value_targets) * targets[:, 4:6, 0]) # mask off unused tokens
+				loss = criterion_mse(pred, targets)
 
 			if batch_indx % 100 == 0:
 				end_event.record()
@@ -275,20 +256,21 @@ if __name__ == '__main__':
 	parser.add_argument('--batch-size', type=int, default=32, help='Batch size for training')
 	parser.add_argument('--modulo', type=int, default=16, help='Modulo for arithmetic operations')
 	parser.add_argument('--hidden-dim', type=int, default=96, help='Hidden dimension size')
-	parser.add_argument('--heads', type=int, default=4, help='Number of attention heads')
-	parser.add_argument('--attn', type=str, default='hypergraph', choices=['hypergraph', 'graph'],
+	parser.add_argument('--num-heads', type=int, default=4, help='Number of attention heads')
+	parser.add_argument('--attn-impl', type=str, default='hypergraph', choices=['hypergraph', 'graph'],
 						help='Attention implementation to use')
 	args = parser.parse_args()
-
-	print("This script tests the graph and hypergraph transformer on a one-digit multiply task")
+	
+	# torch.manual_seed(42)
+	# np.random.seed(42)
 	
 	model = train_model1(
 		num_epochs=args.epochs,
 		device=args.device,
 		modulo=args.modulo,
 		hidden_dim=args.hidden_dim,
-		num_heads=args.heads,
-		attn_impl=args.attn,
+		num_heads=args.num_heads,
+		attn_impl=args.attn_impl,
 		batch_size=args.batch_size
 	)
 
