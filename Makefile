@@ -30,14 +30,14 @@ test: maybe-build
 	@echo "═══════════════════════════════════════════════════════════════"
 	@echo "CORRECTNESS: Quick tests"
 	@echo "═══════════════════════════════════════════════════════════════"
-	$(PYTHON) tests/test_all_kernels_equivalence.py --quick --continue-on-failure -v
+	$(PYTHON) tests/test_kernel_correctness.py --quick --continue-on-failure -v
 
 test-quiet: maybe-build
-	@$(PYTHON) tests/test_all_kernels_equivalence.py --quick --continue-on-failure 2>&1 | \
+	@$(PYTHON) tests/test_kernel_correctness.py --quick --continue-on-failure 2>&1 | \
 		(grep -E "(FAIL|Error|Exception|Traceback)" && exit 1 || echo "  ✓ All correctness tests passed")
 
 test-full: maybe-build
-	$(PYTHON) tests/test_all_kernels_equivalence.py --continue-on-failure -v
+	$(PYTHON) tests/test_kernel_correctness.py --continue-on-failure -v
 
 # --- Benchmarks ---
 

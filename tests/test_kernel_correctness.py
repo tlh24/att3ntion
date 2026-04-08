@@ -595,6 +595,19 @@ def print_summary(results: List[TestResult], verbose: bool = False):
             if fails > 0:
                 print(f"    D={d:>2}: {total-fails}/{total} passed")
 
+        print(f"\n  By B*H:")
+        bh_failures = defaultdict(int)
+        bh_totals = defaultdict(int)
+        for r in results:
+            bh = r.config.B * r.config.H
+            bh_failures[bh] += 0 if r.passed else 1
+            bh_totals[bh] += 1
+        for bh in sorted(bh_totals.keys()):
+            fails = bh_failures[bh]
+            total = bh_totals[bh]
+            if fails > 0:
+                print(f"    B*H={bh:>2}: {total-fails}/{total} passed")
+
     print("=" * 80)
     return failed == 0
 
@@ -619,6 +632,7 @@ def main():
     parser.add_argument('--continue-on-failure', action='store_true', help='Continue after failures')
     parser.add_argument('--max-n-backward', type=int, default=256, help='Max N for backward tests')
 
+    parser.add_argument('--filter', type=str, default=None, help='Filter configs by name substring')
     parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     parser.add_argument('--json', type=str, default=None, help='Save results to JSON')
 
@@ -638,6 +652,12 @@ def main():
             quick=True, standard=True,
             large=args.large, stress=args.stress, edge=args.edge
         )
+
+    if args.filter:
+        configs = [c for c in configs if args.filter.lower() in c.name.lower()]
+        if not configs:
+            print(f"No configs match filter '{args.filter}'")
+            sys.exit(1)
 
     print(f"Configs: {len(configs)} | Device: {device} | rtol={args.rtol}, atol={args.atol}")
     print("-" * 80)
