@@ -72,48 +72,93 @@ QUICK_CONFIGS = [
 ]
 
 STANDARD_CONFIGS = [
-    # Varying N (multiples of 32)
+    # Varying N (multiples of 32, full sweep)
     TestConfig("N32_D32",           B=1, H=2, N=32,  D=32),
     TestConfig("N64_D32",           B=1, H=2, N=64,  D=32),
     TestConfig("N96_D32",           B=1, H=2, N=96,  D=32),
     TestConfig("N128_D32",          B=1, H=2, N=128, D=32),
     TestConfig("N160_D32",          B=1, H=2, N=160, D=32),
     TestConfig("N192_D32",          B=1, H=2, N=192, D=32),
-    # Varying D (multiples of 32, max 64 due to shared memory)
-    TestConfig("N32_D32_",          B=1, H=2, N=32, D=32),
-    TestConfig("N32_D64",           B=1, H=2, N=32, D=64),
-    TestConfig("N64_D64",           B=1, H=2, N=64, D=64),
-    # Varying B
+    TestConfig("N224_D32",          B=1, H=2, N=224, D=32),
+    TestConfig("N256_D32",          B=1, H=2, N=256, D=32),
+    TestConfig("N288_D32",          B=1, H=2, N=288, D=32),
+    TestConfig("N320_D32",          B=1, H=2, N=320, D=32),
+    TestConfig("N352_D32",          B=1, H=2, N=352, D=32),
+    TestConfig("N384_D32",          B=1, H=2, N=384, D=32),
+    TestConfig("N416_D32",          B=1, H=2, N=416, D=32),
+    TestConfig("N448_D32",          B=1, H=2, N=448, D=32),
+    TestConfig("N480_D32",          B=1, H=2, N=480, D=32),
+    TestConfig("N512_D32",          B=1, H=2, N=512, D=32),
+    # Varying D (N x D cross-product, D max 64)
+    TestConfig("N32_D64",           B=1, H=2, N=32,  D=64),
+    TestConfig("N64_D64",           B=1, H=2, N=64,  D=64),
+    TestConfig("N96_D64",           B=1, H=2, N=96,  D=64),
+    TestConfig("N128_D64",          B=1, H=2, N=128, D=64),
+    # Varying B (every value 1-8)
     TestConfig("B1_N32_D32",        B=1, H=2, N=32, D=32),
     TestConfig("B2_N32_D32",        B=2, H=2, N=32, D=32),
     TestConfig("B3_N32_D32",        B=3, H=2, N=32, D=32),
     TestConfig("B4_N32_D32",        B=4, H=2, N=32, D=32),
+    TestConfig("B5_N32_D32",        B=5, H=2, N=32, D=32),
+    TestConfig("B6_N32_D32",        B=6, H=2, N=32, D=32),
+    TestConfig("B7_N32_D32",        B=7, H=2, N=32, D=32),
     TestConfig("B8_N32_D32",        B=8, H=2, N=32, D=32),
-    # Varying H
+    # Varying H (every value 1-8, plus 12,16)
     TestConfig("H1_N32_D32",        B=1, H=1, N=32, D=32),
     TestConfig("H2_N32_D32",        B=1, H=2, N=32, D=32),
+    TestConfig("H3_N32_D32",        B=1, H=3, N=32, D=32),
     TestConfig("H4_N32_D32",        B=1, H=4, N=32, D=32),
+    TestConfig("H5_N32_D32",        B=1, H=5, N=32, D=32),
     TestConfig("H6_N32_D32",        B=1, H=6, N=32, D=32),
+    TestConfig("H7_N32_D32",        B=1, H=7, N=32, D=32),
     TestConfig("H8_N32_D32",        B=1, H=8, N=32, D=32),
     TestConfig("H12_N32_D32",       B=1, H=12, N=32, D=32),
     TestConfig("H16_N32_D32",       B=1, H=16, N=32, D=32),
-    # Combined
+    # Combined B*H
     TestConfig("B2_H4_N32_D32",     B=2, H=4, N=32, D=32),
+    TestConfig("B3_H3_N32_D32",     B=3, H=3, N=32, D=32),
     TestConfig("B2_H4_N32_D64",     B=2, H=4, N=32, D=64),
     TestConfig("B4_H2_N64_D32",     B=4, H=2, N=64, D=32),
     TestConfig("B2_H8_N32_D64",     B=2, H=8, N=32, D=64),
     TestConfig("B4_H4_N64_D64",     B=4, H=4, N=64, D=64),
+    TestConfig("B8_H2_N32_D32",     B=8, H=2, N=32, D=32),
+    # Medium-large with higher B*H
+    TestConfig("med_N64_H4_D32",    B=1, H=4, N=64,  D=32),
+    TestConfig("med_N96_D32",       B=1, H=2, N=96,  D=32),
+    TestConfig("med_N128_D32",      B=1, H=2, N=128, D=32),
+    TestConfig("med_N160_D32",      B=1, H=2, N=160, D=32),
+    TestConfig("med_N192_D32",      B=1, H=2, N=192, D=32),
+    TestConfig("med_N224_D32",      B=1, H=2, N=224, D=32),
+    TestConfig("med_N256_D32",      B=1, H=2, N=256, D=32),
 ]
 
 LARGE_CONFIGS = [
-    TestConfig("N224_D32",          B=1, H=2, N=224, D=32),
-    TestConfig("N224_D64",          B=1, H=2, N=224, D=64),
-    TestConfig("N256_D32",          B=1, H=2, N=256, D=32),
-    TestConfig("N256_D64",          B=1, H=2, N=256, D=64),
-    TestConfig("N320_D32",          B=1, H=1, N=320, D=32),
-    TestConfig("N384_D32",          B=1, H=1, N=384, D=32),
-    TestConfig("N448_D32",          B=1, H=1, N=448, D=32),
-    TestConfig("N512_D32",          B=1, H=1, N=512, D=32),
+    TestConfig("large_N128_B2H6",   B=2, H=6, N=128, D=32),
+    TestConfig("large_N128_D64",    B=2, H=4, N=128, D=64),
+    TestConfig("large_N160_D32",    B=2, H=4, N=160, D=32),
+    TestConfig("large_N160_D64",    B=2, H=2, N=160, D=64),
+    TestConfig("large_N192_D32",    B=2, H=2, N=192, D=32),
+    TestConfig("large_N192_D64",    B=1, H=2, N=192, D=64),
+    TestConfig("large_N224_D32",    B=2, H=2, N=224, D=32),
+    TestConfig("large_N224_D64",    B=1, H=2, N=224, D=64),
+    TestConfig("large_N256_D32",    B=2, H=2, N=256, D=32),
+    TestConfig("large_N256_D64",    B=1, H=2, N=256, D=64),
+    TestConfig("large_N288_D32",    B=1, H=2, N=288, D=32),
+    TestConfig("large_N320_D32",    B=1, H=1, N=320, D=32),
+    TestConfig("large_N384_D32",    B=1, H=1, N=384, D=32),
+    TestConfig("large_N448_D32",    B=1, H=1, N=448, D=32),
+    TestConfig("large_N512_D32",    B=1, H=1, N=512, D=32),
+    # Cross-product (N x D interactions)
+    TestConfig("cross_N64_D64",     B=1, H=2, N=64,  D=64),
+    TestConfig("cross_N128_D64",    B=1, H=1, N=128, D=64),
+    TestConfig("cross_N192_D32",    B=1, H=1, N=192, D=32),
+    TestConfig("cross_N256_D32",    B=1, H=1, N=256, D=32),
+    TestConfig("cross_N256_D64",    B=1, H=1, N=256, D=64),
+    # Production-like configurations
+    TestConfig("prod_B4H8_N64",     B=4, H=8, N=64,  D=32),
+    TestConfig("prod_B2H12_N64",    B=2, H=12, N=64, D=32),
+    TestConfig("prod_B8H4_N32",     B=8, H=4, N=32,  D=64),
+    TestConfig("prod_B1H16_N128",   B=1, H=16, N=128, D=32),
 ]
 
 STRESS_CONFIGS = [
@@ -125,7 +170,6 @@ STRESS_CONFIGS = [
     TestConfig("stress_N64_D64_s2", B=1, H=2, N=64, D=64, input_scale=2.0),
 ]
 
-# Edge configs now only test valid multiples of 32, D max 64
 EDGE_CONFIGS = [
     TestConfig("B1_H1_N32_D32",     B=1, H=1, N=32, D=32),
     TestConfig("B1_H1_N64_D64",     B=1, H=1, N=64, D=64),
