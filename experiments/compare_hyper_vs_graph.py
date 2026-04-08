@@ -6,20 +6,22 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from torch.amp import autocast
 import torch.nn.functional as F
-from rotary_embedding_torch import RotaryEmbedding
+# from rotary_embedding_torch import RotaryEmbedding
 import matplotlib.pyplot as plt
 
 import sys
 from pathlib import Path
 current_script_path = Path(__file__).resolve()
-parent_dir = current_script_path.parent.parent
-parent_dir_str = str(parent_dir)
+script_dir = str(current_script_path.parent)
+parent_dir_str = str(current_script_path.parent.parent)
+if script_dir not in sys.path:
+    sys.path.insert(0, script_dir)
 if parent_dir_str not in sys.path:
     sys.path.insert(0, parent_dir_str)
 
 from att3ntion import _HypergraphAttentionNaive, _GraphAttentionNaive, QuickGELU
 # from att3ntion import HypergraphAttention
-from gen_data_comp import genData3, genData4, genData7
+from compare_gen_data import genData3, genData4, genData7
 import pdb
 
 class SwiGLU(nn.Module):
@@ -41,7 +43,7 @@ class SimpleCompModel(nn.Module):
 		super().__init__()
 		self.input_dim = input_dim
 		self.embedding_proj = nn.Linear(self.input_dim, hidden_dim)
-		self.rotary_emb = RotaryEmbedding(dim = hidden_dim)
+		# self.rotary_emb = RotaryEmbedding(dim = hidden_dim)
 		self.attn_impl = attn_impl
 		self.n_recurse = n_recurse
 		self.d_model = hidden_dim
@@ -213,6 +215,7 @@ def calcLoss(task, pred, targets):
 			n_possible = torch.sum( targets[:,:,0] ).item()
 	return loss, n_correct, n_possible
 
+
 def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl="", log_name="", save_model=False, task=3, replicate=1):
 	
 	if device == 'auto':
@@ -230,7 +233,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 		nsamples = 1500
 	if task == 4:
 		gen_func = genData4
-		nsamples = 1000
+		nsamples = 1000 # batches
 	if task == 7:
 		gen_func = genData7
 		nsamples = 6000 # longer to allow graph attention to converge.

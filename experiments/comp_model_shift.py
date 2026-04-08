@@ -10,8 +10,10 @@ import matplotlib.pyplot as plt
 import sys
 from pathlib import Path
 current_script_path = Path(__file__).resolve()
-parent_dir = current_script_path.parent.parent
-parent_dir_str = str(parent_dir)
+script_dir = str(current_script_path.parent)
+parent_dir_str = str(current_script_path.parent.parent)
+if script_dir not in sys.path:
+    sys.path.insert(0, script_dir)
 if parent_dir_str not in sys.path:
     sys.path.insert(0, parent_dir_str)
 

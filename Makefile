@@ -16,7 +16,7 @@ PYTHON ?= python
 # --- Build ---
 
 build:
-	pip install -e .. --no-build-isolation
+	pip install -e . --no-build-isolation
 
 .PHONY: maybe-build
 maybe-build:
@@ -30,58 +30,58 @@ test: maybe-build
 	@echo "═══════════════════════════════════════════════════════════════"
 	@echo "CORRECTNESS: Quick tests"
 	@echo "═══════════════════════════════════════════════════════════════"
-	$(PYTHON) test_all_kernels_equivalence.py --quick --continue-on-failure -v
+	$(PYTHON) tests/test_all_kernels_equivalence.py --quick --continue-on-failure -v
 
 test-quiet: maybe-build
-	@$(PYTHON) test_all_kernels_equivalence.py --quick --continue-on-failure 2>&1 | \
+	@$(PYTHON) tests/test_all_kernels_equivalence.py --quick --continue-on-failure 2>&1 | \
 		(grep -E "(FAIL|Error|Exception|Traceback)" && exit 1 || echo "  ✓ All correctness tests passed")
 
 test-full: maybe-build
-	$(PYTHON) test_all_kernels_equivalence.py --continue-on-failure -v
+	$(PYTHON) tests/test_all_kernels_equivalence.py --continue-on-failure -v
 
 # --- Benchmarks ---
 
 bench: test-quiet
-	$(PYTHON) benchmark_optimizations.py
+	$(PYTHON) benchmarks/bench_optimizations.py
 
 bench-save: test-quiet
 ifndef NOTE
 	$(error NOTE is required. Usage: make bench-save NOTE="description")
 endif
-	$(PYTHON) benchmark_optimizations.py --save --note "$(NOTE)"
+	$(PYTHON) benchmarks/bench_optimizations.py --save --note "$(NOTE)"
 
 bench-quick: maybe-build
-	$(PYTHON) benchmark_optimizations.py --quick --forward-only
+	$(PYTHON) benchmarks/bench_optimizations.py --quick --forward-only
 
 bench-large: test-quiet
 ifndef NOTE
 	$(error NOTE is required. Usage: make bench-large NOTE="description")
 endif
-	$(PYTHON) benchmark_optimizations.py --large --save --note "$(NOTE)"
+	$(PYTHON) benchmarks/bench_optimizations.py --large --save --note "$(NOTE)"
 
 bench-forward: maybe-build
-	$(PYTHON) benchmark_optimizations.py --forward-only
+	$(PYTHON) benchmarks/bench_optimizations.py --forward-only
 
 bench-backward: maybe-build
-	$(PYTHON) benchmark_optimizations.py --backward-only
+	$(PYTHON) benchmarks/bench_optimizations.py --backward-only
 
 bench-complexity:
-	$(PYTHON) benchmark_optimizations.py --quick --forward-only --warmup 1 --iters 1 --complexity
+	$(PYTHON) benchmarks/bench_optimizations.py --quick --forward-only --warmup 1 --iters 1 --complexity
 
 # --- Profiling ---
 
 profile-timeline: maybe-build
 	@mkdir -p profiling_reports
 	nsys profile -o profiling_reports/timeline_$$(date +%Y%m%d_%H%M%S) \
-		$(PYTHON) benchmark_optimizations.py --quick --forward-only --warmup 1 --iters 1
+		$(PYTHON) benchmarks/bench_optimizations.py --quick --forward-only --warmup 1 --iters 1
 
 profile-kernel: maybe-build
-	$(PYTHON) cuda_profiling_script.py
+	$(PYTHON) benchmarks/profile_kernels.py
 
 # --- History ---
 
 history:
-	@$(PYTHON) benchmark_optimizations.py --show-history
+	@$(PYTHON) benchmarks/bench_optimizations.py --show-history
 
 # --- Combined ---
 
@@ -93,8 +93,8 @@ iterate: test bench-quick
 
 clean:
 	pip uninstall -y att3ntion 2>/dev/null || true
-	rm -rf ../build/ ../dist/ ../*.egg-info/ __pycache__/
-	find .. -name "*.so" -delete
+	rm -rf build/ dist/ *.egg-info/ __pycache__/
+	find . -name "*.so" -delete
 	@echo "Cleaned build artifacts."
 
 .PHONY: build maybe-build test test-quiet test-full \

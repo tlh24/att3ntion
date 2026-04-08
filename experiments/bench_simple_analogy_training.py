@@ -24,12 +24,14 @@ except ImportError:
 
 # Add parent directory to path
 current_script_path = Path(__file__).resolve()
-parent_dir = current_script_path.parent.parent
-parent_dir_str = str(parent_dir)
+script_dir = str(current_script_path.parent)
+parent_dir_str = str(current_script_path.parent.parent)
+if script_dir not in sys.path:
+    sys.path.insert(0, script_dir)
 if parent_dir_str not in sys.path:
     sys.path.insert(0, parent_dir_str)
 
-from tests.simple_analogy_model import train_model, SimpleAnalogyModel, prepare_data
+from simple_analogy_model import train_model, SimpleAnalogyModel, prepare_data
 from gen_data import genData
 from torch.utils.data import DataLoader, TensorDataset
 
