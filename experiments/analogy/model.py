@@ -8,15 +8,14 @@ import argparse
 import sys
 from pathlib import Path
 current_script_path = Path(__file__).resolve()
-parent_dir = current_script_path.parent.parent
-parent_dir_str = str(parent_dir)
-if parent_dir_str not in sys.path:
-    sys.path.insert(0, parent_dir_str)
+script_dir = str(current_script_path.parent)
+project_root = str(current_script_path.parent.parent.parent)
+for d in [script_dir, project_root]:
+    if d not in sys.path:
+        sys.path.insert(0, d)
 
-from pure_pytorch_reference import HypergraphAttention_Naive
-from hypergraph_attention import HypergraphAttentionCPP, HypergraphAttentionCPPReference
+from att3ntion import HypergraphAttention, _HypergraphAttentionTorch, _HypergraphAttentionNaive
 from gen_data import genData
-import pdb
 
 
 def _ensure_all_finite(named_tensors, epoch, batch_idx, stage):
@@ -47,11 +46,11 @@ class SimpleAnalogyModel(nn.Module):
 		for _ in range(n_layers):
 			# Select attention implementation for this layer
 			if attn_impl == 'torch':
-				attention_layer = HypergraphAttention_Naive(hidden_dim, num_heads, head_subspaces=True)
+				attention_layer = _HypergraphAttentionNaive(hidden_dim, num_heads, head_subspaces=True)
 			elif attn_impl == 'cuda':
-				attention_layer = HypergraphAttentionCPP(hidden_dim, num_heads)
+				attention_layer = HypergraphAttention(hidden_dim, num_heads)
 			elif attn_impl == 'torch_cpp':
-				attention_layer = HypergraphAttentionCPPReference(hidden_dim, num_heads)
+				attention_layer = _HypergraphAttentionTorch(hidden_dim, num_heads)
 			else:
 				raise ValueError(f"Unknown attention implementation: {attn_impl}")
 
@@ -81,7 +80,7 @@ class SimpleAnalogyModel(nn.Module):
 
 		for layer_block in self.repeated_layers:
 			attention_module = layer_block['attention']
-			if isinstance(attention_module, HypergraphAttention_Naive):
+			if isinstance(attention_module, _HypergraphAttentionNaive):
 				attn_output = attention_module(x, None)
 			else:
 				attn_output = attention_module(x)

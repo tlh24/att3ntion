@@ -6,10 +6,10 @@ Pure CUDA analysis — no Torch comparison. Measures how the kernel's
 performance scales with increasing N and estimates empirical complexity.
 
 Usage:
-    python tests/benchmark_cuda_scaling.py
-    python tests/benchmark_cuda_scaling.py --n-values 32,64,128,256,512
-    python tests/benchmark_cuda_scaling.py --no-backward
-    python tests/benchmark_cuda_scaling.py --save results.json
+    python benchmarks/bench_cuda_scaling.py
+    python benchmarks/bench_cuda_scaling.py --n-values 32,64,128,256,512
+    python benchmarks/bench_cuda_scaling.py --no-backward
+    python benchmarks/bench_cuda_scaling.py --save results.json
 """
 
 import os
@@ -19,7 +19,7 @@ import argparse
 import math
 from datetime import datetime
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import torch
 
@@ -27,81 +27,10 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-
-# --- GPU Specs ---
-
-def get_gpu_specs() -> Dict:
-    """Get GPU specs for utilization analysis. Falls back to estimation."""
-    props = torch.cuda.get_device_properties(0)
-    name = props.name
-
-    known_gpus = {
-        "NVIDIA GeForce RTX 4080 Laptop GPU": {"fp32_tflops": 33.9,  "mem_bw_gbs": 432.0},
-        "NVIDIA GeForce RTX 4080":            {"fp32_tflops": 48.7,  "mem_bw_gbs": 716.8},
-        "NVIDIA GeForce RTX 4080 SUPER":      {"fp32_tflops": 52.0,  "mem_bw_gbs": 736.3},
-        "NVIDIA GeForce RTX 4090":            {"fp32_tflops": 82.6,  "mem_bw_gbs": 1008.0},
-        "NVIDIA GeForce RTX 3090":            {"fp32_tflops": 35.6,  "mem_bw_gbs": 936.2},
-        "NVIDIA A100-SXM4-40GB":              {"fp32_tflops": 19.5,  "mem_bw_gbs": 1555.0},
-        "NVIDIA A100-SXM4-80GB":              {"fp32_tflops": 19.5,  "mem_bw_gbs": 2039.0},
-        "NVIDIA H100":                        {"fp32_tflops": 51.2,  "mem_bw_gbs": 3350.0},
-    }
-
-    specs = known_gpus.get(name)
-    if specs is None:
-        for gpu_name, gpu_specs in known_gpus.items():
-            if gpu_name in name or name in gpu_name:
-                specs = gpu_specs
-                break
-
-    if specs is None:
-        clock_ghz = props.clock_rate / 1e6
-        cuda_cores = props.multi_processor_count * 128
-        fp32_tflops = cuda_cores * 2 * clock_ghz / 1000
-        mem_bw_gbs = props.total_memory / 1e9 * 10
-        specs = {"fp32_tflops": round(fp32_tflops, 1), "mem_bw_gbs": round(mem_bw_gbs, 1)}
-
-    return {
-        "name": name,
-        "sm_count": props.multi_processor_count,
-        "total_memory_gb": round(props.total_memory / 1e9, 2),
-        **specs,
-    }
-
-
-# --- FLOP Estimation ---
-
-def calc_forward_flops(B: int, H: int, N: int, D: int) -> int:
-    """Theoretical FLOPs for forward pass.
-
-    3 gather kernels:  each B*H*N³*(4D+3)
-    3 scatter kernels: each B*H*N³*(4D+5)
-    """
-    gather = B * H * N**3 * (4 * D + 3)
-    scatter = B * H * N**3 * (4 * D + 5)
-    return 3 * gather + 3 * scatter
-
-
-def calc_backward_flops(B: int, H: int, N: int, D: int) -> int:
-    """Theoretical FLOPs for backward pass.
-
-    6 value gradients: 6*B*H*N³*4D
-    Jacobian terms:    B*H*N³*24D
-    Q/R/S gradients:   3*B*H*N³*24D
-    """
-    v_grad = 6 * B * H * N**3 * 4 * D
-    jacobian = B * H * N**3 * 24 * D
-    qrs_grad = 3 * B * H * N**3 * 24 * D
-    return v_grad + jacobian + qrs_grad
-
-
-def format_flops(flops: float) -> str:
-    if flops >= 1e12:
-        return f"{flops/1e12:.2f}T"
-    elif flops >= 1e9:
-        return f"{flops/1e9:.2f}G"
-    elif flops >= 1e6:
-        return f"{flops/1e6:.2f}M"
-    return f"{flops:.0f}"
+from benchmarks._bench_utils import (
+    create_inputs, benchmark_fn, get_gpu_specs,
+    calc_forward_flops, calc_backward_flops, format_flops,
+)
 
 
 @dataclass
@@ -126,74 +55,40 @@ class ScalingPoint:
 
 # --- Benchmarking ---
 
-def create_inputs(B: int, H: int, N: int, D: int):
-    torch.manual_seed(42)
-    Q = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
-    R = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
-    S = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
-    Vq_1 = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
-    Vq_2 = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
-    Vr_1 = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
-    Vr_2 = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
-    Vs_1 = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
-    Vs_2 = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
-    return Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2
-
-
-def _benchmark_median(fn, warmup, iters):
-    """Run fn with warmup, return median time in ms."""
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-
-    times = []
-    for _ in range(iters):
-        s = torch.cuda.Event(enable_timing=True)
-        e = torch.cuda.Event(enable_timing=True)
-        s.record(); fn(); e.record()
-        torch.cuda.synchronize()
-        times.append(s.elapsed_time(e))
-
-    times.sort()
-    return times[len(times) // 2]
-
-
-def benchmark_forward(ext, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
-                      warmup=5, iters=20):
+def benchmark_forward(ext, inputs, warmup=5, iters=20):
     def run():
-        return ext.forward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, 0.0)
-    return _benchmark_median(run, warmup, iters)
+        return ext.forward(*inputs, 0.0)
+    return benchmark_fn(run, warmup, iters)[0]
 
 
-def benchmark_backward(ext, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
-                       warmup=3, iters=10):
-    B, H, N, D = Q.shape
+def benchmark_backward(ext, inputs, warmup=3, iters=10):
+    B, H, N, D = inputs[0].shape
     grad_output = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
 
-    fwd_out = ext.forward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, 0.0)
+    fwd_out = ext.forward(*inputs, 0.0)
     m_i, l_i, m_j, l_j, m_k, l_k = fwd_out[6:12]
 
     def run():
         return ext.backward(
-            grad_output, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
+            grad_output, *inputs,
             m_i, l_i, m_j, l_j, m_k, l_k, 0.0
         )
-    return _benchmark_median(run, warmup, iters)
+    return benchmark_fn(run, warmup, iters)[0]
 
 
-def measure_peak_memory(ext, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2):
+def measure_peak_memory(ext, inputs):
     """Measure peak GPU memory during forward+backward."""
-    B, H, N, D = Q.shape
+    B, H, N, D = inputs[0].shape
     grad_output = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
 
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
 
-    fwd_out = ext.forward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, 0.0)
+    fwd_out = ext.forward(*inputs, 0.0)
     m_i, l_i, m_j, l_j, m_k, l_k = fwd_out[6:12]
 
     _ = ext.backward(
-        grad_output, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
+        grad_output, *inputs,
         m_i, l_i, m_j, l_j, m_k, l_k, 0.0
     )
     torch.cuda.synchronize()
@@ -219,7 +114,7 @@ def adaptive_iters(N: int, base_warmup: int, base_iters: int):
 
 def run_scaling_analysis(N_values: List[int], B=1, H=2, D=32,
                          include_backward=True, warmup=5, iters=20):
-    import hyper_attn_cpp_manual as cuda_ext
+    import att3ntion._cuda_kernels as cuda_ext
 
     results = []
     prev_point = None
@@ -235,13 +130,13 @@ def run_scaling_analysis(N_values: List[int], B=1, H=2, D=32,
         try:
             inputs = create_inputs(B, H, N, D)
 
-            point.fwd_ms = benchmark_forward(cuda_ext, *inputs, warmup=w, iters=it)
+            point.fwd_ms = benchmark_forward(cuda_ext, inputs, warmup=w, iters=it)
             point.fwd_flops = calc_forward_flops(B, H, N, D)
             point.fwd_tflops = point.fwd_flops / (point.fwd_ms / 1000) / 1e12
 
             if include_backward:
                 torch.cuda.empty_cache()
-                point.bwd_ms = benchmark_backward(cuda_ext, *inputs, warmup=bw, iters=bit)
+                point.bwd_ms = benchmark_backward(cuda_ext, inputs, warmup=bw, iters=bit)
                 point.bwd_flops = calc_backward_flops(B, H, N, D)
                 point.bwd_tflops = point.bwd_flops / (point.bwd_ms / 1000) / 1e12
                 point.total_ms = point.fwd_ms + point.bwd_ms
@@ -249,7 +144,7 @@ def run_scaling_analysis(N_values: List[int], B=1, H=2, D=32,
                 point.total_tflops = point.total_flops / (point.total_ms / 1000) / 1e12
 
             torch.cuda.empty_cache()
-            point.mem_mb = measure_peak_memory(cuda_ext, *inputs)
+            point.mem_mb = measure_peak_memory(cuda_ext, inputs)
 
             if prev_point and prev_point.fwd_ms:
                 point.n_ratio = N / prev_point.N

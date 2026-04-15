@@ -7,10 +7,10 @@ across a sweep of sequence lengths N. Handles Torch OOM gracefully,
 continuing CUDA-only measurements at large N.
 
 Usage:
-    python tests/benchmark_cuda_v_torch_scaling.py
-    python tests/benchmark_cuda_v_torch_scaling.py --n-values 32,64,128,256,512
-    python tests/benchmark_cuda_v_torch_scaling.py --no-backward
-    python tests/benchmark_cuda_v_torch_scaling.py --save results.json
+    python benchmarks/bench_cuda_vs_torch.py
+    python benchmarks/bench_cuda_vs_torch.py --n-values 32,64,128,256,512
+    python benchmarks/bench_cuda_vs_torch.py --no-backward
+    python benchmarks/bench_cuda_vs_torch.py --save results.json
 """
 
 import os
@@ -19,13 +19,15 @@ import json
 import argparse
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import torch
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
+
+from benchmarks._bench_utils import create_inputs, benchmark_fn
 
 
 @dataclass
@@ -44,58 +46,15 @@ class ScalingResult:
     cuda_oom: bool = False
 
 
-# --- Benchmarking Helpers ---
+# --- Memory ---
 
-def benchmark_forward(ext, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
-                      warmup=5, iters=20):
-    """Benchmark forward pass using CUDA events. Returns median ms."""
-    def run():
-        return ext.forward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, 0.0)
-
-    for _ in range(warmup):
-        run()
-    torch.cuda.synchronize()
-
-    times = []
-    for _ in range(iters):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        run()
-        end.record()
-        torch.cuda.synchronize()
-        times.append(start.elapsed_time(end))
-
-    times.sort()
-    return times[len(times) // 2]
-
-
-def measure_memory(ext, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2):
+def measure_fwd_memory(ext, inputs):
     """Measure peak memory for forward pass in MB."""
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
-    _ = ext.forward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, 0.0)
+    _ = ext.forward(*inputs, 0.0)
     torch.cuda.synchronize()
     return torch.cuda.max_memory_allocated() / (1024 ** 2)
-
-
-def _benchmark_backward_times(ext_fn, warmup, iters):
-    """Run backward benchmark loop, return sorted times."""
-    for _ in range(warmup):
-        ext_fn()
-    torch.cuda.synchronize()
-
-    times = []
-    for _ in range(iters):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        ext_fn()
-        end.record()
-        torch.cuda.synchronize()
-        times.append(start.elapsed_time(end))
-    times.sort()
-    return times[len(times) // 2]
 
 
 # --- Main Benchmark Loop ---
@@ -103,8 +62,8 @@ def _benchmark_backward_times(ext_fn, warmup, iters):
 def run_scaling_benchmark(N_values: List[int], B=1, H=2, D=32,
                           include_backward=True, max_n_backward=1024):
     """Run scaling benchmark. Handles Torch OOM separately from CUDA OOM."""
-    import hyper_attn_cpp_manual as cuda_ext
-    import hyper_attn_cpp_reference as ref_ext
+    import att3ntion._cuda_kernels as cuda_ext
+    import att3ntion._torch_kernels as ref_ext
 
     results = []
     torch_oom_started = False
@@ -120,22 +79,13 @@ def run_scaling_benchmark(N_values: List[int], B=1, H=2, D=32,
         cuda_oom = False
 
         try:
-            torch.manual_seed(42)
-            Q = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
-            R = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
-            S = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
-            Vq_1 = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
-            Vq_2 = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
-            Vr_1 = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
-            Vr_2 = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
-            Vs_1 = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
-            Vs_2 = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
+            inputs = create_inputs(B, H, N, D)
 
             # CUDA forward + memory
             try:
-                cuda_fwd = benchmark_forward(cuda_ext, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2)
+                cuda_fwd = benchmark_fn(lambda: cuda_ext.forward(*inputs, 0.0))[0]
                 torch.cuda.empty_cache()
-                cuda_mem = measure_memory(cuda_ext, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2)
+                cuda_mem = measure_fwd_memory(cuda_ext, inputs)
             except torch.cuda.OutOfMemoryError:
                 cuda_oom = True
                 print(" CUDA OOM")
@@ -146,9 +96,9 @@ def run_scaling_benchmark(N_values: List[int], B=1, H=2, D=32,
             if not torch_oom_started:
                 try:
                     torch.cuda.empty_cache()
-                    torch_fwd = benchmark_forward(ref_ext, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2)
+                    torch_fwd = benchmark_fn(lambda: ref_ext.forward(*inputs, 0.0))[0]
                     torch.cuda.empty_cache()
-                    torch_mem = measure_memory(ref_ext, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2)
+                    torch_mem = measure_fwd_memory(ref_ext, inputs)
                 except torch.cuda.OutOfMemoryError:
                     torch_oom = True
                     torch_oom_started = True
@@ -159,15 +109,15 @@ def run_scaling_benchmark(N_values: List[int], B=1, H=2, D=32,
                 if cuda_fwd is not None:
                     try:
                         torch.cuda.empty_cache()
-                        fwd_out = cuda_ext.forward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, 0.0)
+                        fwd_out = cuda_ext.forward(*inputs, 0.0)
                         m_i, l_i, m_j, l_j, m_k, l_k = fwd_out[6:12]
                         grad_output = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
 
                         def run_cuda_bwd():
-                            cuda_ext.backward(grad_output, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
+                            cuda_ext.backward(grad_output, *inputs,
                                               m_i, l_i, m_j, l_j, m_k, l_k, 0.0)
 
-                        cuda_bwd = _benchmark_backward_times(run_cuda_bwd, warmup=3, iters=10)
+                        cuda_bwd = benchmark_fn(run_cuda_bwd, warmup=3, iters=10)[0]
                     except torch.cuda.OutOfMemoryError:
                         torch.cuda.empty_cache()
 
@@ -176,13 +126,12 @@ def run_scaling_benchmark(N_values: List[int], B=1, H=2, D=32,
                         torch.cuda.empty_cache()
 
                         def run_ref_bwd():
-                            inputs = [Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2]
-                            inputs = [t.detach().clone().requires_grad_(True) for t in inputs]
-                            out = ref_ext.forward(*inputs, 0.0)
+                            ref_inputs = [t.detach().clone().requires_grad_(True) for t in inputs]
+                            out = ref_ext.forward(*ref_inputs, 0.0)
                             total = sum(o.sum() for o in out)
                             total.backward()
 
-                        torch_bwd = _benchmark_backward_times(run_ref_bwd, warmup=3, iters=10)
+                        torch_bwd = benchmark_fn(run_ref_bwd, warmup=3, iters=10)[0]
                     except torch.cuda.OutOfMemoryError:
                         torch_oom = True
                         torch_oom_started = True

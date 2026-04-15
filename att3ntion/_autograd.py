@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 import math
-import hyper_attn_cpp_manual
-import hyper_attn_cpp_reference
+import att3ntion._cuda_kernels as _cuda_kernels
+import att3ntion._torch_kernels as _torch_kernels
 from torch.autograd import Function
 
 def _pad_to_multiple(tensor, multiple, dim=2):
@@ -21,7 +21,7 @@ def _pad_to_multiple(tensor, multiple, dim=2):
     return torch.nn.functional.pad(tensor, pad), pad_size
 
 
-class HyperAttentionAutograd(Function):
+class _HypergraphAttentionAutograd(Function):
     """
     Bridge between PyTorch autograd and the manual C++ forward/backward passes.
     Saves softmax statistics from forward pass to avoid redundant computation in backward.
@@ -38,7 +38,6 @@ class HyperAttentionAutograd(Function):
         Returns:
             The output tensor from the C++ forward pass (summed).
         """
-        # CUDA kernels require sequence length to be a multiple of 16 (TILE_I)
         TILE_SIZE = 16
         orig_seq_len = Q.size(2)
         
@@ -52,23 +51,19 @@ class HyperAttentionAutograd(Function):
         Vs_1, _ = _pad_to_multiple(Vs_1.contiguous(), TILE_SIZE, dim=2)
         Vs_2, _ = _pad_to_multiple(Vs_2.contiguous(), TILE_SIZE, dim=2)
 
-        outputs_tuple = hyper_attn_cpp_manual.forward(
+        outputs_tuple = _cuda_kernels.forward(
             Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
         )
 
-        # Forward now returns 12 tensors: 6 outputs + 6 softmax stats
         if isinstance(outputs_tuple, tuple) and len(outputs_tuple) == 12:
             Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_, m_i, l_i, m_j, l_j, m_k, l_k = outputs_tuple
             final_output = Y_q + Y_r + Y_s + Y_q_ + Y_r_ + Y_s_
         else:
             raise TypeError(f"C++ forward expected to return a tuple of 12 Tensors, but got {type(outputs_tuple)} with len {len(outputs_tuple) if isinstance(outputs_tuple, tuple) else 'N/A'}")
 
-        # Remove padding from output to match original sequence length
         if orig_seq_len != final_output.size(2):
             final_output = final_output[:, :, :orig_seq_len, :]
 
-        # Save input tensors AND softmax stats for backward pass
-        # Also save original sequence length for backward padding
         ctx.save_for_backward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
                               m_i, l_i, m_j, l_j, m_k, l_k)
         ctx.orig_seq_len = orig_seq_len
@@ -87,28 +82,23 @@ class HyperAttentionAutograd(Function):
             A tuple of gradients corresponding *exactly* to the inputs of the
             forward function (Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate).
         """
-        # Retrieve saved tensors including softmax stats (these are already padded)
         Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, \
             m_i, l_i, m_j, l_j, m_k, l_k = ctx.saved_tensors
         orig_seq_len = ctx.orig_seq_len
         
-        # Pad grad_output to match the padded sequence length used in forward
         TILE_SIZE = 16
         grad_output, _ = _pad_to_multiple(grad_output.contiguous(), TILE_SIZE, dim=2)
 
-        # Use backward with pre-computed softmax stats from forward pass
-        grad_tuple = hyper_attn_cpp_manual.backward(
+        grad_tuple = _cuda_kernels.backward(
             grad_output, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
             m_i, l_i, m_j, l_j, m_k, l_k
         )
 
-        # Ensure grad_tuple from C++ has the correct number of elements (9 for the 9 tensor inputs)
         if not (isinstance(grad_tuple, tuple) and len(grad_tuple) == 9):
             raise ValueError(f"C++ backward expected to return a tuple of 9 gradients, got {len(grad_tuple) if isinstance(grad_tuple, tuple) else type(grad_tuple)}")
 
         grad_Q, grad_R, grad_S, grad_Vq_1, grad_Vq_2, grad_Vr_1, grad_Vr_2, grad_Vs_1, grad_Vs_2 = grad_tuple
 
-        # Remove padding from gradients to match original sequence length
         if orig_seq_len != grad_Q.size(2):
             grad_Q = grad_Q[:, :, :orig_seq_len, :]
             grad_R = grad_R[:, :, :orig_seq_len, :]
@@ -142,19 +132,22 @@ class HyperAttentionAutograd(Function):
             grad_Vr_2,
             grad_Vs_1,
             grad_Vs_2,
-            None, #dropout doesn't need a gradient
+            None,
         )
 
 class QuickGELU(nn.Module):
     def forward(self, x: torch.Tensor):
         return x * torch.sigmoid(1.702 * x)
 
-class HypergraphAttentionCPP(nn.Module):
+class HypergraphAttention(nn.Module):
     """
-    PyTorch wrapper for cpp/hyper_attn_cpp_manual.cpp.
+    3-way hypergraph attention layer backed by hand-written CUDA kernels.
+
+    This is the primary public API for att3ntion.  Drop it into any
+    transformer-style model in place of standard multi-head attention.
     """
     def __init__(self, d_model, n_heads, dropout_rate=0):
-        super(HypergraphAttentionCPP, self).__init__()
+        super().__init__()
         
         if d_model % n_heads != 0:
             raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
@@ -195,8 +188,7 @@ class HypergraphAttentionCPP(nn.Module):
         Vr_1, Vr_2 = Vr.reshape(batch_size, ntok, self.n_heads, self.head_dim*2).permute(0, 2, 1, 3).split(self.head_dim, dim=-1)
         Vs_1, Vs_2 = Vs.reshape(batch_size, ntok, self.n_heads, self.head_dim*2).permute(0, 2, 1, 3).split(self.head_dim, dim=-1)
         
-        # Core 3-way attention - returns summed output
-        y = HyperAttentionAutograd.apply( 
+        y = _HypergraphAttentionAutograd.apply( 
             Q, R, S,
             Vq_1, Vq_2,
             Vr_1, Vr_2,
@@ -204,7 +196,6 @@ class HypergraphAttentionCPP(nn.Module):
             self.dropout.p
         )
         
-        # Reshape: concatenate heads (CPP uses head_dim = d_model // n_heads)
         y = y.permute(0, 2, 1, 3).contiguous().view(batch_size, ntok, self.n_heads * self.head_dim)
         
         y = self.Wo(y) 
@@ -212,13 +203,13 @@ class HypergraphAttentionCPP(nn.Module):
         return y 
 
 
-class HypergraphAttentionCPPReference(nn.Module):
+class _HypergraphAttentionTorch(nn.Module):
     """
-    PyTorch wrapper for cpp/torch_att3ntion.cpp (reference implementation).
-    Uses PyTorch autograd for backward pass.
+    Torch-based reference implementation (uses PyTorch autograd for backward).
+    Intended for correctness testing against the CUDA kernels.
     """
     def __init__(self, d_model, n_heads, dropout_rate=0):
-        super(HypergraphAttentionCPPReference, self).__init__()
+        super().__init__()
         
         if d_model % n_heads != 0:
             raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
@@ -259,8 +250,7 @@ class HypergraphAttentionCPPReference(nn.Module):
         Vr_1, Vr_2 = Vr.reshape(batch_size, ntok, self.n_heads, self.head_dim*2).permute(0, 2, 1, 3).split(self.head_dim, dim=-1)
         Vs_1, Vs_2 = Vs.reshape(batch_size, ntok, self.n_heads, self.head_dim*2).permute(0, 2, 1, 3).split(self.head_dim, dim=-1)
         
-        # Core 3-way attention using C++ reference (uses autograd for backward)
-        outputs_tuple = hyper_attn_cpp_reference.forward(
+        outputs_tuple = _torch_kernels.forward(
             Q.contiguous(), R.contiguous(), S.contiguous(),
             Vq_1.contiguous(), Vq_2.contiguous(),
             Vr_1.contiguous(), Vr_2.contiguous(),
@@ -268,10 +258,8 @@ class HypergraphAttentionCPPReference(nn.Module):
             self.dropout.p
         )
         
-        # Sum the 6 output tensors
         y = sum(outputs_tuple)
         
-        # Reshape: concatenate heads
         y = y.permute(0, 2, 1, 3).contiguous().view(batch_size, ntok, self.n_heads * self.head_dim)
         
         y = self.Wo(y) 

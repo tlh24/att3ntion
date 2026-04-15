@@ -33,13 +33,13 @@ def demo_basic_usage():
     print("🔺 att3ntion: 3-Way Hypergraph Attention")
     print("=" * 60)
     
-    from hypergraph_attention import HypergraphAttentionCPP
+    from att3ntion import HypergraphAttention
     
     # Create layer
     # CUDA kernel requires head_dim (d_model/n_heads) to be a multiple of 4
     d_model = 64
     n_heads = 4  # head_dim = 64/4 = 16
-    layer = HypergraphAttentionCPP(d_model=d_model, n_heads=n_heads)
+    layer = HypergraphAttention(d_model=d_model, n_heads=n_heads)
     
     print(f"\nLayer config: d_model={d_model}, n_heads={n_heads}")
     print(f"Parameters: {sum(p.numel() for p in layer.parameters()):,}")
@@ -84,7 +84,7 @@ def demo_memory_scaling():
         print("⚠ CUDA not available. Skipping memory benchmark.")
         return
     
-    from hypergraph_attention import HypergraphAttentionCPP
+    from att3ntion import HypergraphAttention
     
     print(f"\nGPU: {torch.cuda.get_device_name(0)}")
     print(f"Testing sequence lengths: 32, 64, 128, 256, 512")
@@ -104,7 +104,7 @@ def demo_memory_scaling():
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         
-        layer = HypergraphAttentionCPP(d_model=d_model, n_heads=n_heads).cuda()
+        layer = HypergraphAttention(d_model=d_model, n_heads=n_heads).cuda()
         x = torch.randn(batch_size, seq_len, d_model, device='cuda', requires_grad=True)
         
         # Forward + backward
@@ -165,13 +165,13 @@ def demo_benchmark():
     
     # Import both implementations
     try:
-        import hyper_attn_cpp_manual as cuda_ext
+        import att3ntion._cuda_kernels as cuda_ext
     except ImportError:
         print("⚠ CUDA extension not found. Run: python setup.py develop")
         return
     
     try:
-        import hyper_attn_cpp_reference as ref_ext
+        import att3ntion._torch_kernels as ref_ext
     except ImportError:
         print("⚠ Reference extension not found. Run: python setup.py develop")
         return
@@ -334,7 +334,7 @@ class ArithmeticModel(nn.Module):
     
     def __init__(self, hidden_dim=128, num_heads=4, n_layers=2, modulo=19):
         super().__init__()
-        from hypergraph_attention import HypergraphAttentionCPP
+        from att3ntion import HypergraphAttention
         
         self.embedding = nn.Linear(32, hidden_dim)
         self.modulo = modulo
@@ -342,7 +342,7 @@ class ArithmeticModel(nn.Module):
         self.layers = nn.ModuleList()
         for _ in range(n_layers):
             self.layers.append(nn.ModuleDict({
-                'attention': HypergraphAttentionCPP(hidden_dim, num_heads),
+                'attention': HypergraphAttention(hidden_dim, num_heads),
                 'norm1': nn.LayerNorm(hidden_dim),
                 'ffn': nn.Sequential(
                     nn.Linear(hidden_dim, 3 * hidden_dim),
