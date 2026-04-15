@@ -1,8 +1,15 @@
-# Trigger an image build in att3ntion-builder whenever code is pushed.
+# Build a Docker image with compiled CUDA extensions via the reusable
+# workflow in astera/att3ntion-builder.
 #
-# Required secrets:
-#   ATT3NTION_BUILDER_PAT -- GitHub PAT with `repo` scope on the
-#                            att3ntion-builder repository.
+# Security:
+#   - pull_request from forks: GitHub does not expose secrets, so the
+#     image build is skipped gracefully. Do NOT switch to pull_request_target.
+#   - Environment protection rules on the "build" environment can require
+#     reviewer approval before secrets are released.
+#
+# Required setup:
+#   1. Create a "build" environment (Settings > Environments).
+#   2. Add HARBOR_USERNAME and HARBOR_PASSWORD as environment secrets.
 
 name: CI
 
@@ -14,22 +21,5 @@ on:
 
 jobs:
   build-image:
-    runs-on: ubuntu-latest
-    # Secret is empty on forks, so the step is skipped gracefully.
-    # The builder enforces its own ref verification as a second layer.
-    env:
-      HAS_BUILDER_PAT: ${{ secrets.ATT3NTION_BUILDER_PAT != '' }}
-    steps:
-      - name: Trigger image build
-        if: env.HAS_BUILDER_PAT == 'true'
-        uses: peter-evans/repository-dispatch@v3
-        with:
-          token: ${{ secrets.ATT3NTION_BUILDER_PAT }}
-          repository: astera/att3ntion-builder
-          event-type: build
-          client-payload: >-
-            {
-              "repo": "${{ github.repository }}",
-              "ref": "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}",
-              "pr": "${{ github.event.pull_request.number || '' }}"
-            }
+    uses: astera/att3ntion-builder/.github/workflows/build.yml@main
+    secrets: inherit
