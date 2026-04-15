@@ -1,0 +1,30 @@
+# Trigger an image build in att3ntion-builder whenever code is pushed.
+#
+# Required secrets:
+#   ATT3NTION_BUILDER_PAT -- GitHub PAT with `repo` scope on the
+#                            att3ntion-builder repository.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-image:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger image build
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.ATT3NTION_BUILDER_PAT }}
+          repository: astera/att3ntion-builder
+          event-type: build
+          client-payload: >-
+            {
+              "ref": "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}",
+              "pr": "${{ github.event.pull_request.number || '' }}"
+            }
