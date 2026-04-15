@@ -14,10 +14,14 @@ on:
 
 jobs:
   build-image:
-    if: github.repository == 'tlh24/att3ntion'
     runs-on: ubuntu-latest
+    # Secret is empty on forks, so the step is skipped gracefully.
+    # The builder enforces its own ref verification as a second layer.
+    env:
+      HAS_BUILDER_PAT: ${{ secrets.ATT3NTION_BUILDER_PAT != '' }}
     steps:
       - name: Trigger image build
+        if: env.HAS_BUILDER_PAT == 'true'
         uses: peter-evans/repository-dispatch@v3
         with:
           token: ${{ secrets.ATT3NTION_BUILDER_PAT }}
