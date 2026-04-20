@@ -984,25 +984,31 @@ __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
                     p_d6[dd]  = vq2i * dyk;
                 }
 
-                // Accumulate over j sub-tile (4 broadcast loads per d per j)
+                // Accumulate over j sub-tile. j-arrays have stride D_CONST
+                // (no padding) and d_base is a multiple of D_TILE=4, so each
+                // 4-float slice is 16-byte aligned → one LDS.128 per array.
                 #pragma unroll
                 for (int jj = 0; jj < J_SUB; jj++) {
                     const int jOff = jSub + jj;
                     if (jBase + jOff >= N) break;
+                    const int rowOff = jOff * D_CONST + d_base;
+                    const float4 rj4  = *reinterpret_cast<const float4*>(&sh_R  [rowOff]);
+                    const float4 vr14 = *reinterpret_cast<const float4*>(&sh_Vr1[rowOff]);
+                    const float4 vr24 = *reinterpret_cast<const float4*>(&sh_Vr2[rowOff]);
+                    const float4 gyj4 = *reinterpret_cast<const float4*>(&sh_gYj[rowOff]);
+                    const float rj[4]  = { rj4.x,  rj4.y,  rj4.z,  rj4.w  };
+                    const float vr1[4] = { vr14.x, vr14.y, vr14.z, vr14.w };
+                    const float vr2[4] = { vr24.x, vr24.y, vr24.z, vr24.w };
+                    const float gyj[4] = { gyj4.x, gyj4.y, gyj4.z, gyj4.w };
                     #pragma unroll
                     for (int dd = 0; dd < D_TILE; dd++) {
-                        const float rj  = sh_R  [jOff*D_CONST + d_base + dd];
-                        const float vr1 = sh_Vr1[jOff*D_CONST + d_base + dd];
-                        const float vr2 = sh_Vr2[jOff*D_CONST + d_base + dd];
-                        const float gyj = sh_gYj[jOff*D_CONST + d_base + dd];
-
-                        dot_j[jj] += p_dot[dd] * rj;
-                        d1_j[jj]  += p_d1[dd]  * vr1;
-                        d2_j[jj]  += p_d2[dd]  * gyj;
-                        d3_j[jj]  += p_d3[dd]  * vr1;   // reuses vr1
-                        d4_j[jj]  += p_d4[dd]  * vr2;
-                        d5_j[jj]  += p_d5[dd]  * gyj;   // reuses gyj
-                        d6_j[jj]  += p_d6[dd]  * vr2;   // reuses vr2
+                        dot_j[jj] += p_dot[dd] * rj[dd];
+                        d1_j[jj]  += p_d1[dd]  * vr1[dd];
+                        d2_j[jj]  += p_d2[dd]  * gyj[dd];
+                        d3_j[jj]  += p_d3[dd]  * vr1[dd];
+                        d4_j[jj]  += p_d4[dd]  * vr2[dd];
+                        d5_j[jj]  += p_d5[dd]  * gyj[dd];
+                        d6_j[jj]  += p_d6[dd]  * vr2[dd];
                     }
                 }
             }
@@ -1030,13 +1036,14 @@ __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
                     const float grad_A = (gAq - sumQi) * Aq
                                        + (gAr - sh_sumr[jOff]) * Ar
                                        + (gAs - sumSk) * As;
-                    // Factored accumulation: only 1 shmem load per d (was 3).
-                    #pragma unroll 4
+                    // Factored accumulation: float4 load per 4 d's (LDS.128).
+                    #pragma unroll
                     for (int d = 0; d < D_CONST; d += 4) {
-                        rj_weighted[d+0] += grad_A * sh_R[jOff*D_CONST + d+0];
-                        rj_weighted[d+1] += grad_A * sh_R[jOff*D_CONST + d+1];
-                        rj_weighted[d+2] += grad_A * sh_R[jOff*D_CONST + d+2];
-                        rj_weighted[d+3] += grad_A * sh_R[jOff*D_CONST + d+3];
+                        const float4 rj4 = *reinterpret_cast<const float4*>(&sh_R[jOff*D_CONST + d]);
+                        rj_weighted[d+0] += grad_A * rj4.x;
+                        rj_weighted[d+1] += grad_A * rj4.y;
+                        rj_weighted[d+2] += grad_A * rj4.z;
+                        rj_weighted[d+3] += grad_A * rj4.w;
                     }
                 }
             }
