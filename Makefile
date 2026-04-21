@@ -117,4 +117,5 @@ clean:
 .PHONY: build maybe-build test test-quiet test-full \
         bench bench-save bench-quick bench-large bench-forward bench-backward bench-complexity \
         bench-scaling bench-scaling-quick bench-compare bench-compare-quick \
-        profile-timeline profile-kernel history all iterate clean
+        profile-timeline profile-kernel history \
+        all iterate clean

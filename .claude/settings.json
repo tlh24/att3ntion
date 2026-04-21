@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./scripts/profile.sh:*)",
+      "Bash(scripts/profile.sh:*)",
+      "Bash(bash scripts/profile.sh:*)"
+    ]
+  }
+}
