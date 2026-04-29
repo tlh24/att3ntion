@@ -1155,12 +1155,12 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
     float* sh_Vs1k = sh_Sk   + BLOCK_K * D_PAD;
     float* sh_Vs2k = sh_Vs1k + BLOCK_K * D_PAD;
     float* sh_dYk  = sh_Vs2k + BLOCK_K * D_PAD;
-    // I-tile data (streamed)
+    // I-tile data (streamed, padded to remove cooperative-store bank conflicts)
     float* sh_Q    = sh_dYk  + BLOCK_K * D_PAD;
-    float* sh_Vq1  = sh_Q    + BLOCK_I * D_CONST;
-    float* sh_Vq2  = sh_Vq1  + BLOCK_I * D_CONST;
-    float* sh_dYi  = sh_Vq2  + BLOCK_I * D_CONST;
-    float* sh_mi   = sh_dYi  + BLOCK_I * D_CONST;
+    float* sh_Vq1  = sh_Q    + BLOCK_I * D_PAD;
+    float* sh_Vq2  = sh_Vq1  + BLOCK_I * D_PAD;
+    float* sh_dYi  = sh_Vq2  + BLOCK_I * D_PAD;
+    float* sh_mi   = sh_dYi  + BLOCK_I * D_PAD;
     float* sh_li   = sh_mi   + BLOCK_I;
     float* sh_sumq = sh_li   + BLOCK_I;
 
@@ -1230,10 +1230,10 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
         for (int ld = threadIdx.y; ld < BLOCK_I && (iBase + ld) < N; ld += BLOCK_K) {
             const int iGlob = iBase + ld;
             for (int d = threadIdx.x; d < D_CONST; d += BLOCK_J) {
-                sh_Q[ld*D_CONST + d]   = Qbh[iGlob*D_CONST + d];
-                sh_Vq1[ld*D_CONST + d] = Vq1bh[iGlob*D_CONST + d];
-                sh_Vq2[ld*D_CONST + d] = Vq2bh[iGlob*D_CONST + d];
-                sh_dYi[ld*D_CONST + d] = gYbh[iGlob*D_CONST + d];
+                sh_Q[ld*D_PAD + d]   = Qbh[iGlob*D_CONST + d];
+                sh_Vq1[ld*D_PAD + d] = Vq1bh[iGlob*D_CONST + d];
+                sh_Vq2[ld*D_PAD + d] = Vq2bh[iGlob*D_CONST + d];
+                sh_dYi[ld*D_PAD + d] = gYbh[iGlob*D_CONST + d];
             }
             if (threadIdx.x == 0) {
                 sh_mi[ld]   = miBH[iGlob];
@@ -1245,64 +1245,92 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
         }
         __syncthreads();
 
-        for (int iOff = 0; iOff < BLOCK_I && (iBase + iOff) < N; ++iOff) {
-            const float* Qi   = sh_Q   + iOff*D_CONST;
-            const float* Vq1i = sh_Vq1 + iOff*D_CONST;
-            const float* Vq2i = sh_Vq2 + iOff*D_CONST;
-            const float* dYi_p = sh_dYi + iOff*D_CONST;
-            const float mi    = sh_mi[iOff];
-            const float li    = sh_li[iOff];
-
-            float dot = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f, d4 = 0.f, d5 = 0.f, d6 = 0.f;
-            for (int d = 0; d < D_CONST; ++d) {
-                const float qi  = Qi[d];
-                const float vq1 = Vq1i[d];
-                const float vq2 = Vq2i[d];
-                const float dyi = dYi_p[d];
-                const float rj   = sh_Rj  [sh_j_off + d];
-                const float sk   = sh_Sk  [sh_k_off + d];
-                const float vr1j = sh_Vr1j[sh_j_off + d];
-                const float vr2j = sh_Vr2j[sh_j_off + d];
-                const float vs1k = sh_Vs1k[sh_k_off + d];
-                const float vs2k = sh_Vs2k[sh_k_off + d];
-                const float dyj  = sh_dYj [sh_j_off + d];
-                const float dyk  = sh_dYk [sh_k_off + d];
-
-                dot += qi * rj * sk;
-                if constexpr (!CORRECTION_ONLY) {
-                    d1 += dyi * vr1j * vs1k;
-                }
-                d2 += dyj * vq1 * vs1k;
-                if constexpr (!CORRECTION_ONLY) {
-                    d3 += dyk * vq1 * vr1j;
-                }
-                d4 += dyi * vr2j * vs2k;
-                if constexpr (!CORRECTION_ONLY) {
-                    d5 += dyj * vq2 * vs2k;
-                }
-                d6 += dyk * vq2 * vr2j;
+        // D-tiled dot products with i sub-tiling.
+        // Mirrors the QS kernel strategy: precompute thread-invariant j/k products
+        // once per D_TILE and reuse them across several i rows.
+        constexpr int I_SUB  = 4;
+        constexpr int D_TILE = 4;
+        for (int iSub = 0; iSub < BLOCK_I && (iBase + iSub) < N; iSub += I_SUB) {
+            float dot_i[I_SUB], d1_i[I_SUB], d2_i[I_SUB], d3_i[I_SUB];
+            float d4_i[I_SUB], d5_i[I_SUB], d6_i[I_SUB];
+            #pragma unroll
+            for (int ii = 0; ii < I_SUB; ++ii) {
+                dot_i[ii] = 0.f; d1_i[ii] = 0.f; d2_i[ii] = 0.f; d3_i[ii] = 0.f;
+                d4_i[ii] = 0.f; d5_i[ii] = 0.f; d6_i[ii] = 0.f;
             }
 
-            const float logits = dot * scale;
-            const float Aq = __expf(fminf(logits - mi, EXP_CLIP)) / fmaxf(li, DENOM_EPS);
-            const float Ar = __expf(fminf(logits - mj, EXP_CLIP)) / fmaxf(lj, DENOM_EPS);
-            const float As = __expf(fminf(logits - mk, EXP_CLIP)) / fmaxf(lk, DENOM_EPS);
+            for (int d_base = 0; d_base < D_CONST; d_base += D_TILE) {
+                float p_dot[D_TILE], p_d1[D_TILE], p_d2[D_TILE], p_d3[D_TILE];
+                float p_d4[D_TILE], p_d5[D_TILE], p_d6[D_TILE];
+                #pragma unroll
+                for (int dd = 0; dd < D_TILE; ++dd) {
+                    const int d = d_base + dd;
+                    const float rj   = sh_Rj  [sh_j_off + d];
+                    const float sk   = sh_Sk  [sh_k_off + d];
+                    const float vr1j = sh_Vr1j[sh_j_off + d];
+                    const float vr2j = sh_Vr2j[sh_j_off + d];
+                    const float vs1k = sh_Vs1k[sh_k_off + d];
+                    const float vs2k = sh_Vs2k[sh_k_off + d];
+                    const float dyj  = sh_dYj [sh_j_off + d];
+                    const float dyk  = sh_dYk [sh_k_off + d];
 
-            const float gAr = d2 + d4 * As + d6 * Aq;
+                    p_dot[dd] = rj * sk;
+                    p_d1[dd]  = vr1j * vs1k;
+                    p_d2[dd]  = dyj * vs1k;
+                    p_d3[dd]  = dyk * vr1j;
+                    p_d4[dd]  = vr2j * vs2k;
+                    p_d5[dd]  = dyj * vs2k;
+                    p_d6[dd]  = dyk * vr2j;
+                }
 
-            if constexpr (CORRECTION_ONLY) {
-                reg_sum_r += gAr * Ar;
-            } else {
-                const float sumQi = sh_sumq[iOff];
-                const float gAq = d1 + d5 * As + d6 * Ar;
-                const float gAs = d3 + d4 * Ar + d5 * Aq;
+                #pragma unroll
+                for (int ii = 0; ii < I_SUB; ++ii) {
+                    const int iOff = iSub + ii;
+                    if (iBase + iOff >= N) break;
+                    const int iRow = iOff * D_PAD + d_base;
+                    #pragma unroll
+                    for (int dd = 0; dd < D_TILE; ++dd) {
+                        const float qi  = sh_Q  [iRow + dd];
+                        const float vq1 = sh_Vq1[iRow + dd];
+                        const float vq2 = sh_Vq2[iRow + dd];
+                        const float dyi = sh_dYi[iRow + dd];
+                        dot_i[ii] += qi  * p_dot[dd];
+                        if constexpr (!CORRECTION_ONLY) d1_i[ii] += dyi * p_d1[dd];
+                        d2_i[ii] += vq1 * p_d2[dd];
+                        if constexpr (!CORRECTION_ONLY) d3_i[ii] += vq1 * p_d3[dd];
+                        d4_i[ii] += dyi * p_d4[dd];
+                        if constexpr (!CORRECTION_ONLY) d5_i[ii] += vq2 * p_d5[dd];
+                        d6_i[ii] += vq2 * p_d6[dd];
+                    }
+                }
+            }
 
-                const float grad_A = (gAq - sumQi) * Aq
-                                   + (gAr - sumRj) * Ar
-                                   + (gAs - sumSk) * As;
+            #pragma unroll
+            for (int ii = 0; ii < I_SUB; ++ii) {
+                const int iOff = iSub + ii;
+                if (iBase + iOff >= N) break;
+                const float mi = sh_mi[iOff];
+                const float li = sh_li[iOff];
 
-                for (int d = 0; d < D_CONST; ++d)
-                    grad_acc[d] += grad_A * Qi[d] * sh_Sk[sh_k_off + d];
+                const float logits = dot_i[ii] * scale;
+                const float Aq = __expf(fminf(logits - mi, EXP_CLIP)) / fmaxf(li, DENOM_EPS);
+                const float Ar = __expf(fminf(logits - mj, EXP_CLIP)) / fmaxf(lj, DENOM_EPS);
+                const float As = __expf(fminf(logits - mk, EXP_CLIP)) / fmaxf(lk, DENOM_EPS);
+                const float gAr = d2_i[ii] + d4_i[ii] * As + d6_i[ii] * Aq;
+
+                if constexpr (CORRECTION_ONLY) {
+                    reg_sum_r += gAr * Ar;
+                } else {
+                    const float sumQi = sh_sumq[iOff];
+                    const float gAq = d1_i[ii] + d5_i[ii] * As + d6_i[ii] * Ar;
+                    const float gAs = d3_i[ii] + d4_i[ii] * Ar + d5_i[ii] * Aq;
+                    const float grad_A = (gAq - sumQi) * Aq
+                                       + (gAr - sumRj) * Ar
+                                       + (gAs - sumSk) * As;
+                    const int iRow = iOff * D_PAD;
+                    for (int d = 0; d < D_CONST; ++d)
+                        grad_acc[d] += grad_A * sh_Q[iRow + d] * sh_Sk[sh_k_off + d];
+                }
             }
         }
         __syncthreads();
@@ -1376,7 +1404,7 @@ backward_impl(torch::Tensor grad_output,
   // ============================================================================
   const int B = Q.size(0);
   const int H = Q.size(1);
-  const int N = Q.size(2);
+  const int N = Q.size(2); //i think N and I/J/K are aliases, deal with later
   const int I = Q.size(2);
   const int J = R.size(2);
   const int K = S.size(2);
@@ -1403,7 +1431,7 @@ backward_impl(torch::Tensor grad_output,
   auto sum_s = torch::zeros({B, H, N}, optionsBH);
 
   // ============================================================================
-  // 5. COMPUTE grad_{Vq,Vr,Vs}_1 (GATHER-GRAD KERNELS)
+  // 3. COMPUTE grad_{Vq,Vr,Vs}_1 (GATHER-GRAD KERNELS)
   // ============================================================================
   DISPATCH_D(D, {
     constexpr int TI = T_I;
@@ -1465,7 +1493,7 @@ backward_impl(torch::Tensor grad_output,
   });
 
   // ============================================================================
-  // 6. COMPUTE grad_{Vq,Vr,Vs}_2 (SCATTER-GRAD KERNELS)
+  // 4. COMPUTE grad_{Vq,Vr,Vs}_2 (SCATTER-GRAD KERNELS)
   // ============================================================================
   DISPATCH_D(D, {
     constexpr int TI = T_I;
@@ -1530,7 +1558,7 @@ backward_impl(torch::Tensor grad_output,
 
 
   // ===========================================================================
-  // 7. JACOBIAN CORRECTIONS + 8. GRAD Q/S/R
+  // 5. JACOBIAN CORRECTIONS + 6. GRAD Q/S/R
   //    All dispatched through D template
   // ============================================================================
   DISPATCH_D(D, {
@@ -1651,7 +1679,7 @@ backward_impl(torch::Tensor grad_output,
       const size_t shmem_bytes =
           4 * tileJ * D_PAD_r * sizeof(float) +
           4 * tileK * D_PAD_r * sizeof(float) +
-          4 * tileI * D_TMPL * sizeof(float) +
+          4 * tileI * D_PAD_r * sizeof(float) +
           3 * tileI * sizeof(float);
 
       cudaFuncSetAttribute(
@@ -1705,8 +1733,7 @@ backward_impl(torch::Tensor grad_output,
 // Public API: backward_cuda (uses pre-computed softmax stats from forward pass)
 // =============================================================================
 // NOTE: The forward pass computes and returns softmax stats (m_i, l_i, m_j, l_j, m_k, l_k).
-// These MUST be passed to the backward pass to avoid redundant computation and ensure
-// numerical consistency between forward and backward passes.
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor,
@@ -1751,3 +1778,5 @@ backward_cuda(torch::Tensor grad_output,
   return backward_impl(grad_output, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
                        m_i, l_i, m_j, l_j, m_k, l_k, dropout_rate);
 }
+
+// #lalala
