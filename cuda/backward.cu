@@ -1151,16 +1151,23 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
     float* sh_Vr1j = sh_Rj   + BLOCK_J * D_PAD;
     float* sh_Vr2j = sh_Vr1j + BLOCK_J * D_PAD;
     float* sh_dYj  = sh_Vr2j + BLOCK_J * D_PAD;
+
     float* sh_Sk   = sh_dYj  + BLOCK_J * D_PAD;
     float* sh_Vs1k = sh_Sk   + BLOCK_K * D_PAD;
     float* sh_Vs2k = sh_Vs1k + BLOCK_K * D_PAD;
     float* sh_dYk  = sh_Vs2k + BLOCK_K * D_PAD;
-    // I-tile data (streamed, padded to remove cooperative-store bank conflicts)
+
+    // I-tile data (streamed). Stride is D_CONST (not D_PAD) so that
+    // 4-element rows are 16-byte aligned and inner-loop reads can use
+    // float4 LDS.128. Bank conflicts are handled at the cooperative-store
+    // site by the linear-tid mapping below (warp covers one row × 32 cols).
+
     float* sh_Q    = sh_dYk  + BLOCK_K * D_PAD;
-    float* sh_Vq1  = sh_Q    + BLOCK_I * D_PAD;
-    float* sh_Vq2  = sh_Vq1  + BLOCK_I * D_PAD;
-    float* sh_dYi  = sh_Vq2  + BLOCK_I * D_PAD;
-    float* sh_mi   = sh_dYi  + BLOCK_I * D_PAD;
+    float* sh_Vq1  = sh_Q    + BLOCK_I * D_CONST;
+    float* sh_Vq2  = sh_Vq1  + BLOCK_I * D_CONST;
+    float* sh_dYi  = sh_Vq2  + BLOCK_I * D_CONST;
+
+    float* sh_mi   = sh_dYi  + BLOCK_I * D_CONST;
     float* sh_li   = sh_mi   + BLOCK_I;
     float* sh_sumq = sh_li   + BLOCK_I;
 
@@ -1225,21 +1232,42 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
     const int sh_k_off = threadIdx.y * D_PAD;
 
     // Stream i-tiles through shared memory
+    const int tid_l       = threadIdx.x + threadIdx.y * BLOCK_J;
+    const int nThreads_l  = BLOCK_J * BLOCK_K;
     for (int iBase = 0; iBase < N; iBase += BLOCK_I) {
-        // Cooperative load of i-tile
-        for (int ld = threadIdx.y; ld < BLOCK_I && (iBase + ld) < N; ld += BLOCK_K) {
-            const int iGlob = iBase + ld;
-            for (int d = threadIdx.x; d < D_CONST; d += BLOCK_J) {
-                sh_Q[ld*D_PAD + d]   = Qbh[iGlob*D_CONST + d];
-                sh_Vq1[ld*D_PAD + d] = Vq1bh[iGlob*D_CONST + d];
-                sh_Vq2[ld*D_PAD + d] = Vq2bh[iGlob*D_CONST + d];
-                sh_dYi[ld*D_PAD + d] = gYbh[iGlob*D_CONST + d];
+        // Cooperative load of i-tile (linear tid mapping → each warp covers
+        // a contiguous 32-column span of one row, eliminating the (16-col x
+        // 2-row) warp shape that otherwise produces 2-way store conflicts).
+        // // well, we still have conflicts lol nvm 
+        for (int idx = tid_l; idx < BLOCK_I * D_CONST; idx += nThreads_l) {
+            const int ii    = idx / D_CONST;
+            const int dd    = idx % D_CONST;
+            const int iGlob = iBase + ii;
+            if (iGlob < N) {
+                sh_Q  [ii*D_CONST + dd] = Qbh  [iGlob*D_CONST + dd];
+                sh_Vq1[ii*D_CONST + dd] = Vq1bh[iGlob*D_CONST + dd];
+                sh_Vq2[ii*D_CONST + dd] = Vq2bh[iGlob*D_CONST + dd];
+                sh_dYi[ii*D_CONST + dd] = gYbh [iGlob*D_CONST + dd];
+            } else {
+                sh_Q  [ii*D_CONST + dd] = 0.0f;
+                sh_Vq1[ii*D_CONST + dd] = 0.0f;
+                sh_Vq2[ii*D_CONST + dd] = 0.0f;
+                sh_dYi[ii*D_CONST + dd] = 0.0f;
             }
-            if (threadIdx.x == 0) {
-                sh_mi[ld]   = miBH[iGlob];
-                sh_li[ld]   = liBH[iGlob];
+        }
+        if (tid_l < BLOCK_I) {
+            const int iGlob = iBase + tid_l;
+            if (iGlob < N) {
+                sh_mi[tid_l] = miBH[iGlob];
+                sh_li[tid_l] = liBH[iGlob];
                 if constexpr (!CORRECTION_ONLY) {
-                    sh_sumq[ld] = (sum_q + (int64_t)bh * N)[iGlob];
+                    sh_sumq[tid_l] = (sum_q + (int64_t)bh * N)[iGlob];
+                }
+            } else {
+                sh_mi[tid_l] = 0.0f;
+                sh_li[tid_l] = 1.0f;  // avoid div-by-zero in OOB rows
+                if constexpr (!CORRECTION_ONLY) {
+                    sh_sumq[tid_l] = 0.0f;
                 }
             }
         }
@@ -1287,20 +1315,26 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
                 for (int ii = 0; ii < I_SUB; ++ii) {
                     const int iOff = iSub + ii;
                     if (iBase + iOff >= N) break;
-                    const int iRow = iOff * D_PAD + d_base;
+                    // i-tile is stored at stride D_CONST (not D_PAD) so each
+                    // 4-float slice is 16-byte aligned: one LDS.128 per array.
+                    const int iRow = iOff * D_CONST + d_base;
+                    const float4 qi4  = *reinterpret_cast<const float4*>(&sh_Q  [iRow]);
+                    const float4 vq14 = *reinterpret_cast<const float4*>(&sh_Vq1[iRow]);
+                    const float4 vq24 = *reinterpret_cast<const float4*>(&sh_Vq2[iRow]);
+                    const float4 dyi4 = *reinterpret_cast<const float4*>(&sh_dYi[iRow]);
+                    const float qi[4]  = { qi4.x,  qi4.y,  qi4.z,  qi4.w  };
+                    const float vq1[4] = { vq14.x, vq14.y, vq14.z, vq14.w };
+                    const float vq2[4] = { vq24.x, vq24.y, vq24.z, vq24.w };
+                    const float dyi[4] = { dyi4.x, dyi4.y, dyi4.z, dyi4.w };
                     #pragma unroll
                     for (int dd = 0; dd < D_TILE; ++dd) {
-                        const float qi  = sh_Q  [iRow + dd];
-                        const float vq1 = sh_Vq1[iRow + dd];
-                        const float vq2 = sh_Vq2[iRow + dd];
-                        const float dyi = sh_dYi[iRow + dd];
-                        dot_i[ii] += qi  * p_dot[dd];
-                        if constexpr (!CORRECTION_ONLY) d1_i[ii] += dyi * p_d1[dd];
-                        d2_i[ii] += vq1 * p_d2[dd];
-                        if constexpr (!CORRECTION_ONLY) d3_i[ii] += vq1 * p_d3[dd];
-                        d4_i[ii] += dyi * p_d4[dd];
-                        if constexpr (!CORRECTION_ONLY) d5_i[ii] += vq2 * p_d5[dd];
-                        d6_i[ii] += vq2 * p_d6[dd];
+                        dot_i[ii] += qi[dd]  * p_dot[dd];
+                        if constexpr (!CORRECTION_ONLY) d1_i[ii] += dyi[dd] * p_d1[dd];
+                        d2_i[ii] += vq1[dd] * p_d2[dd];
+                        if constexpr (!CORRECTION_ONLY) d3_i[ii] += vq1[dd] * p_d3[dd];
+                        d4_i[ii] += dyi[dd] * p_d4[dd];
+                        if constexpr (!CORRECTION_ONLY) d5_i[ii] += vq2[dd] * p_d5[dd];
+                        d6_i[ii] += vq2[dd] * p_d6[dd];
                     }
                 }
             }
@@ -1327,9 +1361,18 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
                     const float grad_A = (gAq - sumQi) * Aq
                                        + (gAr - sumRj) * Ar
                                        + (gAs - sumSk) * As;
-                    const int iRow = iOff * D_PAD;
-                    for (int d = 0; d < D_CONST; ++d)
-                        grad_acc[d] += grad_A * sh_Q[iRow + d] * sh_Sk[sh_k_off + d];
+                    // sh_Q stride D_CONST → float4-aligned; sh_Sk stride D_PAD
+                    // (=D+1) is not 16-byte aligned at sh_k_off for ty>0, so
+                    // it stays scalar.
+                    const int iRow = iOff * D_CONST;
+                    #pragma unroll
+                    for (int d = 0; d < D_CONST; d += 4) {
+                        const float4 qi4 = *reinterpret_cast<const float4*>(&sh_Q[iRow + d]);
+                        grad_acc[d+0] += grad_A * qi4.x * sh_Sk[sh_k_off + d + 0];
+                        grad_acc[d+1] += grad_A * qi4.y * sh_Sk[sh_k_off + d + 1];
+                        grad_acc[d+2] += grad_A * qi4.z * sh_Sk[sh_k_off + d + 2];
+                        grad_acc[d+3] += grad_A * qi4.w * sh_Sk[sh_k_off + d + 3];
+                    }
                 }
             }
         }
@@ -1562,7 +1605,7 @@ backward_impl(torch::Tensor grad_output,
   //    All dispatched through D template
   // ============================================================================
   DISPATCH_D(D, {
-    // Phase 1: Correction sums
+    // Phase 1: Correction sums: sum_q, sum_r, sum_s
     {
       constexpr int corrI = 8;
       constexpr int corrK = 8;
@@ -1679,7 +1722,7 @@ backward_impl(torch::Tensor grad_output,
       const size_t shmem_bytes =
           4 * tileJ * D_PAD_r * sizeof(float) +
           4 * tileK * D_PAD_r * sizeof(float) +
-          4 * tileI * D_PAD_r * sizeof(float) +
+          4 * tileI * D_TMPL * sizeof(float) +
           3 * tileI * sizeof(float);
 
       cudaFuncSetAttribute(
@@ -1689,6 +1732,8 @@ backward_impl(torch::Tensor grad_output,
 
       R_grad_kernel<false, tileJ, tileI, tileK, D_TMPL>
           <<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+
+             // the input tensors
               Q.data_ptr<float>(),
               R.data_ptr<float>(),
               S.data_ptr<float>(),
@@ -1698,17 +1743,26 @@ backward_impl(torch::Tensor grad_output,
               Vr_2.data_ptr<float>(),
               Vs_1.data_ptr<float>(),
               Vs_2.data_ptr<float>(),
+
+              // the gradient of the output 
               grad_output.data_ptr<float>(),
+
+              // softmax stats
               m_i.data_ptr<float>(),
               l_i.data_ptr<float>(),
               m_j.data_ptr<float>(),
               l_j.data_ptr<float>(),
               m_k.data_ptr<float>(),
               l_k.data_ptr<float>(),
+
+              // jacobian correction sums
               sum_q.data_ptr<float>(),
               sum_r.data_ptr<float>(),
               sum_s.data_ptr<float>(),
+
+              // the gradient we want to compute
               grad_R.data_ptr<float>(),
+
               N, scale);
 
       AT_CUDA_CHECK(cudaGetLastError());
@@ -1779,4 +1833,3 @@ backward_cuda(torch::Tensor grad_output,
                        m_i, l_i, m_j, l_j, m_k, l_k, dropout_rate);
 }
 
-// #lalala
