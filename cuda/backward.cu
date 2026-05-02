@@ -918,19 +918,37 @@ __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
             if (lid < BLOCK_J) sh_sumr[lid] = 0.0f;
         }
 
-        for (int ld = threadIdx.y; ld < BLOCK_J && (jBase + ld) < N; ld += BLOCK_K) {
-            const int jGlob = jBase + ld;
-            for (int d = threadIdx.x; d < D_CONST; d += BLOCK_I) {
-                sh_R[ld*D_CONST + d]   = Rbh[jGlob*D_CONST + d];
-                sh_Vr1[ld*D_CONST + d] = Vr1bh[jGlob*D_CONST + d];
-                sh_Vr2[ld*D_CONST + d] = Vr2bh[jGlob*D_CONST + d];
-                sh_gYj[ld*D_CONST + d] = gYbh[jGlob*D_CONST + d];
+        const int tid_l      = threadIdx.x + threadIdx.y * BLOCK_I;
+        const int nThreads_l = BLOCK_I * BLOCK_K;
+        for (int idx = tid_l; idx < BLOCK_J * D_CONST; idx += nThreads_l) {
+            const int jj = idx / D_CONST;
+            const int dd = idx % D_CONST;
+            const int jGlob = jBase + jj;
+            if (jGlob < N) {
+                sh_R  [jj*D_CONST + dd] = Rbh  [jGlob*D_CONST + dd];
+                sh_Vr1[jj*D_CONST + dd] = Vr1bh[jGlob*D_CONST + dd];
+                sh_Vr2[jj*D_CONST + dd] = Vr2bh[jGlob*D_CONST + dd];
+                sh_gYj[jj*D_CONST + dd] = gYbh [jGlob*D_CONST + dd];
+            } else {
+                sh_R  [jj*D_CONST + dd] = 0.0f;
+                sh_Vr1[jj*D_CONST + dd] = 0.0f;
+                sh_Vr2[jj*D_CONST + dd] = 0.0f;
+                sh_gYj[jj*D_CONST + dd] = 0.0f;
             }
-            if (threadIdx.x == 0) {
-                sh_mj[ld]   = mjBH[jGlob];
-                sh_lj[ld]   = ljBH[jGlob];
+        }
+        if (tid_l < BLOCK_J) {
+            const int jGlob = jBase + tid_l;
+            if (jGlob < N) {
+                sh_mj[tid_l] = mjBH[jGlob];
+                sh_lj[tid_l] = ljBH[jGlob];
                 if constexpr (!CORRECTION_ONLY) {
-                    sh_sumr[ld] = (sum_r + (int64_t)bh * N)[jGlob];
+                    sh_sumr[tid_l] = (sum_r + (int64_t)bh * N)[jGlob];
+                }
+            } else {
+                sh_mj[tid_l] = 0.0f;
+                sh_lj[tid_l] = 1.0f;
+                if constexpr (!CORRECTION_ONLY) {
+                    sh_sumr[tid_l] = 0.0f;
                 }
             }
         }
@@ -1235,25 +1253,31 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
     const int tid_l       = threadIdx.x + threadIdx.y * BLOCK_J;
     const int nThreads_l  = BLOCK_J * BLOCK_K;
     for (int iBase = 0; iBase < N; iBase += BLOCK_I) {
-        // Cooperative load of i-tile (linear tid mapping → each warp covers
-        // a contiguous 32-column span of one row, eliminating the (16-col x
-        // 2-row) warp shape that otherwise produces 2-way store conflicts).
-        // // well, we still have conflicts lol nvm 
-        for (int idx = tid_l; idx < BLOCK_I * D_CONST; idx += nThreads_l) {
-            const int ii    = idx / D_CONST;
-            const int dd    = idx % D_CONST;
+        // Cooperative load of i-tile. We keep the linear tid mapping and pack
+        // stores as float4 to lower shared-store instruction pressure.
+        constexpr int D_VEC = 4;
+        const int nVecPerRow = D_CONST / D_VEC;
+        for (int idx4 = tid_l; idx4 < BLOCK_I * nVecPerRow; idx4 += nThreads_l) {
+            const int ii    = idx4 / nVecPerRow;
+            const int vv    = idx4 % nVecPerRow;
+            const int dd    = vv * D_VEC;
             const int iGlob = iBase + ii;
+            float4 q4, vq14, vq24, dyi4;
             if (iGlob < N) {
-                sh_Q  [ii*D_CONST + dd] = Qbh  [iGlob*D_CONST + dd];
-                sh_Vq1[ii*D_CONST + dd] = Vq1bh[iGlob*D_CONST + dd];
-                sh_Vq2[ii*D_CONST + dd] = Vq2bh[iGlob*D_CONST + dd];
-                sh_dYi[ii*D_CONST + dd] = gYbh [iGlob*D_CONST + dd];
+                q4   = *reinterpret_cast<const float4*>(&Qbh  [iGlob*D_CONST + dd]);
+                vq14 = *reinterpret_cast<const float4*>(&Vq1bh[iGlob*D_CONST + dd]);
+                vq24 = *reinterpret_cast<const float4*>(&Vq2bh[iGlob*D_CONST + dd]);
+                dyi4 = *reinterpret_cast<const float4*>(&gYbh [iGlob*D_CONST + dd]);
             } else {
-                sh_Q  [ii*D_CONST + dd] = 0.0f;
-                sh_Vq1[ii*D_CONST + dd] = 0.0f;
-                sh_Vq2[ii*D_CONST + dd] = 0.0f;
-                sh_dYi[ii*D_CONST + dd] = 0.0f;
+                q4   = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                vq14 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                vq24 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                dyi4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             }
+            *reinterpret_cast<float4*>(&sh_Q  [ii*D_CONST + dd]) = q4;
+            *reinterpret_cast<float4*>(&sh_Vq1[ii*D_CONST + dd]) = vq14;
+            *reinterpret_cast<float4*>(&sh_Vq2[ii*D_CONST + dd]) = vq24;
+            *reinterpret_cast<float4*>(&sh_dYi[ii*D_CONST + dd]) = dyi4;
         }
         if (tid_l < BLOCK_I) {
             const int iGlob = iBase + tid_l;
@@ -1384,16 +1408,19 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
         // Block reduction for sum_r[j]: reduce reg_sum_r across k-dim (threadIdx.y)
         float* reduce_buf = shmem;  // reuse shared memory (i-tile data done)
 
-        reduce_buf[threadIdx.x * BLOCK_K + threadIdx.y] = valid ? reg_sum_r : 0.0f;
+        // Transposed [k][j] layout makes warp-contiguous x-lanes hit distinct banks.
+        const int reduce_idx = threadIdx.y * BLOCK_J + threadIdx.x;
+        reduce_buf[reduce_idx] = valid ? reg_sum_r : 0.0f;
         __syncthreads();
         for (int s = BLOCK_K / 2; s > 0; s >>= 1) {
-            if (threadIdx.y < s)
-                reduce_buf[threadIdx.x * BLOCK_K + threadIdx.y] +=
-                    reduce_buf[threadIdx.x * BLOCK_K + threadIdx.y + s];
+            if (threadIdx.y < s) {
+                reduce_buf[reduce_idx] +=
+                    reduce_buf[(threadIdx.y + s) * BLOCK_J + threadIdx.x];
+            }
             __syncthreads();
         }
         if (threadIdx.y == 0 && j0 < N)
-            atomicAdd(&sum_rBH[j0], reduce_buf[threadIdx.x * BLOCK_K]);
+            atomicAdd(&sum_rBH[j0], reduce_buf[threadIdx.x]);
     } else {
         // Write result (atomic due to k-dimension overlap)
         float* gRbh = gradR + bh * stride_BH;
