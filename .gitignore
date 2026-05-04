@@ -49,6 +49,7 @@ optimization_log/sessions/
 
 
 # CLAUDE
+CLAUDE.md
 /docs/*
 .claude/
 .cursor/
