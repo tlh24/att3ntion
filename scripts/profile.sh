@@ -16,8 +16,8 @@ TAG="${2:?tag is required (e.g. baseline, after_float4)}"
 PASS="${3:-forward}"
 DIMS="${4:-1,2,128,128,128,64}"
 
-if [ "$PASS" != "forward" ] && [ "$PASS" != "backward" ]; then
-    echo "pass must be 'forward' or 'backward' (got: $PASS)" >&2
+if [ "$PASS" != "forward" ] && [ "$PASS" != "backward" ] && [ "$PASS" != "both" ]; then
+    echo "pass must be 'forward', 'backward', or 'both' (got: $PASS)" >&2
     exit 2
 fi
 
@@ -45,11 +45,17 @@ mkdir -p profiling_reports/ncu_rep profiling_reports/csv
 NCU_OUT="profiling_reports/ncu_rep/${BASENAME}"
 CSV_OUT="profiling_reports/csv/${BASENAME}.csv"
 
+KERNEL_FLAG=()
+[ "$KERNEL" != "all" ] && KERNEL_FLAG=(-k "$KERNEL")
+
+PASS_FLAG=()
+[ "$PASS" != "both" ] && PASS_FLAG=("--${PASS}-only")
+
 ncu --set full --csv --page raw \
-    -k "$KERNEL" \
+    "${KERNEL_FLAG[@]}" \
     -o "$NCU_OUT" -f \
     python benchmarks/profile_kernels.py --no-profile \
-        --dims "$DIMS" "--${PASS}-only" \
+        --dims "$DIMS" "${PASS_FLAG[@]}" \
   > "$CSV_OUT"
 
 echo "NCU: $(realpath "${NCU_OUT}.ncu-rep")"

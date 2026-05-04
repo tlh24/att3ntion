@@ -10,7 +10,7 @@ description: Run Nsight Compute on a single CUDA kernel and save both the .ncu-r
 - **kernel** (required) — e.g. `QS_grad_kernel`, `Yq_gather`
 - **tag** (required) — short slug describing this run: `baseline`, `after_float4`, `before_smem_fix`. If the user didn't give one, ASK. Do not invent one.
 - **pass** (optional) — `forward` or `backward`, default `forward`
-- **dims** (optional) — `B,H,I,J,K,D`, default `1,2,128,128,128,64`
+- **dims** (optional) — `B,H,I,J,K,D`, default `1,2,128,128,128,64` (H100: `2,2,256,256,256,64`)
 
 ## Output files
 
@@ -26,7 +26,11 @@ Example: `QS_grad_kernel_baseline_apr20_04:58pm.ncu-rep`
 One command. Do not inline the shell logic — call the script:
 
 ```bash
+# Local GPU:
 ./scripts/profile.sh <kernel> <tag> [<pass>] [<dims>]
+
+# H100 pod (pushes sources, profiles remotely, pulls results):
+./scripts/profile_h100.sh <kernel> <tag> [<pass>] [<dims>]
 ```
 
 The script handles: env activation, stale-build check, timestamp, directory creation, and the ncu invocation.

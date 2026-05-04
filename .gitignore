@@ -1,6 +1,7 @@
 myenv
 
 *.pt
+*.tar.gz
 
 # Build artifacts
 build/
@@ -45,3 +46,14 @@ optimization_log/sessions/
 .env
 .env.*
 !.env.example
+
+
+#personal docs and notes
+/docs/*
+
+# personal scripts
+.claude/skills/
+scripts/kpush.sh
+scripts/kpull.sh
+scripts/ksync.sh
+scripts/profile_h100.sh

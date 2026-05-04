@@ -65,6 +65,13 @@ LARGE_CONFIGS = [
     BenchConfig("N256_D64",  B=1, H=1, N=256, D=64),
 ]
 
+H100_CONFIGS = [
+    BenchConfig("N384_D32",  B=2, H=2, N=384, D=32),
+    BenchConfig("N384_D64",  B=2, H=2, N=384, D=64),
+    BenchConfig("N512_D32",  B=2, H=2, N=512, D=32),
+    BenchConfig("N512_D64",  B=2, H=2, N=512, D=64),
+]
+
 
 # --- Benchmark Runners ---
 
@@ -349,6 +356,7 @@ def main():
     parser = argparse.ArgumentParser(description="Benchmark hypergraph attention kernels")
     parser.add_argument("--quick", action="store_true", help="Quick smoke test (2 configs)")
     parser.add_argument("--large", action="store_true", help="Include large N configs")
+    parser.add_argument("--h100", action="store_true", help="Include H100-scale configs (implies --large)")
     parser.add_argument("--forward-only", action="store_true", help="Only benchmark forward")
     parser.add_argument("--backward-only", action="store_true", help="Only benchmark backward")
     parser.add_argument("--warmup", type=int, default=5, help="Warmup iterations")
@@ -359,6 +367,7 @@ def main():
     parser.add_argument("--complexity", action="store_true", help="Show algorithmic complexity")
     parser.add_argument("--show-history", action="store_true", help="Show history only")
     parser.add_argument("--max-n-backward", type=int, default=128, help="Max N for backward")
+    parser.add_argument("--file", type=str, default=RESULTS_FILE, help="Path to history JSONL file")
     args = parser.parse_args()
 
     if args.save and not args.note:
@@ -366,7 +375,7 @@ def main():
         sys.exit(1)
 
     if args.show_history:
-        history = load_history()
+        history = load_history(args.file)
         print_history_compact(history)
         return
 
@@ -390,8 +399,10 @@ def main():
         configs = QUICK_CONFIGS
     else:
         configs = list(STANDARD_CONFIGS)
-        if args.large:
+        if args.large or args.h100:
             configs.extend(LARGE_CONFIGS)
+        if args.h100:
+            configs.extend(H100_CONFIGS)
 
     gpu_specs = get_gpu_specs()
     print_header(gpu_specs, args.note if args.note else None)
@@ -440,7 +451,7 @@ def main():
 
     print(" done")
 
-    history = load_history()
+    history = load_history(args.file)
     prev_run = history[-1] if history else None
 
     print_timing_table(forward_results, backward_results, prev_run)
@@ -461,10 +472,10 @@ def main():
                 "forward": forward_results.get(cfg.name),
                 "backward": backward_results.get(cfg.name),
             }
-        save_results(run_data)
-        print(f"\n  ✓ Saved to {RESULTS_FILE}")
+        save_results(run_data, args.file)
+        print(f"\n  ✓ Saved to {args.file}")
 
-    history = load_history()
+    history = load_history(args.file)
     print_history_compact(history)
 
     print(f"\n{'═'*80}\n")

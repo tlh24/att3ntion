@@ -12,6 +12,9 @@
 #   make bench-scaling                    CUDA scaling analysis
 #   make bench-compare                    CUDA vs Torch comparison
 #   make history                          Show benchmark history with deltas
+#   make bench-save-h100 NOTE="desc"         Push + bench on H100, pull results (no rebuild)
+#   make bench-save-h100 NOTE="desc" BUILD=1  Same but rebuilds first
+#   make history-h100                     Show H100 benchmark history
 #   make clean                            Clean build artifacts
 
 PYTHON ?= python
@@ -100,6 +103,44 @@ profile-kernel: maybe-build
 history:
 	@$(PYTHON) benchmarks/bench_regression.py --show-history
 
+H100_NS = strange-loop
+H100_HISTORY_FILE = benchmarks/benchmark_history_h100.jsonl
+
+bench-save-h100:
+ifndef NOTE
+	$(error NOTE is required. Usage: make bench-save-h100 NOTE="description")
+endif
+	@bash scripts/kpush.sh
+	kubectl exec -n $(H100_NS) \
+	    $$(kubectl get pods -n $(H100_NS) -o jsonpath='{.items[0].metadata.name}') -- \
+	    bash -c "cd /app && source .venv/bin/activate && \
+	        $(if $(BUILD),pip install -e . --no-build-isolation -q &&) \
+	        python benchmarks/bench_regression.py --h100 --warmup 10 --iters 50 \
+	        --save --note '$(NOTE)' --file benchmarks/benchmark_history_h100.jsonl"
+	@bash scripts/kpull.sh
+	@$(PYTHON) benchmarks/bench_regression.py --show-history --file $(H100_HISTORY_FILE)
+
+history-h100:
+	@$(PYTHON) benchmarks/bench_regression.py --show-history --file $(H100_HISTORY_FILE)
+
+history-h100-pop:
+	@python3 -c "\
+import json; lines = open('$(H100_HISTORY_FILE)').readlines(); \
+note = json.loads(lines[-1]).get('note','(no note)') if lines else ''; \
+open('$(H100_HISTORY_FILE)', 'w').writelines(lines[:-1]); \
+print('Removed last entry: ' + note)"
+
+history-h100-rename:
+ifndef NOTE
+	$(error NOTE is required. Usage: make history-h100-rename NOTE="new description")
+endif
+	@python3 -c "\
+import json; lines = open('$(H100_HISTORY_FILE)').readlines(); \
+last = json.loads(lines[-1]); last['note'] = '$(NOTE)'; \
+lines[-1] = json.dumps(last) + '\n'; \
+open('$(H100_HISTORY_FILE)', 'w').writelines(lines); \
+print('Renamed last entry to: $(NOTE)')"
+
 # --- Combined ---
 
 all: test-full bench-save
@@ -117,5 +158,6 @@ clean:
 .PHONY: build maybe-build test test-quiet test-full \
         bench bench-save bench-quick bench-large bench-forward bench-backward bench-complexity \
         bench-scaling bench-scaling-quick bench-compare bench-compare-quick \
-        profile-timeline profile-kernel history \
+        profile-timeline profile-kernel history bench-save-h100 history-h100 \
+        history-h100-pop history-h100-rename \
         all iterate clean
