@@ -48,12 +48,12 @@ optimization_log/sessions/
 !.env.example
 
 
-#personal docs and notes
+# CLAUDE
 /docs/*
-
-# personal scripts
-.claude/skills/
+.claude/
+.cursor/
 scripts/kpush.sh
 scripts/kpull.sh
 scripts/ksync.sh
 scripts/profile_h100.sh
+scripts/profile.sh
