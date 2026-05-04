@@ -99,10 +99,8 @@ def benchmark_backward(cuda_ext, ref_ext, config: BenchConfig, warmup=5, iters=2
     B, H, N, D = config.B, config.H, config.N, config.D
     inputs = create_inputs(B, H, N, D)
     cuda_fwd_inputs = tuple(t.to(torch.bfloat16) for t in inputs)
-    # Backward kernels run in FP32, but must use values consistent with BF16
-    # forward stats. Mirror the autograd path: BF16 forward inputs -> FP32 backward.
-    cuda_bwd_inputs = tuple(t.to(torch.float32) for t in cuda_fwd_inputs)
-    grad_output = torch.randn(B, H, N, D, device="cuda", dtype=torch.float32)
+    cuda_bwd_inputs = cuda_fwd_inputs
+    grad_output = torch.randn(B, H, N, D, device="cuda", dtype=torch.bfloat16)
 
     # Forward kernel is BF16 I/O; backward kernels are still FP32.
     # We use BF16 forward only to get softmax stats for the timed backward call.

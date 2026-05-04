@@ -63,7 +63,7 @@ def benchmark_forward(ext, inputs, warmup=5, iters=20):
 
 def benchmark_backward(ext, fwd_inputs, bwd_inputs, warmup=3, iters=10):
     B, H, N, D = bwd_inputs[0].shape
-    grad_output = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
+    grad_output = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
 
     fwd_out = ext.forward(*fwd_inputs, 0.0)
     m_i, l_i, m_j, l_j, m_k, l_k = fwd_out[6:12]
@@ -79,7 +79,7 @@ def benchmark_backward(ext, fwd_inputs, bwd_inputs, warmup=3, iters=10):
 def measure_peak_memory(ext, fwd_inputs, bwd_inputs):
     """Measure peak GPU memory during forward+backward."""
     B, H, N, D = bwd_inputs[0].shape
-    grad_output = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
+    grad_output = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
 
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
@@ -130,8 +130,7 @@ def run_scaling_analysis(N_values: List[int], B=1, H=2, D=32,
         try:
             inputs_fp32 = create_inputs(B, H, N, D)
             inputs_fwd_bf16 = tuple(t.to(torch.bfloat16) for t in inputs_fp32)
-            # Match autograd pathway: BF16 forward values, FP32 backward values.
-            inputs_bwd_fp32 = tuple(t.to(torch.float32) for t in inputs_fwd_bf16)
+            inputs_bwd_bf16 = inputs_fwd_bf16
 
             point.fwd_ms = benchmark_forward(cuda_ext, inputs_fwd_bf16, warmup=w, iters=it)
             point.fwd_flops = calc_forward_flops(B, H, N, D)
@@ -139,7 +138,7 @@ def run_scaling_analysis(N_values: List[int], B=1, H=2, D=32,
 
             if include_backward:
                 torch.cuda.empty_cache()
-                point.bwd_ms = benchmark_backward(cuda_ext, inputs_fwd_bf16, inputs_bwd_fp32, warmup=bw, iters=bit)
+                point.bwd_ms = benchmark_backward(cuda_ext, inputs_fwd_bf16, inputs_bwd_bf16, warmup=bw, iters=bit)
                 point.bwd_flops = calc_backward_flops(B, H, N, D)
                 point.bwd_tflops = point.bwd_flops / (point.bwd_ms / 1000) / 1e12
                 point.total_ms = point.fwd_ms + point.bwd_ms
@@ -147,7 +146,7 @@ def run_scaling_analysis(N_values: List[int], B=1, H=2, D=32,
                 point.total_tflops = point.total_flops / (point.total_ms / 1000) / 1e12
 
             torch.cuda.empty_cache()
-            point.mem_mb = measure_peak_memory(cuda_ext, inputs_fwd_bf16, inputs_bwd_fp32)
+            point.mem_mb = measure_peak_memory(cuda_ext, inputs_fwd_bf16, inputs_bwd_bf16)
 
             if prev_point and prev_point.fwd_ms:
                 point.n_ratio = N / prev_point.N

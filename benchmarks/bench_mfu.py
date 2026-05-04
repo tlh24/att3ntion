@@ -106,15 +106,13 @@ def main():
     # ── inputs ────────────────────────────────────────────────────────────────
     inputs_fp32 = create_inputs(B, H, N, D)
     inputs_bf16 = tuple(t.to(torch.bfloat16) for t in inputs_fp32)
-    # Match autograd pathway: BF16 forward values, FP32 backward values.
-    inputs_bwd_fp32 = tuple(t.to(torch.float32) for t in inputs_bf16)
 
     fwd_out = cuda_ext.forward(*inputs_bf16, 0.0)
     m_i, l_i, m_j, l_j, m_k, l_k = fwd_out[6:12]
-    dY = torch.randn(B, H, N, D, device="cuda", dtype=torch.float32)
+    dY = torch.randn(B, H, N, D, device="cuda", dtype=torch.bfloat16)
 
     fwd_fn = lambda: cuda_ext.forward(*inputs_bf16, 0.0)
-    bwd_fn = lambda: cuda_ext.backward(dY, *inputs_bwd_fp32, m_i, l_i, m_j, l_j, m_k, l_k, 0.0)
+    bwd_fn = lambda: cuda_ext.backward(dY, *inputs_bf16, m_i, l_i, m_j, l_j, m_k, l_k, 0.0)
 
     # ── total MFU (wall-clock median) ─────────────────────────────────────────
     fwd_ms = benchmark_fn(fwd_fn, warmup=5, iters=20)[0]

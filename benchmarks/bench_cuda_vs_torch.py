@@ -81,8 +81,7 @@ def run_scaling_benchmark(N_values: List[int], B=1, H=2, D=32,
         try:
             inputs_fp32 = create_inputs(B, H, N, D)
             cuda_fwd_inputs = tuple(t.to(torch.bfloat16) for t in inputs_fp32)
-            # Backward kernels are FP32, but they must match BF16-forward values.
-            cuda_bwd_inputs = tuple(t.to(torch.float32) for t in cuda_fwd_inputs)
+            cuda_bwd_inputs = cuda_fwd_inputs
             ref_fwd_inputs = cuda_fwd_inputs
 
             # CUDA forward + memory
@@ -115,7 +114,7 @@ def run_scaling_benchmark(N_values: List[int], B=1, H=2, D=32,
                         torch.cuda.empty_cache()
                         fwd_out = cuda_ext.forward(*cuda_fwd_inputs, 0.0)
                         m_i, l_i, m_j, l_j, m_k, l_k = fwd_out[6:12]
-                        grad_output = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
+                        grad_output = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
 
                         def run_cuda_bwd():
                             cuda_ext.backward(grad_output, *cuda_bwd_inputs,

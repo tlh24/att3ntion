@@ -368,27 +368,30 @@ class KernelTester:
             grad_output = torch.randn(config.B, config.H, N, config.D, device=self.device) * config.input_scale
 
             # Run forward pass first to get softmax stats needed by backward
+            cuda_inputs_bf16 = {
+                k: v.clone().to(torch.bfloat16) for k, v in inputs.items()
+            }
             fwd_out = self.cuda_ext.forward(
-                inputs['Q'].clone().to(torch.bfloat16),
-                inputs['R'].clone().to(torch.bfloat16),
-                inputs['S'].clone().to(torch.bfloat16),
-                inputs['Vq_1'].clone().to(torch.bfloat16),
-                inputs['Vq_2'].clone().to(torch.bfloat16),
-                inputs['Vr_1'].clone().to(torch.bfloat16),
-                inputs['Vr_2'].clone().to(torch.bfloat16),
-                inputs['Vs_1'].clone().to(torch.bfloat16),
-                inputs['Vs_2'].clone().to(torch.bfloat16),
+                cuda_inputs_bf16['Q'],
+                cuda_inputs_bf16['R'],
+                cuda_inputs_bf16['S'],
+                cuda_inputs_bf16['Vq_1'],
+                cuda_inputs_bf16['Vq_2'],
+                cuda_inputs_bf16['Vr_1'],
+                cuda_inputs_bf16['Vr_2'],
+                cuda_inputs_bf16['Vs_1'],
+                cuda_inputs_bf16['Vs_2'],
                 0.0
             )
             # Unpack: Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_, m_i, l_i, m_j, l_j, m_k, l_k
             m_i, l_i, m_j, l_j, m_k, l_k = fwd_out[6], fwd_out[7], fwd_out[8], fwd_out[9], fwd_out[10], fwd_out[11]
 
             cuda_grads = self.cuda_ext.backward(
-                grad_output.clone(),
-                inputs['Q'].clone(), inputs['R'].clone(), inputs['S'].clone(),
-                inputs['Vq_1'].clone(), inputs['Vq_2'].clone(),
-                inputs['Vr_1'].clone(), inputs['Vr_2'].clone(),
-                inputs['Vs_1'].clone(), inputs['Vs_2'].clone(),
+                grad_output.clone().to(torch.bfloat16),
+                cuda_inputs_bf16['Q'], cuda_inputs_bf16['R'], cuda_inputs_bf16['S'],
+                cuda_inputs_bf16['Vq_1'], cuda_inputs_bf16['Vq_2'],
+                cuda_inputs_bf16['Vr_1'], cuda_inputs_bf16['Vr_2'],
+                cuda_inputs_bf16['Vs_1'], cuda_inputs_bf16['Vs_2'],
                 m_i, l_i, m_j, l_j, m_k, l_k,
                 0.0
             )
@@ -448,10 +451,12 @@ class KernelTester:
                     duration_ms=(time.time() - start_time) * 1000
                 )
 
-            max_diff = (cuda_tensor - ref_tensor).abs().max().item()
+            cuda_compare = cuda_tensor.float()
+            ref_compare = ref_tensor.float()
+            max_diff = (cuda_compare - ref_compare).abs().max().item()
             passed = torch.allclose(
-                cuda_tensor,
-                ref_tensor,
+                cuda_compare,
+                ref_compare,
                 rtol=max(self.rtol, 2e-2),
                 atol=max(self.atol, 2e-2),
             )

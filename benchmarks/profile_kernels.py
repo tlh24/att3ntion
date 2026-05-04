@@ -34,7 +34,7 @@ def get_grad_output_cuda(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_):
 
     max_len = max(I, J, K)
 
-    grad_output_combined = torch.zeros(B, H, max_len, D, device=Y_q.device, dtype=torch.float32)
+    grad_output_combined = torch.zeros(B, H, max_len, D, device=Y_q.device, dtype=Y_q.dtype)
     grad_output_combined[:, :, :I, :] += 1.0
     grad_output_combined[:, :, :J, :] += 1.0
     grad_output_combined[:, :, :K, :] += 1.0
@@ -69,7 +69,7 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim,
     Vs_2 = torch.rand(B, H, K_dim, D_dim, device='cuda', dtype=dtype)
 
     fwd_inputs = tuple(t.to(torch.bfloat16) for t in (Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2))
-    bwd_inputs = tuple(t.to(torch.float32) for t in fwd_inputs)
+    bwd_inputs = fwd_inputs
 
     # --- Forward Pass ---
     # forward returns 12 values: Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_,
