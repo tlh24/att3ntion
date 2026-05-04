@@ -52,7 +52,7 @@ setup(
                     '-O3',
                     *get_cuda_arch_flags(),
                     # '-DTORCH_USE_CUDA_DSA', # for debugging
-                    # '-lineinfo' # for debugging
+                    '-lineinfo' # for debugging
                 ]
             }
         ),
