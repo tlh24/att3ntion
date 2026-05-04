@@ -107,20 +107,9 @@ class _HypergraphAttentionAutograd(Function):
 
         out_dtype = getattr(ctx, "input_dtype", Q.dtype)
 
-        # Backward CUDA kernels currently operate in FP32. Keep the forward API
-        # BF16 by casting tensors at the autograd boundary.
-        Q = Q.to(torch.float32)
-        R = R.to(torch.float32)
-        S = S.to(torch.float32)
-        Vq_1 = Vq_1.to(torch.float32)
-        Vq_2 = Vq_2.to(torch.float32)
-        Vr_1 = Vr_1.to(torch.float32)
-        Vr_2 = Vr_2.to(torch.float32)
-        Vs_1 = Vs_1.to(torch.float32)
-        Vs_2 = Vs_2.to(torch.float32)
-
         TILE_SIZE = 16
-        grad_output, _ = _pad_to_multiple(grad_output.contiguous().to(torch.float32), TILE_SIZE, dim=2)
+        # Backward CUDA kernels use BF16 I/O with FP32 accumulation internally.
+        grad_output, _ = _pad_to_multiple(grad_output.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
 
         grad_tuple = _cuda_kernels.backward(
             grad_output, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
