@@ -79,9 +79,11 @@ def benchmark_forward(cuda_ext, ref_ext, config: BenchConfig, warmup=5, iters=20
     """Benchmark forward pass: CUDA vs reference."""
     B, H, N, D = config.B, config.H, config.N, config.D
     inputs = create_inputs(B, H, N, D)
+    cuda_inputs = tuple(t.to(torch.bfloat16) for t in inputs)
+    ref_inputs = cuda_inputs
 
-    cuda_ms, cuda_times = benchmark_fn(lambda: cuda_ext.forward(*inputs, 0.0), warmup=warmup, iters=iters)
-    ref_ms, ref_times = benchmark_fn(lambda: ref_ext.forward(*inputs, 0.0), warmup=warmup, iters=iters)
+    cuda_ms, cuda_times = benchmark_fn(lambda: cuda_ext.forward(*cuda_inputs, 0.0), warmup=warmup, iters=iters)
+    ref_ms, ref_times = benchmark_fn(lambda: ref_ext.forward(*ref_inputs, 0.0), warmup=warmup, iters=iters)
 
     return {
         "cuda_median_ms": round(cuda_ms, 3),
@@ -96,19 +98,25 @@ def benchmark_backward(cuda_ext, ref_ext, config: BenchConfig, warmup=5, iters=2
     """Benchmark backward pass: CUDA vs reference (autograd)."""
     B, H, N, D = config.B, config.H, config.N, config.D
     inputs = create_inputs(B, H, N, D)
+    cuda_fwd_inputs = tuple(t.to(torch.bfloat16) for t in inputs)
+    # Backward kernels run in FP32, but must use values consistent with BF16
+    # forward stats. Mirror the autograd path: BF16 forward inputs -> FP32 backward.
+    cuda_bwd_inputs = tuple(t.to(torch.float32) for t in cuda_fwd_inputs)
     grad_output = torch.randn(B, H, N, D, device="cuda", dtype=torch.float32)
 
-    fwd_out = cuda_ext.forward(*inputs, 0.0)
+    # Forward kernel is BF16 I/O; backward kernels are still FP32.
+    # We use BF16 forward only to get softmax stats for the timed backward call.
+    fwd_out = cuda_ext.forward(*cuda_fwd_inputs, 0.0)
     m_i, l_i, m_j, l_j, m_k, l_k = fwd_out[6:12]
 
     def run_cuda_backward():
         return cuda_ext.backward(
-            grad_output, *inputs,
+            grad_output, *cuda_bwd_inputs,
             m_i, l_i, m_j, l_j, m_k, l_k, 0.0
         )
 
     def run_ref_backward():
-        ref_inputs = [t.detach().clone().requires_grad_(True) for t in inputs]
+        ref_inputs = [t.detach().clone().requires_grad_(True) for t in cuda_bwd_inputs]
         ref_out = ref_ext.forward(*ref_inputs, 0.0)
         total = sum(o.sum() for o in ref_out)
         total.backward()

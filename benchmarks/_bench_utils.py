@@ -109,10 +109,22 @@ def calc_backward_flops(B: int, H: int, N: int, D: int) -> int:
     return v_grad + jacobian + qrs_grad
 
 
-def estimate_forward_bytes(B: int, H: int, N: int, D: int) -> Dict:
-    """Estimate total bytes transferred during forward pass."""
-    input_bytes = 9 * B * H * N * D * 4
-    output_bytes = 6 * B * H * N * D * 4 + 6 * B * H * N * 4
+def estimate_forward_bytes(
+    B: int,
+    H: int,
+    N: int,
+    D: int,
+    tensor_bytes: int = 2,
+    stats_bytes: int = 4,
+) -> Dict:
+    """Estimate total bytes transferred during forward pass.
+
+    Defaults reflect mixed-precision forward:
+    - 9 inputs + 6 outputs in BF16 (`tensor_bytes=2`)
+    - 6 softmax-stat tensors in FP32 (`stats_bytes=4`)
+    """
+    input_bytes = 9 * B * H * N * D * tensor_bytes
+    output_bytes = 6 * B * H * N * D * tensor_bytes + 6 * B * H * N * stats_bytes
     total = input_bytes + output_bytes
     return {"total_bytes": total, "total_mb": total / 1e6}
 

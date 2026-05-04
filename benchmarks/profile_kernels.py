@@ -34,7 +34,7 @@ def get_grad_output_cuda(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_):
 
     max_len = max(I, J, K)
 
-    grad_output_combined = torch.zeros(B, H, max_len, D, device=Y_q.device, dtype=Y_q.dtype)
+    grad_output_combined = torch.zeros(B, H, max_len, D, device=Y_q.device, dtype=torch.float32)
     grad_output_combined[:, :, :I, :] += 1.0
     grad_output_combined[:, :, :J, :] += 1.0
     grad_output_combined[:, :, :K, :] += 1.0
@@ -68,6 +68,9 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim,
     Vs_1 = torch.rand(B, H, K_dim, D_dim, device='cuda', dtype=dtype)
     Vs_2 = torch.rand(B, H, K_dim, D_dim, device='cuda', dtype=dtype)
 
+    fwd_inputs = tuple(t.to(torch.bfloat16) for t in (Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2))
+    bwd_inputs = tuple(t.to(torch.float32) for t in fwd_inputs)
+
     # --- Forward Pass ---
     # forward returns 12 values: Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_,
     #                             m_i, l_i, m_j, l_j, m_k, l_k
@@ -76,7 +79,7 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim,
         (Y_q_mc, Y_r_mc, Y_s_mc, Y_q__mc, Y_r__mc, Y_s__mc,
          m_i, l_i, m_j, l_j, m_k, l_k) = \
             _cuda_kernels.forward(
-                Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
+                *fwd_inputs, dropout_rate
             )
     else:
         # Still need forward outputs to feed backward
@@ -84,7 +87,7 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim,
             (Y_q_mc, Y_r_mc, Y_s_mc, Y_q__mc, Y_r__mc, Y_s__mc,
              m_i, l_i, m_j, l_j, m_k, l_k) = \
                 _cuda_kernels.forward(
-                    Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
+                    *fwd_inputs, dropout_rate
                 )
 
     # --- Backward Pass ---
@@ -95,10 +98,7 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim,
         )
         _cuda_kernels.backward(
             grad_output_cuda,
-            Q, R, S,
-            Vq_1, Vq_2,
-            Vr_1, Vr_2,
-            Vs_1, Vs_2,
+            *bwd_inputs,
             m_i, l_i,
             m_j, l_j,
             m_k, l_k,
