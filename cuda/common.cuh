@@ -10,6 +10,7 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 
 // =============================================================================
 // Numerical Stability Constants
@@ -81,5 +82,15 @@ __device__ __forceinline__ float dot3(
         sum += a[d] * b[d] * c[d];
     }
     return sum;
+}
+
+using bf16 = __nv_bfloat16;
+
+__device__ __forceinline__ float bf2f(bf16 x) {
+    return __bfloat162float(x);
+}
+
+__device__ __forceinline__ bf16 f2bf(float x) {
+    return __float2bfloat16(x);
 }
 

@@ -40,16 +40,19 @@ class _HypergraphAttentionAutograd(Function):
         """
         TILE_SIZE = 16
         orig_seq_len = Q.size(2)
-        
-        Q, pad_q = _pad_to_multiple(Q.contiguous(), TILE_SIZE, dim=2)
-        R, pad_r = _pad_to_multiple(R.contiguous(), TILE_SIZE, dim=2)
-        S, pad_s = _pad_to_multiple(S.contiguous(), TILE_SIZE, dim=2)
-        Vq_1, _ = _pad_to_multiple(Vq_1.contiguous(), TILE_SIZE, dim=2)
-        Vq_2, _ = _pad_to_multiple(Vq_2.contiguous(), TILE_SIZE, dim=2)
-        Vr_1, _ = _pad_to_multiple(Vr_1.contiguous(), TILE_SIZE, dim=2)
-        Vr_2, _ = _pad_to_multiple(Vr_2.contiguous(), TILE_SIZE, dim=2)
-        Vs_1, _ = _pad_to_multiple(Vs_1.contiguous(), TILE_SIZE, dim=2)
-        Vs_2, _ = _pad_to_multiple(Vs_2.contiguous(), TILE_SIZE, dim=2)
+        input_dtype = Q.dtype
+
+        # CUDA forward kernels are BF16 I/O. Cast at the autograd boundary so
+        # callers can remain dtype-agnostic.
+        Q, pad_q = _pad_to_multiple(Q.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
+        R, pad_r = _pad_to_multiple(R.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
+        S, pad_s = _pad_to_multiple(S.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
+        Vq_1, _ = _pad_to_multiple(Vq_1.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
+        Vq_2, _ = _pad_to_multiple(Vq_2.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
+        Vr_1, _ = _pad_to_multiple(Vr_1.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
+        Vr_2, _ = _pad_to_multiple(Vr_2.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
+        Vs_1, _ = _pad_to_multiple(Vs_1.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
+        Vs_2, _ = _pad_to_multiple(Vs_2.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
 
         outputs_tuple = _cuda_kernels.forward(
             Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
@@ -57,16 +60,32 @@ class _HypergraphAttentionAutograd(Function):
 
         if isinstance(outputs_tuple, tuple) and len(outputs_tuple) == 12:
             Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_, m_i, l_i, m_j, l_j, m_k, l_k = outputs_tuple
-            final_output = Y_q + Y_r + Y_s + Y_q_ + Y_r_ + Y_s_
+            # Keep BF16 module behavior unchanged, but avoid BF16 accumulation
+            # when the caller requested a higher-precision output dtype.
+            if input_dtype == torch.bfloat16:
+                final_output = Y_q + Y_r + Y_s + Y_q_ + Y_r_ + Y_s_
+            else:
+                final_output = (
+                    Y_q.to(torch.float32)
+                    + Y_r.to(torch.float32)
+                    + Y_s.to(torch.float32)
+                    + Y_q_.to(torch.float32)
+                    + Y_r_.to(torch.float32)
+                    + Y_s_.to(torch.float32)
+                )
         else:
             raise TypeError(f"C++ forward expected to return a tuple of 12 Tensors, but got {type(outputs_tuple)} with len {len(outputs_tuple) if isinstance(outputs_tuple, tuple) else 'N/A'}")
 
         if orig_seq_len != final_output.size(2):
             final_output = final_output[:, :, :orig_seq_len, :]
 
+        if final_output.dtype != input_dtype:
+            final_output = final_output.to(input_dtype)
+
         ctx.save_for_backward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
                               m_i, l_i, m_j, l_j, m_k, l_k)
         ctx.orig_seq_len = orig_seq_len
+        ctx.input_dtype = input_dtype
         
         return final_output
 
@@ -85,9 +104,23 @@ class _HypergraphAttentionAutograd(Function):
         Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, \
             m_i, l_i, m_j, l_j, m_k, l_k = ctx.saved_tensors
         orig_seq_len = ctx.orig_seq_len
-        
+
+        out_dtype = getattr(ctx, "input_dtype", Q.dtype)
+
+        # Backward CUDA kernels currently operate in FP32. Keep the forward API
+        # BF16 by casting tensors at the autograd boundary.
+        Q = Q.to(torch.float32)
+        R = R.to(torch.float32)
+        S = S.to(torch.float32)
+        Vq_1 = Vq_1.to(torch.float32)
+        Vq_2 = Vq_2.to(torch.float32)
+        Vr_1 = Vr_1.to(torch.float32)
+        Vr_2 = Vr_2.to(torch.float32)
+        Vs_1 = Vs_1.to(torch.float32)
+        Vs_2 = Vs_2.to(torch.float32)
+
         TILE_SIZE = 16
-        grad_output, _ = _pad_to_multiple(grad_output.contiguous(), TILE_SIZE, dim=2)
+        grad_output, _ = _pad_to_multiple(grad_output.contiguous().to(torch.float32), TILE_SIZE, dim=2)
 
         grad_tuple = _cuda_kernels.backward(
             grad_output, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
@@ -109,6 +142,16 @@ class _HypergraphAttentionAutograd(Function):
             grad_Vr_2 = grad_Vr_2[:, :, :orig_seq_len, :]
             grad_Vs_1 = grad_Vs_1[:, :, :orig_seq_len, :]
             grad_Vs_2 = grad_Vs_2[:, :, :orig_seq_len, :]
+
+        grad_Q = grad_Q.to(out_dtype)
+        grad_R = grad_R.to(out_dtype)
+        grad_S = grad_S.to(out_dtype)
+        grad_Vq_1 = grad_Vq_1.to(out_dtype)
+        grad_Vq_2 = grad_Vq_2.to(out_dtype)
+        grad_Vr_1 = grad_Vr_1.to(out_dtype)
+        grad_Vr_2 = grad_Vr_2.to(out_dtype)
+        grad_Vs_1 = grad_Vs_1.to(out_dtype)
+        grad_Vs_2 = grad_Vs_2.to(out_dtype)
 
         debug_names = [
             "grad_Q", "grad_R", "grad_S",

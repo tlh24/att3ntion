@@ -33,6 +33,8 @@ class _HypergraphAttentionNaive(nn.Module):
 		self.gelu = QuickGELU()
 
 	def forward(self, x, rotary_emb):
+		out_dtype = x.dtype
+		x = x.float()
 		batch_size, ntok, d_model = x.shape
 
 		if rotary_emb is not None:
@@ -117,7 +119,7 @@ class _HypergraphAttentionNaive(nn.Module):
 		else:
 			y = y.permute(0, 2, 1, 3).sum(dim=2).squeeze()
 		y = self.Wo(y)
-		return y
+		return y.to(out_dtype)
 
 	def calcFlops(self, x):
 		bs, ntok, d_model = x.shape
@@ -157,6 +159,8 @@ class _GraphAttentionNaive(nn.Module):
 		self.gelu = QuickGELU()
 
 	def forward(self, x, rotary_emb):
+		out_dtype = x.dtype
+		x = x.float()
 		batch_size, ntok, d_model = x.shape
 
 		if rotary_emb is not None:
@@ -186,7 +190,7 @@ class _GraphAttentionNaive(nn.Module):
 			y = y.permute(0, 2, 3, 1).sum(dim=3).squeeze()
 		y = self.gelu(y)
 		y = self.Wo(y)
-		return y
+		return y.to(out_dtype)
 
 	def calcFlops(self, x):
 		bs, ntok, d_model = x.shape
