@@ -103,22 +103,9 @@ profile-kernel: maybe-build
 history:
 	@$(PYTHON) benchmarks/bench_regression.py --show-history
 
-H100_NS = strange-loop
 H100_HISTORY_FILE = benchmarks/benchmark_history_h100.jsonl
 
-bench-save-h100:
-ifndef NOTE
-	$(error NOTE is required. Usage: make bench-save-h100 NOTE="description")
-endif
-	@bash scripts/kpush.sh
-	kubectl exec -n $(H100_NS) \
-	    $$(kubectl get pods -n $(H100_NS) -o jsonpath='{.items[0].metadata.name}') -- \
-	    bash -c "cd /app && source .venv/bin/activate && \
-	        $(if $(BUILD),pip install -e . --no-build-isolation -q &&) \
-	        python benchmarks/bench_regression.py --h100 --warmup 10 --iters 50 \
-	        --save --note '$(NOTE)' --file benchmarks/benchmark_history_h100.jsonl"
-	@bash scripts/kpull.sh
-	@$(PYTHON) benchmarks/bench_regression.py --show-history --file $(H100_HISTORY_FILE)
+-include .claude/Makefile.local
 
 history-h100:
 	@$(PYTHON) benchmarks/bench_regression.py --show-history --file $(H100_HISTORY_FILE)
@@ -158,6 +145,6 @@ clean:
 .PHONY: build maybe-build test test-quiet test-full \
         bench bench-save bench-quick bench-large bench-forward bench-backward bench-complexity \
         bench-scaling bench-scaling-quick bench-compare bench-compare-quick \
-        profile-timeline profile-kernel history bench-save-h100 history-h100 \
+        profile-timeline profile-kernel history history-h100 \
         history-h100-pop history-h100-rename \
         all iterate clean

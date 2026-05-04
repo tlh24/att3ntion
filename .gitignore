@@ -48,13 +48,7 @@ optimization_log/sessions/
 !.env.example
 
 
-# CLAUDE
+# CLAUDE (personal, gitignored)
 CLAUDE.md
-/docs/*
 .claude/
 .cursor/
-scripts/kpush.sh
-scripts/kpull.sh
-scripts/ksync.sh
-scripts/profile_h100.sh
-scripts/profile.sh
