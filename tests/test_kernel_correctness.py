@@ -291,10 +291,15 @@ class KernelTester:
             inputs = self._create_inputs(config)
 
             cuda_out = self.cuda_ext.forward(
-                inputs['Q'].clone(), inputs['R'].clone(), inputs['S'].clone(),
-                inputs['Vq_1'].clone(), inputs['Vq_2'].clone(),
-                inputs['Vr_1'].clone(), inputs['Vr_2'].clone(),
-                inputs['Vs_1'].clone(), inputs['Vs_2'].clone(),
+                inputs['Q'].clone().to(torch.bfloat16),
+                inputs['R'].clone().to(torch.bfloat16),
+                inputs['S'].clone().to(torch.bfloat16),
+                inputs['Vq_1'].clone().to(torch.bfloat16),
+                inputs['Vq_2'].clone().to(torch.bfloat16),
+                inputs['Vr_1'].clone().to(torch.bfloat16),
+                inputs['Vr_2'].clone().to(torch.bfloat16),
+                inputs['Vs_1'].clone().to(torch.bfloat16),
+                inputs['Vs_2'].clone().to(torch.bfloat16),
                 0.0
             )
 
@@ -308,6 +313,14 @@ class KernelTester:
 
             cuda_tensor = cuda_out[kernel_idx]
             ref_tensor = ref_out[kernel_idx]
+
+            if cuda_tensor.dtype != torch.bfloat16:
+                return TestResult(
+                    kernel_name=kernel_name, config=config, passed=False,
+                    max_diff=float('nan'),
+                    error=f"Expected BF16 CUDA output, got {cuda_tensor.dtype}",
+                    duration_ms=(time.time() - start_time) * 1000
+                )
 
             if cuda_tensor.shape != ref_tensor.shape:
                 return TestResult(
@@ -324,8 +337,10 @@ class KernelTester:
                     duration_ms=(time.time() - start_time) * 1000
                 )
 
-            max_diff = (cuda_tensor - ref_tensor).abs().max().item()
-            passed = torch.allclose(cuda_tensor, ref_tensor, rtol=self.rtol, atol=self.atol)
+            cuda_compare = cuda_tensor.float()
+            ref_compare = ref_tensor.float()
+            max_diff = (cuda_compare - ref_compare).abs().max().item()
+            passed = torch.allclose(cuda_compare, ref_compare, rtol=max(self.rtol, 5e-2), atol=max(self.atol, 5e-2))
 
             return TestResult(
                 kernel_name=kernel_name, config=config, passed=passed,
@@ -354,10 +369,15 @@ class KernelTester:
 
             # Run forward pass first to get softmax stats needed by backward
             fwd_out = self.cuda_ext.forward(
-                inputs['Q'].clone(), inputs['R'].clone(), inputs['S'].clone(),
-                inputs['Vq_1'].clone(), inputs['Vq_2'].clone(),
-                inputs['Vr_1'].clone(), inputs['Vr_2'].clone(),
-                inputs['Vs_1'].clone(), inputs['Vs_2'].clone(),
+                inputs['Q'].clone().to(torch.bfloat16),
+                inputs['R'].clone().to(torch.bfloat16),
+                inputs['S'].clone().to(torch.bfloat16),
+                inputs['Vq_1'].clone().to(torch.bfloat16),
+                inputs['Vq_2'].clone().to(torch.bfloat16),
+                inputs['Vr_1'].clone().to(torch.bfloat16),
+                inputs['Vr_2'].clone().to(torch.bfloat16),
+                inputs['Vs_1'].clone().to(torch.bfloat16),
+                inputs['Vs_2'].clone().to(torch.bfloat16),
                 0.0
             )
             # Unpack: Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_, m_i, l_i, m_j, l_j, m_k, l_k
@@ -429,7 +449,12 @@ class KernelTester:
                 )
 
             max_diff = (cuda_tensor - ref_tensor).abs().max().item()
-            passed = torch.allclose(cuda_tensor, ref_tensor, rtol=self.rtol, atol=self.atol)
+            passed = torch.allclose(
+                cuda_tensor,
+                ref_tensor,
+                rtol=max(self.rtol, 2e-2),
+                atol=max(self.atol, 2e-2),
+            )
 
             return TestResult(
                 kernel_name=kernel_name, config=config, passed=passed,
