@@ -38,6 +38,9 @@ constexpr int WMMA_K = 16;  // Inner dimension for accumulation
 
 constexpr int N_I_GATHER = 4;  // i-values per block in multi-i gather
 constexpr int SMEM_PAD = 1;    // Padding to eliminate bank conflicts
+constexpr int YQ_SMEM_PAD = 4;
+constexpr int YR_SMEM_PAD = 4;
+constexpr int YS_SMEM_PAD = 4;
 constexpr int MIN_SPLIT_CHUNKS = 4;  // Only split loops across blocks when >= this many chunks
 constexpr int MAX_SPLIT_CHUNKS = 16; // Cap split workspace growth and reducer scratch.
 
@@ -71,7 +74,7 @@ void Yq_gather(
     const int warp_id = tid / 32;
     const int lane_id = tid % 32;
     const int block_size = blockDim.x;
-    constexpr int DP = D_CONST + SMEM_PAD;
+    constexpr int DP = D_CONST + YQ_SMEM_PAD;
 
     extern __shared__ char smem_raw[];
     bf16* q_vecs  = reinterpret_cast<bf16*>(smem_raw);
@@ -146,10 +149,16 @@ void Yq_gather(
                         float d_accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                         #pragma unroll 4
                         for (int d = 0; d < D_CONST; d += 4) {
-                            d_accum[0] += bf2f(my_q[d+0]) * bf2f(r_tile[jt*DP + d+0]) * bf2f(s_tile[kt*DP + d+0]);
-                            d_accum[1] += bf2f(my_q[d+1]) * bf2f(r_tile[jt*DP + d+1]) * bf2f(s_tile[kt*DP + d+1]);
-                            d_accum[2] += bf2f(my_q[d+2]) * bf2f(r_tile[jt*DP + d+2]) * bf2f(s_tile[kt*DP + d+2]);
-                            d_accum[3] += bf2f(my_q[d+3]) * bf2f(r_tile[jt*DP + d+3]) * bf2f(s_tile[kt*DP + d+3]);
+                            const float2 q01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(my_q + d));
+                            const float2 q23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(my_q + d + 2));
+                            const float2 r01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(r_tile + jt * DP + d));
+                            const float2 r23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(r_tile + jt * DP + d + 2));
+                            const float2 s01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(s_tile + kt * DP + d));
+                            const float2 s23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(s_tile + kt * DP + d + 2));
+                            d_accum[0] += q01.x * r01.x * s01.x;
+                            d_accum[1] += q01.y * r01.y * s01.y;
+                            d_accum[2] += q23.x * r23.x * s23.x;
+                            d_accum[3] += q23.y * r23.y * s23.y;
                         }
                         dot = d_accum[0] + d_accum[1] + d_accum[2] + d_accum[3];
                         my_p[cell_idx] = dot;
@@ -212,34 +221,39 @@ void Yq_gather(
             l_old = __shfl_sync(0xFFFFFFFF, l_old, 0);
             l_new = __shfl_sync(0xFFFFFFFF, l_new, 0);
 
-            for (int d = lane_id; d < D_CONST; d += 32) {
-                float new_o_d = 0.0f;
+            for (int d = lane_id * 2; d < D_CONST; d += 64) {
+                float2 new_o = make_float2(0.0f, 0.0f);
                 if (my_i_valid) {
-                    // Factored output: T[kt] = sum_jt P[jt,kt]*V1[jt,d], then O[d] = sum_kt T[kt]*V2[kt,d]
-                    // Eliminates V2 reads from inner loop (256 → 16 V2 smem reads per d-value)
-                    float T_k[TILE_K];
+                    float2 T_k[TILE_K];
                     #pragma unroll
-                    for (int kt = 0; kt < TILE_K; kt++) T_k[kt] = 0.0f;
+                    for (int kt = 0; kt < TILE_K; kt++) T_k[kt] = make_float2(0.0f, 0.0f);
 
                     for (int jt = 0; jt < TILE_J; jt++) {
                         if (j0 + jt >= J) continue;
-                        float v1_val = bf2f(v1_tile[jt * DP + d]);
+                        const float2 v1_val =
+                            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(v1_tile + jt * DP + d));
                         #pragma unroll
                         for (int kt = 0; kt < TILE_K; kt++) {
-                            T_k[kt] += my_p[jt * TILE_K + kt] * v1_val;
+                            const float p = my_p[jt * TILE_K + kt];
+                            T_k[kt].x += p * v1_val.x;
+                            T_k[kt].y += p * v1_val.y;
                         }
                     }
 
                     #pragma unroll
                     for (int kt = 0; kt < TILE_K; kt++) {
                         if (k0 + kt < K) {
-                            new_o_d += T_k[kt] * bf2f(v2_tile[kt * DP + d]);
+                            const float2 v2_val =
+                                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(v2_tile + kt * DP + d));
+                            new_o.x += T_k[kt].x * v2_val.x;
+                            new_o.y += T_k[kt].y * v2_val.y;
                         }
                     }
                 }
                 
                 if (l_new > 1e-20f) {
-                    my_o[d] = (alpha * l_old * my_o[d] + beta * new_o_d) / l_new;
+                    my_o[d] = (alpha * l_old * my_o[d] + beta * new_o.x) / l_new;
+                    my_o[d + 1] = (alpha * l_old * my_o[d + 1] + beta * new_o.y) / l_new;
                 }
             }
             
@@ -585,7 +599,7 @@ void Yr_gather(
     const int warp_id = tid / 32;
     const int lane_id = tid % 32;
     const int block_size = blockDim.x;
-    constexpr int DP = D_CONST + SMEM_PAD;
+    constexpr int DP = D_CONST + YR_SMEM_PAD;
 
     extern __shared__ char smem_raw[];
     bf16* q_vecs  = reinterpret_cast<bf16*>(smem_raw);
@@ -660,10 +674,16 @@ void Yr_gather(
                         float d_accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                         #pragma unroll 4
                         for (int d = 0; d < D_CONST; d += 4) {
-                            d_accum[0] += bf2f(my_q[d+0]) * bf2f(i_tile[it*DP + d+0]) * bf2f(k_tile[kt*DP + d+0]);
-                            d_accum[1] += bf2f(my_q[d+1]) * bf2f(i_tile[it*DP + d+1]) * bf2f(k_tile[kt*DP + d+1]);
-                            d_accum[2] += bf2f(my_q[d+2]) * bf2f(i_tile[it*DP + d+2]) * bf2f(k_tile[kt*DP + d+2]);
-                            d_accum[3] += bf2f(my_q[d+3]) * bf2f(i_tile[it*DP + d+3]) * bf2f(k_tile[kt*DP + d+3]);
+                            const float2 q01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(my_q + d));
+                            const float2 q23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(my_q + d + 2));
+                            const float2 i01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(i_tile + it * DP + d));
+                            const float2 i23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(i_tile + it * DP + d + 2));
+                            const float2 k01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(k_tile + kt * DP + d));
+                            const float2 k23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(k_tile + kt * DP + d + 2));
+                            d_accum[0] += q01.x * i01.x * k01.x;
+                            d_accum[1] += q01.y * i01.y * k01.y;
+                            d_accum[2] += q23.x * i23.x * k23.x;
+                            d_accum[3] += q23.y * i23.y * k23.y;
                         }
                         dot = d_accum[0] + d_accum[1] + d_accum[2] + d_accum[3];
                         my_p[cell_idx] = dot;
@@ -726,33 +746,39 @@ void Yr_gather(
             l_old = __shfl_sync(0xFFFFFFFF, l_old, 0);
             l_new = __shfl_sync(0xFFFFFFFF, l_new, 0);
 
-            for (int d = lane_id; d < D_CONST; d += 32) {
-                float new_o_d = 0.0f;
+            for (int d = lane_id * 2; d < D_CONST; d += 64) {
+                float2 new_o = make_float2(0.0f, 0.0f);
                 if (my_j_valid) {
-                    // Factored: T[kt] = sum_it P[it,kt]*V1[it,d], then O[d] = sum_kt T[kt]*V2[kt,d]
-                    float T_k[TILE_K];
+                    float2 T_k[TILE_K];
                     #pragma unroll
-                    for (int kt = 0; kt < TILE_K; kt++) T_k[kt] = 0.0f;
+                    for (int kt = 0; kt < TILE_K; kt++) T_k[kt] = make_float2(0.0f, 0.0f);
 
                     for (int it = 0; it < TILE_I; it++) {
                         if (i0 + it >= I) continue;
-                        float v1_val = bf2f(v1_tile[it * DP + d]);
+                        const float2 v1_val =
+                            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(v1_tile + it * DP + d));
                         #pragma unroll
                         for (int kt = 0; kt < TILE_K; kt++) {
-                            T_k[kt] += my_p[it * TILE_K + kt] * v1_val;
+                            const float p = my_p[it * TILE_K + kt];
+                            T_k[kt].x += p * v1_val.x;
+                            T_k[kt].y += p * v1_val.y;
                         }
                     }
 
                     #pragma unroll
                     for (int kt = 0; kt < TILE_K; kt++) {
                         if (k0 + kt < K) {
-                            new_o_d += T_k[kt] * bf2f(v2_tile[kt * DP + d]);
+                            const float2 v2_val =
+                                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(v2_tile + kt * DP + d));
+                            new_o.x += T_k[kt].x * v2_val.x;
+                            new_o.y += T_k[kt].y * v2_val.y;
                         }
                     }
                 }
                 
                 if (l_new > 1e-20f) {
-                    my_o[d] = (alpha * l_old * my_o[d] + beta * new_o_d) / l_new;
+                    my_o[d] = (alpha * l_old * my_o[d] + beta * new_o.x) / l_new;
+                    my_o[d + 1] = (alpha * l_old * my_o[d + 1] + beta * new_o.y) / l_new;
                 }
             }
             
@@ -808,7 +834,7 @@ void Ys_gather(
     const int warp_id = tid / 32;
     const int lane_id = tid % 32;
     const int block_size = blockDim.x;
-    constexpr int DP = D_CONST + SMEM_PAD;
+    constexpr int DP = D_CONST + YS_SMEM_PAD;
 
     extern __shared__ char smem_raw[];
     bf16* q_vecs  = reinterpret_cast<bf16*>(smem_raw);
@@ -883,10 +909,16 @@ void Ys_gather(
                         float d_accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                         #pragma unroll 4
                         for (int d = 0; d < D_CONST; d += 4) {
-                            d_accum[0] += bf2f(my_q[d+0]) * bf2f(i_tile[it*DP + d+0]) * bf2f(j_tile[jt*DP + d+0]);
-                            d_accum[1] += bf2f(my_q[d+1]) * bf2f(i_tile[it*DP + d+1]) * bf2f(j_tile[jt*DP + d+1]);
-                            d_accum[2] += bf2f(my_q[d+2]) * bf2f(i_tile[it*DP + d+2]) * bf2f(j_tile[jt*DP + d+2]);
-                            d_accum[3] += bf2f(my_q[d+3]) * bf2f(i_tile[it*DP + d+3]) * bf2f(j_tile[jt*DP + d+3]);
+                            const float2 q01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(my_q + d));
+                            const float2 q23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(my_q + d + 2));
+                            const float2 i01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(i_tile + it * DP + d));
+                            const float2 i23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(i_tile + it * DP + d + 2));
+                            const float2 j01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(j_tile + jt * DP + d));
+                            const float2 j23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(j_tile + jt * DP + d + 2));
+                            d_accum[0] += q01.x * i01.x * j01.x;
+                            d_accum[1] += q01.y * i01.y * j01.y;
+                            d_accum[2] += q23.x * i23.x * j23.x;
+                            d_accum[3] += q23.y * i23.y * j23.y;
                         }
                         dot = d_accum[0] + d_accum[1] + d_accum[2] + d_accum[3];
                         my_p[cell_idx] = dot;
@@ -949,33 +981,39 @@ void Ys_gather(
             l_old = __shfl_sync(0xFFFFFFFF, l_old, 0);
             l_new = __shfl_sync(0xFFFFFFFF, l_new, 0);
 
-            for (int d = lane_id; d < D_CONST; d += 32) {
-                float new_o_d = 0.0f;
+            for (int d = lane_id * 2; d < D_CONST; d += 64) {
+                float2 new_o = make_float2(0.0f, 0.0f);
                 if (my_k_valid) {
-                    // Factored: T[jt] = sum_it P[it,jt]*V1[it,d], then O[d] = sum_jt T[jt]*V2[jt,d]
-                    float T_j[TILE_J];
+                    float2 T_j[TILE_J];
                     #pragma unroll
-                    for (int jt = 0; jt < TILE_J; jt++) T_j[jt] = 0.0f;
+                    for (int jt = 0; jt < TILE_J; jt++) T_j[jt] = make_float2(0.0f, 0.0f);
 
                     for (int it = 0; it < TILE_I; it++) {
                         if (i0 + it >= I) continue;
-                        float v1_val = bf2f(v1_tile[it * DP + d]);
+                        const float2 v1_val =
+                            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(v1_tile + it * DP + d));
                         #pragma unroll
                         for (int jt = 0; jt < TILE_J; jt++) {
-                            T_j[jt] += my_p[it * TILE_J + jt] * v1_val;
+                            const float p = my_p[it * TILE_J + jt];
+                            T_j[jt].x += p * v1_val.x;
+                            T_j[jt].y += p * v1_val.y;
                         }
                     }
 
                     #pragma unroll
                     for (int jt = 0; jt < TILE_J; jt++) {
                         if (j0 + jt < J) {
-                            new_o_d += T_j[jt] * bf2f(v2_tile[jt * DP + d]);
+                            const float2 v2_val =
+                                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(v2_tile + jt * DP + d));
+                            new_o.x += T_j[jt].x * v2_val.x;
+                            new_o.y += T_j[jt].y * v2_val.y;
                         }
                     }
                 }
                 
                 if (l_new > 1e-20f) {
-                    my_o[d] = (alpha * l_old * my_o[d] + beta * new_o_d) / l_new;
+                    my_o[d] = (alpha * l_old * my_o[d] + beta * new_o.x) / l_new;
+                    my_o[d + 1] = (alpha * l_old * my_o[d + 1] + beta * new_o.y) / l_new;
                 }
             }
             
@@ -2056,7 +2094,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
         const int num_i_tiles = (I + N_I_GATHER - 1) / N_I_GATHER;
         dim3 grid_yq(num_i_tiles * num_j_chunks_q, H, B);
         
-        constexpr int DP = D_TMPL + SMEM_PAD;
+        constexpr int DP = D_TMPL + YQ_SMEM_PAD;
         size_t smem_size =
             sizeof(bf16) * (
                 N_I_GATHER * D_TMPL +         // q_vecs
@@ -2100,7 +2138,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     {
         const int num_j_tiles = (J + N_I_GATHER - 1) / N_I_GATHER;
         dim3 grid(num_j_tiles * num_i_chunks_r, H, B);
-        constexpr int DP = D_TMPL + SMEM_PAD;
+        constexpr int DP = D_TMPL + YR_SMEM_PAD;
         size_t smem_size =
             sizeof(bf16) * (
                 N_I_GATHER * D_TMPL +
@@ -2140,7 +2178,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     {
         const int num_k_tiles = (K + N_I_GATHER - 1) / N_I_GATHER;
         dim3 grid(num_k_tiles * num_i_chunks_s, H, B);
-        constexpr int DP = D_TMPL + SMEM_PAD;
+        constexpr int DP = D_TMPL + YS_SMEM_PAD;
         size_t smem_size =
             sizeof(bf16) * (
                 N_I_GATHER * D_TMPL +
