@@ -1309,10 +1309,14 @@ void Yq_scatter(
                 for (int i0 = 0; i0 < 4; i0++) {
                     #pragma unroll
                     for (int i1 = 0; i1 < 4; i1++) {
+                        // Hoist q*r outside the i2 loop: each (i0,i1) is reused
+                        // across all 4 values of i2, so the two q*r FMULs need
+                        // happen only once per (i0,i1,db) instead of per i2.
+                        const float qrx = qa[i0].x * ra[i1].x;
+                        const float qry = qa[i0].y * ra[i1].y;
                         #pragma unroll
                         for (int i2 = 0; i2 < 4; i2++) {
-                            acc[i0][i1][i2] += qa[i0].x * ra[i1].x * sa[i2].x
-                                             + qa[i0].y * ra[i1].y * sa[i2].y;
+                            acc[i0][i1][i2] += qrx * sa[i2].x + qry * sa[i2].y;
                         }
                     }
                 }
@@ -1355,20 +1359,23 @@ void Yq_scatter(
 
             // --- Apply Softmax Scaling ---
             if (da == 0) {
+                // Fuse exp(logit-mjt)*ljt * exp(logit-mkt)*lkt into a single
+                // exp(2*logit - mjt - mkt) * ljt * lkt: halves MUFU expf traffic.
+                const float two_scale = 2.0f * scale;
                 #pragma unroll
                 for (int i0 = 0; i0 < 4; i0++) {
                     #pragma unroll
                     for (int i1 = 0; i1 < 4; i1++) {
-                        float mjt = mj_tile[ja * 4 + i1];
-                        float ljt = lj_tile[ja * 4 + i1];
+                        const float mjt = mj_tile[ja * 4 + i1];
+                        const float ljt = lj_tile[ja * 4 + i1];
                         #pragma unroll
                         for (int i2 = 0; i2 < 4; i2++) {
-                            float logit = acc[i0][i1][i2] * scale;
-                            float ar = expf(logit - mjt) * ljt;
-                            float as = expf(logit - mk_tile[ka * 4 + i2]) * lk_tile[ka * 4 + i2];
+                            const float mkt = mk_tile[ka * 4 + i2];
+                            const float lkt = lk_tile[ka * 4 + i2];
+                            const float logit2 = acc[i0][i1][i2] * two_scale;
                             attn_tile[(ia * 4 + i0) * ATTN_I_STRIDE +
                                       (ja * 4 + i1) * ATTN_K_STRIDE +
-                                      (ka * 4 + i2)] = ar * as;
+                                      (ka * 4 + i2)] = __expf(logit2 - mjt - mkt) * ljt * lkt;
                         }
                     }
                 }
