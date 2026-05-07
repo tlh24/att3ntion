@@ -208,7 +208,7 @@ def calcLoss(task, pred, targets):
 			n_possible = torch.sum( targets[:,:,0] ).item()
 	return loss, n_correct, n_possible
 
-def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl="", log_name="", save_model=False, task=3, replicate=1):
+def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl="", log_name="", save_model=False, task=3, replicate=1, use_bf16=False):
 	
 	if device == 'auto':
 		if torch.cuda.is_available():
@@ -254,7 +254,8 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 		else:
 			n_layers = 4 # Positive control: these converge at the same rate.
 
-	model = SimpleCompModel(input_dim, hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse).to(device)
+	dtype = torch.bfloat16 if use_bf16 else torch.float32
+	model = SimpleCompModel(input_dim, hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse).to(device=device, dtype=dtype)
 	if save_model:
 		try:
 			model.load_model(f"comp_model_{attn_impl}_r{replicate}.pt", device)
@@ -268,11 +269,12 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	# optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), 'cuda')
 	optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, amsgrad=True)
 	model.printParamCount()
-	model = torch.compile(model) # mode="max-autotune"
+	model = torch.compile(model, backend="eager") # mode="max-autotune"
 
-	bf16_supported = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-	print(f"Bfloat16 supported: {bf16_supported}")
-	print("--- Running with Automatic Mixed Precision ---")
+	if use_bf16:
+		print("--- Running in full bfloat16 ---")
+	else:
+		print("--- Running with Automatic Mixed Precision (fp32 weights) ---")
 
 	nam = {"hypergraph":"hg","graph":"g"}.get(attn_impl)
 	fd_losslog = open(f'losslog_{nam}_t{task}_{log_name}_r{replicate}.txt', 'w')
@@ -290,14 +292,14 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 		end_event = torch.cuda.Event(enable_timing=True)
 		
 		for batch_indx, (inputs_np,outputs_np) in enumerate(train_loader):
-			inputs = torch.FloatTensor(inputs_np).to(device)
-			targets = torch.FloatTensor(outputs_np).to(device)
+			inputs = inputs_np.to(device=device, dtype=dtype)
+			targets = outputs_np.to(device=device, dtype=dtype)
 
 			if batch_indx % 100 == 0:
 				start_event.record()
 			optimizer.zero_grad()
 
-			with autocast('cuda', dtype=torch.bfloat16):
+			with autocast('cuda', dtype=torch.bfloat16, enabled=not use_bf16):
 				pred = model(inputs, batch_indx)
 				loss, n_correct, n_possible = calcLoss(task, pred, targets)
 				correct_vals += n_correct
@@ -362,15 +364,13 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	total = 0
 	with torch.no_grad():
 		for batch_indx, (inputs_np,outputs_np) in enumerate(loader_v):
-			inputs = torch.FloatTensor(inputs_np).to(device)
-			targets = torch.FloatTensor(outputs_np).to(device)
-			value_targets = torch.FloatTensor(outputs_np[:,:, 1:32]).to(device)
-			value_targets = value_targets.permute(0, 2, 1) # for cross eentropy loss - it measures CE over axis 1
+			inputs = inputs_np.to(device=device, dtype=dtype)
+			targets = outputs_np.to(device=device, dtype=dtype)
 
 			if batch_indx % 100 == 0:
 				start_event.record()
 
-			with autocast('cuda', dtype=torch.bfloat16):
+			with autocast('cuda', dtype=torch.bfloat16, enabled=not use_bf16):
 				pred = model(inputs, 0)
 				loss, n_correct, n_possible = calcLoss(task, pred, targets)
 			correct_vals += n_correct
@@ -401,7 +401,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	return model
 
 if __name__ == '__main__':
-	parser = argparse.ArgumentParser(description='Train analogy model')
+	parser = argparse.ArgumentParser(description='Train aritmetic model')
 	parser.add_argument('--device', type=str, default='auto',
 						help='Device to use (cpu, cuda, auto)')
 	parser.add_argument('--epochs', type=int, default=10, help='Number of epochs')
@@ -416,6 +416,7 @@ if __name__ == '__main__':
         help='Load and save model parameters.')
 	parser.add_argument('--task', type=int, help="what task to run the model on", required=True)
 	parser.add_argument('--repl', type=int, default=1, help="what replicate this is",)
+	parser.add_argument('--bf16', action='store_true', help='Train entirely in bfloat16 (model weights + activations)')
 	args = parser.parse_args()
 	
 	model = trainModel(
@@ -428,6 +429,7 @@ if __name__ == '__main__':
 		log_name=args.log_name,
 		save_model=args.save,
 		task = args.task,
-		replicate = args.repl
+		replicate = args.repl,
+		use_bf16 = args.bf16,
 	)
 
