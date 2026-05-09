@@ -59,7 +59,7 @@ __global__ void Vq_gather_grad(
     int bh  = blockIdx.z;          // flattened (batch, head)
     int i0  = blockIdx.x * T_I + threadIdx.x;
     int k0  = blockIdx.y * T_K + threadIdx.y;
-    
+
     // Track if this thread should compute (DON'T return early - need all threads for shared mem loading)
     const bool active = (i0 < N && k0 < N);
 
@@ -76,22 +76,28 @@ __global__ void Vq_gather_grad(
     const float* lKBH  = l_k     + (int64_t)bh * N;
           float* gVqBH = gradVq  + bh * stride_BH;
 
-    /* ---- load bf2f(Q[i,:])  bf2f(S[k,:])  bf2f(Vs[k,:]) into registers ------------------- */
-    float q_vec[D_CONST];
-    float s_vec[D_CONST], vs_vec[D_CONST];
+    /* ---- per-thread vectors: fused qs = q*s (drops separate q,s scalars in inner loop)
+            vs_vec stays in regs (k-only, hot for Yr path)
+            gyk_vec = gradY[k0,:] hoisted out of j-loop (was reloaded inside) */
+    float qs_vec[D_CONST];
+    float vs_vec[D_CONST];
+    float gyk_vec[D_CONST];
     float grad_acc[D_CONST] = {0.0f};
-    
+
     // Clamp indices for safe memory access (inactive threads load from valid location)
     const int i0_safe = min(i0, N-1);
     const int k0_safe = min(k0, N-1);
-    
+
     #pragma unroll
     for (int d=0; d<D_CONST; ++d){
-        q_vec[d]  = bf2f(QBH[i0_safe*D_CONST + d]);
-        s_vec[d]  = bf2f(SBH[k0_safe*D_CONST + d]);
-        vs_vec[d] = bf2f(VsBH[k0_safe*D_CONST + d]);
+        qs_vec[d]  = bf2f(QBH[i0_safe*D_CONST + d]) * bf2f(SBH[k0_safe*D_CONST + d]);
+        vs_vec[d]  = bf2f(VsBH[k0_safe*D_CONST + d]);
+        gyk_vec[d] = bf2f(gYBH[k0_safe*D_CONST + d]);
     }
 
+    // Hoist k-only stats out of j-loop; pre-invert l_k once.
+    const float mk     = mKBH[k0_safe];
+    const float inv_lk = 1.0f / fmaxf(lKBH[k0_safe], DENOM_EPS);
 
     /* ---- loop over J in chunks ---------------------------------------- */
     for (int jBase=0; jBase<N; jBase+=T_J){
@@ -99,7 +105,7 @@ __global__ void Vq_gather_grad(
         __shared__ float sh_Vr[T_J][D_CONST];
         __shared__ float sh_gY[T_J][D_CONST];
         __shared__ float sh_mj[T_J];
-        __shared__ float sh_lj[T_J];
+        __shared__ float sh_lj_inv[T_J];      // pre-inverted, multiply not divide
 
         // Cooperative loading: ALL threads participate to cover all D dimensions
         int lj = threadIdx.y;                       // 0 … T_K-1 (≤T_J)
@@ -112,8 +118,8 @@ __global__ void Vq_gather_grad(
                 sh_gY[lj][d] = bf2f(gYBH[jGlob*D_CONST + d]);   // grad_Yr = grad_output
             }
             if (threadIdx.x == 0){
-                sh_mj[lj] = mJBH[jGlob];
-                sh_lj[lj] = lJBH[jGlob];
+                sh_mj[lj]     = mJBH[jGlob];
+                sh_lj_inv[lj] = 1.0f / fmaxf(lJBH[jGlob], DENOM_EPS);
             }
         }
         __syncthreads();
@@ -121,19 +127,20 @@ __global__ void Vq_gather_grad(
         /* ---- iterate inside loaded j-chunk (only active threads compute) */
         if (active) {
             for (int jOff=0; jOff<T_J && (jBase+jOff)<N; ++jOff){
+                // logits = (q*s) · r — halved FMA vs q*r*s (save 64 FMA per j)
                 float logits=0.f;
                 #pragma unroll
                 for (int d=0; d<D_CONST; ++d)
-                    logits += q_vec[d]*sh_R[jOff][d]*s_vec[d];
+                    logits += qs_vec[d] * sh_R[jOff][d];
                 logits *= scale;
 
-                float wj = __expf(fminf(logits - sh_mj[jOff], EXP_CLIP)) / fmaxf(sh_lj[jOff], DENOM_EPS);
-                float wk = __expf(fminf(logits - mKBH[k0], EXP_CLIP))    / fmaxf(lKBH[k0], DENOM_EPS);
+                float wj = __expf(fminf(logits - sh_mj[jOff], EXP_CLIP)) * sh_lj_inv[jOff];
+                float wk = __expf(fminf(logits - mk,           EXP_CLIP)) * inv_lk;
 
                 #pragma unroll
                 for (int d=0; d<D_CONST; ++d){
-                    grad_acc[d] += wj * sh_gY[jOff][d] * vs_vec[d]        /* Yr path */
-                                  + wk * bf2f(gYBH[k0*D_CONST + d])  * sh_Vr[jOff][d];/* Ys path */
+                    grad_acc[d] += wj * sh_gY[jOff][d] * vs_vec[d]      /* Yr path */
+                                +  wk * gyk_vec[d]     * sh_Vr[jOff][d]; /* Ys path */
                 }
             }
         }
