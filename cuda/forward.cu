@@ -1621,10 +1621,14 @@ void Yr_scatter(
                 for (int i0 = 0; i0 < 4; i0++) {
                     #pragma unroll
                     for (int i1 = 0; i1 < 4; i1++) {
+                        // Hoist q*r outside the i2 loop: each (i0,i1) is reused
+                        // across all 4 values of i2, so the two q*r FMULs need
+                        // happen only once per (i0,i1,db) instead of per i2.
+                        const float qrx = qa[i0].x * ra[i1].x;
+                        const float qry = qa[i0].y * ra[i1].y;
                         #pragma unroll
                         for (int i2 = 0; i2 < 4; i2++) {
-                            acc[i0][i1][i2] += qa[i0].x * ra[i1].x * sa[i2].x
-                                             + qa[i0].y * ra[i1].y * sa[i2].y;
+                            acc[i0][i1][i2] += qrx * sa[i2].x + qry * sa[i2].y;
                         }
                     }
                 }
@@ -1667,20 +1671,23 @@ void Yr_scatter(
 
             // --- Apply Softmax Scaling ---
             if (da == 0) {
+                // Fuse exp(logit-mit)*lit * exp(logit-mkt)*lkt into a single
+                // exp(2*logit - mit - mkt) * lit * lkt: halves MUFU expf traffic.
+                const float two_scale = 2.0f * scale;
                 #pragma unroll
                 for (int i0 = 0; i0 < 4; i0++) {
-                    float mit = mi_tile[ia * 4 + i0];
-                    float lit = li_tile[ia * 4 + i0];
+                    const float mit = mi_tile[ia * 4 + i0];
+                    const float lit = li_tile[ia * 4 + i0];
                     #pragma unroll
                     for (int i1 = 0; i1 < 4; i1++) {
                         #pragma unroll
                         for (int i2 = 0; i2 < 4; i2++) {
-                            float logit = acc[i0][i1][i2] * scale;
-                            float ai = expf(logit - mit) * lit;
-                            float as = expf(logit - mk_tile[ka * 4 + i2]) * lk_tile[ka * 4 + i2];
+                            const float mkt = mk_tile[ka * 4 + i2];
+                            const float lkt = lk_tile[ka * 4 + i2];
+                            const float logit2 = acc[i0][i1][i2] * two_scale;
                             attn_tile[(ia * 4 + i0) * ATTN_I_STRIDE +
                                       (ja * 4 + i1) * ATTN_K_STRIDE +
-                                      (ka * 4 + i2)] = ai * as;
+                                      (ka * 4 + i2)] = __expf(logit2 - mit - mkt) * lit * lkt;
                         }
                     }
                 }
@@ -1695,27 +1702,51 @@ void Yr_scatter(
             }
             __syncthreads();
 
-            // --- Accumulate Output ---
+            // --- Accumulate Output (factored outer product: f = u^T (A v)) ---
+            // dy depends only on (tid % load_pairs); since tpb=256 is a multiple
+            // of load_pairs=32, dy is identical across both n=0 and n=1 iters —
+            // so vqts/vsts can be loaded once and reused.
+            const int dy_h = (tid % load_pairs) * 2;
+            float2 vqts[TILE_I];
+            float2 vsts[TILE_K];
+            #pragma unroll
+            for (int iy = 0; iy < TILE_I; iy++) {
+                vqts[iy] = __bfloat1622float2(
+                    *reinterpret_cast<const __nv_bfloat162*>(vq_tile + iy * DP + dy_h));
+            }
+            #pragma unroll
+            for (int ky = 0; ky < TILE_K; ky++) {
+                vsts[ky] = __bfloat1622float2(
+                    *reinterpret_cast<const __nv_bfloat162*>(vs_tile + ky * DP + dy_h));
+            }
             for (int n = 0; n < load_iters; n++) {
                 int tid_n = tid + n * tpb;
                 if (tid_n < TILE_J * load_pairs) {
                     int jy = tid_n / load_pairs;
-                    int dy = (tid_n % load_pairs) * 2;
 
-                    float2 f = make_float2(0.0f, 0.0f);
-                    for (int iy = 0; iy < TILE_I; iy++) {
-                        const float2 vqt =
-                            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(vq_tile + iy * DP + dy));
+                    // Pair-process 2 iy values per outer iter: 4 parallel inner
+                    // FMA chains (vs 2 with single iy), keeping the FFMA pipe
+                    // saturated through dependency latency. No extra reduction
+                    // adds — each `fx +=` is one FMA, two of them per outer iter.
+                    float fx = 0.0f, fy = 0.0f;
+                    #pragma unroll
+                    for (int iy = 0; iy < TILE_I; iy += 2) {
+                        float tx_a = 0.0f, ty_a = 0.0f;
+                        float tx_b = 0.0f, ty_b = 0.0f;
+                        #pragma unroll
                         for (int ky = 0; ky < TILE_K; ky++) {
-                            const float p = attn_tile[iy * ATTN_I_STRIDE + jy * ATTN_K_STRIDE + ky];
-                            const float2 vst =
-                                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(vs_tile + ky * DP + dy));
-                            f.x += p * vqt.x * vst.x;
-                            f.y += p * vqt.y * vst.y;
+                            const float p_a = attn_tile[(iy + 0) * ATTN_I_STRIDE + jy * ATTN_K_STRIDE + ky];
+                            const float p_b = attn_tile[(iy + 1) * ATTN_I_STRIDE + jy * ATTN_K_STRIDE + ky];
+                            tx_a += p_a * vsts[ky].x;  tx_b += p_b * vsts[ky].x;
+                            ty_a += p_a * vsts[ky].y;  ty_b += p_b * vsts[ky].y;
                         }
+                        fx += vqts[iy + 0].x * tx_a;
+                        fx += vqts[iy + 1].x * tx_b;
+                        fy += vqts[iy + 0].y * ty_a;
+                        fy += vqts[iy + 1].y * ty_b;
                     }
-                    yr_acc[n].x += f.x;
-                    yr_acc[n].y += f.y;
+                    yr_acc[n].x += fx;
+                    yr_acc[n].y += fy;
                 }
             }
             __syncthreads();
@@ -1908,10 +1939,14 @@ void Ys_scatter(
                 for (int i0 = 0; i0 < 4; i0++) {
                     #pragma unroll
                     for (int i1 = 0; i1 < 4; i1++) {
+                        // Hoist q*r outside the i2 loop: each (i0,i1) is reused
+                        // across all 4 values of i2, so the two q*r FMULs need
+                        // happen only once per (i0,i1,db) instead of per i2.
+                        const float qrx = qa[i0].x * ra[i1].x;
+                        const float qry = qa[i0].y * ra[i1].y;
                         #pragma unroll
                         for (int i2 = 0; i2 < 4; i2++) {
-                            acc[i0][i1][i2] += qa[i0].x * ra[i1].x * sa[i2].x
-                                             + qa[i0].y * ra[i1].y * sa[i2].y;
+                            acc[i0][i1][i2] += qrx * sa[i2].x + qry * sa[i2].y;
                         }
                     }
                 }
@@ -1954,49 +1989,74 @@ void Ys_scatter(
 
             // --- Apply Softmax Scaling ---
             if (da == 0) {
+                // Fuse exp(logit-mit)*lit * exp(logit-mjt)*ljt into a single
+                // exp(2*logit - mit - mjt) * lit * ljt: halves MUFU expf traffic.
+                const float two_scale = 2.0f * scale;
                 #pragma unroll
                 for (int i0 = 0; i0 < 4; i0++) {
-                    float mit = mi_tile[ia * 4 + i0];
-                    float lit = li_tile[ia * 4 + i0];
+                    const float mit = mi_tile[ia * 4 + i0];
+                    const float lit = li_tile[ia * 4 + i0];
                     #pragma unroll
                     for (int i1 = 0; i1 < 4; i1++) {
-                        float mjt = mj_tile[ja * 4 + i1];
-                        float ljt = lj_tile[ja * 4 + i1];
+                        const float mjt = mj_tile[ja * 4 + i1];
+                        const float ljt = lj_tile[ja * 4 + i1];
                         #pragma unroll
                         for (int i2 = 0; i2 < 4; i2++) {
-                            float logit = acc[i0][i1][i2] * scale;
-                            float ai = expf(logit - mit) * lit;
-                            float aj = expf(logit - mjt) * ljt;
+                            const float logit2 = acc[i0][i1][i2] * two_scale;
                             attn_tile[(ia * 4 + i0) * ATTN_I_STRIDE +
                                       (ja * 4 + i1) * ATTN_K_STRIDE +
-                                      (ka * 4 + i2)] = ai * aj;
+                                      (ka * 4 + i2)] = __expf(logit2 - mit - mjt) * lit * ljt;
                         }
                     }
                 }
             }
             __syncthreads();
 
-            // --- Accumulate Output ---
+            // --- Accumulate Output (factored outer product: f = u^T (A v)) ---
+            // dy depends only on (tid % load_pairs); since tpb=256 is a multiple
+            // of load_pairs=32, dy is identical across both n=0 and n=1 iters —
+            // so vqts/vrts can be loaded once and reused.
+            const int dy_h = (tid % load_pairs) * 2;
+            float2 vqts[TILE_I];
+            float2 vrts[TILE_J];
+            #pragma unroll
+            for (int iy = 0; iy < TILE_I; iy++) {
+                vqts[iy] = __bfloat1622float2(
+                    *reinterpret_cast<const __nv_bfloat162*>(vq_tile + iy * DP + dy_h));
+            }
+            #pragma unroll
+            for (int jy = 0; jy < TILE_J; jy++) {
+                vrts[jy] = __bfloat1622float2(
+                    *reinterpret_cast<const __nv_bfloat162*>(vr_tile + jy * DP + dy_h));
+            }
             for (int n = 0; n < load_iters; n++) {
                 int tid_n = tid + n * tpb;
                 if (tid_n < TILE_K * load_pairs) {
                     int ky = tid_n / load_pairs;
-                    int dy = (tid_n % load_pairs) * 2;
 
-                    float2 f = make_float2(0.0f, 0.0f);
-                    for (int iy = 0; iy < TILE_I; iy++) {
-                        const float2 vqt =
-                            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(vq_tile + iy * DP + dy));
+                    // Pair-process 2 iy values per outer iter: 4 parallel inner
+                    // FMA chains (vs 2 with single iy), keeping the FFMA pipe
+                    // saturated through dependency latency. No extra reduction
+                    // adds — each `fx +=` is one FMA, two of them per outer iter.
+                    float fx = 0.0f, fy = 0.0f;
+                    #pragma unroll
+                    for (int iy = 0; iy < TILE_I; iy += 2) {
+                        float tx_a = 0.0f, ty_a = 0.0f;
+                        float tx_b = 0.0f, ty_b = 0.0f;
+                        #pragma unroll
                         for (int jy = 0; jy < TILE_J; jy++) {
-                            const float p = attn_tile[iy * ATTN_I_STRIDE + jy * ATTN_K_STRIDE + ky];
-                            const float2 vrt =
-                                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(vr_tile + jy * DP + dy));
-                            f.x += p * vqt.x * vrt.x;
-                            f.y += p * vqt.y * vrt.y;
+                            const float p_a = attn_tile[(iy + 0) * ATTN_I_STRIDE + jy * ATTN_K_STRIDE + ky];
+                            const float p_b = attn_tile[(iy + 1) * ATTN_I_STRIDE + jy * ATTN_K_STRIDE + ky];
+                            tx_a += p_a * vrts[jy].x;  tx_b += p_b * vrts[jy].x;
+                            ty_a += p_a * vrts[jy].y;  ty_b += p_b * vrts[jy].y;
                         }
+                        fx += vqts[iy + 0].x * tx_a;
+                        fx += vqts[iy + 1].x * tx_b;
+                        fy += vqts[iy + 0].y * ty_a;
+                        fy += vqts[iy + 1].y * ty_b;
                     }
-                    ys_acc[n].x += f.x;
-                    ys_acc[n].y += f.y;
+                    ys_acc[n].x += fx;
+                    ys_acc[n].y += fy;
                 }
             }
             __syncthreads();
