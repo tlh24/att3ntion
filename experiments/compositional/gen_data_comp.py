@@ -1,6 +1,9 @@
 import numpy as np
+import matplotlib.pyplot as plt
 import random
 import math
+import argparse
+import pdb
 
 def randint(k):
 	return np.random.randint(k)
@@ -63,6 +66,7 @@ def clipOp(va, vb, op, md):
 def genData1(bs, md, do_print=False):
 	'''
 	Task 1: learn the rules of modulo arithmetic.
+	No longer used!
 	'''
 	assert(md < 32-4)
 	x = np.zeros((bs, 4, 32), dtype=int)
@@ -166,30 +170,33 @@ def genData3(bs, do_print=False, validation=False):
 	This ought to be easy - ?
 	'''
 	ntok = 24
-	nbits = 4
+	nbits = 4 # number of position encoding bits
 	md = 64 - (5 + (nbits*2)*3) # 35
+	# 5 operations, 2 bits per graycode axis, 3 pointer spaces.
+	# md is the modulo of the operation
 
 	x = np.zeros((bs, ntok, md + 5 + (nbits*2)*3), dtype=np.float32)
 	y = np.zeros_like(x)
-	nd = ntok - 2
+	nd = ntok - 2 #number of arguments.
 	for b in range(bs):
 		pos_enc = graycodePosEnc(ntok, nbits, rand_phase=True)
 		d = np.random.randint(1, 8, size=(nd,))
+		# This setting will only wrap with multipy (7*6 = 42 etc)
 		ai = randint(nd)
 		bi = randint(nd)
 		op = randint(4)
 		c,ops = clipOp(d[ai], d[bi], op, md)
 		# encode the list of nd integers
 		for k in range(nd):
-			x[b,k,d[k]+5] = 1
+			x[b,k,d[k]+5] = 1 # one-hot encoding.  0..4 are the ops
 		x[b,nd,op] = 1
-		x[b,nd+1,4 ] = 1 # result
+		x[b,nd+1,4 ] = 1 # result one-hot
 		# positional encoding
 		x[b,:,md+5:md+5+8] = pos_enc
 		x[b,nd,md+5+8:md+5+16] = pos_enc[ai,:] # point to arg A
 		x[b,nd,md+5+16:md+5+24] = pos_enc[bi,:] # point to arg B
 		x[b,nd+1,md+5+8:md+5+16] = pos_enc[8,:] # point to op
-		# y[b,nd+1, 5+d[ai]] = 1 # TEST - extra label makes it work super fast
+		# y[b,nd+1, 5+d[ai]] = 1 # TEST - extra label makes it work super fast!
 		# y[b,nd+1, 5+d[bi]] = 1
 		# y[b,nd+1,md+5+8:md+5+16] = pos_enc[ai,:] # copy pointer
 		# y[b,nd+1,md+5+16:md+5+24] = pos_enc[bi,:]
@@ -202,7 +209,6 @@ def genData3(bs, do_print=False, validation=False):
 	return x,y
 
 def plotData3():
-	import matplotlib.pyplot as plt
 	x,y = genData3(800, do_print=False) # Test
 	bs = 3
 	x,y = genData3(bs, do_print=True)
@@ -303,7 +309,7 @@ class Expression:
 		# recusively evaluate the expression
 		if self.op is None:
 			return self.value
-		c,_ = modOp(self.left.evaluate(md), self.right.evaluate(md), self.op, md) # NOTE was clipOp for the pitch.
+		c,_ = modOp(self.left.evaluate(md), self.right.evaluate(md), self.op, md)
 		self.value = c # save for supervised learning
 		return c
 
@@ -313,7 +319,7 @@ class ExpressionGenerator:
 	def __init__(self, max_terms, modulo):
 		self.max_terms = max(2, max_terms) # Need at least 2 terms for an op
 		self.modulo = modulo
-		# these cataland numbers start at 2.
+		# these catalan numbers start at 2.
 		self.catalan = [2, 5, 14, 42, 132, 429, 1430, 4862]
 		self.catalan[0] = 2 + 30 # increase the frequency of the
 		self.catalan[1] = 5 + 20 # simple expr
@@ -397,6 +403,8 @@ def genData4(bs, do_print=False, validation=False):
 	ntok = 32
 	nbits = 4 # hardcoded in class expression
 	md = 64 - (5 + (nbits*2)*3) # modulo = 35
+	# 5 operations, 2 bits per graycode axis, 3 pointer spaces.
+	# md is the modulo of the operation
 
 	rng = np.random.default_rng()
 	x = np.zeros((bs, ntok, md + 5 + 8*3), dtype=np.float32)
@@ -407,53 +415,67 @@ def genData4(bs, do_print=False, validation=False):
 		tries = 16
 		cnt = 0
 		while tries > 0:
+			# could do a much better packing alg ..meh
 			val = 0
 			while val == 0:
 				tree = exp_gen.generate()
 				val = tree.evaluate(md)
+			# pos_enc_permute = rng.permutation(pos_enc, axis=0)
+			# pos_enc_permute = np.copy(pos_enc)
 			n = tree.count()
-			result = tree.evaluate(md)
-			if n + 1 + cnt < 32 and result > 0 and result < md-1:
-				tree.setLocRec(cnt)
+			result = tree.evaluate(md) # sets internal values of the ops
+			if n + 1 + cnt < 32 and result > 0 and result < md-1: # one spot for the result
+				tree.setLocRec(cnt) # also resets eval.
 				if do_print:
 					print(f"[{b}] expr:", tree)
 					print(f"[{b}] res loc :", tree.printLoc())
 					print(f"[{b}] ploc:", tree.printParentLoc(tree.getLoc()))
 				tree.encode(md, x, b, pos_enc)
-				result = tree.evaluate(md)
+				# encode the result
+				result = tree.evaluate(md) # sets internal values of the ops
 				if do_print:
 					print(f"[{b}] res: ", result)
-				tree.encode(md, y, b, pos_enc)
+				tree.encode(md, y, b, pos_enc) # note!  calling with Y not X
 				cnt += n
 				x[b, cnt, 4] = 1
-				x[b, cnt, md+5:md+5+8] = pos_enc[cnt]
+				x[b, cnt, md+5:md+5+8] = pos_enc[cnt] # so X only has this trrivial posenc
 				y[b, cnt, 4] = 1
 				y[b, cnt, result+5] = 1
 				y[b, cnt, md+5:md+5+8] = pos_enc[cnt]
+				# y[b, cnt, md+5+8:md+5+16] = pos_enc[tree.getLoc()] # predict this!
 				cnt += 1
 			else:
 				tries -= 1
 
-	x[:, :, md+5+8:] = 0
+			# x[b, cnt:, 5] = 1 # default zero value
+			# y[b, cnt:, 5] = 1 # o/w crossentropy is undefined
+
+	x[:, :, md+5+8:] = 0 # mask pointer: model must predict
 	return x,y
+
+def plotData4():
+	x,y = genData4(800, do_print=False) # Test
+	bs = 4
+	x,y = genData4(bs, do_print=True)
+	fig,axs = plt.subplots(bs,2)
+	for b in range(bs):
+		im = axs[b, 0].imshow(np.squeeze(x[b,:,:]))
+		plt.colorbar(im, ax=axs[b, 0])
+		im = axs[b, 1].imshow(np.squeeze(y[b,:,:]))
+		plt.colorbar(im, ax=axs[b, 1])
+		axs[b,0].set_title('X')
+		axs[b,1].set_title('Y')
+	plt.show()
 
 def genData5(bs,md, do_print):
 	'''
 	Can a hypergraph transformer add and remove tokens?
+	A: not yet
 	'''
-	ntok = 32
-	pos_enc = np.zeros((ntok,8), dtype=np.float32)
-	indx = np.linspace(0, (ntok-1)*2*math.pi, ntok)
-	for i in range(4):
-		# gray code: [0][1] has a period of 4
-		# [2][3] has a period of sqrt(4*8) = sqrt(32) = 4 sqrt(2)
-		# [4][5] period of 8..
-		# period = 4 * (math.sqrt(2.0))**i
-		period = 4 * 2.0**i
-		phase = math.pi / period # indx is scaled by 2 pi
-		pos_enc[:, 2*i  ] = -np.cos(indx / period + phase)
-		pos_enc[:, 2*i+1] = np.sin(indx / period + phase)
-	x = np.zeros((bs, ntok, md + 8), dtype=np.float32)
+	ntok = 128
+	nbits = 6
+	pos_enc = graycodePosEnc(ntok, nbits)
+	x = np.zeros((bs, ntok, md + nbits*2), dtype=np.float32)
 	y = np.zeros_like(x)
 
 	x[:, :, md:] = pos_enc # static --
@@ -498,6 +520,15 @@ def genData5(bs,md, do_print):
 		y[b, :, 8:16] += noizp
 	return x, y
 
+def plotData5():
+	x,y = genData5(2, 24-8, do_print=True)
+	print(x.shape)
+	fig,axs = plt.subplots(2,2)
+	for i in range(2):
+		axs[0,i].imshow(np.squeeze(x[i,...]).T)
+		axs[1,i].imshow(np.squeeze(y[i,...]).T)
+	plt.show()
+
 def genData6(bs, do_print):
 	'''
 	train the network to accurately multiply two one-digit
@@ -511,7 +542,7 @@ def genData6(bs, do_print):
 	x = np.zeros((bs, ntok, md + nbits*2), dtype=np.float32)
 	y = np.zeros_like(x)
 	x[:, :, -nbits*2:] = pos_enc
-	y[:, :, -nbits*2:] = pos_enc
+	y[:, :, -nbits*2:] = pos_enc # this will be overwritten
 
 	for b in range(bs):
 		va = randint(16)
@@ -524,29 +555,51 @@ def genData6(bs, do_print):
 		vc0 = vc % 16
 		vc1 = vc // 16
 		def encode(tok, val):
-			x[b, tok, 0] = 1.0
+			x[b, tok, 0] = 1.0 # occupied!
 			x[b, tok, val] += 1.0
 		encode(0, va + 8)
 		encode(1, 1+op*2) # +-*/=?() -> 12345678
 		encode(2, vb + 8)
 		encode(3, 5) # =
 		encode(4, 6) # ? (result)
+		# last two entries are left empty / free.
 
 		def encodeY(tok, val):
-			y[b, tok, 0] = 1.0
+			y[b, tok, 0] = 1.0 # occupied!
 			y[b, tok, val] += 1.0
 		encodeY(4, vc0 + 8)
 		if vc1 > 0:
+			# encode a pointer
 			y[b, 4, 24:32] = y[b, 5, 32:40]
 			encodeY(5, vc1 + 8)
+			# leave the pointer field in tok 5 empty = Null
+		# else:
+			# noop - leave the pointer field in tok 4 empty.
+		# this means we need to measure loss:
+		# cross-entropy over the digit (both 4 & 5)
+		# MSE over pointer field (both)
 		if do_print:
 			print(f"{va} * {vb} = {vc} = 0x{vc1:x}{vc0:x}")
+	# TODO TODO: we need to vary the allocation & make sure the pointer op still works.
+	# which is OK, since we're only allocating one token.
 	return x, y
+
+def plotData6():
+	bs = 2
+	x, y = genData6(bs, True)
+	fig,axs = plt.subplots(bs,2)
+	for b in range(bs):
+		axs[b, 0].imshow(np.squeeze(x[b,:,:]).T)
+		axs[b, 1].imshow(np.squeeze(y[b,:,:]).T)
+		axs[b,0].set_title('X')
+		axs[b,1].set_title('Y')
+	plt.show()
 
 class Encoder:
 	'''
-	Helper class for genData7: encodes individual values/symbols
-	or encodes lists of values with optional parent pointers.
+	helper class for genData7
+	encodes individual values / symbols,
+	or encodes lists of values.
 	'''
 	def __init__(self, ntok, nbits, do_print):
 		self.tok_ctr = 0
@@ -559,12 +612,14 @@ class Encoder:
 	def encode(self, z, b, val, pos_space):
 		if type(val) == str:
 			dic = [' ','+','-','*','/','=','?','(',')','sl1','sl2','$']
+			# technically it's shift /right/ since this is little-endian..
 			v = dic.index(val)
 		else:
-			v = val + 16
-		z[b, self.tok_ctr, 0] = 1.0
+			v = val + 16 # number of operations
+		z[b, self.tok_ctr, 0] = 1.0 # occupied!
 		z[b, self.tok_ctr, v] = 1.0
 		pos = self.horiz_ctr[pos_space]
+		# 2d addressing scheme!
 		nb = self.nbits
 		z[b, self.tok_ctr, -nb*2:] = self.pos_enc[pos, :]
 		z[b, self.tok_ctr, -nb*4:-nb*2] = self.pos_enc[pos_space, :]
@@ -581,13 +636,15 @@ class Encoder:
 			dic = [' ','+','-','*','/','=','?','(',')','sl1','sl2','$']
 			v = dic.index(val)
 		else:
-			v = val + 16
-		z[b, self.tok_ctr, 0] = 1.0
+			v = val + 16 # number of operations
+		z[b, self.tok_ctr, 0] = 1.0 # occupied!
 		z[b, self.tok_ctr, v] = 1.0
 		pos = self.horiz_ctr[pos_space]
+		# 2d addressing scheme!
 		nb = self.nbits
 		z[b, self.tok_ctr, -nb*2:] = self.pos_enc[pos, :]
 		z[b, self.tok_ctr, -nb*4:-nb*2] = self.pos_enc[pos_space, :]
+		# encode the 2d lparent & rparent (seems so inefficient?)
 		z[b, self.tok_ctr, -nb*6 :-nb*4 ] = self.pos_enc[lparent[0], :]
 		z[b, self.tok_ctr, -nb*8 :-nb*6 ] = self.pos_enc[lparent[1], :]
 		z[b, self.tok_ctr, -nb*10:-nb*8 ] = self.pos_enc[rparent[0], :]
@@ -606,10 +663,11 @@ class Encoder:
 		for val in val_list:
 			self.encode(z, b, val, self.vert_ctr)
 		if self.do_print:
-			print(" ")
+			print(" ") # newline
 		self.vert_ctr += 1
 
 	def encodeListPtrs(self, z, b, val_list, lparents, rparents):
+		''' encode a list with pointers!'''
 		if self.do_print:
 			print(f"{self.vert_ctr}: ", end='')
 		for i in range(len(val_list)):
@@ -618,19 +676,21 @@ class Encoder:
 			print(lparents, rparents)
 		self.vert_ctr += 1
 
+
 def genData7(bs, do_print=False, validation=False):
 	'''
-	Train a network to do long addition with carries,
+	train a network to do long addition with carries,
 	writing multiple tokens per pass (multiple single-digit adds in parallel),
 	followed by ripple carry accumulation over multiple steps.
-	Uses argument pointers (absolute token locations).
+	Use argument pointers (absolute token locations) to instruct learning the algorithm. This makes it rather complicated!
 	Train with arguments 1-4 hex digits, test on 4 digit arithmetic.
 	'''
-	nop = 16
-	ntok = 52
-	nbits = 8
+	nop = 16 # _+-*/=?() -> 012345678
+	ntok = 52 # 8 for the simple tasks, 28 for sub-task 3
+	nbits = 8 # bits to encode the position
 
 	md = nop + 16 + (nbits*2)*2*(1+2)
+	# one-hot indicators, digits, 2 pointers, 2d posenc
 	x = np.zeros((bs, ntok, md), dtype=np.float32)
 	y = np.zeros_like(x)
 
@@ -669,9 +729,10 @@ def genData7(bs, do_print=False, validation=False):
 		return lst
 
 	for b in range(bs):
+		# new encoder per batch for a random phase.
 		enc = Encoder(ntok, nbits, do_print)
-		x[b, :, -nbits*2:] = enc.pos_enc
-		x[b, :, -nbits*4:-nbits*2] = enc.pos_enc[0,:]
+		x[b, :, -nbits*2:] = enc.pos_enc # "horizontal"
+		x[b, :, -nbits*4:-nbits*2] = enc.pos_enc[0,:] # "vertical"
 
 		na = randint(4) + 1
 		nb = randint(4) + 1
@@ -681,29 +742,35 @@ def genData7(bs, do_print=False, validation=False):
 		va = randint(16**na)
 		vb = randint(16**nb)
 		lst = []
+		# encode the first digit with a leading zero
+		# which can be used for subsequent additions.
 		lst = [0]
 		lst = encHex(lst, va, ndigits=na)
 		lst.append('+')
 		lst = encHex(lst, vb, ndigits=nb)
-		lst.append('=')
+		lst.append('=') # need to delineate end-of-number/expression
 		enc.encodeList(x, b, lst)
 		ndigits = max(na, nb)
-		numsteps = 4 + 2*(ndigits-1)
+		numsteps = 4 + 2*(ndigits-1) # dont count the problem.
 		step = b % numsteps
 
-		vc0 = []
+		# two-phase process:
+		# setup the graph, then execute it, alocating as needed.
+		vc0 = [] # list of lists
 		vc1 = []
 		vo = []
 		def encodeStep(enc, z, i):
 			nonlocal x, y, b, vc0, vc1, vo
 			if i == 0:
+				# setup graph for adding all digits in parallel
 				ops = ['+' for _ in range(ndigits)]
 				lparent = [(0,i+1) for i in range(na)]
 				lparent.extend([(0,0) for _ in range(ndigits-na)])
 				rparent = [(0,na+i+2) for i in range(nb)]
 				rparent.extend([(0,0) for _ in range(ndigits-nb)])
-				enc.encodeListPtrs(z, b, ops, lparent, rparent)
+				enc.encodeListPtrs(z, b, ops, lparent, rparent) # y=1
 			if i == 1:
+				# do the calculations
 				vc0_ = []
 				vc1_ = []
 				for j in range(ndigits):
@@ -712,12 +779,13 @@ def genData7(bs, do_print=False, validation=False):
 					vc1_.append((vc >> 4) & 0xf)
 				lparent = [(1,i) for i in range(ndigits)]
 				rparent = [(0,0) for _ in range(ndigits)]
-				enc.encodeListPtrs(z, b, vc0_, lparent, rparent)
+				enc.encodeListPtrs(z, b, vc0_, lparent, rparent) # y=2
 				rparent = [(2,i) for i in range(ndigits)]
-				enc.encodeListPtrs(z, b, vc1_, lparent, rparent)
+				enc.encodeListPtrs(z, b, vc1_, lparent, rparent) # y=3
 				vc0.append(vc0_)
 				vc1.append(vc1_)
 			if i >= 2 and i < 2 + 2*(ndigits-1):
+				# ripple carries
 				vc0_ = []
 				vc1_ = []
 				ci = (i - 2)//2
@@ -726,7 +794,7 @@ def genData7(bs, do_print=False, validation=False):
 					lparent = [(2+3*ci,i+1) for i in range(ndigits-ci-1)]
 					rparent = [(3+3*ci,i) for i in range(ndigits-ci-1)]
 					enc.encodeListPtrs(z, b, ops, lparent, rparent)
-				else:
+				else: # results
 					for j in range(ndigits-ci-1):
 						vc = vc0[ci][j+1] + vc1[ci][j]
 						vc0_.append(vc & 0xf)
@@ -741,7 +809,7 @@ def genData7(bs, do_print=False, validation=False):
 			if i == 2 + 2*(ndigits-1):
 				ops = ['$' for _ in range(ndigits+1)]
 				lparent = [(2+i*3,0) for i in range(ndigits)]
-				lparent.append((3,ndigits-1))
+				lparent.append((3,ndigits-1)) # original carry but this isn't right
 				rparent = [(0,0) for _ in range(ndigits+1)]
 				enc.encodeListPtrs(z, b, ops, lparent, rparent)
 			if i == 3 + 2*(ndigits-1):
@@ -750,23 +818,24 @@ def genData7(bs, do_print=False, validation=False):
 				lparent = [(ndigits*3+1,i) for i in range(ndigits+1)]
 				rparent = [(0,0) for _ in range(ndigits+1)]
 				enc.encodeListPtrs(z, b, vo, lparent, rparent)
+			# TODO: fix the cascaded carries! in an elegant way.
+			# TODO: point back to the original op
 
 		for i in range(step):
 			encodeStep(enc, x, i)
-		encodeStep(enc, y, step)
+		encodeStep(enc, y, step) # supervised target
 
 	return x, y
 
-
-if __name__ == '__main__':
-	import matplotlib.pyplot as plt
-
-	x,y = genData5(2, 24-8, do_print=True)
-	print(x.shape)
-	fig,axs = plt.subplots(2,2)
-	for i in range(2):
-		axs[0,i].imshow(np.squeeze(x[i,...]))
-		axs[1,i].imshow(np.squeeze(y[i,...]))
+def plotData7():
+	bs = 10
+	x, y = genData7(bs, True, True)
+	fig,axs = plt.subplots(bs,2)
+	for b in range(bs):
+		axs[b, 0].imshow(np.squeeze(x[b,:,:]))
+		axs[b, 1].imshow(np.squeeze(y[b,:,:] + 0.25*x[b,:,:]))
+		axs[b,0].set_title('X')
+		axs[b,1].set_title('Y')
 	plt.show()
 
 
@@ -880,8 +949,8 @@ def genData8(bs, do_print=False):
 
 
 if __name__ == '__main__':
-	parser = argparse.ArgumentParser(description='generate compositional data for training graph/hypergraph transformers')
-	parser.add_argument('-t', type=int, default=6, help='which test to run')
+	parser = argparse.ArgumentParser(description='generate compositional data for comparing graph and hypergraph transformers')
+	parser.add_argument('-t', type=int, default=6, help='which test to run.  options: 3, 4, 7')
 	args = parser.parse_args()
 	if args.t == 3:
 		plotData3()

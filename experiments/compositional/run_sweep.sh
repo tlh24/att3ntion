@@ -32,7 +32,7 @@ for attn in "${ATTN_TYPES[@]}"; do
 	for task in "${TASKS[@]}"; do
 		echo "Running: Attn=$attn | Task=$task | Log=$LOG_NAME | Replicate=$REPL"
 
-		python train.py --bf16 \
+		python train_orig.py --bf16 \
 			--batch-size "$BATCH_SIZE" \
 			--epochs "$EPOCHS" \
 			--attn "$attn" \
