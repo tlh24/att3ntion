@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from torch.amp import autocast
 import torch.nn.functional as F
 import sys
+import pdb
 from pathlib import Path
 current_script_path = Path(__file__).resolve()
 script_dir = str(current_script_path.parent)
@@ -20,28 +21,28 @@ from att3ntion import _HypergraphAttentionNaive, _GraphAttentionNaive, QuickGELU
 # Try to import CUDA-backed hypergraph attention; fall back to naive if not built.
 _cuda_kernels_available = False
 try:
-    from att3ntion import HypergraphAttention as _HypergraphAttentionCuda
-    _cuda_kernels_available = True
+	from att3ntion import HypergraphAttention as _HypergraphAttentionCuda
+	_cuda_kernels_available = True
 except (ImportError, OSError):
-    pass
+	pass
 
 if _cuda_kernels_available:
-    class _CudaHypergraphWrapper(_HypergraphAttentionCuda):
-        """HypergraphAttention adapted to the (x, rotary_emb) call convention used here."""
-        def forward(self, x, rotary_emb=None):
-            return super().forward(x)
+	class _CudaHypergraphWrapper(_HypergraphAttentionCuda):
+		"""HypergraphAttention adapted to the (x, rotary_emb) call convention used here."""
+		def forward(self, x, rotary_emb=None):
+			return super().forward(x)
 
-        def calcFlops(self, x):
-            bs, ntok, d_model = x.shape
-            f = 0.0
-            f += 3 * bs * ntok * d_model**2 * self.n_heads * d_model
-            f += 3 * bs * ntok * d_model**2 * self.n_heads * d_model * 2
-            f += bs * self.n_heads * ntok**3 * self.head_dim * 2
-            f += bs * self.n_heads * ntok**3 * 2 * 3
-            f += bs * self.n_heads * ntok**3 * self.head_dim * 6
-            f += bs * self.n_heads * ntok * self.head_dim * (6 + 6)
-            f += bs * ntok * d_model**2
-            return f
+		def calcFlops(self, x):
+			bs, ntok, d_model = x.shape
+			f = 0.0
+			f += 3 * bs * ntok * d_model**2 * self.n_heads * d_model
+			f += 3 * bs * ntok * d_model**2 * self.n_heads * d_model * 2
+			f += bs * self.n_heads * ntok**3 * self.head_dim * 2
+			f += bs * self.n_heads * ntok**3 * 2 * 3
+			f += bs * self.n_heads * ntok**3 * self.head_dim * 6
+			f += bs * self.n_heads * ntok * self.head_dim * (6 + 6)
+			f += bs * ntok * d_model**2
+			return f
 
 from gen_data_comp import genData3, genData4, genData7
 
@@ -310,7 +311,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	if use_bf16:
 		print("--- Running in full bfloat16 ---")
 	else:
-		print("--- Running with Automatic Mixed Precision (fp32 weights) ---")
+		print("--- Running with Torch automatic mixed precision (fp32 weights) ---")
 
 	nam = {"hypergraph":"hg","graph":"g"}.get(attn_impl)
 	fd_losslog = open(f'losslog_{nam}_t{task}_{log_name}_r{replicate}.txt', 'w')
@@ -335,10 +336,10 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 				start_event.record()
 			optimizer.zero_grad()
 
-			with autocast('cuda', dtype=torch.bfloat16, enabled=not use_bf16):
-				pred = model(inputs, batch_indx)
-				loss, n_correct, n_possible = calcLoss(task, pred, targets)
-				correct_vals += n_correct
+			# with autocast('cuda', dtype=torch.bfloat16, enabled=not use_bf16):
+			pred = model(inputs, batch_indx)
+			loss, n_correct, n_possible = calcLoss(task, pred, targets)
+			correct_vals += n_correct
 
 			loss.backward()
 			torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
