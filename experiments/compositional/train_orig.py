@@ -17,8 +17,8 @@ parent_dir_str = str(parent_dir)
 if parent_dir_str not in sys.path:
     sys.path.insert(0, parent_dir_str)
 
-from pure_pytorch_reference import HypergraphAttention_Naive, GraphAttention_Naive, QuickGELU
-# from hyper_attn_cpp_wrapper import HypergraphAttentionCPP
+# from pure_pytorch_reference import HypergraphAttention_Naive, GraphAttention_Naive, QuickGELU # original
+from att3ntion import _HypergraphAttentionNaive, _GraphAttentionNaive, QuickGELU
 from gen_data_comp import genData3, genData4, genData7
 import pdb
 
@@ -49,9 +49,9 @@ class SimpleCompModel(nn.Module):
 		self.repeated_layers = nn.ModuleList()
 		for _ in range(n_layers):
 			if attn_impl == "hypergraph":
-				attention_layer = HypergraphAttention_Naive(hidden_dim, num_heads, head_subspaces=True)
+				attention_layer = _HypergraphAttentionNaive(hidden_dim, num_heads, head_subspaces=True)
 			else:
-				attention_layer = GraphAttention_Naive(hidden_dim, num_heads, head_subspaces=True)
+				attention_layer = _GraphAttentionNaive(hidden_dim, num_heads, head_subspaces=True)
 
 			norm1_layer = nn.RMSNorm(hidden_dim) # was LayerNorm
 			norm2_layer = nn.RMSNorm(hidden_dim)
@@ -274,7 +274,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	# optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), 'cuda')
 	optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, amsgrad=True)
 	model.printParamCount()
-	model = torch.compile(model) # mode="max-autotune"
+	model = torch.compile(model, backend="eager") # mode="max-autotune"
 
 	bf16_supported = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
 	print(f"Bfloat16 supported: {bf16_supported}")
