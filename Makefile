@@ -16,7 +16,7 @@ PYTHON ?= python
 # --- Build ---
 
 build:
-	pip install -e .
+	pip install -e . # --no-build-isolation
 
 .PHONY: maybe-build
 maybe-build:
