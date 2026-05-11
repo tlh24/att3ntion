@@ -245,7 +245,7 @@ def calcLoss(task, pred, targets):
 			n_possible = torch.sum( targets[:,:,0] ).item()
 	return loss, n_correct, n_possible
 
-def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl="", log_name="", save_model=False, task=3, replicate=1, use_bf16=False, use_cuda_kernels=True):
+def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl="", log_name="", save_model=False, task=3, replicate=1, no_amp=False, use_cuda_kernels=True):
 	
 	if device == 'auto':
 		if torch.cuda.is_available():
@@ -291,7 +291,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 		else:
 			n_layers = 4 # Positive control: these converge at the same rate.
 
-	dtype = torch.bfloat16 if use_bf16 else torch.float32
+	dtype = torch.float32
 	model = SimpleCompModel(input_dim, hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse, use_cuda_kernels=use_cuda_kernels).to(device=device, dtype=dtype)
 	if save_model:
 		try:
@@ -308,8 +308,8 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	model.printParamCount()
 	model = torch.compile(model, backend="eager") # mode="max-autotune"
 
-	if use_bf16:
-		print("--- Running in full bfloat16 ---")
+	if no_amp:
+		print("--- Running in full fp32 ---")
 	else:
 		print("--- Running with Torch automatic mixed precision (fp32 weights) ---")
 
@@ -336,9 +336,13 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 				start_event.record()
 			optimizer.zero_grad()
 
-			# with autocast('cuda', dtype=torch.bfloat16, enabled=not use_bf16):
-			pred = model(inputs, batch_indx)
-			loss, n_correct, n_possible = calcLoss(task, pred, targets)
+			if no_amp:
+				pred = model(inputs, batch_indx)
+				loss, n_correct, n_possible = calcLoss(task, pred, targets)
+			else:
+				with autocast('cuda'):
+					pred = model(inputs, batch_indx)
+					loss, n_correct, n_possible = calcLoss(task, pred, targets)
 			correct_vals += n_correct
 
 			loss.backward()
@@ -407,9 +411,13 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 			if batch_indx % 100 == 0:
 				start_event.record()
 
-			# with autocast('cuda', dtype=torch.bfloat16, enabled=not use_bf16):
-			pred = model(inputs, 0)
-			loss, n_correct, n_possible = calcLoss(task, pred, targets)
+			if no_amp:
+				pred = model(inputs, 0)
+				loss, n_correct, n_possible = calcLoss(task, pred, targets)
+			else:
+				with autocast('cuda'):
+					pred = model(inputs, 0)
+					loss, n_correct, n_possible = calcLoss(task, pred, targets)
 			correct_vals += n_correct
 
 			total += n_possible
@@ -453,7 +461,7 @@ if __name__ == '__main__':
         help='Load and save model parameters.')
 	parser.add_argument('--task', type=int, help="what task to run the model on", required=True)
 	parser.add_argument('--repl', type=int, default=1, help="what replicate this is",)
-	parser.add_argument('--bf16', action='store_true', help='Train entirely in bfloat16 (model weights + activations)')
+	parser.add_argument('--no-amp', action='store_true', help='Disable Torch automatic mixed precision')
 	parser.add_argument('--no-cuda-kernels', action='store_true',
 						help='Force naive PyTorch hypergraph attention even if CUDA kernels are built')
 	args = parser.parse_args()
@@ -469,7 +477,7 @@ if __name__ == '__main__':
 		save_model=args.save,
 		task = args.task,
 		replicate = args.repl,
-		use_bf16 = args.bf16,
+		no_amp = args.no_amp,
 		use_cuda_kernels = not args.no_cuda_kernels,
 	)
 
