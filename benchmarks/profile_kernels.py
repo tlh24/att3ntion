@@ -1,5 +1,5 @@
 import torch
-import hyper_attn_cpp_manual
+import att3ntion._cuda_kernels as _cuda_kernels
 import subprocess
 import sys
 import datetime
@@ -75,7 +75,7 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim,
         print("Running forward pass...")
         (Y_q_mc, Y_r_mc, Y_s_mc, Y_q__mc, Y_r__mc, Y_s__mc,
          m_i, l_i, m_j, l_j, m_k, l_k) = \
-            hyper_attn_cpp_manual.forward(
+            _cuda_kernels.forward(
                 Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
             )
     else:
@@ -83,7 +83,7 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim,
         with torch.no_grad():
             (Y_q_mc, Y_r_mc, Y_s_mc, Y_q__mc, Y_r__mc, Y_s__mc,
              m_i, l_i, m_j, l_j, m_k, l_k) = \
-                hyper_attn_cpp_manual.forward(
+                _cuda_kernels.forward(
                     Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
                 )
 
@@ -93,7 +93,7 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim,
         grad_output_cuda = get_grad_output_cuda(
             Y_q_mc, Y_r_mc, Y_s_mc, Y_q__mc, Y_r__mc, Y_s__mc
         )
-        hyper_attn_cpp_manual.backward(
+        _cuda_kernels.backward(
             grad_output_cuda,
             Q, R, S,
             Vq_1, Vq_2,
@@ -244,7 +244,7 @@ Available kernels:
             launch_profiler(args)
 
     except ImportError:
-        print("\nImportError: Could not import 'hyper_attn_cpp_manual'.")
+        print("\nImportError: Could not import 'att3ntion._cuda_kernels'.")
         print("Please ensure the extension is compiled via 'python setup.py install' or 'develop'.")
     except Exception as e:
         print(f"\nAn unexpected error occurred: {e}")

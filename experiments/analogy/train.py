@@ -22,14 +22,15 @@ except ImportError:
     HAS_MATPLOTLIB = False
     print("Warning: matplotlib not available, will save results to text file only")
 
-# Add parent directory to path
+# Add script dir and project root to path
 current_script_path = Path(__file__).resolve()
-parent_dir = current_script_path.parent.parent
-parent_dir_str = str(parent_dir)
-if parent_dir_str not in sys.path:
-    sys.path.insert(0, parent_dir_str)
+script_dir = str(current_script_path.parent)
+project_root = str(current_script_path.parent.parent.parent)
+for d in [script_dir, project_root]:
+    if d not in sys.path:
+        sys.path.insert(0, d)
 
-from tests.simple_analogy_model import train_model, SimpleAnalogyModel, prepare_data
+from model import train_model, SimpleAnalogyModel, prepare_data
 from gen_data import genData
 from torch.utils.data import DataLoader, TensorDataset
 

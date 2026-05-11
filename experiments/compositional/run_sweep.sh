@@ -32,7 +32,7 @@ for attn in "${ATTN_TYPES[@]}"; do
 	for task in "${TASKS[@]}"; do
 		echo "Running: Attn=$attn | Task=$task | Log=$LOG_NAME | Replicate=$REPL"
 
-		python compare_hyper_vs_graph.py \
+		python train.py --bf16 \
 			--batch-size "$BATCH_SIZE" \
 			--epochs "$EPOCHS" \
 			--attn "$attn" \

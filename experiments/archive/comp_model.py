@@ -10,15 +10,15 @@ import matplotlib.pyplot as plt
 import sys
 from pathlib import Path
 current_script_path = Path(__file__).resolve()
-parent_dir = current_script_path.parent.parent
-parent_dir_str = str(parent_dir)
-if parent_dir_str not in sys.path:
-    sys.path.insert(0, parent_dir_str)
+script_dir = str(current_script_path.parent)
+compositional_dir = str(current_script_path.parent.parent / 'compositional')
+project_root = str(current_script_path.parent.parent.parent)
+for d in [script_dir, compositional_dir, project_root]:
+    if d not in sys.path:
+        sys.path.insert(0, d)
 
-from pure_pytorch_reference import HypergraphAttention_Naive, GraphAttention_Naive, QuickGELU
-# from hypergraph_attention import HypergraphAttentionCPP
+from att3ntion import _HypergraphAttentionNaive, _GraphAttentionNaive, QuickGELU
 from gen_data_comp import genData1, genData2, genData3, genData5
-import pdb
 
 class SimpleCompModel(nn.Module):
 	"""Model with hypergraph attention layer."""
@@ -33,9 +33,9 @@ class SimpleCompModel(nn.Module):
 		self.repeated_layers = nn.ModuleList()
 		for _ in range(n_layers):
 			if attn_impl == "hypergraph":
-				attention_layer = HypergraphAttention_Naive(hidden_dim, num_heads)
+				attention_layer = _HypergraphAttentionNaive(hidden_dim, num_heads)
 			else:
-				attention_layer = GraphAttention_Naive(hidden_dim, num_heads)
+				attention_layer = _GraphAttentionNaive(hidden_dim, num_heads)
 
 			norm1_layer = nn.LayerNorm(hidden_dim)
 			ffn_layer = nn.Sequential(
@@ -105,9 +105,9 @@ class CompModel(nn.Module):
 		self.repeated_layers = nn.ModuleList()
 		for _ in range(n_layers):
 			if attn_impl == "hypergraph":
-				attention_layer = HypergraphAttention_Naive(hidden_dim, num_heads)
+				attention_layer = _HypergraphAttentionNaive(hidden_dim, num_heads)
 			else:
-				attention_layer = GraphAttention_Naive(hidden_dim, num_heads)
+				attention_layer = _GraphAttentionNaive(hidden_dim, num_heads)
 
 			norm1_layer = nn.LayerNorm(hidden_dim)
 			ffn_layer = nn.Sequential(
@@ -273,8 +273,7 @@ def train_model1(num_epochs, batch_size, hidden_dim, num_heads, device, modulo, 
 		device = torch.device(device)
 	
 	print(f"Using device: {device}")
-	pdb.set_trace()
-	data = genData4(batch_size * 100, modulo, do_print=False)
+	data = genData1(batch_size * 100, modulo, do_print=False)
 	dataset = TensorDataset(torch.tensor(data))
 	train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 

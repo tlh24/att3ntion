@@ -27,10 +27,10 @@ python demo.py --all        # Run everything
 ## Basic Usage
 
 ```python
-from hypergraph_attention import HypergraphAttentionCPP
+from att3ntion import HypergraphAttention
 
 # Create layer (drop-in replacement for attention)
-layer = HypergraphAttentionCPP(d_model=64, n_heads=4).cuda()
+layer = HypergraphAttention(d_model=64, n_heads=4).cuda()
 
 # Forward pass
 x = torch.randn(batch_size, seq_len, d_model, device='cuda')
@@ -169,11 +169,20 @@ The above summations would suggest that a full $\large A[..]$ is required for ca
 ## Project Structure
 
 ```
-att3ntion/
-├── demo.py                    # Interactive demo
-├── hypergraph_attention.py    # Main PyTorch module
-├── pure_pytorch_reference.py  # Naive reference implementation
-├── cpp/                       # C++ bindings
-├── cuda/                      # CUDA kernels (forward.cu, backward.cu)
-└── tests/                     # Benchmarks and equivalence tests
+att3ntion/                          # repo root
+├── att3ntion/                      # Python package
+│   ├── __init__.py                 # public API: HypergraphAttention
+│   ├── _autograd.py                # CUDA-backed layer + autograd bridge
+│   └── _naive.py                   # naive O(N³) reference (testing only)
+├── cpp/                            # pybind11 C++ bindings
+│   ├── cuda_bindings.cpp/.h        # Python ↔ CUDA glue
+│   └── torch_reference.cpp         # torch-based reference kernel
+├── cuda/                           # hand-written CUDA kernels
+│   ├── forward.cu                  # forward pass
+│   ├── backward.cu                 # backward pass
+│   └── common.cuh                  # shared constants & device utilities
+├── tests/                          # benchmarks, equivalence tests, Makefile
+├── demo.py                         # interactive demo
+├── setup.py                        # build config (C extensions)
+└── pyproject.toml                  # package metadata
 ```
