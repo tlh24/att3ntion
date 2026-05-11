@@ -407,9 +407,9 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 			if batch_indx % 100 == 0:
 				start_event.record()
 
-			with autocast('cuda', dtype=torch.bfloat16, enabled=not use_bf16):
-				pred = model(inputs, 0)
-				loss, n_correct, n_possible = calcLoss(task, pred, targets)
+			# with autocast('cuda', dtype=torch.bfloat16, enabled=not use_bf16):
+			pred = model(inputs, 0)
+			loss, n_correct, n_possible = calcLoss(task, pred, targets)
 			correct_vals += n_correct
 
 			total += n_possible
