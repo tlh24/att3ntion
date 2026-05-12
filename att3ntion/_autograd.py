@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import math
-import att3ntion._cuda_kernels as _cuda_kernels
+import att3ntion._custom_op  # noqa: F401 — registers torch.ops.att3ntion.hypergraph_{forward,backward}
 import att3ntion._torch_kernels as _torch_kernels
 from torch.autograd import Function
 
@@ -54,7 +54,7 @@ class _HypergraphAttentionAutograd(Function):
         Vs_1, _ = _pad_to_multiple(Vs_1.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
         Vs_2, _ = _pad_to_multiple(Vs_2.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
 
-        outputs_tuple = _cuda_kernels.forward(
+        outputs_tuple = torch.ops.att3ntion.hypergraph_forward(
             Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
         )
 
@@ -104,7 +104,7 @@ class _HypergraphAttentionAutograd(Function):
         grad_Y_r, _ = _pad_to_multiple(grad_Y_r.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
         grad_Y_s, _ = _pad_to_multiple(grad_Y_s.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
 
-        grad_tuple = _cuda_kernels.backward(
+        grad_tuple = torch.ops.att3ntion.hypergraph_backward(
             grad_Y_q, grad_Y_r, grad_Y_s, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
             m_i, l_i, m_j, l_j, m_k, l_k
         )
