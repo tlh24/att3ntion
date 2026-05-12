@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from torch.amp import autocast
 import torch.nn.functional as F
 import sys
+import pdb
 from pathlib import Path
 current_script_path = Path(__file__).resolve()
 script_dir = str(current_script_path.parent)
@@ -16,6 +17,33 @@ for d in [script_dir, project_root]:
         sys.path.insert(0, d)
 
 from att3ntion import _HypergraphAttentionNaive, _GraphAttentionNaive, QuickGELU
+
+# Try to import CUDA-backed hypergraph attention; fall back to naive if not built.
+_cuda_kernels_available = False
+try:
+	from att3ntion import HypergraphAttention as _HypergraphAttentionCuda
+	_cuda_kernels_available = True
+except (ImportError, OSError):
+	pass
+
+if _cuda_kernels_available:
+	class _CudaHypergraphWrapper(_HypergraphAttentionCuda):
+		"""HypergraphAttention adapted to the (x, rotary_emb) call convention used here."""
+		def forward(self, x, rotary_emb=None):
+			return super().forward(x)
+
+		def calcFlops(self, x):
+			bs, ntok, d_model = x.shape
+			f = 0.0
+			f += 3 * bs * ntok * d_model**2 * self.n_heads * d_model
+			f += 3 * bs * ntok * d_model**2 * self.n_heads * d_model * 2
+			f += bs * self.n_heads * ntok**3 * self.head_dim * 2
+			f += bs * self.n_heads * ntok**3 * 2 * 3
+			f += bs * self.n_heads * ntok**3 * self.head_dim * 6
+			f += bs * self.n_heads * ntok * self.head_dim * (6 + 6)
+			f += bs * ntok * d_model**2
+			return f
+
 from gen_data_comp import genData3, genData4, genData7
 
 class SwiGLU(nn.Module):
@@ -33,18 +61,27 @@ class SwiGLU(nn.Module):
 
 class SimpleCompModel(nn.Module):
 	"""Model with hypergraph attention layer."""
-	def __init__(self, input_dim:int, hidden_dim:int, num_heads:int, n_layers:int, attn_impl:str='', n_recurse:int=1):
+	def __init__(self, input_dim:int, hidden_dim:int, num_heads:int, n_layers:int, attn_impl:str='', n_recurse:int=1, use_cuda_kernels:bool=True):
 		super().__init__()
 		self.input_dim = input_dim
 		self.embedding_proj = nn.Linear(self.input_dim, hidden_dim)
 		self.attn_impl = attn_impl
 		self.n_recurse = n_recurse
 		self.d_model = hidden_dim
-		
+
+		use_cuda = use_cuda_kernels and _cuda_kernels_available and attn_impl == "hypergraph"
+		if use_cuda:
+			print("Using CUDA hypergraph attention kernels.")
+		elif attn_impl == "hypergraph":
+			print("Using naive (PyTorch) hypergraph attention.")
+
 		self.repeated_layers = nn.ModuleList()
 		for _ in range(n_layers):
 			if attn_impl == "hypergraph":
-				attention_layer = _HypergraphAttentionNaive(hidden_dim, num_heads, head_subspaces=True)
+				if use_cuda:
+					attention_layer = _CudaHypergraphWrapper(hidden_dim, num_heads)
+				else:
+					attention_layer = _HypergraphAttentionNaive(hidden_dim, num_heads, head_subspaces=True)
 			else:
 				attention_layer = _GraphAttentionNaive(hidden_dim, num_heads, head_subspaces=True)
 
@@ -208,7 +245,7 @@ def calcLoss(task, pred, targets):
 			n_possible = torch.sum( targets[:,:,0] ).item()
 	return loss, n_correct, n_possible
 
-def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl="", log_name="", save_model=False, task=3, replicate=1, use_bf16=False):
+def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl="", log_name="", save_model=False, task=3, replicate=1, no_amp=False, use_cuda_kernels=True):
 	
 	if device == 'auto':
 		if torch.cuda.is_available():
@@ -254,8 +291,8 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 		else:
 			n_layers = 4 # Positive control: these converge at the same rate.
 
-	dtype = torch.bfloat16 if use_bf16 else torch.float32
-	model = SimpleCompModel(input_dim, hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse).to(device=device, dtype=dtype)
+	dtype = torch.float32
+	model = SimpleCompModel(input_dim, hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse, use_cuda_kernels=use_cuda_kernels).to(device=device, dtype=dtype)
 	if save_model:
 		try:
 			model.load_model(f"comp_model_{attn_impl}_r{replicate}.pt", device)
@@ -271,10 +308,10 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	model.printParamCount()
 	model = torch.compile(model, backend="eager") # mode="max-autotune"
 
-	if use_bf16:
-		print("--- Running in full bfloat16 ---")
+	if no_amp:
+		print("--- Running in full fp32 ---")
 	else:
-		print("--- Running with Automatic Mixed Precision (fp32 weights) ---")
+		print("--- Running with Torch automatic mixed precision (fp32 weights) ---")
 
 	nam = {"hypergraph":"hg","graph":"g"}.get(attn_impl)
 	fd_losslog = open(f'losslog_{nam}_t{task}_{log_name}_r{replicate}.txt', 'w')
@@ -299,10 +336,14 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 				start_event.record()
 			optimizer.zero_grad()
 
-			with autocast('cuda', dtype=torch.bfloat16, enabled=not use_bf16):
+			if no_amp:
 				pred = model(inputs, batch_indx)
 				loss, n_correct, n_possible = calcLoss(task, pred, targets)
-				correct_vals += n_correct
+			else:
+				with autocast('cuda'):
+					pred = model(inputs, batch_indx)
+					loss, n_correct, n_possible = calcLoss(task, pred, targets)
+			correct_vals += n_correct
 
 			loss.backward()
 			torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -370,9 +411,13 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 			if batch_indx % 100 == 0:
 				start_event.record()
 
-			with autocast('cuda', dtype=torch.bfloat16, enabled=not use_bf16):
+			if no_amp:
 				pred = model(inputs, 0)
 				loss, n_correct, n_possible = calcLoss(task, pred, targets)
+			else:
+				with autocast('cuda'):
+					pred = model(inputs, 0)
+					loss, n_correct, n_possible = calcLoss(task, pred, targets)
 			correct_vals += n_correct
 
 			total += n_possible
@@ -416,7 +461,9 @@ if __name__ == '__main__':
         help='Load and save model parameters.')
 	parser.add_argument('--task', type=int, help="what task to run the model on", required=True)
 	parser.add_argument('--repl', type=int, default=1, help="what replicate this is",)
-	parser.add_argument('--bf16', action='store_true', help='Train entirely in bfloat16 (model weights + activations)')
+	parser.add_argument('--no-amp', action='store_true', help='Disable Torch automatic mixed precision')
+	parser.add_argument('--no-cuda-kernels', action='store_true',
+						help='Force naive PyTorch hypergraph attention even if CUDA kernels are built')
 	args = parser.parse_args()
 	
 	model = trainModel(
@@ -430,6 +477,7 @@ if __name__ == '__main__':
 		save_model=args.save,
 		task = args.task,
 		replicate = args.repl,
-		use_bf16 = args.bf16,
+		no_amp = args.no_amp,
+		use_cuda_kernels = not args.no_cuda_kernels,
 	)
 
