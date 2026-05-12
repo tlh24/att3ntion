@@ -76,9 +76,9 @@ class _HypergraphAttentionNaive(nn.Module):
 			Y_q = torch.einsum('bhijk,bhjd,bhkd->bhid', Aq, Vr, Vs)
 			Y_r = torch.einsum('bhijk,bhid,bhkd->bhjd', Ar, Vq, Vs)
 			Y_s = torch.einsum('bhijk,bhid,bhjd->bhkd', As, Vq, Vr)
-			Y_q = self.gelu(Y_q)
-			Y_r = self.gelu(Y_r)
-			Y_s = self.gelu(Y_s)
+			# Y_q = self.gelu(Y_q) FIXME
+			# Y_r = self.gelu(Y_r)
+			# Y_s = self.gelu(Y_s)
 
 		if scatter:
 			if False:
@@ -98,19 +98,21 @@ class _HypergraphAttentionNaive(nn.Module):
 				Y_r_ = torch.einsum('bhijk,bhid,bhijk,bhkd->bhjd', Aq, Vq_, As, Vs_)
 				Y_s_ = torch.einsum('bhijk,bhid,bhijk,bhjd->bhkd', Aq, Vq_, Ar, Vr_)
 
-			Y_q_ = self.gelu(Y_q_)
-			Y_r_ = self.gelu(Y_r_)
-			Y_s_ = self.gelu(Y_s_)
+			# Y_q_ = self.gelu(Y_q_) FIXME
+			# Y_r_ = self.gelu(Y_r_)
+			# Y_s_ = self.gelu(Y_s_)
 			if gather:
 				y = Y_q + Y_r + Y_s + Y_q_ + Y_r_ + Y_s_
 			else:
 				y = Y_q_ + Y_r_ + Y_s_
 
 		else:
-			Y_q = self.gelu(Y_q)
-			Y_r = self.gelu(Y_r)
-			Y_s = self.gelu(Y_s)
+			# Y_q = self.gelu(Y_q) # FIXME
+			# Y_r = self.gelu(Y_r)
+			# Y_s = self.gelu(Y_s)
 			y = Y_q + Y_r + Y_s
+
+		y = self.gelu(y) # FIXME
 
 		if self.head_subspaces:
 			y = y.permute(0, 2, 1, 3).reshape(batch_size, ntok, self.d_model)
