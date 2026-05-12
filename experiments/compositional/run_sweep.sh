@@ -32,13 +32,13 @@ for attn in "${ATTN_TYPES[@]}"; do
 	for task in "${TASKS[@]}"; do
 		echo "Running: Attn=$attn | Task=$task | Log=$LOG_NAME | Replicate=$REPL"
 
-		python train_orig.py --bf16 \
+		python train_orig.py \
 			--batch-size "$BATCH_SIZE" \
 			--epochs "$EPOCHS" \
 			--attn "$attn" \
 			--task "$task" \
 			--log-name "$LOG_NAME" \
-			--repl "$REPL"
-
+			--repl "$REPL" \
+			--no-cuda-kernels # for now! FIXME
 	done
 done
