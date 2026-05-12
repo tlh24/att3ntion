@@ -19,6 +19,9 @@ profiling_reports/
 # Benchmark results (machine-specific timings)
 benchmarks/benchmark_history.jsonl
 
+# Per-run training loss logs (machine-specific, large)
+experiments/compositional/losslog_*.txt
+
 # Per-run session narratives (reference per-machine bench numbers).
 # NOTE: optimization_log/changelog.jsonl IS committed — team-shared history
 # of what's been tried, avoids repeat work.
