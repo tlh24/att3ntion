@@ -15,8 +15,36 @@ for d in [script_dir, project_root]:
     if d not in sys.path:
         sys.path.insert(0, d)
 
-from att3ntion import _HypergraphAttentionNaive, _GraphAttentionNaive, QuickGELU
+from att3ntion import HypergraphAttention, _HypergraphAttentionNaive, _GraphAttentionNaive, QuickGELU
 from gen_data_comp import genData3, genData4, genData7
+
+
+class _HypergraphCudaWrapper(nn.Module):
+	"""Adapter so the CUDA HypergraphAttention slots into the (x, rotary_emb) call site."""
+	def __init__(self, d_model, n_heads, head_subspaces=True, **kwargs):
+		super().__init__()
+		assert head_subspaces, "CUDA HypergraphAttention only supports head_subspaces=True"
+		self.d_model = d_model
+		self.n_heads = n_heads
+		self.inner = HypergraphAttention(d_model, n_heads)
+
+	def forward(self, x, rotary_emb):
+		assert rotary_emb is None, "to consider later: CUDA HypergraphAttention does not support rotary embeddings"
+		return self.inner(x)
+
+	def calcFlops(self, x):
+		# Mirror _HypergraphAttentionNaive.calcFlops so the validation GFlops print works.
+		bs, ntok, d_model = x.shape
+		f = 0.0
+		f += 3 * bs * ntok * d_model**2 * self.n_heads * d_model
+		f += 3 * bs * ntok * d_model**2 * self.n_heads * d_model * 2
+		f += bs * self.n_heads * ntok**3 * d_model * 2
+		f += bs * self.n_heads * ntok**3 * 2 * 3
+		f += bs * self.n_heads * ntok**3 * d_model * 3
+		f += bs * self.n_heads * ntok**3 * d_model * 3 * 3
+		f += bs * self.n_heads * ntok * d_model * (6 + 6)
+		f += bs * self.n_heads * ntok * d_model**2
+		return f
 
 class SwiGLU(nn.Module):
 	"""
@@ -45,6 +73,8 @@ class SimpleCompModel(nn.Module):
 		for _ in range(n_layers):
 			if attn_impl == "hypergraph":
 				attention_layer = _HypergraphAttentionNaive(hidden_dim, num_heads, head_subspaces=True)
+			elif attn_impl == "hypergraph_cuda":
+				attention_layer = _HypergraphCudaWrapper(hidden_dim, num_heads, head_subspaces=True)
 			else:
 				attention_layer = _GraphAttentionNaive(hidden_dim, num_heads, head_subspaces=True)
 
@@ -241,7 +271,8 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 
 	input_dim = x.shape[2]
 
-	if attn_impl == "hypergraph":
+	is_hg = attn_impl in ("hypergraph", "hypergraph_cuda")
+	if is_hg:
 		n_layers = 3
 	else:
 		n_layers = 6 # match the number of parameters and (approx) model complexity.  (But not flops, of course!)
@@ -249,7 +280,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 
 	if task == 4:
 		n_recurse = 5
-		if attn_impl == "hypergraph":
+		if is_hg:
 			n_layers = 2
 		else:
 			n_layers = 4 # Positive control: these converge at the same rate.
@@ -276,7 +307,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	else:
 		print("--- Running with Automatic Mixed Precision (fp32 weights) ---")
 
-	nam = {"hypergraph":"hg","graph":"g"}.get(attn_impl)
+	nam = {"hypergraph":"hg","hypergraph_cuda":"hgc","graph":"g"}.get(attn_impl)
 	fd_losslog = open(f'losslog_{nam}_t{task}_{log_name}_r{replicate}.txt', 'w')
 
 	print("\ntrain_model1 started...")
@@ -408,7 +439,7 @@ if __name__ == '__main__':
 	parser.add_argument('--batch-size', type=int, default=32, help='Batch size for training')
 	parser.add_argument('--hidden', type=int, default=256, help='Hidden dimension size')
 	parser.add_argument('--heads', type=int, default=8, help='Number of attention heads')
-	parser.add_argument('--attn', type=str, default='hypergraph', choices=['hypergraph', 'graph'],
+	parser.add_argument('--attn', type=str, default='hypergraph', choices=['hypergraph', 'hypergraph_cuda', 'graph'],
 						help='Attention implementation to use')
 	parser.add_argument('--log-name', type=str,
 						help='postfix logname')
