@@ -46,7 +46,8 @@ __global__ void Vq_gather_grad(
     const bf16* __restrict__ S,        // [B,H,N,D]
     const bf16* __restrict__ Vs,       // [B,H,N,D]   (Vs_1 slice)
     const bf16* __restrict__ Vr,       // [B,H,N,D]   (Vr_1 slice)
-    const bf16* __restrict__ gradY,    // [B,H,N,D]   (grad_output slice)   <-- single source
+    const bf16* __restrict__ grad_Yr,  // [B,H,N,D] upstream grad for Y_r
+    const bf16* __restrict__ grad_Ys,  // [B,H,N,D] upstream grad for Y_s
     const float* __restrict__ m_j,      // [B,H,N]
     const float* __restrict__ l_j,      // [B,H,N]
     const float* __restrict__ m_k,      // [B,H,N]
@@ -69,7 +70,8 @@ __global__ void Vq_gather_grad(
     const bf16* SBH = S       + bh * stride_BH;
     const bf16* VsBH = Vs      + bh * stride_BH;
     const bf16* VrBH = Vr      + bh * stride_BH;
-    const bf16* gYBH = gradY   + bh * stride_BH;
+    const bf16* gYrBH = grad_Yr + bh * stride_BH;
+    const bf16* gYsBH = grad_Ys + bh * stride_BH;
     const float* mJBH  = m_j     + (int64_t)bh * N;
     const float* lJBH  = l_j     + (int64_t)bh * N;
     const float* mKBH  = m_k     + (int64_t)bh * N;
@@ -78,7 +80,7 @@ __global__ void Vq_gather_grad(
 
     /* ---- per-thread vectors: fused qs = q*s (drops separate q,s scalars in inner loop)
             vs_vec stays in regs (k-only, hot for Yr path)
-            gyk_vec = gradY[k0,:] hoisted out of j-loop (was reloaded inside) */
+            gyk_vec = grad_Ys[k0,:] hoisted out of j-loop (was reloaded inside) */
     float qs_vec[D_CONST];
     float vs_vec[D_CONST];
     float gyk_vec[D_CONST];
@@ -92,7 +94,7 @@ __global__ void Vq_gather_grad(
     for (int d=0; d<D_CONST; ++d){
         qs_vec[d]  = bf2f(QBH[i0_safe*D_CONST + d]) * bf2f(SBH[k0_safe*D_CONST + d]);
         vs_vec[d]  = bf2f(VsBH[k0_safe*D_CONST + d]);
-        gyk_vec[d] = bf2f(gYBH[k0_safe*D_CONST + d]);
+        gyk_vec[d] = bf2f(gYsBH[k0_safe*D_CONST + d]);
     }
 
     // Hoist k-only stats out of j-loop; pre-invert l_k once.
@@ -103,7 +105,7 @@ __global__ void Vq_gather_grad(
     for (int jBase=0; jBase<N; jBase+=T_J){
         __shared__ float sh_R [T_J][D_CONST];
         __shared__ float sh_Vr[T_J][D_CONST];
-        __shared__ float sh_gY[T_J][D_CONST];
+        __shared__ float sh_gYr[T_J][D_CONST];
         __shared__ float sh_mj[T_J];
         __shared__ float sh_lj_inv[T_J];      // pre-inverted, multiply not divide
 
@@ -115,7 +117,7 @@ __global__ void Vq_gather_grad(
             for (int d=threadIdx.x; d<D_CONST; d+=T_I){
                 sh_R [lj][d] = bf2f(RBH[jGlob*D_CONST + d]);
                 sh_Vr[lj][d] = bf2f(VrBH[jGlob*D_CONST + d]);
-                sh_gY[lj][d] = bf2f(gYBH[jGlob*D_CONST + d]);   // grad_Yr = grad_output
+                sh_gYr[lj][d] = bf2f(gYrBH[jGlob*D_CONST + d]);
             }
             if (threadIdx.x == 0){
                 sh_mj[lj]     = mJBH[jGlob];
@@ -139,7 +141,7 @@ __global__ void Vq_gather_grad(
 
                 #pragma unroll
                 for (int d=0; d<D_CONST; ++d){
-                    grad_acc[d] += wj * sh_gY[jOff][d] * vs_vec[d]      /* Yr path */
+                    grad_acc[d] += wj * sh_gYr[jOff][d] * vs_vec[d]      /* Yr path */
                                 +  wk * gyk_vec[d]     * sh_Vr[jOff][d]; /* Ys path */
                 }
             }
@@ -162,7 +164,8 @@ __global__ void Vr_gather_grad(
     const bf16* __restrict__ S,        // [B,H,N,D]
     const bf16* __restrict__ Vq,       // [B,H,N,D]
     const bf16* __restrict__ Vs,       // [B,H,N,D]
-    const bf16* __restrict__ gradY,    // [B,H,N,D]
+    const bf16* __restrict__ grad_Yq,  // [B,H,N,D] upstream grad for Y_q
+    const bf16* __restrict__ grad_Ys,  // [B,H,N,D] upstream grad for Y_s
     const float* __restrict__ m_i,      // [B,H,N]
     const float* __restrict__ l_i,      // [B,H,N]
     const float* __restrict__ m_k,      // [B,H,N]
@@ -184,7 +187,8 @@ __global__ void Vr_gather_grad(
     const bf16* SBH = S      + bh * stride_BH;
     const bf16* VqBH = Vq     + bh * stride_BH;
     const bf16* VsBH = Vs     + bh * stride_BH;
-    const bf16* gYBH = gradY  + bh * stride_BH;
+    const bf16* gYqBH = grad_Yq + bh * stride_BH;
+    const bf16* gYsBH = grad_Ys + bh * stride_BH;
     const float* mIBH  = m_i    + (int64_t)bh * N;
     const float* lIBH  = l_i    + (int64_t)bh * N;
     const float* mKBH  = m_k    + (int64_t)bh * N;
@@ -197,7 +201,7 @@ __global__ void Vr_gather_grad(
 
     /* ---- per-thread vectors: fused rs = r*s (drops separate r,s scalars in inner loop)
             vs_vec stays in regs (k-only, hot for Yi path)
-            gy_k_vec = gradY[k0,:] hoisted out of i-loop */
+            gy_k_vec = grad_Ys[k0,:] hoisted out of i-loop */
     float rs_vec[D_CONST];
     float vs_vec[D_CONST];
     float gy_k_vec[D_CONST];
@@ -207,7 +211,7 @@ __global__ void Vr_gather_grad(
     for (int d=0; d<D_CONST; ++d){
         rs_vec[d]   = bf2f(RBH[j0_safe*D_CONST + d]) * bf2f(SBH[k0_safe*D_CONST + d]);
         vs_vec[d]   = bf2f(VsBH[k0_safe*D_CONST + d]);
-        gy_k_vec[d] = bf2f(gYBH[k0_safe*D_CONST + d]);
+        gy_k_vec[d] = bf2f(gYsBH[k0_safe*D_CONST + d]);
     }
 
     // Hoist k-only stats out of i-loop; pre-invert l_k once.
@@ -218,7 +222,7 @@ __global__ void Vr_gather_grad(
     for (int iBase=0; iBase<N; iBase+=T_J){
         __shared__ float sh_Q [T_J][D_CONST];
         __shared__ float sh_Vq[T_J][D_CONST];
-        __shared__ float sh_gY[T_J][D_CONST];
+        __shared__ float sh_gYq[T_J][D_CONST];
         __shared__ float sh_mi[T_J];
         __shared__ float sh_li_inv[T_J];      // pre-inverted, multiply not divide
 
@@ -230,7 +234,7 @@ __global__ void Vr_gather_grad(
             for (int d=threadIdx.x; d<D_CONST; d+=T_I){
                 sh_Q [li][d] = bf2f(QBH[iGlob*D_CONST + d]);
                 sh_Vq[li][d] = bf2f(VqBH[iGlob*D_CONST + d]);
-                sh_gY[li][d] = bf2f(gYBH[iGlob*D_CONST + d]);
+                sh_gYq[li][d] = bf2f(gYqBH[iGlob*D_CONST + d]);
             }
             if (threadIdx.x == 0){
                 sh_mi[li]     = mIBH[iGlob];
@@ -254,7 +258,7 @@ __global__ void Vr_gather_grad(
 
                 #pragma unroll
                 for (int d=0; d<D_CONST; ++d){
-                    grad_acc[d] += wi * sh_gY[iOff][d] * vs_vec[d]
+                    grad_acc[d] += wi * sh_gYq[iOff][d] * vs_vec[d]
                                   + wk * gy_k_vec[d]   * sh_Vq[iOff][d];
                 }
             }
@@ -277,7 +281,8 @@ __global__ void Vs_gather_grad(
     const bf16* __restrict__ S,        // [B,H,N,D]
     const bf16* __restrict__ Vq,       // [B,H,N,D]
     const bf16* __restrict__ Vr,       // [B,H,N,D]
-    const bf16* __restrict__ gradY,    // [B,H,N,D]
+    const bf16* __restrict__ grad_Yq,  // [B,H,N,D] upstream grad for Y_q
+    const bf16* __restrict__ grad_Yr,  // [B,H,N,D] upstream grad for Y_r
     const float* __restrict__ m_i,      // [B,H,N]
     const float* __restrict__ l_i,      // [B,H,N]
     const float* __restrict__ m_j,      // [B,H,N]
@@ -299,7 +304,8 @@ __global__ void Vs_gather_grad(
     const bf16* SBH = S      + bh * stride_BH;
     const bf16* VqBH = Vq     + bh * stride_BH;
     const bf16* VrBH = Vr     + bh * stride_BH;
-    const bf16* gYBH = gradY  + bh * stride_BH;
+    const bf16* gYqBH = grad_Yq + bh * stride_BH;
+    const bf16* gYrBH = grad_Yr + bh * stride_BH;
     const float* mIBH  = m_i    + (int64_t)bh * N;
     const float* lIBH  = l_i    + (int64_t)bh * N;
     const float* mJBH  = m_j    + (int64_t)bh * N;
@@ -312,7 +318,7 @@ __global__ void Vs_gather_grad(
 
     /* ---- per-thread vectors: fused qs = q*s (drops separate q,s scalars in inner loop)
             vq_vec stays in regs (i-only, hot for Yj path)
-            gy_i_vec = gradY[i0,:] hoisted out of j-loop */
+            gy_i_vec = grad_Yq[i0,:] hoisted out of j-loop */
     float qs_vec[D_CONST];
     float vq_vec[D_CONST];
     float gy_i_vec[D_CONST];
@@ -322,7 +328,7 @@ __global__ void Vs_gather_grad(
     for (int d=0; d<D_CONST; ++d){
         qs_vec[d]   = bf2f(QBH[i0_safe*D_CONST + d]) * bf2f(SBH[k0_safe*D_CONST + d]);
         vq_vec[d]   = bf2f(VqBH[i0_safe*D_CONST + d]);
-        gy_i_vec[d] = bf2f(gYBH[i0_safe*D_CONST + d]);
+        gy_i_vec[d] = bf2f(gYqBH[i0_safe*D_CONST + d]);
     }
 
     // Hoist i-only stats out of j-loop; pre-invert l_i once.
@@ -333,7 +339,7 @@ __global__ void Vs_gather_grad(
     for (int jBase=0; jBase<N; jBase+=T_J){
         __shared__ float sh_R [T_J][D_CONST];
         __shared__ float sh_Vr[T_J][D_CONST];
-        __shared__ float sh_gY[T_J][D_CONST];
+        __shared__ float sh_gYr[T_J][D_CONST];
         __shared__ float sh_mj[T_J];
         __shared__ float sh_lj_inv[T_J];      // pre-inverted, multiply not divide
 
@@ -345,7 +351,7 @@ __global__ void Vs_gather_grad(
             for (int d=threadIdx.x; d<D_CONST; d+=T_I){
                 sh_R [lj][d] = bf2f(RBH[jGlob*D_CONST + d]);
                 sh_Vr[lj][d] = bf2f(VrBH[jGlob*D_CONST + d]);
-                sh_gY[lj][d] = bf2f(gYBH[jGlob*D_CONST + d]);
+                sh_gYr[lj][d] = bf2f(gYrBH[jGlob*D_CONST + d]);
             }
             if (threadIdx.x == 0){
                 sh_mj[lj]     = mJBH[jGlob];
@@ -369,8 +375,8 @@ __global__ void Vs_gather_grad(
 
                 #pragma unroll
                 for (int d=0; d<D_CONST; ++d){
-                    grad_acc[d] += wi * gy_i_vec[d]   * sh_Vr[jOff][d]
-                                  + wj * sh_gY[jOff][d] * vq_vec[d];
+                    grad_acc[d] += wi * gy_i_vec[d]    * sh_Vr[jOff][d]
+                                  + wj * sh_gYr[jOff][d] * vq_vec[d];
                 }
             }
         }
@@ -807,7 +813,9 @@ __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
     const bf16* __restrict__ Vq1, const bf16* __restrict__ Vq2,
     const bf16* __restrict__ Vr1, const bf16* __restrict__ Vr2,
     const bf16* __restrict__ Vs1, const bf16* __restrict__ Vs2,
-    const bf16* __restrict__ gradY,
+    const bf16* __restrict__ grad_Yq,
+    const bf16* __restrict__ grad_Yr,
+    const bf16* __restrict__ grad_Ys,
     const float* __restrict__ m_i, const float* __restrict__ l_i,
     const float* __restrict__ m_j, const float* __restrict__ l_j,
     const float* __restrict__ m_k, const float* __restrict__ l_k,
@@ -834,7 +842,9 @@ __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
     const bf16* Vr2bh = Vr2 + bh * stride_BH;
     const bf16* Vs1bh = Vs1 + bh * stride_BH;
     const bf16* Vs2bh = Vs2 + bh * stride_BH;
-    const bf16* gYbh = gradY + bh * stride_BH;
+    const bf16* gYqbh = grad_Yq + bh * stride_BH;
+    const bf16* gYrbh = grad_Yr + bh * stride_BH;
+    const bf16* gYsbh = grad_Ys + bh * stride_BH;
     const float* miBH  = m_i + bh * N;
     const float* liBH  = l_i + bh * N;
     const float* mjBH  = m_j + bh * N;
@@ -873,7 +883,7 @@ __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
                 sh_Qi  [ii * D_PAD + dd] = bf2f(Qbh[iGlob * D_CONST + dd]);
                 sh_Vq1i[ii * D_PAD + dd] = bf2f(Vq1bh[iGlob * D_CONST + dd]);
                 sh_Vq2i[ii * D_PAD + dd] = bf2f(Vq2bh[iGlob * D_CONST + dd]);
-                sh_dYi [ii * D_PAD + dd] = bf2f(gYbh[iGlob * D_CONST + dd]);
+                sh_dYi [ii * D_PAD + dd] = bf2f(gYqbh[iGlob * D_CONST + dd]);
             } else {
                 sh_Qi  [ii * D_PAD + dd] = 0.0f;
                 sh_Vq1i[ii * D_PAD + dd] = 0.0f;
@@ -889,7 +899,7 @@ __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
                 sh_Sk  [kk * D_PAD + dd] = bf2f(Sbh[kGlob * D_CONST + dd]);
                 sh_Vs1k[kk * D_PAD + dd] = bf2f(Vs1bh[kGlob * D_CONST + dd]);
                 sh_Vs2k[kk * D_PAD + dd] = bf2f(Vs2bh[kGlob * D_CONST + dd]);
-                sh_dYk [kk * D_PAD + dd] = bf2f(gYbh[kGlob * D_CONST + dd]);
+                sh_dYk [kk * D_PAD + dd] = bf2f(gYsbh[kGlob * D_CONST + dd]);
             } else {
                 sh_Sk  [kk * D_PAD + dd] = 0.0f;
                 sh_Vs1k[kk * D_PAD + dd] = 0.0f;
@@ -941,7 +951,7 @@ __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
                 sh_R  [jj*D_CONST + dd] = bf2f(Rbh[jGlob*D_CONST + dd]);
                 sh_Vr1[jj*D_CONST + dd] = bf2f(Vr1bh[jGlob*D_CONST + dd]);
                 sh_Vr2[jj*D_CONST + dd] = bf2f(Vr2bh[jGlob*D_CONST + dd]);
-                sh_gYj[jj*D_CONST + dd] = bf2f(gYbh[jGlob*D_CONST + dd]);
+                sh_gYj[jj*D_CONST + dd] = bf2f(gYrbh[jGlob*D_CONST + dd]);
             } else {
                 sh_R  [jj*D_CONST + dd] = 0.0f;
                 sh_Vr1[jj*D_CONST + dd] = 0.0f;
@@ -1141,7 +1151,9 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
     const bf16* __restrict__ Vq1, const bf16* __restrict__ Vq2,
     const bf16* __restrict__ Vr1, const bf16* __restrict__ Vr2,
     const bf16* __restrict__ Vs1, const bf16* __restrict__ Vs2,
-    const bf16* __restrict__ gradY,
+    const bf16* __restrict__ grad_Yq,
+    const bf16* __restrict__ grad_Yr,
+    const bf16* __restrict__ grad_Ys,
     const float* __restrict__ m_i, const float* __restrict__ l_i,
     const float* __restrict__ m_j, const float* __restrict__ l_j,
     const float* __restrict__ m_k, const float* __restrict__ l_k,
@@ -1165,7 +1177,9 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
     const bf16* Vr2bh = Vr2 + bh * stride_BH;
     const bf16* Vs1bh = Vs1 + bh * stride_BH;
     const bf16* Vs2bh = Vs2 + bh * stride_BH;
-    const bf16* gYbh = gradY + bh * stride_BH;
+    const bf16* gYqbh = grad_Yq + bh * stride_BH;
+    const bf16* gYrbh = grad_Yr + bh * stride_BH;
+    const bf16* gYsbh = grad_Ys + bh * stride_BH;
     const float* miBH  = m_i + bh * N;
     const float* liBH  = l_i + bh * N;
     const float* mjBH  = m_j + bh * N;
@@ -1214,7 +1228,7 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
                 sh_Rj  [jj * D_PAD + dd] = bf2f(Rbh[jGlob * D_CONST + dd]);
                 sh_Vr1j[jj * D_PAD + dd] = bf2f(Vr1bh[jGlob * D_CONST + dd]);
                 sh_Vr2j[jj * D_PAD + dd] = bf2f(Vr2bh[jGlob * D_CONST + dd]);
-                sh_dYj [jj * D_PAD + dd] = bf2f(gYbh[jGlob * D_CONST + dd]);
+                sh_dYj [jj * D_PAD + dd] = bf2f(gYrbh[jGlob * D_CONST + dd]);
             } else {
                 sh_Rj  [jj * D_PAD + dd] = 0.0f;
                 sh_Vr1j[jj * D_PAD + dd] = 0.0f;
@@ -1230,7 +1244,7 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
                 sh_Sk  [kk * D_PAD + dd] = bf2f(Sbh[kGlob * D_CONST + dd]);
                 sh_Vs1k[kk * D_PAD + dd] = bf2f(Vs1bh[kGlob * D_CONST + dd]);
                 sh_Vs2k[kk * D_PAD + dd] = bf2f(Vs2bh[kGlob * D_CONST + dd]);
-                sh_dYk [kk * D_PAD + dd] = bf2f(gYbh[kGlob * D_CONST + dd]);
+                sh_dYk [kk * D_PAD + dd] = bf2f(gYsbh[kGlob * D_CONST + dd]);
             } else {
                 sh_Sk  [kk * D_PAD + dd] = 0.0f;
                 sh_Vs1k[kk * D_PAD + dd] = 0.0f;
@@ -1293,10 +1307,10 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
                     bf2f(Vq2bh[iGlob*D_CONST + dd + 2]),
                     bf2f(Vq2bh[iGlob*D_CONST + dd + 3]));
                 dyi4 = make_float4(
-                    bf2f(gYbh[iGlob*D_CONST + dd + 0]),
-                    bf2f(gYbh[iGlob*D_CONST + dd + 1]),
-                    bf2f(gYbh[iGlob*D_CONST + dd + 2]),
-                    bf2f(gYbh[iGlob*D_CONST + dd + 3]));
+                    bf2f(gYqbh[iGlob*D_CONST + dd + 0]),
+                    bf2f(gYqbh[iGlob*D_CONST + dd + 1]),
+                    bf2f(gYqbh[iGlob*D_CONST + dd + 2]),
+                    bf2f(gYqbh[iGlob*D_CONST + dd + 3]));
             } else {
                 q4   = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
                 vq14 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -1480,7 +1494,9 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor>
-backward_impl(torch::Tensor grad_output,
+backward_impl(torch::Tensor grad_Y_q,
+              torch::Tensor grad_Y_r,
+              torch::Tensor grad_Y_s,
               torch::Tensor Q,
               torch::Tensor R,
               torch::Tensor S,
@@ -1510,7 +1526,9 @@ backward_impl(torch::Tensor grad_output,
   TORCH_CHECK(Vr_2.scalar_type() == at::kBFloat16, "backward expects bfloat16 activations.");
   TORCH_CHECK(Vs_1.scalar_type() == at::kBFloat16, "backward expects bfloat16 activations.");
   TORCH_CHECK(Vs_2.scalar_type() == at::kBFloat16, "backward expects bfloat16 activations.");
-  TORCH_CHECK(grad_output.scalar_type() == at::kBFloat16, "backward expects bfloat16 grad_output.");
+  TORCH_CHECK(grad_Y_q.scalar_type() == at::kBFloat16, "backward expects bfloat16 grad_Y_q.");
+  TORCH_CHECK(grad_Y_r.scalar_type() == at::kBFloat16, "backward expects bfloat16 grad_Y_r.");
+  TORCH_CHECK(grad_Y_s.scalar_type() == at::kBFloat16, "backward expects bfloat16 grad_Y_s.");
   TORCH_CHECK(m_i.scalar_type() == at::kFloat && l_i.scalar_type() == at::kFloat &&
               m_j.scalar_type() == at::kFloat && l_j.scalar_type() == at::kFloat &&
               m_k.scalar_type() == at::kFloat && l_k.scalar_type() == at::kFloat,
@@ -1523,7 +1541,6 @@ backward_impl(torch::Tensor grad_output,
   const int J = R.size(2);
   const int K = S.size(2);
   const int D = Q.size(3);
-  const int N_grad = grad_output.size(2);
   const float scale = 1.0f / sqrtf(static_cast<float>(D));
 
   // ============================================================================
@@ -1562,7 +1579,8 @@ backward_impl(torch::Tensor grad_output,
           reinterpret_cast<const bf16*>(S.data_ptr<at::BFloat16>()),
           reinterpret_cast<const bf16*>(Vs_1.data_ptr<at::BFloat16>()),
           reinterpret_cast<const bf16*>(Vr_1.data_ptr<at::BFloat16>()),
-          reinterpret_cast<const bf16*>(grad_output.data_ptr<at::BFloat16>()),
+          reinterpret_cast<const bf16*>(grad_Y_r.data_ptr<at::BFloat16>()),
+          reinterpret_cast<const bf16*>(grad_Y_s.data_ptr<at::BFloat16>()),
           m_j.data_ptr<float>(),
           l_j.data_ptr<float>(),
           m_k.data_ptr<float>(),
@@ -1579,7 +1597,8 @@ backward_impl(torch::Tensor grad_output,
           reinterpret_cast<const bf16*>(S.data_ptr<at::BFloat16>()),
           reinterpret_cast<const bf16*>(Vq_1.data_ptr<at::BFloat16>()),
           reinterpret_cast<const bf16*>(Vs_1.data_ptr<at::BFloat16>()),
-          reinterpret_cast<const bf16*>(grad_output.data_ptr<at::BFloat16>()),
+          reinterpret_cast<const bf16*>(grad_Y_q.data_ptr<at::BFloat16>()),
+          reinterpret_cast<const bf16*>(grad_Y_s.data_ptr<at::BFloat16>()),
           m_i.data_ptr<float>(),
           l_i.data_ptr<float>(),
           m_k.data_ptr<float>(),
@@ -1596,7 +1615,8 @@ backward_impl(torch::Tensor grad_output,
           reinterpret_cast<const bf16*>(S.data_ptr<at::BFloat16>()),
           reinterpret_cast<const bf16*>(Vq_1.data_ptr<at::BFloat16>()),
           reinterpret_cast<const bf16*>(Vr_1.data_ptr<at::BFloat16>()),
-          reinterpret_cast<const bf16*>(grad_output.data_ptr<at::BFloat16>()),
+          reinterpret_cast<const bf16*>(grad_Y_q.data_ptr<at::BFloat16>()),
+          reinterpret_cast<const bf16*>(grad_Y_r.data_ptr<at::BFloat16>()),
           m_i.data_ptr<float>(),
           l_i.data_ptr<float>(),
           m_j.data_ptr<float>(),
@@ -1607,68 +1627,12 @@ backward_impl(torch::Tensor grad_output,
   });
 
   // ============================================================================
-  // 4. COMPUTE grad_{Vq,Vr,Vs}_2 (SCATTER-GRAD KERNELS)
+  // 4. grad_{Vq,Vr,Vs}_2 (scatter path) is intentionally skipped.
+  //
+  // The Tim-matching architecture is gather-only (scatter disabled, V*_2 are
+  // zeroed in Python). Scatter outputs are not part of the forward result, so
+  // their upstream gradients are zero and grad_V*_2 should remain zero.
   // ============================================================================
-  DISPATCH_D(D, {
-    constexpr int TI = T_I;
-    constexpr int TK = T_K;
-    dim3 block_dim(TI, TK);
-    dim3 grid_dim((N + TI - 1) / TI, (N + TK - 1) / TK, B * H);
-    size_t shmem_bytes =
-        T_J * D_TMPL * 3 * sizeof(float) + T_J * 2 * sizeof(float);
-
-    // --- grad_Vq_2 ---
-    Vq_scatter_grad<D_TMPL><<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const bf16*>(Q.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(R.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(S.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(Vr_2.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(Vs_2.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(grad_output.data_ptr<at::BFloat16>()),
-        m_i.data_ptr<float>(),
-        l_i.data_ptr<float>(),
-        m_j.data_ptr<float>(),
-        l_j.data_ptr<float>(),
-        m_k.data_ptr<float>(),
-        l_k.data_ptr<float>(),
-        grad_Vq_2.data_ptr<float>(),
-        N, scale);
-    AT_CUDA_CHECK(cudaGetLastError());
-
-    // --- grad_Vr_2 ---
-    Vr_scatter_grad<D_TMPL><<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const bf16*>(Q.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(R.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(S.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(Vq_2.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(Vs_2.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(grad_output.data_ptr<at::BFloat16>()),
-        m_i.data_ptr<float>(),
-        l_i.data_ptr<float>(),
-        m_j.data_ptr<float>(),
-        l_j.data_ptr<float>(),
-        m_k.data_ptr<float>(),
-        l_k.data_ptr<float>(),
-        grad_Vr_2.data_ptr<float>(),
-        N, scale);
-
-    // --- grad_Vs_2 ---
-    Vs_scatter_grad<D_TMPL><<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const bf16*>(Q.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(R.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(S.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(Vq_2.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(Vr_2.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(grad_output.data_ptr<at::BFloat16>()),
-        m_i.data_ptr<float>(),
-        l_i.data_ptr<float>(),
-        m_j.data_ptr<float>(),
-        l_j.data_ptr<float>(),
-        m_k.data_ptr<float>(),
-        l_k.data_ptr<float>(),
-        grad_Vs_2.data_ptr<float>(),
-        N, scale);
-  });
 
 
   // ===========================================================================
@@ -1710,7 +1674,9 @@ backward_impl(torch::Tensor grad_output,
               reinterpret_cast<const bf16*>(Vr_2.data_ptr<at::BFloat16>()),
               reinterpret_cast<const bf16*>(Vs_1.data_ptr<at::BFloat16>()),
               reinterpret_cast<const bf16*>(Vs_2.data_ptr<at::BFloat16>()),
-              reinterpret_cast<const bf16*>(grad_output.data_ptr<at::BFloat16>()),
+              reinterpret_cast<const bf16*>(grad_Y_q.data_ptr<at::BFloat16>()),
+              reinterpret_cast<const bf16*>(grad_Y_r.data_ptr<at::BFloat16>()),
+              reinterpret_cast<const bf16*>(grad_Y_s.data_ptr<at::BFloat16>()),
               m_i.data_ptr<float>(),
               l_i.data_ptr<float>(),
               m_j.data_ptr<float>(),
@@ -1761,7 +1727,9 @@ backward_impl(torch::Tensor grad_output,
               reinterpret_cast<const bf16*>(Vr_2.data_ptr<at::BFloat16>()),
               reinterpret_cast<const bf16*>(Vs_1.data_ptr<at::BFloat16>()),
               reinterpret_cast<const bf16*>(Vs_2.data_ptr<at::BFloat16>()),
-              reinterpret_cast<const bf16*>(grad_output.data_ptr<at::BFloat16>()),
+              reinterpret_cast<const bf16*>(grad_Y_q.data_ptr<at::BFloat16>()),
+              reinterpret_cast<const bf16*>(grad_Y_r.data_ptr<at::BFloat16>()),
+              reinterpret_cast<const bf16*>(grad_Y_s.data_ptr<at::BFloat16>()),
               m_i.data_ptr<float>(),
               l_i.data_ptr<float>(),
               m_j.data_ptr<float>(),
@@ -1816,7 +1784,9 @@ backward_impl(torch::Tensor grad_output,
               reinterpret_cast<const bf16*>(Vs_2.data_ptr<at::BFloat16>()),
 
               // the gradient of the output 
-              reinterpret_cast<const bf16*>(grad_output.data_ptr<at::BFloat16>()),
+              reinterpret_cast<const bf16*>(grad_Y_q.data_ptr<at::BFloat16>()),
+              reinterpret_cast<const bf16*>(grad_Y_r.data_ptr<at::BFloat16>()),
+              reinterpret_cast<const bf16*>(grad_Y_s.data_ptr<at::BFloat16>()),
 
               // softmax stats
               m_i.data_ptr<float>(),
@@ -1863,7 +1833,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor>
-backward_cuda(torch::Tensor grad_output,
+backward_cuda(torch::Tensor grad_Y_q,
+              torch::Tensor grad_Y_r,
+              torch::Tensor grad_Y_s,
               torch::Tensor Q,
               torch::Tensor R,
               torch::Tensor S,
@@ -1882,7 +1854,9 @@ backward_cuda(torch::Tensor grad_output,
               double dropout_rate) {
                 
   // Ensure all tensors are contiguous
-  grad_output = grad_output.contiguous();
+  grad_Y_q = grad_Y_q.contiguous();
+  grad_Y_r = grad_Y_r.contiguous();
+  grad_Y_s = grad_Y_s.contiguous();
   Q = Q.contiguous();
   R = R.contiguous();
   S = S.contiguous();
@@ -1900,7 +1874,7 @@ backward_cuda(torch::Tensor grad_output,
   l_k = l_k.contiguous();
 
   // Call the internal implementation directly with provided stats
-  return backward_impl(grad_output, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
+  return backward_impl(grad_Y_q, grad_Y_r, grad_Y_s, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
                        m_i, l_i, m_j, l_j, m_k, l_k, dropout_rate);
 }
 

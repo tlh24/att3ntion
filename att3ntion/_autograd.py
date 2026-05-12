@@ -36,7 +36,7 @@ class _HypergraphAttentionAutograd(Function):
             Q, R, S, V*_*: Input tensors for the attention mechanism.
             dropout_rate: Dropout rate (passed to C++ if needed, but not differentiable).
         Returns:
-            The output tensor from the C++ forward pass (summed).
+            Tuple of gather outputs (Y_q, Y_r, Y_s).
         """
         TILE_SIZE = 16
         orig_seq_len = Q.size(2)
@@ -60,43 +60,34 @@ class _HypergraphAttentionAutograd(Function):
 
         if isinstance(outputs_tuple, tuple) and len(outputs_tuple) == 12:
             Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_, m_i, l_i, m_j, l_j, m_k, l_k = outputs_tuple
-            # Keep BF16 module behavior unchanged, but avoid BF16 accumulation
-            # when the caller requested a higher-precision output dtype.
-            if input_dtype == torch.bfloat16:
-                final_output = Y_q + Y_r + Y_s + Y_q_ + Y_r_ + Y_s_
-            else:
-                final_output = (
-                    Y_q.to(torch.float32)
-                    + Y_r.to(torch.float32)
-                    + Y_s.to(torch.float32)
-                    + Y_q_.to(torch.float32)
-                    + Y_r_.to(torch.float32)
-                    + Y_s_.to(torch.float32)
-                )
         else:
             raise TypeError(f"C++ forward expected to return a tuple of 12 Tensors, but got {type(outputs_tuple)} with len {len(outputs_tuple) if isinstance(outputs_tuple, tuple) else 'N/A'}")
 
-        if orig_seq_len != final_output.size(2):
-            final_output = final_output[:, :, :orig_seq_len, :]
+        if orig_seq_len != Y_q.size(2):
+            Y_q = Y_q[:, :, :orig_seq_len, :]
+            Y_r = Y_r[:, :, :orig_seq_len, :]
+            Y_s = Y_s[:, :, :orig_seq_len, :]
 
-        if final_output.dtype != input_dtype:
-            final_output = final_output.to(input_dtype)
+        if Y_q.dtype != input_dtype:
+            Y_q = Y_q.to(input_dtype)
+            Y_r = Y_r.to(input_dtype)
+            Y_s = Y_s.to(input_dtype)
 
         ctx.save_for_backward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
                               m_i, l_i, m_j, l_j, m_k, l_k)
         ctx.orig_seq_len = orig_seq_len
         ctx.input_dtype = input_dtype
         
-        return final_output
+        return Y_q, Y_r, Y_s
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_Y_q, grad_Y_r, grad_Y_s):
         """
         Calls the C++ backward pass using saved tensors and pre-computed softmax stats.
         This avoids redundant computation of softmax statistics.
         Args:
             ctx: Context object with saved tensors.
-            grad_output: Gradient of the loss w.r.t. the summed output.
+            grad_Y_q/grad_Y_r/grad_Y_s: Upstream gradients for per-axis outputs.
         Returns:
             A tuple of gradients corresponding *exactly* to the inputs of the
             forward function (Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate).
@@ -109,10 +100,12 @@ class _HypergraphAttentionAutograd(Function):
 
         TILE_SIZE = 16
         # Backward CUDA kernels use BF16 I/O with FP32 accumulation internally.
-        grad_output, _ = _pad_to_multiple(grad_output.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
+        grad_Y_q, _ = _pad_to_multiple(grad_Y_q.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
+        grad_Y_r, _ = _pad_to_multiple(grad_Y_r.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
+        grad_Y_s, _ = _pad_to_multiple(grad_Y_s.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
 
         grad_tuple = _cuda_kernels.backward(
-            grad_output, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
+            grad_Y_q, grad_Y_r, grad_Y_s, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
             m_i, l_i, m_j, l_j, m_k, l_k
         )
 
@@ -219,20 +212,32 @@ class HypergraphAttention(nn.Module):
         Vq_1, Vq_2 = Vq.reshape(batch_size, ntok, self.n_heads, self.head_dim*2).permute(0, 2, 1, 3).split(self.head_dim, dim=-1)
         Vr_1, Vr_2 = Vr.reshape(batch_size, ntok, self.n_heads, self.head_dim*2).permute(0, 2, 1, 3).split(self.head_dim, dim=-1)
         Vs_1, Vs_2 = Vs.reshape(batch_size, ntok, self.n_heads, self.head_dim*2).permute(0, 2, 1, 3).split(self.head_dim, dim=-1)
-        
-        y = _HypergraphAttentionAutograd.apply( 
+
+        # Drop scatter to match _HypergraphAttentionNaive (gather=True, scatter=False).
+        # With V_2 inputs zeroed, kernel-computed Y_q_/Y_r_/Y_s_ and their grad paths are zero.
+        Vq_2 = torch.zeros_like(Vq_2)
+        Vr_2 = torch.zeros_like(Vr_2)
+        Vs_2 = torch.zeros_like(Vs_2)
+
+        Y_q, Y_r, Y_s = _HypergraphAttentionAutograd.apply(
             Q, R, S,
             Vq_1, Vq_2,
             Vr_1, Vr_2,
             Vs_1, Vs_2,
             self.dropout.p
         )
-        
-        y = y.permute(0, 2, 1, 3).contiguous().view(batch_size, ntok, self.n_heads * self.head_dim)
-        
-        y = self.Wo(y) 
 
-        return y 
+        Y_q = self.gelu(self.gelu(Y_q))
+        Y_r = self.gelu(self.gelu(Y_r))
+        Y_s = self.gelu(self.gelu(Y_s))
+
+        y = Y_q + Y_r + Y_s
+
+        y = y.permute(0, 2, 1, 3).contiguous().view(batch_size, ntok, self.n_heads * self.head_dim)
+
+        y = self.Wo(y)
+
+        return y
 
 
 class _HypergraphAttentionTorch(nn.Module):
