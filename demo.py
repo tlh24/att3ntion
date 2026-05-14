@@ -210,27 +210,30 @@ def demo_benchmark():
         Vr_2 = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
         Vs_1 = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
         Vs_2 = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
-        grad_output = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
+        cuda_inputs = tuple(t.to(torch.bfloat16) for t in (Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2))
+        grad_Y_q = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
+        grad_Y_r = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
+        grad_Y_s = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
         
         # Forward benchmarks
         def run_cuda_fwd():
-            return cuda_ext.forward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, 0.0)
+            return cuda_ext.forward(*cuda_inputs, 0.0)
         
         def run_ref_fwd():
-            return ref_ext.forward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, 0.0)
+            return ref_ext.forward(*cuda_inputs, 0.0)
         
         cuda_fwd_ms, _, _ = benchmark_fn(run_cuda_fwd, warmup, iters)
         ref_fwd_ms, _, _ = benchmark_fn(run_ref_fwd, warmup, iters)
         fwd_ratio = cuda_fwd_ms / ref_fwd_ms if ref_fwd_ms > 0 else float('inf')
         
         # Get forward outputs for backward pass
-        fwd_out = cuda_ext.forward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, 0.0)
+        fwd_out = cuda_ext.forward(*cuda_inputs, 0.0)
         m_i, l_i, m_j, l_j, m_k, l_k = fwd_out[6:12]
         
         # Backward benchmarks
         def run_cuda_bwd():
             return cuda_ext.backward(
-                grad_output, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
+                grad_Y_q, grad_Y_r, grad_Y_s, *cuda_inputs,
                 m_i, l_i, m_j, l_j, m_k, l_k, 0.0
             )
         
@@ -257,7 +260,7 @@ def demo_benchmark():
         
         print(f"{name:<12} │ {cuda_fwd_ms:>7.2f}ms {ref_fwd_ms:>7.2f}ms {fmt_ratio(fwd_ratio):>8} │ {cuda_bwd_ms:>7.2f}ms {ref_bwd_ms:>7.2f}ms {fmt_ratio(bwd_ratio):>8}")
         
-        del Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, grad_output
+        del Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, grad_Y_q, grad_Y_r, grad_Y_s
         torch.cuda.empty_cache()
     
     print("─" * 76)

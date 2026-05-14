@@ -29,7 +29,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor,
            at::Tensor, at::Tensor, at::Tensor,
            at::Tensor, at::Tensor, at::Tensor>
 backward_cuda(
-    at::Tensor grad_output,
+    at::Tensor grad_Y_q,
+    at::Tensor grad_Y_r,
+    at::Tensor grad_Y_s,
     at::Tensor Q, at::Tensor R, at::Tensor S,
     at::Tensor Vq_1, at::Tensor Vq_2,
     at::Tensor Vr_1, at::Tensor Vr_2,

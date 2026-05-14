@@ -51,8 +51,8 @@ setup(
                 'nvcc': [
                     '-O3',
                     *get_cuda_arch_flags(),
-                    # '-DTORCH_USE_CUDA_DSA', # for debugging
-                    # '-lineinfo' # for debugging
+                    # '-DTORCH_USE_CUDA_DSA',  #for debugging
+                    # '-lineinfo'              #for debugging
                 ]
             }
         ),

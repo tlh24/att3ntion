@@ -1,6 +1,7 @@
 myenv
 
 *.pt
+*.tar.gz
 
 # Build artifacts
 build/
@@ -11,15 +12,46 @@ build/
 __pycache__/
 *.py[cod]
 
-# Profiling reports
+# Profiling reports (machine-specific, large binaries)
 *.ncu-rep
 profiling_reports/
 
-# Benchmark results (machine-specific)
+# Benchmark results (machine-specific timings)
 benchmarks/benchmark_history.jsonl
+
+# Per-run training loss logs (machine-specific, large)
+experiments/compositional/losslog_*.txt
+
+# Per-run session narratives (reference per-machine bench numbers).
+# NOTE: optimization_log/changelog.jsonl IS committed — team-shared history
+# of what's been tried, avoids repeat work.
+optimization_log/sessions/
+
+# Agent-generated state artifacts (machine-specific profile snapshots)
+.agent/state/
 
 # Python tooling caches
 .pytest_cache/
 
-.claude
-.cursor
+# User-local Claude/Cursor configs (but commit project skills + rules)
+.claude/settings.local.json
+.claude/logs/
+.cursor/settings.json
+
+# Editor / OS noise (for teammates on other setups)
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Env files (safety — may contain secrets)
+.env
+.env.*
+!.env.example
+
+
+# CLAUDE (personal, gitignored)
+CLAUDE.md
+.claude/
+.cursor/
