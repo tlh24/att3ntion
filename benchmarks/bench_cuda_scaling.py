@@ -63,14 +63,16 @@ def benchmark_forward(ext, inputs, warmup=5, iters=20):
 
 def benchmark_backward(ext, fwd_inputs, bwd_inputs, warmup=3, iters=10):
     B, H, N, D = bwd_inputs[0].shape
-    grad_output = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
+    grad_Y_q = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
+    grad_Y_r = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
+    grad_Y_s = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
 
     fwd_out = ext.forward(*fwd_inputs, 0.0)
     m_i, l_i, m_j, l_j, m_k, l_k = fwd_out[6:12]
 
     def run():
         return ext.backward(
-            grad_output, *bwd_inputs,
+            grad_Y_q, grad_Y_r, grad_Y_s, *bwd_inputs,
             m_i, l_i, m_j, l_j, m_k, l_k, 0.0
         )
     return benchmark_fn(run, warmup, iters)[0]
@@ -79,7 +81,9 @@ def benchmark_backward(ext, fwd_inputs, bwd_inputs, warmup=3, iters=10):
 def measure_peak_memory(ext, fwd_inputs, bwd_inputs):
     """Measure peak GPU memory during forward+backward."""
     B, H, N, D = bwd_inputs[0].shape
-    grad_output = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
+    grad_Y_q = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
+    grad_Y_r = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
+    grad_Y_s = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
 
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
@@ -88,7 +92,7 @@ def measure_peak_memory(ext, fwd_inputs, bwd_inputs):
     m_i, l_i, m_j, l_j, m_k, l_k = fwd_out[6:12]
 
     _ = ext.backward(
-        grad_output, *bwd_inputs,
+        grad_Y_q, grad_Y_r, grad_Y_s, *bwd_inputs,
         m_i, l_i, m_j, l_j, m_k, l_k, 0.0
     )
     torch.cuda.synchronize()

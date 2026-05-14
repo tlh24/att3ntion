@@ -114,10 +114,12 @@ def run_scaling_benchmark(N_values: List[int], B=1, H=2, D=32,
                         torch.cuda.empty_cache()
                         fwd_out = cuda_ext.forward(*cuda_fwd_inputs, 0.0)
                         m_i, l_i, m_j, l_j, m_k, l_k = fwd_out[6:12]
-                        grad_output = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
+                        grad_Y_q = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
+                        grad_Y_r = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
+                        grad_Y_s = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
 
                         def run_cuda_bwd():
-                            cuda_ext.backward(grad_output, *cuda_bwd_inputs,
+                            cuda_ext.backward(grad_Y_q, grad_Y_r, grad_Y_s, *cuda_bwd_inputs,
                                               m_i, l_i, m_j, l_j, m_k, l_k, 0.0)
 
                         cuda_bwd = benchmark_fn(run_cuda_bwd, warmup=3, iters=10)[0]

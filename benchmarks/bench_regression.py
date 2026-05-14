@@ -100,7 +100,9 @@ def benchmark_backward(cuda_ext, ref_ext, config: BenchConfig, warmup=5, iters=2
     inputs = create_inputs(B, H, N, D)
     cuda_fwd_inputs = tuple(t.to(torch.bfloat16) for t in inputs)
     cuda_bwd_inputs = cuda_fwd_inputs
-    grad_output = torch.randn(B, H, N, D, device="cuda", dtype=torch.bfloat16)
+    grad_Y_q = torch.randn(B, H, N, D, device="cuda", dtype=torch.bfloat16)
+    grad_Y_r = torch.randn(B, H, N, D, device="cuda", dtype=torch.bfloat16)
+    grad_Y_s = torch.randn(B, H, N, D, device="cuda", dtype=torch.bfloat16)
 
     # Forward kernel is BF16 I/O; backward kernels are still FP32.
     # We use BF16 forward only to get softmax stats for the timed backward call.
@@ -109,7 +111,7 @@ def benchmark_backward(cuda_ext, ref_ext, config: BenchConfig, warmup=5, iters=2
 
     def run_cuda_backward():
         return cuda_ext.backward(
-            grad_output, *cuda_bwd_inputs,
+            grad_Y_q, grad_Y_r, grad_Y_s, *cuda_bwd_inputs,
             m_i, l_i, m_j, l_j, m_k, l_k, 0.0
         )
 
