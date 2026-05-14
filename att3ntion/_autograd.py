@@ -28,7 +28,20 @@ class _HypergraphAttentionAutograd(Function):
     """
 
     @staticmethod
-    def forward(ctx, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate=0.0):
+    def forward(
+        ctx,
+        Q,
+        R,
+        S,
+        Vq_1,
+        Vq_2,
+        Vr_1,
+        Vr_2,
+        Vs_1,
+        Vs_2,
+        dropout_rate=0.0,
+        scatter=False,
+    ):
         """
         Calls the C++ forward pass and saves necessary tensors for backward.
         Args:
@@ -36,7 +49,7 @@ class _HypergraphAttentionAutograd(Function):
             Q, R, S, V*_*: Input tensors for the attention mechanism.
             dropout_rate: Dropout rate (passed to C++ if needed, but not differentiable).
         Returns:
-            Tuple of gather outputs (Y_q, Y_r, Y_s).
+            Tuple of selected per-axis outputs (Y_q, Y_r, Y_s).
         """
         TILE_SIZE = 16
         orig_seq_len = Q.size(2)
@@ -62,6 +75,11 @@ class _HypergraphAttentionAutograd(Function):
             Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_, m_i, l_i, m_j, l_j, m_k, l_k = outputs_tuple
         else:
             raise TypeError(f"C++ forward expected to return a tuple of 12 Tensors, but got {type(outputs_tuple)} with len {len(outputs_tuple) if isinstance(outputs_tuple, tuple) else 'N/A'}")
+
+        if scatter:
+            Y_q = Y_q + Y_q_
+            Y_r = Y_r + Y_r_
+            Y_s = Y_s + Y_s_
 
         if orig_seq_len != Y_q.size(2):
             Y_q = Y_q[:, :, :orig_seq_len, :]
@@ -90,7 +108,9 @@ class _HypergraphAttentionAutograd(Function):
             grad_Y_q/grad_Y_r/grad_Y_s: Upstream gradients for per-axis outputs.
         Returns:
             A tuple of gradients corresponding *exactly* to the inputs of the
-            forward function (Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate).
+            forward function (
+              Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate, scatter
+            ).
         """
         Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, \
             m_i, l_i, m_j, l_j, m_k, l_k = ctx.saved_tensors
@@ -158,6 +178,7 @@ class _HypergraphAttentionAutograd(Function):
             grad_Vs_1,
             grad_Vs_2,
             None,
+            None,
         )
 
 class QuickGELU(nn.Module):
@@ -171,7 +192,7 @@ class HypergraphAttention(nn.Module):
     This is the primary public API for att3ntion.  Drop it into any
     transformer-style model in place of standard multi-head attention.
     """
-    def __init__(self, d_model, n_heads, dropout_rate=0):
+    def __init__(self, d_model, n_heads, dropout_rate=0, scatter=False):
         super().__init__()
         
         if d_model % n_heads != 0:
@@ -180,19 +201,67 @@ class HypergraphAttention(nn.Module):
         self.d_model = d_model
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
+        self.scatter = scatter
         
         self.Wq = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
         self.Wr = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
         self.Ws = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
         
-        self.Wv_q = nn.Linear(d_model, n_heads * self.head_dim * 2, bias=True)
-        self.Wv_r = nn.Linear(d_model, n_heads * self.head_dim * 2, bias=True)
-        self.Wv_s = nn.Linear(d_model, n_heads * self.head_dim * 2, bias=True)
+        value_proj_multiplier = 2 if self.scatter else 1
+        self.Wv_q = nn.Linear(d_model, n_heads * self.head_dim * value_proj_multiplier, bias=True)
+        self.Wv_r = nn.Linear(d_model, n_heads * self.head_dim * value_proj_multiplier, bias=True)
+        self.Wv_s = nn.Linear(d_model, n_heads * self.head_dim * value_proj_multiplier, bias=True)
         
         self.Wo = nn.Linear(n_heads * self.head_dim, d_model, bias=True)
        
         self.dropout = nn.Dropout(dropout_rate)
         self.gelu = QuickGELU()
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # Backward-compatible loading for Wv_* shapes across gather/scatter configs.
+        for proj_name in ("Wv_q", "Wv_r", "Wv_s"):
+            module = getattr(self, proj_name)
+            for suffix, target in (("weight", module.weight), ("bias", module.bias)):
+                key = f"{prefix}{proj_name}.{suffix}"
+                if key not in state_dict:
+                    continue
+                loaded = state_dict[key]
+                if loaded.shape == target.shape:
+                    continue
+                if (
+                    loaded.ndim == target.ndim
+                    and loaded.shape[0] == target.shape[0] * 2
+                    and loaded.shape[1:] == target.shape[1:]
+                ):
+                    state_dict[key] = loaded[: target.shape[0]].contiguous()
+                    continue
+                if (
+                    loaded.ndim == target.ndim
+                    and loaded.shape[0] * 2 == target.shape[0]
+                    and loaded.shape[1:] == target.shape[1:]
+                ):
+                    expanded = torch.zeros_like(target)
+                    expanded[: loaded.shape[0]] = loaded
+                    state_dict[key] = expanded
+
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
         
     def forward(self, x):
         batch_size, ntok, d_model = x.shape
@@ -201,30 +270,32 @@ class HypergraphAttention(nn.Module):
         R = self.Wr(x)
         S = self.Ws(x)
         
-        Vq = self.Wv_q(x)
-        Vr = self.Wv_r(x)
-        Vs = self.Wv_s(x)
+        if self.scatter:
+            Vq = self.Wv_q(x)
+            Vr = self.Wv_r(x)
+            Vs = self.Wv_s(x)
+            Vq_1, Vq_2 = Vq.reshape(batch_size, ntok, self.n_heads, self.head_dim * 2).permute(0, 2, 1, 3).split(self.head_dim, dim=-1)
+            Vr_1, Vr_2 = Vr.reshape(batch_size, ntok, self.n_heads, self.head_dim * 2).permute(0, 2, 1, 3).split(self.head_dim, dim=-1)
+            Vs_1, Vs_2 = Vs.reshape(batch_size, ntok, self.n_heads, self.head_dim * 2).permute(0, 2, 1, 3).split(self.head_dim, dim=-1)
+        else:
+            Vq_1 = self.Wv_q(x).reshape(batch_size, ntok, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+            Vr_1 = self.Wv_r(x).reshape(batch_size, ntok, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+            Vs_1 = self.Wv_s(x).reshape(batch_size, ntok, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+            Vq_2 = torch.zeros_like(Vq_1)
+            Vr_2 = torch.zeros_like(Vr_1)
+            Vs_2 = torch.zeros_like(Vs_1)
         
         Q = Q.reshape(batch_size, ntok, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
         R = R.reshape(batch_size, ntok, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
         S = S.reshape(batch_size, ntok, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
         
-        Vq_1, Vq_2 = Vq.reshape(batch_size, ntok, self.n_heads, self.head_dim*2).permute(0, 2, 1, 3).split(self.head_dim, dim=-1)
-        Vr_1, Vr_2 = Vr.reshape(batch_size, ntok, self.n_heads, self.head_dim*2).permute(0, 2, 1, 3).split(self.head_dim, dim=-1)
-        Vs_1, Vs_2 = Vs.reshape(batch_size, ntok, self.n_heads, self.head_dim*2).permute(0, 2, 1, 3).split(self.head_dim, dim=-1)
-
-        # Drop scatter to match _HypergraphAttentionNaive (gather=True, scatter=False).
-        # With V_2 inputs zeroed, kernel-computed Y_q_/Y_r_/Y_s_ and their grad paths are zero.
-        Vq_2 = torch.zeros_like(Vq_2)
-        Vr_2 = torch.zeros_like(Vr_2)
-        Vs_2 = torch.zeros_like(Vs_2)
-
         Y_q, Y_r, Y_s = _HypergraphAttentionAutograd.apply(
             Q, R, S,
             Vq_1, Vq_2,
             Vr_1, Vr_2,
             Vs_1, Vs_2,
-            self.dropout.p
+            self.dropout.p,
+            self.scatter,
         )
 
         Y_q = self.gelu(self.gelu(Y_q))
