@@ -398,7 +398,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 
 		if save_model:
 			# save after each epoch
-			model.save_model(f"comp_model_{args.attn}_r{replicate}.pt")
+			model.save_model(f"comp_model_{attn_impl}_r{replicate}.pt")
 
 	fd_losslog.flush()
 	# validation!
@@ -439,7 +439,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 
 			total_loss += loss.item()
 
-		avg_loss = total_loss / len(train_loader)
+		avg_loss = total_loss / len(loader_v) 
 		val_accuracy = 100 * correct_vals / total
 		print(f'Validation Loss: {avg_loss:.4f}, accuracy {val_accuracy}')
 
