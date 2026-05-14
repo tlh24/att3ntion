@@ -1,9 +1,12 @@
+import os
 import torch
 import torch.nn as nn
 import math
 import att3ntion._custom_op  # noqa: F401 — registers torch.ops.att3ntion.hypergraph_{forward,backward}
 import att3ntion._torch_kernels as _torch_kernels
 from torch.autograd import Function
+
+_CHECK_GRAD_FINITE = os.getenv("ATT3NTION_CHECK_GRADS", "0").lower() in {"1", "true", "yes", "on"}
 
 def _pad_to_multiple(tensor, multiple, dim=2):
     """Pad tensor along specified dimension to be a multiple of `multiple`."""
@@ -155,17 +158,18 @@ class _HypergraphAttentionAutograd(Function):
         grad_Vs_1 = grad_Vs_1.to(out_dtype)
         grad_Vs_2 = grad_Vs_2.to(out_dtype)
 
-        debug_names = [
-            "grad_Q", "grad_R", "grad_S",
-            "grad_Vq_1", "grad_Vq_2",
-            "grad_Vr_1", "grad_Vr_2",
-            "grad_Vs_1", "grad_Vs_2",
-        ]
-        grads = (grad_Q, grad_R, grad_S, grad_Vq_1, grad_Vq_2, grad_Vr_1, grad_Vr_2, grad_Vs_1, grad_Vs_2)
-        for name, tensor in zip(debug_names, grads):
-            if tensor is not None and tensor.is_floating_point():
-                if not torch.isfinite(tensor).all():
-                    raise RuntimeError(f"{name} contains non-finite values")
+        if _CHECK_GRAD_FINITE:
+            debug_names = [
+                "grad_Q", "grad_R", "grad_S",
+                "grad_Vq_1", "grad_Vq_2",
+                "grad_Vr_1", "grad_Vr_2",
+                "grad_Vs_1", "grad_Vs_2",
+            ]
+            grads = (grad_Q, grad_R, grad_S, grad_Vq_1, grad_Vq_2, grad_Vr_1, grad_Vr_2, grad_Vs_1, grad_Vs_2)
+            for name, tensor in zip(debug_names, grads):
+                if tensor is not None and tensor.is_floating_point():
+                    if not torch.isfinite(tensor).all():
+                        raise RuntimeError(f"{name} contains non-finite values")
 
         return (
             grad_Q,
