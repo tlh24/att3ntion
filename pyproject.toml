@@ -25,7 +25,7 @@ packages = ["att3ntion"]
 
 [project.optional-dependencies]
 cu130 = []
-cu124 = []
+cu126 = []
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
@@ -33,14 +33,14 @@ url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [[tool.uv.index]]
-name = "pytorch-cu124"
-url = "https://download.pytorch.org/whl/cu124"
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
 explicit = true
 
 [tool.uv.sources]
 torch = [
-    { index = "pytorch-cu130", marker = "extra == 'cu130' and extra != 'cu124'" },
-    { index = "pytorch-cu124", marker = "extra == 'cu124' and extra != 'cu130'" },
+    { index = "pytorch-cu130", marker = "extra == 'cu130' and extra != 'cu126'" },
+    { index = "pytorch-cu126", marker = "extra == 'cu126' and extra != 'cu130'" },
 ]
 
 [dependency-groups]
@@ -53,7 +53,7 @@ no-build-isolation-package = ["att3ntion"]
 conflicts = [
     [
         { extra = "cu130" },
-        { extra = "cu124" },
+        { extra = "cu126" },
     ],
 ]
 
