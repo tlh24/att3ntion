@@ -43,6 +43,11 @@ torch = [
     { index = "pytorch-cu124", marker = "extra == 'cu124' and extra != 'cu130'" },
 ]
 
+[dependency-groups]
+dev = [
+    "ninja>=1.13.0",
+]
+
 [tool.uv]
 no-build-isolation-package = ["att3ntion"]
 conflicts = [
