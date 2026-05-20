@@ -4,17 +4,25 @@
 
 ## Quick Start
 Clone this repository, then: 
+
 ```bash
-# Install (see NOTE)
+# determine CUDA toolkit version:
+nvcc --version | grep -oP 'release \K[\d.]+'
+
+# Install CUDA-enabled Torch (either cu126 or cu130 depending on nvcc output)
+pip install torch --extra-index-url https://download.pytorch.org/whl/cu130
+pip install torch --extra-index-url https://download.pytorch.org/whl/cu126
+
+# If something goes wrong, you can do:
+pip install --force-reinstall torch --extra-index-url https://download.pytorch.org/whl/cu130
+pip install --force-reinstall torch --extra-index-url https://download.pytorch.org/whl/cu126
+
+# Install
 cd att3ntion
 pip install -r requirements.txt
-pip install -e .   
 
-# NOTE: if you have CUDA 13.0 (see nvcc --version), then first do one of:
-pip install torch --extra-index-url https://download.pytorch.org/whl/cu130
-pip install --force-reinstall torch --extra-index-url https://download.pytorch.org/whl/cu130
-
-# and, use --no-build-isolation to ensure the compilation uses your installed torch
+# This will launch the CUDA compilation
+# The --no-build-isolation flag is mandatory, and considered best practice
 pip install -e . --no-build-isolation
 
 # Run demo
@@ -23,6 +31,35 @@ python demo.py --memory     # Memory scaling benchmark
 python demo.py --train      # Train on arithmetic task
 python demo.py --all        # Run everything
 ```
+
+## UV based Quick Start
+
+```bash
+uv --version # must be >= 0.11
+
+# to get or update uv, use:
+curl -LsSf https://astral.sh/uv/install.sh | sh
+hash -r
+
+# clone
+git clone git@github.com:tlh24/att3ntion
+cd att3ntion
+
+# determine CUDA toolkit version:
+nvcc --version | grep -oP 'release \K[\d.]+'
+
+# install dependencies (does not compile yet)
+# choose cu130 or cu126 based on nvcc output
+uv sync --extra cu130 --no-install-package att3ntion
+uv sync --extra cu126 --no-install-package att3ntion
+
+# launch the compilation
+uv sync --extra cu130
+uv sync --extra cu126
+
+source .venv/bin/activate
+```
+
 
 ## Basic Usage
 
