@@ -17,7 +17,15 @@ pip install --force-reinstall torch --extra-index-url https://download.pytorch.o
 # and, use --no-build-isolation to ensure the compilation uses your installed torch
 pip install -e . --no-build-isolation
 
-# Alternate UV-based install
+# Run demo
+python demo.py              # Basic usage
+python demo.py --memory     # Memory scaling benchmark
+python demo.py --train      # Train on arithmetic task
+python demo.py --all        # Run everything
+```
+
+## UV based Quick Start
+
 ```bash
 uv --version # must be >= 0.11
 
@@ -44,13 +52,6 @@ uv sync --extra cu126
 source .venv/bin/activate
 ```
 
-
-# Run demo
-python demo.py              # Basic usage
-python demo.py --memory     # Memory scaling benchmark
-python demo.py --train      # Train on arithmetic task
-python demo.py --all        # Run everything
-```
 
 ## Basic Usage
 
