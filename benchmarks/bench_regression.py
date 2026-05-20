@@ -65,6 +65,13 @@ LARGE_CONFIGS = [
     BenchConfig("N256_D64",  B=1, H=1, N=256, D=64),
 ]
 
+H100_CONFIGS = [
+    BenchConfig("N384_D32",  B=2, H=2, N=384, D=32),
+    BenchConfig("N384_D64",  B=2, H=2, N=384, D=64),
+    BenchConfig("N512_D32",  B=2, H=2, N=512, D=32),
+    BenchConfig("N512_D64",  B=2, H=2, N=512, D=64),
+]
+
 
 # --- Benchmark Runners ---
 
@@ -72,9 +79,11 @@ def benchmark_forward(cuda_ext, ref_ext, config: BenchConfig, warmup=5, iters=20
     """Benchmark forward pass: CUDA vs reference."""
     B, H, N, D = config.B, config.H, config.N, config.D
     inputs = create_inputs(B, H, N, D)
+    cuda_inputs = tuple(t.to(torch.bfloat16) for t in inputs)
+    ref_inputs = cuda_inputs
 
-    cuda_ms, cuda_times = benchmark_fn(lambda: cuda_ext.forward(*inputs, 0.0), warmup=warmup, iters=iters)
-    ref_ms, ref_times = benchmark_fn(lambda: ref_ext.forward(*inputs, 0.0), warmup=warmup, iters=iters)
+    cuda_ms, cuda_times = benchmark_fn(lambda: cuda_ext.forward(*cuda_inputs, 0.0), warmup=warmup, iters=iters)
+    ref_ms, ref_times = benchmark_fn(lambda: ref_ext.forward(*ref_inputs, 0.0), warmup=warmup, iters=iters)
 
     return {
         "cuda_median_ms": round(cuda_ms, 3),
@@ -89,19 +98,25 @@ def benchmark_backward(cuda_ext, ref_ext, config: BenchConfig, warmup=5, iters=2
     """Benchmark backward pass: CUDA vs reference (autograd)."""
     B, H, N, D = config.B, config.H, config.N, config.D
     inputs = create_inputs(B, H, N, D)
-    grad_output = torch.randn(B, H, N, D, device="cuda", dtype=torch.float32)
+    cuda_fwd_inputs = tuple(t.to(torch.bfloat16) for t in inputs)
+    cuda_bwd_inputs = cuda_fwd_inputs
+    grad_Y_q = torch.randn(B, H, N, D, device="cuda", dtype=torch.bfloat16)
+    grad_Y_r = torch.randn(B, H, N, D, device="cuda", dtype=torch.bfloat16)
+    grad_Y_s = torch.randn(B, H, N, D, device="cuda", dtype=torch.bfloat16)
 
-    fwd_out = cuda_ext.forward(*inputs, 0.0)
+    # Forward kernel is BF16 I/O; backward kernels are still FP32.
+    # We use BF16 forward only to get softmax stats for the timed backward call.
+    fwd_out = cuda_ext.forward(*cuda_fwd_inputs, 0.0)
     m_i, l_i, m_j, l_j, m_k, l_k = fwd_out[6:12]
 
     def run_cuda_backward():
         return cuda_ext.backward(
-            grad_output, *inputs,
+            grad_Y_q, grad_Y_r, grad_Y_s, *cuda_bwd_inputs,
             m_i, l_i, m_j, l_j, m_k, l_k, 0.0
         )
 
     def run_ref_backward():
-        ref_inputs = [t.detach().clone().requires_grad_(True) for t in inputs]
+        ref_inputs = [t.detach().clone().requires_grad_(True) for t in cuda_bwd_inputs]
         ref_out = ref_ext.forward(*ref_inputs, 0.0)
         total = sum(o.sum() for o in ref_out)
         total.backward()
@@ -349,6 +364,7 @@ def main():
     parser = argparse.ArgumentParser(description="Benchmark hypergraph attention kernels")
     parser.add_argument("--quick", action="store_true", help="Quick smoke test (2 configs)")
     parser.add_argument("--large", action="store_true", help="Include large N configs")
+    parser.add_argument("--h100", action="store_true", help="Include H100-scale configs (implies --large)")
     parser.add_argument("--forward-only", action="store_true", help="Only benchmark forward")
     parser.add_argument("--backward-only", action="store_true", help="Only benchmark backward")
     parser.add_argument("--warmup", type=int, default=5, help="Warmup iterations")
@@ -359,6 +375,7 @@ def main():
     parser.add_argument("--complexity", action="store_true", help="Show algorithmic complexity")
     parser.add_argument("--show-history", action="store_true", help="Show history only")
     parser.add_argument("--max-n-backward", type=int, default=128, help="Max N for backward")
+    parser.add_argument("--file", type=str, default=RESULTS_FILE, help="Path to history JSONL file")
     args = parser.parse_args()
 
     if args.save and not args.note:
@@ -366,7 +383,7 @@ def main():
         sys.exit(1)
 
     if args.show_history:
-        history = load_history()
+        history = load_history(args.file)
         print_history_compact(history)
         return
 
@@ -390,8 +407,10 @@ def main():
         configs = QUICK_CONFIGS
     else:
         configs = list(STANDARD_CONFIGS)
-        if args.large:
+        if args.large or args.h100:
             configs.extend(LARGE_CONFIGS)
+        if args.h100:
+            configs.extend(H100_CONFIGS)
 
     gpu_specs = get_gpu_specs()
     print_header(gpu_specs, args.note if args.note else None)
@@ -440,7 +459,7 @@ def main():
 
     print(" done")
 
-    history = load_history()
+    history = load_history(args.file)
     prev_run = history[-1] if history else None
 
     print_timing_table(forward_results, backward_results, prev_run)
@@ -461,10 +480,10 @@ def main():
                 "forward": forward_results.get(cfg.name),
                 "backward": backward_results.get(cfg.name),
             }
-        save_results(run_data)
-        print(f"\n  ✓ Saved to {RESULTS_FILE}")
+        save_results(run_data, args.file)
+        print(f"\n  ✓ Saved to {args.file}")
 
-    history = load_history()
+    history = load_history(args.file)
     print_history_compact(history)
 
     print(f"\n{'═'*80}\n")

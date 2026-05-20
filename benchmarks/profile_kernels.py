@@ -23,23 +23,15 @@ ALL_KERNELS = [
 DEFAULT_DIMS = (1, 2, 128, 128, 128, 64)
 
 
-def get_grad_output_cuda(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_):
+def get_grad_outputs_cuda(Y_q, Y_r, Y_s):
     """
-    Creates a gradient tensor with the correct shape to drive the backward pass.
-    For profiling, the values don't matter, only the shape and device.
+    Create backward gradients for Y_q, Y_r, and Y_s.
+    For profiling, values don't matter; shapes and dtypes must match.
     """
-    B, H, I, D = Y_q.shape
-    _, _, J, _ = Y_r.shape
-    _, _, K, _ = Y_s.shape
-
-    max_len = max(I, J, K)
-
-    grad_output_combined = torch.zeros(B, H, max_len, D, device=Y_q.device, dtype=Y_q.dtype)
-    grad_output_combined[:, :, :I, :] += 1.0
-    grad_output_combined[:, :, :J, :] += 1.0
-    grad_output_combined[:, :, :K, :] += 1.0
-
-    return grad_output_combined
+    grad_Y_q = torch.ones_like(Y_q)
+    grad_Y_r = torch.ones_like(Y_r)
+    grad_Y_s = torch.ones_like(Y_s)
+    return grad_Y_q, grad_Y_r, grad_Y_s
 
 
 def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim,
@@ -68,6 +60,9 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim,
     Vs_1 = torch.rand(B, H, K_dim, D_dim, device='cuda', dtype=dtype)
     Vs_2 = torch.rand(B, H, K_dim, D_dim, device='cuda', dtype=dtype)
 
+    fwd_inputs = tuple(t.to(torch.bfloat16) for t in (Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2))
+    bwd_inputs = fwd_inputs
+
     # --- Forward Pass ---
     # forward returns 12 values: Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_,
     #                             m_i, l_i, m_j, l_j, m_k, l_k
@@ -76,7 +71,7 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim,
         (Y_q_mc, Y_r_mc, Y_s_mc, Y_q__mc, Y_r__mc, Y_s__mc,
          m_i, l_i, m_j, l_j, m_k, l_k) = \
             _cuda_kernels.forward(
-                Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
+                *fwd_inputs, dropout_rate
             )
     else:
         # Still need forward outputs to feed backward
@@ -84,21 +79,18 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim,
             (Y_q_mc, Y_r_mc, Y_s_mc, Y_q__mc, Y_r__mc, Y_s__mc,
              m_i, l_i, m_j, l_j, m_k, l_k) = \
                 _cuda_kernels.forward(
-                    Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
+                    *fwd_inputs, dropout_rate
                 )
 
     # --- Backward Pass ---
     if not forward_only:
         print("Running backward pass...")
-        grad_output_cuda = get_grad_output_cuda(
-            Y_q_mc, Y_r_mc, Y_s_mc, Y_q__mc, Y_r__mc, Y_s__mc
-        )
+        grad_Y_q, grad_Y_r, grad_Y_s = get_grad_outputs_cuda(Y_q_mc, Y_r_mc, Y_s_mc)
         _cuda_kernels.backward(
-            grad_output_cuda,
-            Q, R, S,
-            Vq_1, Vq_2,
-            Vr_1, Vr_2,
-            Vs_1, Vs_2,
+            grad_Y_q,
+            grad_Y_r,
+            grad_Y_s,
+            *bwd_inputs,
             m_i, l_i,
             m_j, l_j,
             m_k, l_k,

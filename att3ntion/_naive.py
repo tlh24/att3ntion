@@ -7,7 +7,7 @@ from att3ntion._autograd import QuickGELU
 
 class _HypergraphAttentionNaive(nn.Module):
 	"""Pure-PyTorch naive O(N^3) implementation for correctness testing."""
-	def __init__(self, d_model, n_heads, dropout_rate=0, head_subspaces=False, **kwargs):
+	def __init__(self, d_model, n_heads, dropout_rate=0, head_subspaces=False, scatter=False, **kwargs):
 		super().__init__()
 
 		self.d_model = d_model
@@ -18,14 +18,16 @@ class _HypergraphAttentionNaive(nn.Module):
 			self.d_head = d_model
 		self.head_subspaces = head_subspaces
 		self.d_val = self.d_head*1
+		self.scatter = scatter
 
 		self.Wq = nn.Linear(d_model, self.d_head*n_heads, bias=False, **kwargs)
 		self.Wr = nn.Linear(d_model, self.d_head*n_heads, bias=False, **kwargs)
 		self.Ws = nn.Linear(d_model, self.d_head*n_heads, bias=False, **kwargs)
 
-		self.Wv_q = nn.Linear(d_model, self.d_val*n_heads*2, bias=True, **kwargs)
-		self.Wv_r = nn.Linear(d_model, self.d_val*n_heads*2, bias=True, **kwargs)
-		self.Wv_s = nn.Linear(d_model, self.d_val*n_heads*2, bias=True, **kwargs)
+		value_proj_multiplier = 2 if self.scatter else 1
+		self.Wv_q = nn.Linear(d_model, self.d_val*n_heads*value_proj_multiplier, bias=True, **kwargs)
+		self.Wv_r = nn.Linear(d_model, self.d_val*n_heads*value_proj_multiplier, bias=True, **kwargs)
+		self.Wv_s = nn.Linear(d_model, self.d_val*n_heads*value_proj_multiplier, bias=True, **kwargs)
 
 		self.Wo = nn.Linear(self.d_model, d_model, bias=True, **kwargs)
 
@@ -33,6 +35,8 @@ class _HypergraphAttentionNaive(nn.Module):
 		self.gelu = QuickGELU()
 
 	def forward(self, x, rotary_emb):
+		out_dtype = x.dtype
+		x = x.float()
 		batch_size, ntok, d_model = x.shape
 
 		if rotary_emb is not None:
@@ -44,17 +48,24 @@ class _HypergraphAttentionNaive(nn.Module):
 			R = self.Wr(x)
 			S = self.Ws(x)
 
-		Vq = self.Wv_q(x)
-		Vr = self.Wv_r(x)
-		Vs = self.Wv_s(x)
-
 		Q = Q.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
 		R = R.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
 		S = S.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
 
-		Vq, Vq_ = Vq.reshape(batch_size, ntok, self.n_heads, self.d_val*2).permute(0, 2, 1, 3).split(self.d_val, dim=-1)
-		Vr, Vr_ = Vr.reshape(batch_size, ntok, self.n_heads, self.d_val*2).permute(0, 2, 1, 3).split(self.d_val, dim=-1)
-		Vs, Vs_ = Vs.reshape(batch_size, ntok, self.n_heads, self.d_val*2).permute(0, 2, 1, 3).split(self.d_val, dim=-1)
+		if self.scatter:
+			Vq_full = self.Wv_q(x)
+			Vr_full = self.Wv_r(x)
+			Vs_full = self.Wv_s(x)
+			Vq, Vq_ = Vq_full.reshape(batch_size, ntok, self.n_heads, self.d_val*2).permute(0, 2, 1, 3).split(self.d_val, dim=-1)
+			Vr, Vr_ = Vr_full.reshape(batch_size, ntok, self.n_heads, self.d_val*2).permute(0, 2, 1, 3).split(self.d_val, dim=-1)
+			Vs, Vs_ = Vs_full.reshape(batch_size, ntok, self.n_heads, self.d_val*2).permute(0, 2, 1, 3).split(self.d_val, dim=-1)
+		else:
+			Vq = self.Wv_q(x).reshape(batch_size, ntok, self.n_heads, self.d_val).permute(0, 2, 1, 3)
+			Vr = self.Wv_r(x).reshape(batch_size, ntok, self.n_heads, self.d_val).permute(0, 2, 1, 3)
+			Vs = self.Wv_s(x).reshape(batch_size, ntok, self.n_heads, self.d_val).permute(0, 2, 1, 3)
+			# Vq_ = torch.zeros_like(Vq)
+			# Vr_ = torch.zeros_like(Vr)
+			# Vs_ = torch.zeros_like(Vs)
 
 		dot_product = torch.einsum('bhid,bhjd,bhkd->bhijk', Q, R, S)
 		dot_product = dot_product / (math.sqrt(self.d_head))
@@ -70,56 +81,30 @@ class _HypergraphAttentionNaive(nn.Module):
 		As = torch.softmax(dot_product_s.flatten(3, 4), dim=-1).reshape(dot_product.shape)
 		As = As.permute(0, 1, 3, 4, 2)
 
-		gather = True
-		scatter = False
-		if gather:
-			Y_q = torch.einsum('bhijk,bhjd,bhkd->bhid', Aq, Vr, Vs)
-			Y_r = torch.einsum('bhijk,bhid,bhkd->bhjd', Ar, Vq, Vs)
-			Y_s = torch.einsum('bhijk,bhid,bhjd->bhkd', As, Vq, Vr)
-			# Y_q = self.gelu(Y_q) FIXME
-			# Y_r = self.gelu(Y_r)
-			# Y_s = self.gelu(Y_s)
+		Y_q = torch.einsum('bhijk,bhjd,bhkd->bhid', Aq, Vr, Vs)
+		Y_r = torch.einsum('bhijk,bhid,bhkd->bhjd', Ar, Vq, Vs)
+		Y_s = torch.einsum('bhijk,bhid,bhjd->bhkd', As, Vq, Vr)
+		Y_q = self.gelu(Y_q)
+		Y_r = self.gelu(Y_r)
+		Y_s = self.gelu(Y_s)
+		y = Y_q + Y_r + Y_s
 
-		if scatter:
-			if False:
-				Aq = torch.softmax(dot_product, dim=2)
-				Ar = torch.softmax(dot_product, dim=3)
-				As = torch.softmax(dot_product, dim=4)
-
-			if False:
-				Y_q_ = torch.einsum('bhijk,bhjd->bhid', Ar, Vr_) + \
-						torch.einsum('bhijk,bhkd->bhid', As, Vs_)
-				Y_r_ = torch.einsum('bhijk,bhid->bhjd', Aq, Vq_) + \
-						torch.einsum('bhijk,bhkd->bhjd', As, Vs_)
-				Y_s_ = torch.einsum('bhijk,bhid->bhkd', Aq, Vq_) + \
-						torch.einsum('bhijk,bhjd->bhkd', Ar, Vr_)
-			else:
-				Y_q_ = torch.einsum('bhijk,bhjd,bhijk,bhkd->bhid', Ar, Vr_, As, Vs_)
-				Y_r_ = torch.einsum('bhijk,bhid,bhijk,bhkd->bhjd', Aq, Vq_, As, Vs_)
-				Y_s_ = torch.einsum('bhijk,bhid,bhijk,bhjd->bhkd', Aq, Vq_, Ar, Vr_)
-
-			# Y_q_ = self.gelu(Y_q_) FIXME
-			# Y_r_ = self.gelu(Y_r_)
-			# Y_s_ = self.gelu(Y_s_)
-			if gather:
-				y = Y_q + Y_r + Y_s + Y_q_ + Y_r_ + Y_s_
-			else:
-				y = Y_q_ + Y_r_ + Y_s_
-
-		else:
-			# Y_q = self.gelu(Y_q) # FIXME
-			# Y_r = self.gelu(Y_r)
-			# Y_s = self.gelu(Y_s)
-			y = Y_q + Y_r + Y_s
-
-		y = self.gelu(y) # FIXME
+		if self.scatter:
+			# note: option for diamond op in scatter being 'add' removed.
+			Y_q_ = torch.einsum('bhijk,bhjd,bhijk,bhkd->bhid', Ar, Vr_, As, Vs_)
+			Y_r_ = torch.einsum('bhijk,bhid,bhijk,bhkd->bhjd', Aq, Vq_, As, Vs_)
+			Y_s_ = torch.einsum('bhijk,bhid,bhijk,bhjd->bhkd', Aq, Vq_, Ar, Vr_)
+			Y_q_ = self.gelu(Y_q_)
+			Y_r_ = self.gelu(Y_r_)
+			Y_s_ = self.gelu(Y_s_)
+			y = y + Y_q_ + Y_r_ + Y_s_
 
 		if self.head_subspaces:
 			y = y.permute(0, 2, 1, 3).reshape(batch_size, ntok, self.d_model)
 		else:
 			y = y.permute(0, 2, 1, 3).sum(dim=2).squeeze()
 		y = self.Wo(y)
-		return y
+		return y.to(out_dtype)
 
 	def calcFlops(self, x):
 		bs, ntok, d_model = x.shape
@@ -159,6 +144,8 @@ class _GraphAttentionNaive(nn.Module):
 		self.gelu = QuickGELU()
 
 	def forward(self, x, rotary_emb):
+		out_dtype = x.dtype
+		x = x.float()
 		batch_size, ntok, d_model = x.shape
 
 		if rotary_emb is not None:
@@ -188,7 +175,7 @@ class _GraphAttentionNaive(nn.Module):
 			y = y.permute(0, 2, 3, 1).sum(dim=3).squeeze()
 		y = self.gelu(y)
 		y = self.Wo(y)
-		return y
+		return y.to(out_dtype)
 
 	def calcFlops(self, x):
 		bs, ntok, d_model = x.shape

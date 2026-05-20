@@ -46,6 +46,7 @@ if _cuda_kernels_available:
 
 from gen_data_comp import genData3, genData4, genData7
 
+
 class SwiGLU(nn.Module):
 	"""
 	Swish Gated Linear Units based Feed-Forward Network.
@@ -278,7 +279,8 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 
 	input_dim = x.shape[2]
 
-	if attn_impl == "hypergraph":
+	is_hg = attn_impl == "hypergraph"
+	if is_hg:
 		n_layers = 3
 	else:
 		n_layers = 6 # match the number of parameters and (approx) model complexity.  (But not flops, of course!)
@@ -286,7 +288,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 
 	if task == 4:
 		n_recurse = 5
-		if attn_impl == "hypergraph":
+		if is_hg:
 			n_layers = 2
 		else:
 			n_layers = 4 # Positive control: these converge at the same rate.
@@ -396,7 +398,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 
 		if save_model:
 			# save after each epoch
-			model.save_model(f"comp_model_{args.attn}_r{replicate}.pt")
+			model.save_model(f"comp_model_{attn_impl}_r{replicate}.pt")
 
 	fd_losslog.flush()
 	# validation!
@@ -437,7 +439,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 
 			total_loss += loss.item()
 
-		avg_loss = total_loss / len(train_loader)
+		avg_loss = total_loss / len(loader_v) 
 		val_accuracy = 100 * correct_vals / total
 		print(f'Validation Loss: {avg_loss:.4f}, accuracy {val_accuracy}')
 
