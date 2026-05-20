@@ -17,6 +17,34 @@ pip install --force-reinstall torch --extra-index-url https://download.pytorch.o
 # and, use --no-build-isolation to ensure the compilation uses your installed torch
 pip install -e . --no-build-isolation
 
+# Alternate UV-based install
+```bash
+uv --version # must be >= 0.11
+
+# to get or update uv, use:
+curl -LsSf https://astral.sh/uv/install.sh | sh
+hash -r
+
+# clone
+git clone git@github.com:tlh24/att3ntion
+cd att3ntion
+
+# determine CUDA toolkit version:
+nvcc --version | grep -oP 'release \K[\d.]+'
+
+# install dependencies (does not compile yet)
+# choose cu130 or cu126 based on nvcc output
+uv sync --extra cu130 --no-install-package att3ntion
+uv sync --extra cu126 --no-install-package att3ntion
+
+# launch the compilation
+uv sync --extra cu130
+uv sync --extra cu126
+
+source .venv/bin/activate
+```
+
+
 # Run demo
 python demo.py              # Basic usage
 python demo.py --memory     # Memory scaling benchmark
