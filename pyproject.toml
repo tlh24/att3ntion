@@ -16,7 +16,6 @@ dependencies = [
     "pandas>=2.3.3",
     "psutil>=7.2.2",
     "scikit-learn>=1.7.2",
-    "torch>=2.5",
 ]
 
 [tool.setuptools]
@@ -24,8 +23,8 @@ packages = ["att3ntion"]
 
 
 [project.optional-dependencies]
-cu130 = []
-cu126 = []
+cu130 = ["torch>=2.5"]
+cu126 = ["torch>=2.5"]
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
