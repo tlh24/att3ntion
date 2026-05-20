@@ -4,17 +4,25 @@
 
 ## Quick Start
 Clone this repository, then: 
+
 ```bash
-# Install (see NOTE)
+# determine CUDA toolkit version:
+nvcc --version | grep -oP 'release \K[\d.]+'
+
+# Install CUDA-enabled Torch (either cu126 or cu130 depending on nvcc output)
+pip install torch --extra-index-url https://download.pytorch.org/whl/cu130
+pip install torch --extra-index-url https://download.pytorch.org/whl/cu126
+
+# If something goes wrong, you can do:
+pip install --force-reinstall torch --extra-index-url https://download.pytorch.org/whl/cu130
+pip install --force-reinstall torch --extra-index-url https://download.pytorch.org/whl/cu126
+
+# Install
 cd att3ntion
 pip install -r requirements.txt
-pip install -e .   
 
-# NOTE: if you have CUDA 13.0 (see nvcc --version), then first do one of:
-pip install torch --extra-index-url https://download.pytorch.org/whl/cu130
-pip install --force-reinstall torch --extra-index-url https://download.pytorch.org/whl/cu130
-
-# and, use --no-build-isolation to ensure the compilation uses your installed torch
+# This will launch the CUDA compilation
+# The --no-build-isolation flag is mandatory, and considered best practice
 pip install -e . --no-build-isolation
 
 # Run demo
