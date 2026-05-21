@@ -1,28 +1,35 @@
 #!/usr/bin/bash
 
 # 1. Define Default Variables
-BATCH_SIZE=32 # same as the python script
+BATCH_SIZE=32 # same as default in the python script
 EPOCHS=10
 LOG_NAME="test" # Default value if no argument is provided
 REPL=1 # what replicate this is
 
 # This looks for --log-name and assigns the next argument to the variable
 while [[ "$#" -gt 0 ]]; do
-	case $1 in
+	case "$1" in
 		--log-name)
+			if [[ -z "$2" ]]; then
+				echo "Error: --log-name requires a value." >&2
+				exit 1
+			fi
 			LOG_NAME="$2"
-			shift
+			shift 2
 			;;
 		--repl)
+			if [[ -z "$2" ]]; then
+				echo "Error: --repl requires a value." >&2
+				exit 1
+			fi
 			REPL="$2"
-			shift
+			shift 2
 			;;
 		*)
-			echo "Unknown parameter passed: $1"
+			echo "Unknown parameter passed: $1" >&2
 			exit 1
 			;;
 	esac
-	shift
 done
 
 ATTN_TYPES=("hypergraph" "graph")

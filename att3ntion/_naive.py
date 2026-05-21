@@ -53,6 +53,7 @@ class _HypergraphAttentionNaive(nn.Module):
 		S = S.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
 
 		if self.scatter:
+			# split the values into scatter and gather components
 			Vq_full = self.Wv_q(x)
 			Vr_full = self.Wv_r(x)
 			Vs_full = self.Wv_s(x)
@@ -63,9 +64,6 @@ class _HypergraphAttentionNaive(nn.Module):
 			Vq = self.Wv_q(x).reshape(batch_size, ntok, self.n_heads, self.d_val).permute(0, 2, 1, 3)
 			Vr = self.Wv_r(x).reshape(batch_size, ntok, self.n_heads, self.d_val).permute(0, 2, 1, 3)
 			Vs = self.Wv_s(x).reshape(batch_size, ntok, self.n_heads, self.d_val).permute(0, 2, 1, 3)
-			Vq_ = torch.zeros_like(Vq)
-			Vr_ = torch.zeros_like(Vr)
-			Vs_ = torch.zeros_like(Vs)
 
 		dot_product = torch.einsum('bhid,bhjd,bhkd->bhijk', Q, R, S)
 		dot_product = dot_product / (math.sqrt(self.d_head))
@@ -84,20 +82,21 @@ class _HypergraphAttentionNaive(nn.Module):
 		Y_q = torch.einsum('bhijk,bhjd,bhkd->bhid', Aq, Vr, Vs)
 		Y_r = torch.einsum('bhijk,bhid,bhkd->bhjd', Ar, Vq, Vs)
 		Y_s = torch.einsum('bhijk,bhid,bhjd->bhkd', As, Vq, Vr)
+		Y_q = self.gelu(Y_q)
+		Y_r = self.gelu(Y_r)
+		Y_s = self.gelu(Y_s)
+		y = Y_q + Y_r + Y_s
 
 		if self.scatter:
+			# note: option for diamond op in scatter being 'add' removed.
+			# (see README.md)
 			Y_q_ = torch.einsum('bhijk,bhjd,bhijk,bhkd->bhid', Ar, Vr_, As, Vs_)
 			Y_r_ = torch.einsum('bhijk,bhid,bhijk,bhkd->bhjd', Aq, Vq_, As, Vs_)
 			Y_s_ = torch.einsum('bhijk,bhid,bhijk,bhjd->bhkd', Aq, Vq_, Ar, Vr_)
-		else:
-			Y_q_ = torch.zeros_like(Y_q)
-			Y_r_ = torch.zeros_like(Y_r)
-			Y_s_ = torch.zeros_like(Y_s)
-
-		Y_q = self.gelu(self.gelu(Y_q + Y_q_))
-		Y_r = self.gelu(self.gelu(Y_r + Y_r_))
-		Y_s = self.gelu(self.gelu(Y_s + Y_s_))
-		y = Y_q + Y_r + Y_s
+			Y_q_ = self.gelu(Y_q_)
+			Y_r_ = self.gelu(Y_r_)
+			Y_s_ = self.gelu(Y_s_)
+			y = y + Y_q_ + Y_r_ + Y_s_
 
 		if self.head_subspaces:
 			y = y.permute(0, 2, 1, 3).reshape(batch_size, ntok, self.d_model)
