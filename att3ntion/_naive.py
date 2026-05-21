@@ -63,9 +63,6 @@ class _HypergraphAttentionNaive(nn.Module):
 			Vq = self.Wv_q(x).reshape(batch_size, ntok, self.n_heads, self.d_val).permute(0, 2, 1, 3)
 			Vr = self.Wv_r(x).reshape(batch_size, ntok, self.n_heads, self.d_val).permute(0, 2, 1, 3)
 			Vs = self.Wv_s(x).reshape(batch_size, ntok, self.n_heads, self.d_val).permute(0, 2, 1, 3)
-			# Vq_ = torch.zeros_like(Vq)
-			# Vr_ = torch.zeros_like(Vr)
-			# Vs_ = torch.zeros_like(Vs)
 
 		dot_product = torch.einsum('bhid,bhjd,bhkd->bhijk', Q, R, S)
 		dot_product = dot_product / (math.sqrt(self.d_head))

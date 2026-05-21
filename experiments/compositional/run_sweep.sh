@@ -1,7 +1,7 @@
 #!/usr/bin/bash
 
 # 1. Define Default Variables
-BATCH_SIZE=32 # same as the python script
+BATCH_SIZE=32 # same as default inthe python script
 EPOCHS=10
 LOG_NAME="test" # Default value if no argument is provided
 REPL=1 # what replicate this is
