@@ -53,6 +53,7 @@ class _HypergraphAttentionNaive(nn.Module):
 		S = S.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
 
 		if self.scatter:
+			# split the values into scatter and gather components
 			Vq_full = self.Wv_q(x)
 			Vr_full = self.Wv_r(x)
 			Vs_full = self.Wv_s(x)
@@ -88,6 +89,7 @@ class _HypergraphAttentionNaive(nn.Module):
 
 		if self.scatter:
 			# note: option for diamond op in scatter being 'add' removed.
+			# (see README.md)
 			Y_q_ = torch.einsum('bhijk,bhjd,bhijk,bhkd->bhid', Ar, Vr_, As, Vs_)
 			Y_r_ = torch.einsum('bhijk,bhid,bhijk,bhkd->bhjd', Aq, Vq_, As, Vs_)
 			Y_s_ = torch.einsum('bhijk,bhid,bhijk,bhjd->bhkd', Aq, Vq_, Ar, Vr_)
