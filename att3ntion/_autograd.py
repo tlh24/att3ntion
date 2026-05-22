@@ -302,11 +302,7 @@ class HypergraphAttention(nn.Module):
             self.scatter,
         )
 
-        Y_q = self.gelu(self.gelu(Y_q))
-        Y_r = self.gelu(self.gelu(Y_r))
-        Y_s = self.gelu(self.gelu(Y_s))
-
-        y = Y_q + Y_r + Y_s
+        y = self.gelu(Y_q) + self.gelu(Y_r) + self.gelu(Y_s)
 
         y = y.permute(0, 2, 1, 3).contiguous().view(batch_size, ntok, self.n_heads * self.head_dim)
 
