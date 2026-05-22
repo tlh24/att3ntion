@@ -79,30 +79,31 @@ class _HypergraphAttentionAutograd(Function):
         else:
             raise TypeError(f"C++ forward expected to return a tuple of 12 Tensors, but got {type(outputs_tuple)} with len {len(outputs_tuple) if isinstance(outputs_tuple, tuple) else 'N/A'}")
 
-        if scatter:
-            Y_q = Y_q + Y_q_
-            Y_r = Y_r + Y_r_
-            Y_s = Y_s + Y_s_
-
         if orig_seq_len != Y_q.size(2):
-            Y_q = Y_q[:, :, :orig_seq_len, :]
-            Y_r = Y_r[:, :, :orig_seq_len, :]
-            Y_s = Y_s[:, :, :orig_seq_len, :]
+            Y_q  = Y_q [:, :, :orig_seq_len, :]
+            Y_r  = Y_r [:, :, :orig_seq_len, :]
+            Y_s  = Y_s [:, :, :orig_seq_len, :]
+            Y_q_ = Y_q_[:, :, :orig_seq_len, :]
+            Y_r_ = Y_r_[:, :, :orig_seq_len, :]
+            Y_s_ = Y_s_[:, :, :orig_seq_len, :]
 
         if Y_q.dtype != input_dtype:
-            Y_q = Y_q.to(input_dtype)
-            Y_r = Y_r.to(input_dtype)
-            Y_s = Y_s.to(input_dtype)
+            Y_q  = Y_q .to(input_dtype)
+            Y_r  = Y_r .to(input_dtype)
+            Y_s  = Y_s .to(input_dtype)
+            Y_q_ = Y_q_.to(input_dtype)
+            Y_r_ = Y_r_.to(input_dtype)
+            Y_s_ = Y_s_.to(input_dtype)
 
         ctx.save_for_backward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
                               m_i, l_i, m_j, l_j, m_k, l_k)
         ctx.orig_seq_len = orig_seq_len
         ctx.input_dtype = input_dtype
-        
-        return Y_q, Y_r, Y_s
+
+        return Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_
 
     @staticmethod
-    def backward(ctx, grad_Y_q, grad_Y_r, grad_Y_s):
+    def backward(ctx, grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_):
         """
         Calls the C++ backward pass using saved tensors and pre-computed softmax stats.
         This avoids redundant computation of softmax statistics.
@@ -123,12 +124,24 @@ class _HypergraphAttentionAutograd(Function):
 
         TILE_SIZE = 16
         # Backward CUDA kernels use BF16 I/O with FP32 accumulation internally.
+        # Keep gather/scatter cotangents separate so each backward path receives
+        # the exact upstream gradient for its own output branch.
+        if grad_Y_q_ is None:
+            grad_Y_q_ = torch.zeros_like(grad_Y_q)
+        if grad_Y_r_ is None:
+            grad_Y_r_ = torch.zeros_like(grad_Y_r)
+        if grad_Y_s_ is None:
+            grad_Y_s_ = torch.zeros_like(grad_Y_s)
         grad_Y_q, _ = _pad_to_multiple(grad_Y_q.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
         grad_Y_r, _ = _pad_to_multiple(grad_Y_r.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
         grad_Y_s, _ = _pad_to_multiple(grad_Y_s.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
+        grad_Y_q_, _ = _pad_to_multiple(grad_Y_q_.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
+        grad_Y_r_, _ = _pad_to_multiple(grad_Y_r_.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
+        grad_Y_s_, _ = _pad_to_multiple(grad_Y_s_.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
 
         grad_tuple = torch.ops.att3ntion.hypergraph_backward(
-            grad_Y_q, grad_Y_r, grad_Y_s, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
+            grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_,
+            Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
             m_i, l_i, m_j, l_j, m_k, l_k
         )
 
@@ -293,7 +306,7 @@ class HypergraphAttention(nn.Module):
         R = R.reshape(batch_size, ntok, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
         S = S.reshape(batch_size, ntok, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
         
-        Y_q, Y_r, Y_s = _HypergraphAttentionAutograd.apply(
+        Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_ = _HypergraphAttentionAutograd.apply(
             Q, R, S,
             Vq_1, Vq_2,
             Vr_1, Vr_2,
@@ -302,11 +315,9 @@ class HypergraphAttention(nn.Module):
             self.scatter,
         )
 
-        Y_q = self.gelu(self.gelu(Y_q))
-        Y_r = self.gelu(self.gelu(Y_r))
-        Y_s = self.gelu(self.gelu(Y_s))
-
-        y = Y_q + Y_r + Y_s
+        y = self.gelu(Y_q) + self.gelu(Y_r) + self.gelu(Y_s)
+        if self.scatter:
+            y = y + self.gelu(Y_q_) + self.gelu(Y_r_) + self.gelu(Y_s_)
 
         y = y.permute(0, 2, 1, 3).contiguous().view(batch_size, ntok, self.n_heads * self.head_dim)
 

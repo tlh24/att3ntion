@@ -25,6 +25,8 @@ forward_cuda(
 // Backward pass using pre-computed softmax stats from forward pass.
 // This is the only backward API - stats must come from forward pass to ensure
 // numerical consistency and avoid redundant O(N²) computation.
+// Upstream grads include gather (grad_Y_q/r/s) and scatter (grad_Y_q_/r_/s_)
+// branches separately.
 std::tuple<at::Tensor, at::Tensor, at::Tensor,
            at::Tensor, at::Tensor, at::Tensor,
            at::Tensor, at::Tensor, at::Tensor>
@@ -32,6 +34,9 @@ backward_cuda(
     at::Tensor grad_Y_q,
     at::Tensor grad_Y_r,
     at::Tensor grad_Y_s,
+    at::Tensor grad_Y_q_,
+    at::Tensor grad_Y_r_,
+    at::Tensor grad_Y_s_,
     at::Tensor Q, at::Tensor R, at::Tensor S,
     at::Tensor Vq_1, at::Tensor Vq_2,
     at::Tensor Vr_1, at::Tensor Vr_2,

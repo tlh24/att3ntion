@@ -214,6 +214,9 @@ def demo_benchmark():
         grad_Y_q = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
         grad_Y_r = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
         grad_Y_s = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
+        grad_Y_q_ = torch.zeros_like(grad_Y_q)
+        grad_Y_r_ = torch.zeros_like(grad_Y_r)
+        grad_Y_s_ = torch.zeros_like(grad_Y_s)
         
         # Forward benchmarks
         def run_cuda_fwd():
@@ -233,7 +236,7 @@ def demo_benchmark():
         # Backward benchmarks
         def run_cuda_bwd():
             return cuda_ext.backward(
-                grad_Y_q, grad_Y_r, grad_Y_s, *cuda_inputs,
+                grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_, *cuda_inputs,
                 m_i, l_i, m_j, l_j, m_k, l_k, 0.0
             )
         
@@ -260,7 +263,7 @@ def demo_benchmark():
         
         print(f"{name:<12} │ {cuda_fwd_ms:>7.2f}ms {ref_fwd_ms:>7.2f}ms {fmt_ratio(fwd_ratio):>8} │ {cuda_bwd_ms:>7.2f}ms {ref_bwd_ms:>7.2f}ms {fmt_ratio(bwd_ratio):>8}")
         
-        del Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, grad_Y_q, grad_Y_r, grad_Y_s
+        del Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_
         torch.cuda.empty_cache()
     
     print("─" * 76)
