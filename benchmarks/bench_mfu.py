@@ -112,9 +112,15 @@ def main():
     dY_q = torch.randn(B, H, N, D, device="cuda", dtype=torch.bfloat16)
     dY_r = torch.randn(B, H, N, D, device="cuda", dtype=torch.bfloat16)
     dY_s = torch.randn(B, H, N, D, device="cuda", dtype=torch.bfloat16)
+    dY_q_ = torch.zeros_like(dY_q)
+    dY_r_ = torch.zeros_like(dY_r)
+    dY_s_ = torch.zeros_like(dY_s)
 
     fwd_fn = lambda: cuda_ext.forward(*inputs_bf16, 0.0)
-    bwd_fn = lambda: cuda_ext.backward(dY_q, dY_r, dY_s, *inputs_bf16, m_i, l_i, m_j, l_j, m_k, l_k, 0.0)
+    bwd_fn = lambda: cuda_ext.backward(
+        dY_q, dY_r, dY_s, dY_q_, dY_r_, dY_s_,
+        *inputs_bf16, m_i, l_i, m_j, l_j, m_k, l_k, 0.0
+    )
 
     # ── total MFU (wall-clock median) ─────────────────────────────────────────
     fwd_ms = benchmark_fn(fwd_fn, warmup=5, iters=20)[0]

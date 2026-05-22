@@ -86,10 +86,14 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim,
     if not forward_only:
         print("Running backward pass...")
         grad_Y_q, grad_Y_r, grad_Y_s = get_grad_outputs_cuda(Y_q_mc, Y_r_mc, Y_s_mc)
+        grad_Y_q_, grad_Y_r_, grad_Y_s_ = get_grad_outputs_cuda(Y_q__mc, Y_r__mc, Y_s__mc)
         _cuda_kernels.backward(
             grad_Y_q,
             grad_Y_r,
             grad_Y_s,
+            grad_Y_q_,
+            grad_Y_r_,
+            grad_Y_s_,
             *bwd_inputs,
             m_i, l_i,
             m_j, l_j,

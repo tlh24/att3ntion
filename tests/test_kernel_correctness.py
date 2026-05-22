@@ -365,14 +365,12 @@ class KernelTester:
         try:
             N = config.N
             inputs = self._create_inputs(config)
-            # Phase-2 path matches gather-only architecture (scatter disabled in
-            # module wrapper by zeroing V*_2). Mirror that setup here.
-            inputs['Vq_2'].zero_()
-            inputs['Vr_2'].zero_()
-            inputs['Vs_2'].zero_()
             grad_Y_q = torch.randn(config.B, config.H, N, config.D, device=self.device) * config.input_scale
             grad_Y_r = torch.randn(config.B, config.H, N, config.D, device=self.device) * config.input_scale
             grad_Y_s = torch.randn(config.B, config.H, N, config.D, device=self.device) * config.input_scale
+            grad_Y_q_ = torch.randn(config.B, config.H, N, config.D, device=self.device) * config.input_scale
+            grad_Y_r_ = torch.randn(config.B, config.H, N, config.D, device=self.device) * config.input_scale
+            grad_Y_s_ = torch.randn(config.B, config.H, N, config.D, device=self.device) * config.input_scale
 
             # Run forward pass first to get softmax stats needed by backward
             cuda_inputs_bf16 = {
@@ -397,6 +395,9 @@ class KernelTester:
                 grad_Y_q.clone().to(torch.bfloat16),
                 grad_Y_r.clone().to(torch.bfloat16),
                 grad_Y_s.clone().to(torch.bfloat16),
+                grad_Y_q_.clone().to(torch.bfloat16),
+                grad_Y_r_.clone().to(torch.bfloat16),
+                grad_Y_s_.clone().to(torch.bfloat16),
                 cuda_inputs_bf16['Q'], cuda_inputs_bf16['R'], cuda_inputs_bf16['S'],
                 cuda_inputs_bf16['Vq_1'], cuda_inputs_bf16['Vq_2'],
                 cuda_inputs_bf16['Vr_1'], cuda_inputs_bf16['Vr_2'],
@@ -419,6 +420,9 @@ class KernelTester:
                 (Y_q * grad_Y_q).sum()
                 + (Y_r * grad_Y_r).sum()
                 + (Y_s * grad_Y_s).sum()
+                + (Y_q_ * grad_Y_q_).sum()
+                + (Y_r_ * grad_Y_r_).sum()
+                + (Y_s_ * grad_Y_s_).sum()
             )
             loss.backward()
 

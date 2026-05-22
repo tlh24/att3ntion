@@ -66,13 +66,16 @@ def benchmark_backward(ext, fwd_inputs, bwd_inputs, warmup=3, iters=10):
     grad_Y_q = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
     grad_Y_r = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
     grad_Y_s = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
+    grad_Y_q_ = torch.zeros_like(grad_Y_q)
+    grad_Y_r_ = torch.zeros_like(grad_Y_r)
+    grad_Y_s_ = torch.zeros_like(grad_Y_s)
 
     fwd_out = ext.forward(*fwd_inputs, 0.0)
     m_i, l_i, m_j, l_j, m_k, l_k = fwd_out[6:12]
 
     def run():
         return ext.backward(
-            grad_Y_q, grad_Y_r, grad_Y_s, *bwd_inputs,
+            grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_, *bwd_inputs,
             m_i, l_i, m_j, l_j, m_k, l_k, 0.0
         )
     return benchmark_fn(run, warmup, iters)[0]
@@ -84,6 +87,9 @@ def measure_peak_memory(ext, fwd_inputs, bwd_inputs):
     grad_Y_q = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
     grad_Y_r = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
     grad_Y_s = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
+    grad_Y_q_ = torch.zeros_like(grad_Y_q)
+    grad_Y_r_ = torch.zeros_like(grad_Y_r)
+    grad_Y_s_ = torch.zeros_like(grad_Y_s)
 
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
@@ -92,7 +98,7 @@ def measure_peak_memory(ext, fwd_inputs, bwd_inputs):
     m_i, l_i, m_j, l_j, m_k, l_k = fwd_out[6:12]
 
     _ = ext.backward(
-        grad_Y_q, grad_Y_r, grad_Y_s, *bwd_inputs,
+        grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_, *bwd_inputs,
         m_i, l_i, m_j, l_j, m_k, l_k, 0.0
     )
     torch.cuda.synchronize()
