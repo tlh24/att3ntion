@@ -47,6 +47,7 @@ def _hypergraph_forward_fake(
 @custom_op("att3ntion::hypergraph_backward", mutates_args=())
 def hypergraph_backward(
     grad_Y_q: torch.Tensor, grad_Y_r: torch.Tensor, grad_Y_s: torch.Tensor,
+    grad_Y_q_: torch.Tensor, grad_Y_r_: torch.Tensor, grad_Y_s_: torch.Tensor,
     Q: torch.Tensor, R: torch.Tensor, S: torch.Tensor,
     Vq_1: torch.Tensor, Vq_2: torch.Tensor,
     Vr_1: torch.Tensor, Vr_2: torch.Tensor,
@@ -60,14 +61,16 @@ def hypergraph_backward(
     torch.Tensor, torch.Tensor, torch.Tensor,
 ]:
     return _cuda_kernels.backward(
-        grad_Y_q, grad_Y_r, grad_Y_s, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
+        grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_,
+        Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
         m_i, l_i, m_j, l_j, m_k, l_k,
     )
 
 
 @hypergraph_backward.register_fake
 def _hypergraph_backward_fake(
-    grad_Y_q, grad_Y_r, grad_Y_s, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
+    grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_,
+    Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
     m_i, l_i, m_j, l_j, m_k, l_k,
 ):
     return (
@@ -90,9 +93,22 @@ def _backward(
     grad_m_i, grad_l_i, grad_m_j, grad_l_j, grad_m_k, grad_l_k,
 ):
     Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, m_i, l_i, m_j, l_j, m_k, l_k = ctx.saved_tensors
+    if grad_Y_q is None:
+        grad_Y_q = torch.zeros_like(Q)
+    if grad_Y_r is None:
+        grad_Y_r = torch.zeros_like(R)
+    if grad_Y_s is None:
+        grad_Y_s = torch.zeros_like(S)
+    if grad_Y_q_ is None:
+        grad_Y_q_ = torch.zeros_like(grad_Y_q)
+    if grad_Y_r_ is None:
+        grad_Y_r_ = torch.zeros_like(grad_Y_r)
+    if grad_Y_s_ is None:
+        grad_Y_s_ = torch.zeros_like(grad_Y_s)
     return (
         *hypergraph_backward(
-            grad_Y_q, grad_Y_r, grad_Y_s, Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
+            grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_,
+            Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
             m_i, l_i, m_j, l_j, m_k, l_k,
         ),
         None,
