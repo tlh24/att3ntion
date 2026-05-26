@@ -94,13 +94,11 @@ class _HypergraphAttentionNaive(nn.Module):
 			mask_BHQT = mask[:,None,:,:] # all heads masked the same
 			mask_BHIJK = torch.logical_and(mask_BHQT[:,:,:,:,None], mask_BHQT[:,:,:,None,:])
 			mask_BHKZ = mask_BHIJK.flatten(3, 4) # [batch, head, key, other]
+			neginf = torch.full_like(dot_product_q, float('-inf'))
 
-			dot_product_q = torch.where(
-				mask_BHKZ, dot_product_q, torch.full_like(dot_product_q, float('-inf')))
-			dot_product_r = torch.where(
-				mask_BHKZ, dot_product_r, torch.full_like(dot_product_r, float('-inf')))
-			dot_product_s = torch.where(
-				mask_BHKZ, dot_product_s, torch.full_like(dot_product_s, float('-inf')))
+			dot_product_q = torch.where(mask_BHKZ, dot_product_q, neginf)
+			dot_product_r = torch.where(mask_BHKZ, dot_product_r, neginf)
+			dot_product_s = torch.where(mask_BHKZ, dot_product_s, neginf)
 
 		Aq = torch.softmax(dot_product_q, dim=-1).reshape(dot_product.shape)
 		Aq = torch.nan_to_num(Aq, nan=0.0)
