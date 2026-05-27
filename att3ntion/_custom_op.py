@@ -26,7 +26,7 @@ def hypergraph_forward(
     )
 
 
- 
+@hypergraph_forward.register_fake
 def _hypergraph_forward_fake(
     Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate,
     I_valid=-1, J_valid=-1, K_valid=-1,
