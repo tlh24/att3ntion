@@ -112,7 +112,10 @@ class SimpleCompModel(nn.Module):
 		self.gelu = QuickGELU()
 		
 	def forward(self, x, b):
-		# skip = b % (self.n_recurse)
+		# # skip = b % (self.n_recurse)
+		bs, ntok, d_model = x.shape
+		mask = torch.tril(torch.ones(ntok, ntok))
+		mask = mask.to(x.device)
 		skip = 0
 		if skip > 0:
 			with torch.no_grad():
@@ -125,7 +128,7 @@ class SimpleCompModel(nn.Module):
 					for layer_block in self.repeated_layers:
 						# attn_output = layer_block['attention'](x, self.rotary_emb)
 						xn = layer_block['norm1'](x) # PreNorm
-						attn_output = layer_block['attention'](xn, None)
+						attn_output = layer_block['attention'](xn, None, mask)
 						x = x + attn_output
 						xn = layer_block['norm2'](x)
 						ffn_output = layer_block['ffn'](xn)
@@ -134,7 +137,7 @@ class SimpleCompModel(nn.Module):
 				for layer_block in self.repeated_layers:
 					# attn_output = layer_block['attention'](x, self.rotary_emb)
 					xn = layer_block['norm1'](x)
-					attn_output = layer_block['attention'](xn, None)
+					attn_output = layer_block['attention'](xn, None, mask)
 					x = x + attn_output
 					xn = layer_block['norm2'](x)
 					ffn_output = layer_block['ffn'](xn)

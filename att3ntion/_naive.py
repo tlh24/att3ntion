@@ -3,6 +3,7 @@ import torch.nn as nn
 import math
 
 from att3ntion._autograd import QuickGELU
+import pdb
 
 
 class _HypergraphAttentionNaive(nn.Module):
@@ -84,21 +85,21 @@ class _HypergraphAttentionNaive(nn.Module):
 		dot_product = torch.einsum('bhid,bhjd,bhkd->bhijk', Q, R, S)
 		dot_product = dot_product / (math.sqrt(self.d_head))
 
-		dot_product_q = dot_product.flatten(3, 4) # BHQZ
-		dot_product_r = dot_product.permute(0, 1, 3, 2, 4).flatten(3, 4) # BHRZ
-		dot_product_s = dot_product.permute(0, 1, 4, 2, 3).flatten(3, 4) # BHSZ
+		dot_product_q = dot_product.flatten(3, 4) # BHI(JK)
+		dot_product_r = dot_product.permute(0, 1, 3, 2, 4).flatten(3, 4) # BHJ(IK)
+		dot_product_s = dot_product.permute(0, 1, 4, 2, 3).flatten(3, 4) # BHK(IJ)
 
 		if mask is not None:
-			if mask.ndim == 2:
-				mask = mask[:,None,:]
-			mask_BHQT = mask[:,None,:,:] # all heads masked the same
-			mask_BHIJK = torch.logical_and(mask_BHQT[:,:,:,:,None], mask_BHQT[:,:,:,None,:])
-			mask_BHKZ = mask_BHIJK.flatten(3, 4) # [batch, head, key, other]
-			neginf = torch.full_like(dot_product_q, float('-inf'))
-
-			dot_product_q = torch.where(mask_BHKZ, dot_product_q, neginf)
-			dot_product_r = torch.where(mask_BHKZ, dot_product_r, neginf)
-			dot_product_s = torch.where(mask_BHKZ, dot_product_s, neginf)
+			# mask is the standard 2D matrix (ntok, ntok)
+			assert(mask.ndim == 2)
+			inf = torch.full_like(mask, float('inf'))
+			mask_inf = torch.where(mask>0, mask, inf)
+			# any i can attend to j,k <= i (likewise for the other 2 permutations).
+			mask_inf3 = -1*(mask_inf[:,:,None] * mask_inf[:,None,:]).flatten(1,2) + 1 #invert then translate -1 to 0.  Can't be in-place op due to inf weirdness!
+			# the three dot_products are permuted and flattened so that the last dim is the softmax dim. * doesn't work, has to be +
+			dot_product_q = dot_product_q + mask_inf3[None,None,:,:]
+			dot_product_r = dot_product_r + mask_inf3[None,None,:,:]
+			dot_product_s = dot_product_s + mask_inf3[None,None,:,:]
 
 		Aq = torch.softmax(dot_product_q, dim=-1).reshape(dot_product.shape)
 		Aq = torch.nan_to_num(Aq, nan=0.0)
