@@ -7,7 +7,14 @@ from att3ntion._autograd import QuickGELU
 
 class _HypergraphAttentionNaive(nn.Module):
 	"""Pure-PyTorch naive O(N^3) implementation for correctness testing."""
-	def __init__(self, d_model, n_heads, dropout_rate=0, head_subspaces=False, scatter=False, **kwargs):
+	def __init__(
+			self, d_model, n_heads, dropout_rate=0,
+			head_subspaces=False,
+			scatter=False,
+			qrs_bias=False,
+			value_bias=False,
+			out_bias=False,
+			**kwargs):
 		super().__init__()
 
 		self.d_model = d_model
@@ -20,21 +27,23 @@ class _HypergraphAttentionNaive(nn.Module):
 		self.d_val = self.d_head*1
 		self.scatter = scatter
 
-		self.Wq = nn.Linear(d_model, self.d_head*n_heads, bias=False, **kwargs)
-		self.Wr = nn.Linear(d_model, self.d_head*n_heads, bias=False, **kwargs)
-		self.Ws = nn.Linear(d_model, self.d_head*n_heads, bias=False, **kwargs)
+		self.Wq = nn.Linear(d_model, self.d_head*n_heads, bias=qrs_bias, **kwargs)
+		self.Wr = nn.Linear(d_model, self.d_head*n_heads, bias=qrs_bias, **kwargs)
+		self.Ws = nn.Linear(d_model, self.d_head*n_heads, bias=qrs_bias, **kwargs)
 
 		value_proj_multiplier = 2 if self.scatter else 1
-		self.Wv_q = nn.Linear(d_model, self.d_val*n_heads*value_proj_multiplier, bias=True, **kwargs)
-		self.Wv_r = nn.Linear(d_model, self.d_val*n_heads*value_proj_multiplier, bias=True, **kwargs)
-		self.Wv_s = nn.Linear(d_model, self.d_val*n_heads*value_proj_multiplier, bias=True, **kwargs)
+		self.Wv_q = nn.Linear(d_model, self.d_val*n_heads*value_proj_multiplier, bias=value_bias, **kwargs)
+		self.Wv_r = nn.Linear(d_model, self.d_val*n_heads*value_proj_multiplier, bias=value_bias, **kwargs)
+		self.Wv_s = nn.Linear(d_model, self.d_val*n_heads*value_proj_multiplier, bias=value_bias, **kwargs)
+
+		self.Wo = nn.Linear(self.d_model, d_model, bias=out_bias, **kwargs)
 
 		self.Wo = nn.Linear(self.d_model, d_model, bias=True, **kwargs)
 
 		self.dropout = nn.Dropout(dropout_rate)
 		self.gelu = QuickGELU()
 
-	def forward(self, x, rotary_emb, mask):
+	def forward(self, x, rotary_emb, mask=None):
 		out_dtype = x.dtype
 		x = x.float()
 		batch_size, ntok, d_model = x.shape
@@ -158,7 +167,7 @@ class _GraphAttentionNaive(nn.Module):
 		self.dropout = nn.Dropout(dropout_rate)
 		self.gelu = QuickGELU()
 
-	def forward(self, x, rotary_emb):
+	def forward(self, x, rotary_emb, mask=None):
 		out_dtype = x.dtype
 		x = x.float()
 		batch_size, ntok, d_model = x.shape
@@ -177,9 +186,9 @@ class _GraphAttentionNaive(nn.Module):
 		V = V.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
 
 		A = torch.einsum('bhid,bhjd->bhij', Q, K)
-		if False:  # causal attention
-			mask = torch.triu(torch.ones(ntok, ntok), diagonal=1).bool().to(x.device)
-			A = A.masked_fill(mask, -torch.inf)
+		if mask is not None:  # causal attention
+			invalid = mask <= 0
+			A = A.masked_fill(invalid, -torch.inf)
 		A = torch.softmax(A, dim=-1)
 		y = torch.einsum('bhij,bhjd->bhid', A, V)
 
