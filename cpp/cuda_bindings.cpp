@@ -29,7 +29,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("Vr_2"),
           py::arg("Vs_1"),
           py::arg("Vs_2"),
-          py::arg("dropout_rate") = 0.0);
+          py::arg("dropout_rate") = 0.0,
+          py::arg("I_valid") = -1,
+          py::arg("J_valid") = -1,
+          py::arg("K_valid") = -1);
 
     m.def("backward", &backward_cuda,
           "Hypergraph Attention backward (requires pre-computed softmax stats from forward pass)",
