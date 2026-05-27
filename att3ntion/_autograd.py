@@ -70,12 +70,6 @@ class _HypergraphAttentionAutograd(Function):
         Vs_1, _ = _pad_to_multiple(Vs_1.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
         Vs_2, _ = _pad_to_multiple(Vs_2.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
 
-        # Tell the gather kernels the *unpadded* sequence length so they can
-        # mask softmax cells with j_global >= orig_seq_len (and k/i analogously)
-        # to NEG_INF. Without this, padded slots contribute exp(0 - m) to the
-        # softmax denominator and dampen the valid weights — making the CUDA
-        # output disagree with the unpadded naive reference whenever
-        # orig_seq_len % TILE_SIZE != 0.
         outputs_tuple = torch.ops.att3ntion.hypergraph_forward(
             Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate,
             orig_seq_len, orig_seq_len, orig_seq_len,
