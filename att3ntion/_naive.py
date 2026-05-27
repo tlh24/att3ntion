@@ -82,12 +82,16 @@ class _HypergraphAttentionNaive(nn.Module):
 		dot_product_s = dot_product.permute(0, 1, 4, 2, 3).flatten(3, 4) # BHK(IJ)
 
 		if mask is not None:
-			# mask is the standard 2D matrix (ntok, ntok)
-			assert(mask.ndim == 2)
+			if mask.ndim == 2:
+				# mask is the standard 2D matrix (ntok, ntok)
+				# add in a (dummy, broadcasted) batch dim
+				mask = mask[None,:,:]
+			# otherwise can have a different mask per batch element
+			assert(mask.ndim == 3)
 			valid = mask > 0 # convert to boolean (byte)
 			# any i can attend to j,k <= i (likewise for the other 2 permutations).
-			valid3 = (valid[:, :, None] & valid[:, None, :]).flatten(1, 2)
-			invalid3 = ~(valid3[None, None, :, :])
+			valid3 = (valid[:,:,:,None] & valid[:,:,None,:]).flatten(2, 3)
+			invalid3 = ~(valid3[:,None,:,:])
 			# the three dot_products are permuted and flattened so that the last dim is the softmax dim.
 			dot_product_q = dot_product_q.masked_fill(invalid3, float('-inf'))
 			dot_product_r = dot_product_r.masked_fill(invalid3, float('-inf'))
@@ -188,6 +192,7 @@ class _GraphAttentionNaive(nn.Module):
 		A = torch.einsum('bhid,bhjd->bhij', Q, K)
 		if mask is not None:  # causal attention
 			invalid = mask <= 0
+			# this should broadcast properly if mask.ndim is 3 or 2
 			A = A.masked_fill(invalid, -torch.inf)
 		A = torch.softmax(A, dim=-1)
 		y = torch.einsum('bhij,bhjd->bhid', A, V)
