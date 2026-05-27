@@ -47,6 +47,12 @@ constexpr int MIN_SPLIT_CHUNKS = 4;  // Only split loops across blocks when >= t
 constexpr int MAX_SPLIT_CHUNKS = 16; // Cap split workspace growth and reducer scratch.
 
 // Multi-i warp-parallel gather: 4 output vectors per block, warp-shuffle softmax
+//
+// I/J/K are the *padded* sizes (multiple of TILE_I/J/K) used for tile loops and
+// shared-memory loads. I_valid/J_valid/K_valid are the *original* (pre-pad)
+// sizes used to mask the dot-product softmax: cells with j_global >= J_valid
+// or k_global >= K_valid get NEG_INF so the padded slots drop out of both the
+// running max and the denominator, matching the unpadded reference.
 template<int D_CONST>
 __global__
 void Yq_gather(
@@ -59,7 +65,8 @@ void Yq_gather(
     float*       __restrict__ m_i_out,
     float*       __restrict__ l_i_out,
     int B, int H, int I, int J, int K, float scale,
-    int num_j_chunks)
+    int num_j_chunks,
+    int I_valid, int J_valid, int K_valid)
 {
     const int j_chunk = blockIdx.x % num_j_chunks;
     const int i_base = (blockIdx.x / num_j_chunks) * N_I_GATHER;
@@ -147,7 +154,7 @@ void Yq_gather(
                     int kt = cell_idx % TILE_K;
                     
                     float dot = 0.0f;
-                    if (my_i_valid && j0 + jt < J && k0 + kt < K) {
+                    if (my_i_valid && j0 + jt < J_valid && k0 + kt < K_valid) {
                         float d_accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                         #pragma unroll 4
                         for (int d = 0; d < D_CONST; d += 4) {
@@ -192,7 +199,7 @@ void Yq_gather(
                 if (cell_idx < TILE_J * TILE_K) {
                     int jt = cell_idx / TILE_K;
                     int kt = cell_idx % TILE_K;
-                    if (my_i_valid && j0 + jt < J && k0 + kt < K) {
+                    if (my_i_valid && j0 + jt < J_valid && k0 + kt < K_valid) {
                         float p_val = expf(my_p[cell_idx] * scale - m_ij);
                         my_p[cell_idx] = p_val;
                         l_ij += p_val;
@@ -584,7 +591,8 @@ void Yr_gather(
     float*       __restrict__ m_j_out,
     float*       __restrict__ l_j_out,
     int B, int H, int I, int J, int K, float scale,
-    int num_i_chunks)
+    int num_i_chunks,
+    int I_valid, int J_valid, int K_valid)
 {
     const int i_chunk = blockIdx.x % num_i_chunks;
     const int j_base = (blockIdx.x / num_i_chunks) * N_I_GATHER;
@@ -672,7 +680,7 @@ void Yr_gather(
                     int kt = cell_idx % TILE_K;
                     
                     float dot = 0.0f;
-                    if (my_j_valid && i0 + it < I && k0 + kt < K) {
+                    if (my_j_valid && i0 + it < I_valid && k0 + kt < K_valid) {
                         float d_accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                         #pragma unroll 4
                         for (int d = 0; d < D_CONST; d += 4) {
@@ -717,7 +725,7 @@ void Yr_gather(
                 if (cell_idx < TILE_I * TILE_K) {
                     int it = cell_idx / TILE_K;
                     int kt = cell_idx % TILE_K;
-                    if (my_j_valid && i0 + it < I && k0 + kt < K) {
+                    if (my_j_valid && i0 + it < I_valid && k0 + kt < K_valid) {
                         float p_val = expf(my_p[cell_idx] * scale - m_ij);
                         my_p[cell_idx] = p_val;
                         l_ij += p_val;
@@ -819,7 +827,8 @@ void Ys_gather(
     float*       __restrict__ m_k_out,
     float*       __restrict__ l_k_out,
     int B, int H, int I, int J, int K, float scale,
-    int num_i_chunks)
+    int num_i_chunks,
+    int I_valid, int J_valid, int K_valid)
 {
     const int i_chunk = blockIdx.x % num_i_chunks;
     const int k_base = (blockIdx.x / num_i_chunks) * N_I_GATHER;
@@ -907,7 +916,7 @@ void Ys_gather(
                     int jt = cell_idx % TILE_J;
                     
                     float dot = 0.0f;
-                    if (my_k_valid && i0 + it < I && j0 + jt < J) {
+                    if (my_k_valid && i0 + it < I_valid && j0 + jt < J_valid) {
                         float d_accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                         #pragma unroll 4
                         for (int d = 0; d < D_CONST; d += 4) {
@@ -952,7 +961,7 @@ void Ys_gather(
                 if (cell_idx < TILE_I * TILE_J) {
                     int it = cell_idx / TILE_J;
                     int jt = cell_idx % TILE_J;
-                    if (my_k_valid && i0 + it < I && j0 + jt < J) {
+                    if (my_k_valid && i0 + it < I_valid && j0 + jt < J_valid) {
                         float p_val = expf(my_p[cell_idx] * scale - m_ij);
                         my_p[cell_idx] = p_val;
                         l_ij += p_val;
@@ -2088,7 +2097,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     at::Tensor Vq_1, at::Tensor Vq_2,
     at::Tensor Vr_1, at::Tensor Vr_2,
     at::Tensor Vs_1, at::Tensor Vs_2,
-    double dropout_rate) {
+    double dropout_rate,
+    int64_t I_valid, int64_t J_valid, int64_t K_valid) {
     Q = Q.contiguous();  
     R = R.contiguous();  
     S = S.contiguous();
@@ -2105,6 +2115,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     const auto J = R.size(2);
     const auto K = S.size(2);
     const auto D = Q.size(3);
+
+    // Default I_valid/J_valid/K_valid to the padded sizes (no masking) when
+    // callers don't supply them. This preserves the legacy behavior where the
+    // softmax denominator includes padded slots.
+    if (I_valid <= 0 || I_valid > I) I_valid = I;
+    if (J_valid <= 0 || J_valid > J) J_valid = J;
+    if (K_valid <= 0 || K_valid > K) K_valid = K;
 
     const float scale = 1.0f / sqrtf((float)D); 
 
@@ -2250,7 +2267,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
             m_part_q.data_ptr<float>(),
             l_part_q.data_ptr<float>(),
             B, H, I, J, K, scale,
-            num_j_chunks_q
+            num_j_chunks_q,
+            (int)I_valid, (int)J_valid, (int)K_valid
         );
 
         reduce_gather_partials<D_TMPL><<<dim3(I, H, B), D_TMPL, 0, streams[0]>>>(
@@ -2290,7 +2308,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
             m_part_r.data_ptr<float>(),
             l_part_r.data_ptr<float>(),
             B, H, I, J, K, scale,
-            num_i_chunks_r
+            num_i_chunks_r,
+            (int)I_valid, (int)J_valid, (int)K_valid
         );
 
         reduce_gather_partials<D_TMPL><<<dim3(J, H, B), D_TMPL, 0, streams[1]>>>(
@@ -2330,7 +2349,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
             m_part_s.data_ptr<float>(),
             l_part_s.data_ptr<float>(),
             B, H, I, J, K, scale,
-            num_i_chunks_s
+            num_i_chunks_s,
+            (int)I_valid, (int)J_valid, (int)K_valid
         );
 
         reduce_gather_partials<D_TMPL><<<dim3(K, H, B), D_TMPL, 0, streams[2]>>>(

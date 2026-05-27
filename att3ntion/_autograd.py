@@ -71,7 +71,8 @@ class _HypergraphAttentionAutograd(Function):
         Vs_2, _ = _pad_to_multiple(Vs_2.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
 
         outputs_tuple = torch.ops.att3ntion.hypergraph_forward(
-            Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate
+            Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate,
+            orig_seq_len, orig_seq_len, orig_seq_len,
         )
 
         if isinstance(outputs_tuple, tuple) and len(outputs_tuple) == 12:
