@@ -75,14 +75,14 @@ class _HypergraphAttentionNaive(nn.Module):
 		if mask is not None:
 			# mask is the standard 2D matrix (ntok, ntok)
 			assert(mask.ndim == 2)
-			inf = torch.full_like(mask, float('inf'))
-			mask_inf = torch.where(mask>0, mask, inf)
+			valid = mask > 0 # convert to boolean (byte)
 			# any i can attend to j,k <= i (likewise for the other 2 permutations).
-			mask_inf3 = -1*(mask_inf[:,:,None] * mask_inf[:,None,:]).flatten(1,2) + 1 #invert then translate -1 to 0.  Can't be in-place op due to inf weirdness!
-			# the three dot_products are permuted and flattened so that the last dim is the softmax dim. * doesn't work, has to be +
-			dot_product_q = dot_product_q + mask_inf3[None,None,:,:]
-			dot_product_r = dot_product_r + mask_inf3[None,None,:,:]
-			dot_product_s = dot_product_s + mask_inf3[None,None,:,:]
+			valid3 = (valid[:, :, None] & valid[:, None, :]).flatten(1, 2)
+			invalid3 = ~(valid3[None, None, :, :])
+			# the three dot_products are permuted and flattened so that the last dim is the softmax dim.
+			dot_product_q = dot_product_q.masked_fill(invalid3, float('-inf'))
+			dot_product_r = dot_product_r.masked_fill(invalid3, float('-inf'))
+			dot_product_s = dot_product_s.masked_fill(invalid3, float('-inf'))
 
 		Aq = torch.softmax(dot_product_q, dim=-1).reshape(dot_product.shape)
 		Aq = torch.nan_to_num(Aq, nan=0.0)

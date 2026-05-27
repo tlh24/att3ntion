@@ -311,7 +311,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	# optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), 'cuda')
 	optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, amsgrad=True)
 	model.printParamCount()
-	model = torch.compile(model, backend="eager") # mode="max-autotune"
+	# model = torch.compile(model, backend="eager") # mode="max-autotune"
 
 	if no_amp:
 		print("--- Running in full fp32 ---")
