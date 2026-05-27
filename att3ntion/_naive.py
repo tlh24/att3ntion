@@ -3,19 +3,11 @@ import torch.nn as nn
 import math
 
 from att3ntion._autograd import QuickGELU
-import pdb
 
 
 class _HypergraphAttentionNaive(nn.Module):
 	"""Pure-PyTorch naive O(N^3) implementation for correctness testing."""
-	def __init__(
-			self, d_model, n_heads, dropout_rate=0, 
-			head_subspaces=False, 
-			scatter=False, 
-			qrs_bias=False,
-			value_bias=False,
-			out_bias=False,
-			**kwargs):
+	def __init__(self, d_model, n_heads, dropout_rate=0, head_subspaces=False, scatter=False, **kwargs):
 		super().__init__()
 
 		self.d_model = d_model
@@ -28,28 +20,21 @@ class _HypergraphAttentionNaive(nn.Module):
 		self.d_val = self.d_head*1
 		self.scatter = scatter
 
-		self.Wq = nn.Linear(d_model, self.d_head*n_heads, bias=qrs_bias, **kwargs)
-		self.Wr = nn.Linear(d_model, self.d_head*n_heads, bias=qrs_bias, **kwargs)
-		self.Ws = nn.Linear(d_model, self.d_head*n_heads, bias=qrs_bias, **kwargs)
+		self.Wq = nn.Linear(d_model, self.d_head*n_heads, bias=False, **kwargs)
+		self.Wr = nn.Linear(d_model, self.d_head*n_heads, bias=False, **kwargs)
+		self.Ws = nn.Linear(d_model, self.d_head*n_heads, bias=False, **kwargs)
 
 		value_proj_multiplier = 2 if self.scatter else 1
-		self.Wv_q = nn.Linear(d_model, self.d_val*n_heads*value_proj_multiplier, bias=value_bias, **kwargs)
-		self.Wv_r = nn.Linear(d_model, self.d_val*n_heads*value_proj_multiplier, bias=value_bias, **kwargs)
-		self.Wv_s = nn.Linear(d_model, self.d_val*n_heads*value_proj_multiplier, bias=value_bias, **kwargs)
+		self.Wv_q = nn.Linear(d_model, self.d_val*n_heads*value_proj_multiplier, bias=True, **kwargs)
+		self.Wv_r = nn.Linear(d_model, self.d_val*n_heads*value_proj_multiplier, bias=True, **kwargs)
+		self.Wv_s = nn.Linear(d_model, self.d_val*n_heads*value_proj_multiplier, bias=True, **kwargs)
 
-		self.Wo = nn.Linear(self.d_model, d_model, bias=out_bias, **kwargs)
+		self.Wo = nn.Linear(self.d_model, d_model, bias=True, **kwargs)
 
 		self.dropout = nn.Dropout(dropout_rate)
 		self.gelu = QuickGELU()
 
 	def forward(self, x, rotary_emb, mask):
-		"""
-		x: float[batch, ctx, model]
-		rotary_emb: instance of rotary_embedding_torch.RotaryEmbedding
-		mask is one of:
-			bool[batch, target] - a target mask applied to all queries
-			bool[batch, query, target] - a target mask specific to each query
-		"""
 		out_dtype = x.dtype
 		x = x.float()
 		batch_size, ntok, d_model = x.shape
@@ -68,6 +53,7 @@ class _HypergraphAttentionNaive(nn.Module):
 		S = S.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
 
 		if self.scatter:
+			# split the values into scatter and gather components
 			Vq_full = self.Wv_q(x)
 			Vr_full = self.Wv_r(x)
 			Vs_full = self.Wv_s(x)
@@ -78,9 +64,6 @@ class _HypergraphAttentionNaive(nn.Module):
 			Vq = self.Wv_q(x).reshape(batch_size, ntok, self.n_heads, self.d_val).permute(0, 2, 1, 3)
 			Vr = self.Wv_r(x).reshape(batch_size, ntok, self.n_heads, self.d_val).permute(0, 2, 1, 3)
 			Vs = self.Wv_s(x).reshape(batch_size, ntok, self.n_heads, self.d_val).permute(0, 2, 1, 3)
-			Vq_ = torch.zeros_like(Vq)
-			Vr_ = torch.zeros_like(Vr)
-			Vs_ = torch.zeros_like(Vs)
 
 		dot_product = torch.einsum('bhid,bhjd,bhkd->bhijk', Q, R, S)
 		dot_product = dot_product / (math.sqrt(self.d_head))
@@ -115,31 +98,27 @@ class _HypergraphAttentionNaive(nn.Module):
 		Y_q = torch.einsum('bhijk,bhjd,bhkd->bhid', Aq, Vr, Vs)
 		Y_r = torch.einsum('bhijk,bhid,bhkd->bhjd', Ar, Vq, Vs)
 		Y_s = torch.einsum('bhijk,bhid,bhjd->bhkd', As, Vq, Vr)
+		Y_q = self.gelu(Y_q)
+		Y_r = self.gelu(Y_r)
+		Y_s = self.gelu(Y_s)
+		y = Y_q + Y_r + Y_s
 
 		if self.scatter:
+			# note: option for diamond op in scatter being 'add' removed.
+			# (see README.md)
 			Y_q_ = torch.einsum('bhijk,bhjd,bhijk,bhkd->bhid', Ar, Vr_, As, Vs_)
 			Y_r_ = torch.einsum('bhijk,bhid,bhijk,bhkd->bhjd', Aq, Vq_, As, Vs_)
 			Y_s_ = torch.einsum('bhijk,bhid,bhijk,bhjd->bhkd', Aq, Vq_, Ar, Vr_)
-		else:
-			Y_q_ = torch.zeros_like(Y_q)
-			Y_r_ = torch.zeros_like(Y_r)
-			Y_s_ = torch.zeros_like(Y_s)
-
-		Y_q = self.gelu(self.gelu(Y_q + Y_q_))
-		Y_r = self.gelu(self.gelu(Y_r + Y_r_))
-		Y_s = self.gelu(self.gelu(Y_s + Y_s_))
-		y = Y_q + Y_r + Y_s
+			Y_q_ = self.gelu(Y_q_)
+			Y_r_ = self.gelu(Y_r_)
+			Y_s_ = self.gelu(Y_s_)
+			y = y + Y_q_ + Y_r_ + Y_s_
 
 		if self.head_subspaces:
 			y = y.permute(0, 2, 1, 3).reshape(batch_size, ntok, self.d_model)
 		else:
 			y = y.permute(0, 2, 1, 3).sum(dim=2).squeeze()
 		y = self.Wo(y)
-
-		if torch.isnan(y.sum()):
-			import pdb
-			pdb.set_trace()
-
 		return y.to(out_dtype)
 
 	def calcFlops(self, x):
