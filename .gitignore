@@ -1,50 +1,57 @@
 myenv
 
 *.pt
-*.pyc
-*.pyo
-*.pyd
-*.pyw
-*.pyz
-*.pywz
-*.pywzc
-losslog.txt
+*.tar.gz
 
 # Build artifacts
 build/
-dist/
 *.so
-*.pyd
-*.dll
-*.dylib
 *.egg-info/
-
-# LibTorch
-libtorch/
-libtorch.zip
 
 # Python cache
 __pycache__/
 *.py[cod]
-*$py.class
 
-# Temporary files
-*.log
-.DS_Store
-
-# Profiling reports
+# Profiling reports (machine-specific, large binaries)
 *.ncu-rep
 profiling_reports/
 
-# IDE and editor files
+# Benchmark results (machine-specific timings)
+benchmarks/benchmark_history.jsonl
+
+# Per-run training loss logs (machine-specific, large)
+experiments/compositional/losslog_*.txt
+
+# Per-run session narratives (reference per-machine bench numbers).
+# NOTE: optimization_log/changelog.jsonl IS committed — team-shared history
+# of what's been tried, avoids repeat work.
+optimization_log/sessions/
+
+# Agent-generated state artifacts (machine-specific profile snapshots)
+.agent/state/
+
+# Python tooling caches
+.pytest_cache/
+
+# User-local Claude/Cursor configs (but commit project skills + rules)
+.claude/settings.local.json
+.claude/logs/
+.cursor/settings.json
+
+# Editor / OS noise (for teammates on other setups)
 .vscode/
 .idea/
+.DS_Store
 *.swp
 *.swo
-*~
 
-# Jupyter notebooks
-.ipynb_checkpoints/
+# Env files (safety — may contain secrets)
+.env
+.env.*
+!.env.example
 
-# Output directories
-comparison_plots/
+
+# CLAUDE (personal, gitignored)
+CLAUDE.md
+.claude/
+.cursor/

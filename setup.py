@@ -32,15 +32,15 @@ def get_cuda_arch_flags():
 	return flags
 
 setup(
-    name='hyper_attn_extensions',
+    name='att3ntion',
     version='0.2.0',
     ext_modules=[
         CppExtension(
-            name='hyper_attn_cpp_reference',
+            name='att3ntion._torch_kernels',
             sources=['cpp/torch_reference.cpp'],
         ),
         CUDAExtension(
-            name='hyper_attn_cpp_manual',
+            name='att3ntion._cuda_kernels',
             sources=[
                 'cpp/cuda_bindings.cpp',
                 'cuda/forward.cu',
@@ -51,8 +51,8 @@ setup(
                 'nvcc': [
                     '-O3',
                     *get_cuda_arch_flags(),
-                    # '-DTORCH_USE_CUDA_DSA', # for debugging
-                    # '-lineinfo' # for debugging
+                    # '-DTORCH_USE_CUDA_DSA',  #for debugging
+                    # '-lineinfo'              #for debugging
                 ]
             }
         ),

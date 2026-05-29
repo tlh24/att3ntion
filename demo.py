@@ -5,11 +5,13 @@ att3ntion Demo: Hypergraph Attention with Flash-style Memory Efficiency
 This demo showcases:
 1. Basic usage of the HypergraphAttention layer
 2. Memory scaling comparison (O(N) vs naive O(N³))
-3. Training on a compositional arithmetic task
+3. Timing comparison: CUDA kernels vs PyTorch reference
+4. Training on a compositional arithmetic task
 
 Usage:
     python demo.py                    # Quick sanity check
     python demo.py --memory           # Memory scaling benchmark
+    python demo.py --benchmark        # CUDA vs Torch timing comparison
     python demo.py --train            # Train on modular arithmetic
     python demo.py --all              # Run everything
 """
@@ -31,13 +33,13 @@ def demo_basic_usage():
     print("🔺 att3ntion: 3-Way Hypergraph Attention")
     print("=" * 60)
     
-    from hypergraph_attention import HypergraphAttentionCPP
+    from att3ntion import HypergraphAttention
     
     # Create layer
     # CUDA kernel requires head_dim (d_model/n_heads) to be a multiple of 4
     d_model = 64
     n_heads = 4  # head_dim = 64/4 = 16
-    layer = HypergraphAttentionCPP(d_model=d_model, n_heads=n_heads)
+    layer = HypergraphAttention(d_model=d_model, n_heads=n_heads)
     
     print(f"\nLayer config: d_model={d_model}, n_heads={n_heads}")
     print(f"Parameters: {sum(p.numel() for p in layer.parameters()):,}")
@@ -82,7 +84,7 @@ def demo_memory_scaling():
         print("⚠ CUDA not available. Skipping memory benchmark.")
         return
     
-    from hypergraph_attention import HypergraphAttentionCPP
+    from att3ntion import HypergraphAttention
     
     print(f"\nGPU: {torch.cuda.get_device_name(0)}")
     print(f"Testing sequence lengths: 32, 64, 128, 256, 512")
@@ -102,7 +104,7 @@ def demo_memory_scaling():
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         
-        layer = HypergraphAttentionCPP(d_model=d_model, n_heads=n_heads).cuda()
+        layer = HypergraphAttention(d_model=d_model, n_heads=n_heads).cuda()
         x = torch.randn(batch_size, seq_len, d_model, device='cuda', requires_grad=True)
         
         # Forward + backward
@@ -123,6 +125,149 @@ def demo_memory_scaling():
         del layer, x, y
         torch.cuda.empty_cache()
     
+    print("\n" + "-" * 60)
+
+
+# ============================================================================
+# TIMING BENCHMARK: CUDA vs TORCH
+# ============================================================================
+
+def benchmark_fn(fn, warmup=5, iters=20):
+    """Benchmark a function using CUDA events. Returns (median_ms, min_ms, max_ms)."""
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+
+    times = []
+    for _ in range(iters):
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        fn()
+        end_event.record()
+        torch.cuda.synchronize()
+        times.append(start_event.elapsed_time(end_event))
+
+    times.sort()
+    median = times[len(times) // 2]
+    return median, min(times), max(times)
+
+
+def demo_benchmark():
+    """Compare CUDA kernel timing vs PyTorch reference implementation."""
+    print("\n" + "=" * 60)
+    print("⏱️  Timing Benchmark: CUDA Kernels vs PyTorch Reference")
+    print("=" * 60)
+    
+    if not torch.cuda.is_available():
+        print("⚠ CUDA not available. Skipping timing benchmark.")
+        return
+    
+    # Import both implementations
+    try:
+        import att3ntion._cuda_kernels as cuda_ext
+    except ImportError:
+        print("⚠ CUDA extension not found. Run: python setup.py develop")
+        return
+    
+    try:
+        import att3ntion._torch_kernels as ref_ext
+    except ImportError:
+        print("⚠ Reference extension not found. Run: python setup.py develop")
+        return
+    
+    print(f"\nGPU: {torch.cuda.get_device_name(0)}")
+    print("\nComparing forward and backward pass timings.")
+    print("Lower is better. Ratio < 1.0 means CUDA is faster.\n")
+    
+    # Test configurations: (N, D) pairs
+    configs = [
+        ("N32_D32",  32,  32),
+        ("N64_D32",  64,  32),
+        ("N64_D64",  64,  64),
+        ("N128_D32", 128, 32),
+        ("N128_D64", 128, 64),
+    ]
+    
+    B, H = 1, 2  # batch, heads
+    warmup, iters = 5, 20
+    
+    print(f"{'Config':<12} │ {'Forward':^29} │ {'Backward':^29}")
+    print(f"{'':12} │ {'CUDA':>8}  {'Torch':>8}  {'Ratio':>8} │ {'CUDA':>8}  {'Torch':>8}  {'Ratio':>8}")
+    print("─" * 76)
+    
+    for name, N, D in configs:
+        torch.cuda.empty_cache()
+        torch.manual_seed(42)
+        
+        # Create inputs
+        Q    = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
+        R    = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
+        S    = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
+        Vq_1 = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
+        Vq_2 = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
+        Vr_1 = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
+        Vr_2 = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
+        Vs_1 = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
+        Vs_2 = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
+        cuda_inputs = tuple(t.to(torch.bfloat16) for t in (Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2))
+        grad_Y_q = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
+        grad_Y_r = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
+        grad_Y_s = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
+        grad_Y_q_ = torch.zeros_like(grad_Y_q)
+        grad_Y_r_ = torch.zeros_like(grad_Y_r)
+        grad_Y_s_ = torch.zeros_like(grad_Y_s)
+        
+        # Forward benchmarks
+        def run_cuda_fwd():
+            return cuda_ext.forward(*cuda_inputs, 0.0)
+        
+        def run_ref_fwd():
+            return ref_ext.forward(*cuda_inputs, 0.0)
+        
+        cuda_fwd_ms, _, _ = benchmark_fn(run_cuda_fwd, warmup, iters)
+        ref_fwd_ms, _, _ = benchmark_fn(run_ref_fwd, warmup, iters)
+        fwd_ratio = cuda_fwd_ms / ref_fwd_ms if ref_fwd_ms > 0 else float('inf')
+        
+        # Get forward outputs for backward pass
+        fwd_out = cuda_ext.forward(*cuda_inputs, 0.0)
+        m_i, l_i, m_j, l_j, m_k, l_k = fwd_out[6:12]
+        
+        # Backward benchmarks
+        def run_cuda_bwd():
+            return cuda_ext.backward(
+                grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_, *cuda_inputs,
+                m_i, l_i, m_j, l_j, m_k, l_k, 0.0
+            )
+        
+        def run_ref_bwd():
+            # Reference uses autograd
+            inputs = [Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2]
+            ref_inputs = [t.detach().clone().requires_grad_(True) for t in inputs]
+            ref_out = ref_ext.forward(*ref_inputs, 0.0)
+            total = sum(o.sum() for o in ref_out)
+            total.backward()
+        
+        cuda_bwd_ms, _, _ = benchmark_fn(run_cuda_bwd, warmup, iters)
+        ref_bwd_ms, _, _ = benchmark_fn(run_ref_bwd, warmup, iters)
+        bwd_ratio = cuda_bwd_ms / ref_bwd_ms if ref_bwd_ms > 0 else float('inf')
+        
+        # Format ratio with indicator
+        def fmt_ratio(r):
+            if r < 0.9:
+                return f"{r:.2f} ✓"
+            elif r > 1.1:
+                return f"{r:.2f} ✗"
+            else:
+                return f"{r:.2f}  "
+        
+        print(f"{name:<12} │ {cuda_fwd_ms:>7.2f}ms {ref_fwd_ms:>7.2f}ms {fmt_ratio(fwd_ratio):>8} │ {cuda_bwd_ms:>7.2f}ms {ref_bwd_ms:>7.2f}ms {fmt_ratio(bwd_ratio):>8}")
+        
+        del Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_
+        torch.cuda.empty_cache()
+    
+    print("─" * 76)
+    print("\n✓ = CUDA faster, ✗ = Torch faster")
     print("\n" + "-" * 60)
 
 
@@ -195,7 +340,7 @@ class ArithmeticModel(nn.Module):
     
     def __init__(self, hidden_dim=128, num_heads=4, n_layers=2, modulo=19):
         super().__init__()
-        from hypergraph_attention import HypergraphAttentionCPP
+        from att3ntion import HypergraphAttention
         
         self.embedding = nn.Linear(32, hidden_dim)
         self.modulo = modulo
@@ -203,7 +348,7 @@ class ArithmeticModel(nn.Module):
         self.layers = nn.ModuleList()
         for _ in range(n_layers):
             self.layers.append(nn.ModuleDict({
-                'attention': HypergraphAttentionCPP(hidden_dim, num_heads),
+                'attention': HypergraphAttention(hidden_dim, num_heads),
                 'norm1': nn.LayerNorm(hidden_dim),
                 'ffn': nn.Sequential(
                     nn.Linear(hidden_dim, 3 * hidden_dim),
@@ -325,12 +470,15 @@ def main():
 Examples:
     python demo.py              # Quick sanity check
     python demo.py --memory     # Memory scaling benchmark
+    python demo.py --benchmark  # CUDA vs Torch timing comparison
     python demo.py --train      # Train on arithmetic task
     python demo.py --all        # Run all demos
         """
     )
     parser.add_argument('--memory', action='store_true',
                         help='Run memory scaling benchmark')
+    parser.add_argument('--benchmark', action='store_true',
+                        help='Run CUDA vs Torch timing comparison')
     parser.add_argument('--train', action='store_true',
                         help='Train on compositional arithmetic')
     parser.add_argument('--epochs', type=int, default=50,
@@ -346,11 +494,14 @@ Examples:
     if args.memory or args.all:
         demo_memory_scaling()
     
+    if args.benchmark or args.all:
+        demo_benchmark()
+    
     if args.train or args.all:
         demo_training(epochs=args.epochs)
     
-    if not (args.memory or args.train or args.all):
-        print("\nTip: Run with --memory, --train, or --all for more demos!")
+    if not (args.memory or args.benchmark or args.train or args.all):
+        print("\nTip: Run with --memory, --benchmark, --train, or --all for more demos!")
     
     print("\n✨ Demo complete!\n")
 

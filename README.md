@@ -4,11 +4,26 @@
 
 ## Quick Start
 Clone this repository, then: 
+
 ```bash
+# determine CUDA toolkit version:
+nvcc --version | grep -oP 'release \K[\d.]+'
+
+# Install CUDA-enabled Torch (either cu126 or cu130 depending on nvcc output)
+pip install torch --extra-index-url https://download.pytorch.org/whl/cu130
+pip install torch --extra-index-url https://download.pytorch.org/whl/cu126
+
+# If something goes wrong, you can do:
+pip install --force-reinstall torch --extra-index-url https://download.pytorch.org/whl/cu130
+pip install --force-reinstall torch --extra-index-url https://download.pytorch.org/whl/cu126
+
 # Install
 cd att3ntion
 pip install -r requirements.txt
-pip install -e .   
+
+# This will launch the CUDA compilation
+# The --no-build-isolation flag is mandatory, and considered best practice
+pip install -e . --no-build-isolation
 
 # Run demo
 python demo.py              # Basic usage
@@ -17,13 +32,42 @@ python demo.py --train      # Train on arithmetic task
 python demo.py --all        # Run everything
 ```
 
+## UV based Quick Start
+
+```bash
+uv --version # must be >= 0.11
+
+# to get or update uv, use:
+curl -LsSf https://astral.sh/uv/install.sh | sh
+hash -r
+
+# clone
+git clone git@github.com:tlh24/att3ntion
+cd att3ntion
+
+# determine CUDA toolkit version:
+nvcc --version | grep -oP 'release \K[\d.]+'
+
+# install dependencies (does not compile yet)
+# choose cu130 or cu126 based on nvcc output
+uv sync --extra cu130 --no-install-package att3ntion
+uv sync --extra cu126 --no-install-package att3ntion
+
+# launch the compilation
+uv sync --extra cu130
+uv sync --extra cu126
+
+source .venv/bin/activate
+```
+
+
 ## Basic Usage
 
 ```python
-from hypergraph_attention import HypergraphAttentionCPP
+from att3ntion import HypergraphAttention
 
 # Create layer (drop-in replacement for attention)
-layer = HypergraphAttentionCPP(d_model=64, n_heads=4).cuda()
+layer = HypergraphAttention(d_model=64, n_heads=4).cuda()
 
 # Forward pass
 x = torch.randn(batch_size, seq_len, d_model, device='cuda')
@@ -162,11 +206,20 @@ The above summations would suggest that a full $\large A[..]$ is required for ca
 ## Project Structure
 
 ```
-att3ntion/
-├── demo.py                    # Interactive demo
-├── hypergraph_attention.py    # Main PyTorch module
-├── pure_pytorch_reference.py  # Naive reference implementation
-├── cpp/                       # C++ bindings
-├── cuda/                      # CUDA kernels (forward.cu, backward.cu)
-└── tests/                     # Benchmarks and equivalence tests
+att3ntion/                          # repo root
+├── att3ntion/                      # Python package
+│   ├── __init__.py                 # public API: HypergraphAttention
+│   ├── _autograd.py                # CUDA-backed layer + autograd bridge
+│   └── _naive.py                   # naive O(N³) reference (testing only)
+├── cpp/                            # pybind11 C++ bindings
+│   ├── cuda_bindings.cpp/.h        # Python ↔ CUDA glue
+│   └── torch_reference.cpp         # torch-based reference kernel
+├── cuda/                           # hand-written CUDA kernels
+│   ├── forward.cu                  # forward pass
+│   ├── backward.cu                 # backward pass
+│   └── common.cuh                  # shared constants & device utilities
+├── tests/                          # benchmarks, equivalence tests, Makefile
+├── demo.py                         # interactive demo
+├── setup.py                        # build config (C extensions)
+└── pyproject.toml                  # package metadata
 ```
