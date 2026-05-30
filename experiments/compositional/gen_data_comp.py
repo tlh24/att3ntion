@@ -932,20 +932,25 @@ def genData8(bs, do_print=False):
 		if do_print:
 			print("num_tok", tok_ctr)
 
-# genData9(bs, do_print=False):
-# 	''' replicate http://arxiv.org/abs/2505.20896
-# 	'''
-# 	md = 8 + 16 + 8 # one-hot indicators, digits, pointer, [posenc]
-# 	ntok = 24
-# 	nbits = 8
-#
-# 	pos_enc = graycodePosEnc(ntok, nbits, rand_phase=False)
-# 	x = np.zeros((bs, ntok, md + nbits*2), dtype=np.float32)
-# 	y = np.zeros_like(x)
-# 	x[:, :, -nbits*2:] = pos_enc
-# 	y[:, :, -nbits*2:] = pos_enc # this will be overwritten
-#
-# 	for b in range(bs):
+def genData9(bs, md, depth, nvars, do_print):
+	'''
+	Generate auto-regressive expansion of depth 'depth' formulas
+	over modular arithmetic expressions with 'nvars' variables
+	depth = 1 means 1 operator
+	nvars = 1 means 1 auto-regressive variable
+			= 2 means 1 or 2 auto-regressive variables
+			there are hence nvars - (depth + 1) constants
+	'''
+	train_split = 0.6
+	operators = ['+','-','*','//']
+	# enumerate *all* the expressions (could be slow!)
+	expr = []
+	for d in range(depth):
+		for nv in range(min(d+2, nvars)):
+			nconst = nv - (d+2)
+			for op in operators:
+				if op == '+' or op == '*':
+					# commutative
 
 
 if __name__ == '__main__':
