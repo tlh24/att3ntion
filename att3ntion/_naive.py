@@ -115,7 +115,7 @@ class _HypergraphAttentionNaive(nn.Module):
 		Y_q = self.gelu(Y_q)
 		Y_r = self.gelu(Y_r)
 		Y_s = self.gelu(Y_s)
-		y = Y_q + Y_r + Y_s
+		y = Y_q + Y_r + Y_s # should we break the symmetry in other ways here?
 
 		if self.scatter:
 			# note: option for diamond op in scatter being 'add' removed.
@@ -132,7 +132,7 @@ class _HypergraphAttentionNaive(nn.Module):
 			y = y.permute(0, 2, 1, 3).reshape(batch_size, ntok, self.d_model)
 		else:
 			y = y.permute(0, 2, 1, 3).sum(dim=2).squeeze()
-		y = self.Wo(y)
+		# y = self.Wo(y) # NOTE: may or may not be needed.
 		return y.to(out_dtype)
 
 	def calcFlops(self, x):
@@ -147,7 +147,6 @@ class _HypergraphAttentionNaive(nn.Module):
 		f += bs * self.n_heads * ntok * d_model * (6 + 6)
 		f += bs * self.n_heads * ntok * d_model**2
 		return f
-
 
 class _GraphAttentionNaive(nn.Module):
 	"""Pure-PyTorch naive standard 2-way attention for comparison testing."""
@@ -164,43 +163,46 @@ class _GraphAttentionNaive(nn.Module):
 
 		self.Wq = nn.Linear(d_model, self.d_head*n_heads, bias=False, **kwargs)
 		self.Wk = nn.Linear(d_model, self.d_head*n_heads, bias=False, **kwargs)
-		self.Wv = nn.Linear(d_model, self.d_head*n_heads, bias=False, **kwargs)
-		self.Wo = nn.Linear(d_model, d_model, bias=False, **kwargs)
-		nn.init.normal_(self.Wo.weight, std=1.0 / np.sqrt(d_model))
 
-		self.dropout = nn.Dropout(dropout_rate)
-		self.gelu = QuickGELU()
+		self.Wv = nn.Linear(d_model, self.d_head*n_heads, bias=True, **kwargs)
 
 	def forward(self, x, rotary_emb, mask=None):
+		"""
+		mask: bool[batch, query, target] if provided
+		"""
 		out_dtype = x.dtype
 		x = x.float()
-		B, ntok, d_model = x.shape
-		q, k, v = self.Wq(x), self.Wk(x), self.Wv(x)
-
-		def split_heads(t):
-			return t.view(B, ntok, self.n_heads, self.d_head).transpose(1, 2)
-			# shape (B, self.n_heads, ntok, self.d_head)
-		q, k, v = split_heads(q), split_heads(k), split_heads(v)
+		batch_size, ntok, d_model = x.shape
 
 		if rotary_emb is not None:
-			q = rotary_emb.rotate_queries_or_keys(q)
-			k = rotary_emb.rotate_queries_or_keys(k)
+			Q = rotary_emb.rotate_queries_or_keys(self.Wq(x))
+			K = rotary_emb.rotate_queries_or_keys(self.Wk(x))
+		else:
+			Q = self.Wq(x)
+			K = self.Wk(x)
+		V = self.Wv(x)
 
-		A = torch.einsum('bhid,bhjd->bhij', q, k) / np.sqrt(self.d_head)
-		if mask is not None:  # causal attention
+		Q = Q.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
+		K = K.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
+
+		V = V.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
+
+		A = torch.einsum('bhid,bhjd->bhij', Q, K) / np.sqrt(self.d_head)
+		if mask is not None:
+			if mask.ndim == 2:
+				mask = mask[None,:,:] # unsqueeze batch dim
+			mask = mask[:,None,:,:] # unsqueeze head dimension
 			invalid = mask <= 0
-			# this should broadcast properly if mask.ndim is 3 or 2
 			A = A.masked_fill(invalid, -torch.inf)
 		A = torch.softmax(A, dim=-1)
-		y = torch.einsum('bhij,bhjd->bhid', A, v)
+		A = torch.nan_to_num(A, nan=0.0) # needed if all positions of mask are False
+		y = torch.einsum('bhij,bhjd->bhid', A, V)
 
 		if self.head_subspaces:
 			y = y.permute(0,2,1,3)
-			y = y.reshape(B, ntok, d_model)
+			y = y.reshape(batch_size, ntok, d_model)
 		else:
 			y = y.permute(0, 2, 3, 1).sum(dim=3).squeeze()
-		y = self.gelu(y)
-		y = self.Wo(y)
 		return y.to(out_dtype)
 
 	def calcFlops(self, x):

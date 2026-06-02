@@ -69,7 +69,7 @@ class SimpleCompModel(nn.Module):
 		self.attn_impl = attn_impl
 		self.n_recurse = n_recurse
 		self.d_model = hidden_dim
-		self.rope = RotaryEmbedding(dim = hidden_dim)
+		self.rope = RotaryEmbedding(dim = hidden_dim//num_heads)
 
 		use_cuda = use_cuda_kernels and _cuda_kernels_available and attn_impl == "hypergraph"
 		if use_cuda:
@@ -93,9 +93,9 @@ class SimpleCompModel(nn.Module):
 			norm2_layer = nn.LayerNorm(hidden_dim)
 			if True:
 				ffn_layer = nn.Sequential(
-					nn.Linear(hidden_dim, 3 * hidden_dim),
+					nn.Linear(hidden_dim, 3 * hidden_dim, bias=False),
 					nn.ReLU(),
-					nn.Linear(3 * hidden_dim, hidden_dim)
+					nn.Linear(3 * hidden_dim, hidden_dim, bias=False)
 				)
 			else:
 				ffn_layer = SwiGLU(hidden_dim, 2*hidden_dim, hidden_dim)
@@ -108,10 +108,10 @@ class SimpleCompModel(nn.Module):
 						'norm2': norm2_layer,
 				})
 				)
-		self.output_proj = nn.Linear(hidden_dim, input_vocab)
+		self.output_proj = nn.Linear(hidden_dim, input_vocab, bias=False)
 		self.gelu = QuickGELU()
 		
-	def forward(self, x, b):
+	def forward(self, x):
 		bs, ntok = x.shape
 		mask = torch.tril(torch.ones(ntok, ntok))
 		mask = mask.to(x.device)
@@ -297,8 +297,8 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	n_recurse = 1
 
 	dtype = torch.float32
-	# model = SimpleCompModel(vocab_size, hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse, use_cuda_kernels=use_cuda_kernels).to(device=device, dtype=dtype)
-	model = GrokkingTransformer(vocab_size, hidden_dim, 1, use_norm=True).to(device=device)
+	model = SimpleCompModel(vocab_size, hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse, use_cuda_kernels=use_cuda_kernels).to(device=device, dtype=dtype)
+	# model = GrokkingTransformer(vocab_size, hidden_dim, 1, use_norm=True).to(device=device)
 	if save_model:
 		try:
 			model.load_model(f"comp_model_{attn_impl}_r{replicate}.pt", device)
@@ -348,7 +348,6 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 				loss, n_correct, n_possible = calcLoss(task, pred, targets)
 			else:
 				with autocast('cuda'):
-					# pred = model(inputs, batch_indx)
 					pred = model(inputs)
 					loss, n_correct, n_possible = calcLoss(task, pred, targets)
 			correct_vals += n_correct
@@ -424,7 +423,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 				loss, n_correct, n_possible = calcLoss(task, pred, targets)
 			else:
 				with autocast('cuda'):
-					pred = model(inputs) # FIXME
+					pred = model(inputs)
 					loss, n_correct, n_possible = calcLoss(task, pred, targets)
 			correct_vals += n_correct
 
@@ -434,9 +433,9 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 				end_event.record()
 				torch.cuda.synchronize()
 				amp_time = start_event.elapsed_time(end_event)
-				f = model.calcFlops(inputs)
 				print("batch time:", amp_time, "ms")
-				print(f"{(f/1e9) / (amp_time / 1000.0)} GFlops approx")
+				# f = model.calcFlops(inputs)
+				# print(f"{(f/1e9) / (amp_time / 1000.0)} GFlops approx")
 				fd_losslog.flush()
 
 			lloss = loss.detach().cpu().item()

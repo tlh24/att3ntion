@@ -932,26 +932,6 @@ def genData8(bs, do_print=False):
 		if do_print:
 			print("num_tok", tok_ctr)
 
-def genData9(bs, md, depth, nvars, do_print):
-	'''
-	Generate auto-regressive expansion of depth 'depth' formulas
-	over modular arithmetic expressions with 'nvars' variables
-	depth = 1 means 1 operator
-	nvars = 1 means 1 auto-regressive variable
-			= 2 means 1 or 2 auto-regressive variables
-			there are hence nvars - (depth + 1) constants
-	'''
-	train_split = 0.6
-	operators = ['+','-','*','//']
-	# enumerate *all* the expressions (could be slow!)
-	expr = []
-	for d in range(depth):
-		for nv in range(min(d+2, nvars)):
-			nconst = nv - (d+2)
-			for op in operators:
-				if op == '+' or op == '*':
-					# commutative
-
 
 if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='generate compositional data for comparing graph and hypergraph transformers')
