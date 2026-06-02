@@ -44,6 +44,9 @@ class _HypergraphAttentionNaive(nn.Module):
 		self.gelu = QuickGELU()
 
 	def forward(self, x, rotary_emb, mask=None):
+		"""
+		mask: bool[batch, query, target] if provided
+		"""
 		out_dtype = x.dtype
 		x = x.float()
 		batch_size, ntok, d_model = x.shape
@@ -88,9 +91,8 @@ class _HypergraphAttentionNaive(nn.Module):
 				mask = mask[None,:,:]
 			# otherwise can have a different mask per batch element
 			assert(mask.ndim == 3)
-			valid = mask > 0 # convert to boolean (byte)
 			# any i can attend to j,k <= i (likewise for the other 2 permutations).
-			valid3 = (valid[:,:,:,None] & valid[:,:,None,:]).flatten(2, 3)
+			valid3 = (mask[:,:,:,None] & mask[:,:,None,:]).flatten(2, 3)
 			invalid3 = ~(valid3[:,None,:,:])
 			# the three dot_products are permuted and flattened so that the last dim is the softmax dim.
 			dot_product_q = dot_product_q.masked_fill(invalid3, float('-inf'))
@@ -172,6 +174,9 @@ class _GraphAttentionNaive(nn.Module):
 		self.gelu = QuickGELU()
 
 	def forward(self, x, rotary_emb, mask=None):
+		"""
+		mask: bool[batch, query, target] if provided
+		"""
 		out_dtype = x.dtype
 		x = x.float()
 		batch_size, ntok, d_model = x.shape
@@ -190,11 +195,12 @@ class _GraphAttentionNaive(nn.Module):
 		V = V.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
 
 		A = torch.einsum('bhid,bhjd->bhij', Q, K)
-		if mask is not None:  # causal attention
-			invalid = mask <= 0
-			# this should broadcast properly if mask.ndim is 3 or 2
+		if mask is not None:
+			mask = mask[:,None,:,:] # unsqueeze head dimension
+			invalid = ~mask
 			A = A.masked_fill(invalid, -torch.inf)
 		A = torch.softmax(A, dim=-1)
+		A = torch.nan_to_num(A, nan=0.0) # needed if all positions of mask are False
 		y = torch.einsum('bhij,bhjd->bhid', A, V)
 
 		if self.head_subspaces:
