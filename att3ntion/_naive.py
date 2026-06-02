@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import math
+import pdb
+import numpy as np
 
 from att3ntion._autograd import QuickGELU
 
@@ -37,8 +39,7 @@ class _HypergraphAttentionNaive(nn.Module):
 		self.Wv_s = nn.Linear(d_model, self.d_val*n_heads*value_proj_multiplier, bias=value_bias, **kwargs)
 
 		self.Wo = nn.Linear(self.d_model, d_model, bias=out_bias, **kwargs)
-
-		self.Wo = nn.Linear(self.d_model, d_model, bias=True, **kwargs)
+		nn.init.normal_(self.Wo.weight, std=1.0 / np.sqrt(d_model))
 
 		self.dropout = nn.Dropout(dropout_rate)
 		self.gelu = QuickGELU()
@@ -163,10 +164,9 @@ class _GraphAttentionNaive(nn.Module):
 
 		self.Wq = nn.Linear(d_model, self.d_head*n_heads, bias=False, **kwargs)
 		self.Wk = nn.Linear(d_model, self.d_head*n_heads, bias=False, **kwargs)
-
-		self.Wv = nn.Linear(d_model, self.d_head*n_heads, bias=True, **kwargs)
-
-		self.Wo = nn.Linear(d_model, d_model, bias=True, **kwargs)
+		self.Wv = nn.Linear(d_model, self.d_head*n_heads, bias=False, **kwargs)
+		self.Wo = nn.Linear(d_model, d_model, bias=False, **kwargs)
+		nn.init.normal_(self.Wo.weight, std=1.0 / np.sqrt(d_model))
 
 		self.dropout = nn.Dropout(dropout_rate)
 		self.gelu = QuickGELU()
@@ -174,32 +174,29 @@ class _GraphAttentionNaive(nn.Module):
 	def forward(self, x, rotary_emb, mask=None):
 		out_dtype = x.dtype
 		x = x.float()
-		batch_size, ntok, d_model = x.shape
+		B, ntok, d_model = x.shape
+		q, k, v = self.Wq(x), self.Wk(x), self.Wv(x)
+
+		def split_heads(t):
+			return t.view(B, ntok, self.n_heads, self.d_head).transpose(1, 2)
+			# shape (B, self.n_heads, ntok, self.d_head)
+		q, k, v = split_heads(q), split_heads(k), split_heads(v)
 
 		if rotary_emb is not None:
-			Q = rotary_emb.rotate_queries_or_keys(self.Wq(x))
-			K = rotary_emb.rotate_queries_or_keys(self.Wk(x))
-		else:
-			Q = self.Wq(x)
-			K = self.Wk(x)
-		V = self.Wv(x)
+			q = rotary_emb.rotate_queries_or_keys(q)
+			k = rotary_emb.rotate_queries_or_keys(k)
 
-		Q = Q.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
-		K = K.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
-
-		V = V.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
-
-		A = torch.einsum('bhid,bhjd->bhij', Q, K)
+		A = torch.einsum('bhid,bhjd->bhij', q, k) / np.sqrt(self.d_head)
 		if mask is not None:  # causal attention
 			invalid = mask <= 0
 			# this should broadcast properly if mask.ndim is 3 or 2
 			A = A.masked_fill(invalid, -torch.inf)
 		A = torch.softmax(A, dim=-1)
-		y = torch.einsum('bhij,bhjd->bhid', A, V)
+		y = torch.einsum('bhij,bhjd->bhid', A, v)
 
 		if self.head_subspaces:
 			y = y.permute(0,2,1,3)
-			y = y.reshape(batch_size, ntok, d_model)
+			y = y.reshape(B, ntok, d_model)
 		else:
 			y = y.permute(0, 2, 3, 1).sum(dim=3).squeeze()
 		y = self.gelu(y)

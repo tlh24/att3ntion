@@ -1,6 +1,8 @@
 import itertools
 from functools import lru_cache
 import random
+import numpy as np
+import matplotlib.pyplot as plt
 
 # OPS = ['+', '-', '*', '/']
 OPS = ['+']
@@ -90,8 +92,8 @@ def evaluate_autoregressive(func, init_X, C_vals, L=10, P=113):
 
 def gen_data(mode, max_d, V, P=113, L=1, data_size=1000, exact_v=True):
 	"""
-	mode 'A': Formulas shared. Inputs (init_conditions & constants) split 60/40. (Grokking)
-	mode 'B': Formulas split 60/40. Inputs sampled uniformly. (Formula generalization)
+	mode 'grok': Formulas shared. Inputs (init_conditions & constants) split 60/40. (Grokking)
+	mode 'formulas': Formulas split 60/40. Inputs sampled uniformly. (Formula generalization)
 	max_d : maximum formula depth
 	V :  number of variables
 	L : length of autoregressive roll-out
@@ -107,7 +109,7 @@ def gen_data(mode, max_d, V, P=113, L=1, data_size=1000, exact_v=True):
 			formulas.append((expr_str, num_c, func))
 
 	# 2. Assign formulas to Train/Test (Mode B only)
-	if mode == 'B':
+	if mode != 'grok':
 		random.shuffle(formulas)
 		train_formulas = set(f[0] for f in formulas[:int(len(formulas) * 0.6)])
 
@@ -144,7 +146,7 @@ def gen_data(mode, max_d, V, P=113, L=1, data_size=1000, exact_v=True):
 		record = (final_str, init_X, seq)
 
 		# 3. Route to Train or Test based on the Mode rules
-		if mode == 'A':
+		if mode == 'grok':
 			# Hash the inputs to get a stable 60/40 split across all formulas
 			is_train = hash(inputs) % 100 < 60
 		else:
@@ -157,6 +159,37 @@ def gen_data(mode, max_d, V, P=113, L=1, data_size=1000, exact_v=True):
 			test_data.append(record)
 
 	return train_data, test_data
+
+def to_numpy(train_data, test_data, P):
+	"""Maps expressions and sequences to an int32 numpy array, padding the expression."""
+	OP_MAP = {'+': 0, '-': 1, '*': 2, '/': 3, '(': 4, ')': 5}
+
+	def tokenize(expr):
+		# Safely separate parens so .split() works cleanly
+		for r in '()': expr = expr.replace(r, f' {r} ')
+		return [
+			P + OP_MAP[t] if t in OP_MAP
+			else P + len(OP_MAP) + int(t[2:]) if t.startswith('x_')
+			else int(t)
+			for t in expr.split()
+		]
+	# Pre-parse to compute the max expression length
+	tr_parsed = [(tokenize(e), seq) for e, _, seq in train_data]
+	te_parsed = [(tokenize(e), seq) for e, _, seq in test_data]
+
+	max_e = max((len(e) for e, _ in tr_parsed + te_parsed), default=0)
+	seq_l = len(tr_parsed[0][1]) # train and test must be the same len
+	total_len = max_e + seq_l
+
+	def build_array(parsed_data):
+		# Pre-allocate contiguous array filled with -1
+		arr = np.full((len(parsed_data), total_len), -1, dtype=np.int32)
+		for i, (e_toks, seq) in enumerate(parsed_data):
+			arr[i, :len(e_toks)] = e_toks  # Drop expression at the start
+			arr[i, max_e:] = seq           # Drop sequence at the exact end
+		return arr
+	# return the maximum expression length & np train test arrays.
+	return max_e, build_array(tr_parsed), build_array(te_parsed)
 
 if __name__ == "__main__":
 	V = 2 # Variables
@@ -185,11 +218,21 @@ if __name__ == "__main__":
 		if count >= 10: break
 
 	print("Generating Mode A (Grokking Split)...")
-	train_A, test_A = generate_dataset('A', max_d=1, V=2, L=1, data_size=50)
+	train_A, test_A = gen_data('grok', max_d=1, V=2, L=1, data_size=50)
 	for row in train_A: print(f"Train: {row}")
 	for row in test_A:  print(f"Test:  {row}")
 
+	# check numpy conversion
+	max_exprlen, train_np, test_np = to_numpy(train_A, test_A, 113)
+	fig,axs = plt.subplots(2, 1, figsize=(12, 6))
+	axs[0].imshow(train_np.T - 113)
+	axs[0].set_title('Train')
+	axs[1].imshow(test_np.T - 113)
+	axs[1].set_title('Test')
+	plt.show()
+
 	print("\nGenerating Mode B (Formula Split)...")
-	train_B, test_B = generate_dataset('B', max_d=1, V=2, L=2, data_size=5)
+	train_B, test_B = gen_data('B', max_d=1, V=2, L=2, data_size=5)
 	for row in train_B: print(f"Train: {row}")
 	for row in test_B:  print(f"Test:  {row}")
+
