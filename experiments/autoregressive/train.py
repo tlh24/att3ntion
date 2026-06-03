@@ -20,7 +20,9 @@ for d in [script_dir, project_root]:
 from att3ntion import _HypergraphAttentionNaive, _GraphAttentionNaive, QuickGELU
 from gen_data import gen_data, to_numpy
 
-SEQ_L = 1 # length of the autoregressive output sequence
+SEQ_L = 1 # length of the output sequence
+MASKED = False # masked vs autoregressive training.
+		# if False, use autoregressive training
 
 # Try to import CUDA-backed hypergraph attention; fall back to naive if not built.
 _cuda_kernels_available = False
@@ -283,14 +285,16 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	max_exprlen, train_np, test_np = to_numpy(train_s, test_s, 113)
 	x = train_np.copy() + 1
 	y = train_np + 1 # to_numpy uses -1 for the null tok
-	x[:,-SEQ_L:] = 0 # mask off sequence tokens
-	# x = x[:,:-1] # shift for autoregression
-	# y = y[:,1:] # this doesn't work!
 	x_v = test_np.copy() + 1
 	y_v = test_np + 1
-	x_v[:,-SEQ_L:] = 0
-	# x_v = x_v[:,:-1]
-	# y_v = y_v[:,1:]
+	if MASKED:
+		x[:,-SEQ_L:] = 0 # mask off sequence tokens
+		x_v[:,-SEQ_L:] = 0
+	else:
+		x = x[:,:-1] # shift for autoregression
+		y = y[:,1:] # this doesn't work well for graph attn
+		x_v = x_v[:,:-1]
+		y_v = y_v[:,1:]
 
 	dataset = TensorDataset(torch.tensor(x), torch.tensor(y))
 	train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -302,8 +306,8 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 
 	is_hg = attn_impl == "hypergraph"
 	n_layers = 1
-	# if attn_impl == "graph":
-	# 	n_layers = 2
+	if attn_impl == "graph":
+		n_layers = 2
 	n_recurse = 1
 
 	dtype = torch.float32
@@ -331,7 +335,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 		print("--- Running with Torch automatic mixed precision (fp32 weights) ---")
 
 	nam = {"hypergraph":"hg","graph":"g"}.get(attn_impl)
-	fd_losslog = open(f'losslog_{nam}_{log_name}_r{replicate}.txt', 'w')
+	fd_losslog = open(f'losslog_{nam}_{log_name}_s{SEQ_L}_r{replicate}.txt', 'w')
 
 	print("\ntrain_model1 started...")
 	uu = 0
@@ -471,12 +475,14 @@ if __name__ == '__main__':
 						help='postfix logname')
 	parser.add_argument('--save', action='store_true',
         help='Load and save model parameters.')
-	# parser.add_argument('--task', type=int, help="what task to run the model on", required=True)
+	parser.add_argument('--seq-l', type=int, help="sequence length", required=True)
 	parser.add_argument('--repl', type=int, default=1, help="what replicate this is",)
 	parser.add_argument('--no-amp', action='store_true', help='Disable Torch automatic mixed precision')
 	parser.add_argument('--use-cuda-kernels', action='store_true',
 						help='Use CUDA kernels')
 	args = parser.parse_args()
+
+	SEQ_L = args.seq_l # sorry about the global
 	
 	model = trainModel(
 		num_epochs=args.epochs,
