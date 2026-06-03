@@ -303,8 +303,8 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	n_recurse = 1
 
 	dtype = torch.float32
-	model = SimpleCompModel(vocab_size, hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse, use_cuda_kernels=use_cuda_kernels).to(device=device, dtype=dtype)
-	# model = GrokkingTransformer(vocab_size, hidden_dim, 1, use_norm=True).to(device=device)
+	# model = SimpleCompModel(vocab_size, hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse, use_cuda_kernels=use_cuda_kernels).to(device=device, dtype=dtype)
+	model = GrokkingTransformer(vocab_size, hidden_dim, 1, use_norm=True).to(device=device)
 	if save_model:
 		try:
 			model.load_model(f"comp_model_{attn_impl}_r{replicate}.pt", device)
