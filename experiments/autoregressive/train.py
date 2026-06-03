@@ -283,12 +283,12 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	max_exprlen, train_np, test_np = to_numpy(train_s, test_s, 113)
 	x = train_np.copy() + 1
 	y = train_np + 1 # to_numpy uses -1 for the null tok
-	x[:,-1] = 0 # mask off last token
+	x[:,-SEQ_L:] = 0 # mask off sequence tokens
 	# x = x[:,:-1] # shift for autoregression
-	# y = y[:,1:]
+	# y = y[:,1:] # this doesn't work!
 	x_v = test_np.copy() + 1
 	y_v = test_np + 1
-	x_v[:,-1] = 0
+	x_v[:,-SEQ_L:] = 0
 	# x_v = x_v[:,:-1]
 	# y_v = y_v[:,1:]
 
@@ -307,8 +307,8 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	n_recurse = 1
 
 	dtype = torch.float32
-	# model = SimpleCompModel(vocab_size, hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse, use_cuda_kernels=use_cuda_kernels).to(device=device, dtype=dtype)
-	model = GrokkingTransformer(vocab_size, hidden_dim, 1, use_norm=True).to(device=device)
+	model = SimpleCompModel(vocab_size, hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse, use_cuda_kernels=use_cuda_kernels).to(device=device, dtype=dtype)
+	# model = GrokkingTransformer(vocab_size, hidden_dim, 1, use_norm=True).to(device=device)
 	if save_model:
 		try:
 			model.load_model(f"comp_model_{attn_impl}_r{replicate}.pt", device)

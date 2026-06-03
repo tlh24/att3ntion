@@ -161,8 +161,8 @@ class _GraphAttentionNaive(nn.Module):
 			self.d_head = d_model
 		self.head_subspaces = head_subspaces
 
-		self.Wq = nn.Linear(d_model, self.d_head*n_heads, bias=False, **kwargs)
-		self.Wk = nn.Linear(d_model, self.d_head*n_heads, bias=False, **kwargs)
+		self.Wq = nn.Linear(d_model, self.d_head*n_heads, bias=True, **kwargs)
+		self.Wk = nn.Linear(d_model, self.d_head*n_heads, bias=True, **kwargs)
 		self.Wv = nn.Linear(d_model, self.d_head*n_heads, bias=True, **kwargs)
 		self.Wo = nn.Linear(d_model, d_model, bias=True, **kwargs)
 		nn.init.normal_(self.Wo.weight, std=1.0 / np.sqrt(d_model))
