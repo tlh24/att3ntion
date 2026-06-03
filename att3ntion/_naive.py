@@ -205,8 +205,8 @@ class _GraphAttentionNaive(nn.Module):
 			y = y.reshape(batch_size, ntok, d_model)
 		else:
 			y = y.permute(0, 2, 3, 1).sum(dim=3).squeeze()
-		y = self.gelu(y)
-		y = self.Wo(y)
+		# y = self.gelu(y)
+		# y = self.Wo(y)
 		return y.to(out_dtype)
 
 	def calcFlops(self, x):
