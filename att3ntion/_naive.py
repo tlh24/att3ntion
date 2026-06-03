@@ -38,7 +38,7 @@ class _HypergraphAttentionNaive(nn.Module):
 		self.Wv_r = nn.Linear(d_model, self.d_val*n_heads*value_proj_multiplier, bias=value_bias, **kwargs)
 		self.Wv_s = nn.Linear(d_model, self.d_val*n_heads*value_proj_multiplier, bias=value_bias, **kwargs)
 
-		self.Wo = nn.Linear(self.d_model, d_model, bias=out_bias, **kwargs)
+		self.Wo = nn.Linear(self.d_model*3, d_model, bias=out_bias, **kwargs)
 		nn.init.normal_(self.Wo.weight, std=1.0 / np.sqrt(d_model))
 
 		self.dropout = nn.Dropout(dropout_rate)
@@ -115,7 +115,9 @@ class _HypergraphAttentionNaive(nn.Module):
 		Y_q = self.gelu(Y_q)
 		Y_r = self.gelu(Y_r)
 		Y_s = self.gelu(Y_s)
-		y = Y_q + Y_r + Y_s # should we break the symmetry in other ways here?
+		# y = torch.cat((Y_q, Y_r, Y_s), dim=-1)
+		y = Y_q + Y_r + Y_s
+		# note: cat -> projection, GeLU, and no GELU all more-or-less work well.
 
 		if self.scatter:
 			# note: option for diamond op in scatter being 'add' removed.
@@ -126,13 +128,15 @@ class _HypergraphAttentionNaive(nn.Module):
 			Y_q_ = self.gelu(Y_q_)
 			Y_r_ = self.gelu(Y_r_)
 			Y_s_ = self.gelu(Y_s_)
-			y = y + Y_q_ + Y_r_ + Y_s_
+			# y = y + torch.cat((Y_q_, Y_r_, Y_s_), dim=-1)
+			y = Y_q_ + Y_r_ + Y_s_
 
+		# y = self.Wo(y) # required w torch.cat
 		if self.head_subspaces:
 			y = y.permute(0, 2, 1, 3).reshape(batch_size, ntok, self.d_model)
 		else:
 			y = y.permute(0, 2, 1, 3).sum(dim=2).squeeze()
-		# y = self.Wo(y) # NOTE: may or may not be needed.
+
 		return y.to(out_dtype)
 
 	def calcFlops(self, x):
