@@ -163,8 +163,10 @@ class _GraphAttentionNaive(nn.Module):
 
 		self.Wq = nn.Linear(d_model, self.d_head*n_heads, bias=False, **kwargs)
 		self.Wk = nn.Linear(d_model, self.d_head*n_heads, bias=False, **kwargs)
-
 		self.Wv = nn.Linear(d_model, self.d_head*n_heads, bias=True, **kwargs)
+		self.Wo = nn.Linear(d_model, d_model, bias=True, **kwargs)
+		nn.init.normal_(self.Wo.weight, std=1.0 / np.sqrt(d_model))
+		self.gelu = QuickGELU()
 
 	def forward(self, x, rotary_emb, mask=None):
 		"""
@@ -203,6 +205,8 @@ class _GraphAttentionNaive(nn.Module):
 			y = y.reshape(batch_size, ntok, d_model)
 		else:
 			y = y.permute(0, 2, 3, 1).sum(dim=3).squeeze()
+		y = self.gelu(y)
+		y = self.Wo(y)
 		return y.to(out_dtype)
 
 	def calcFlops(self, x):

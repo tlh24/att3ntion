@@ -20,6 +20,8 @@ for d in [script_dir, project_root]:
 from att3ntion import _HypergraphAttentionNaive, _GraphAttentionNaive, QuickGELU
 from gen_data import gen_data, to_numpy
 
+SEQ_L = 1 # length of the autoregressive output sequence
+
 # Try to import CUDA-backed hypergraph attention; fall back to naive if not built.
 _cuda_kernels_available = False
 try:
@@ -87,10 +89,10 @@ class SimpleCompModel(nn.Module):
 			else:
 				attention_layer = _GraphAttentionNaive(hidden_dim, num_heads, head_subspaces=True)
 
-			# norm1_layer = nn.RMSNorm(hidden_dim)
-			# norm2_layer = nn.RMSNorm(hidden_dim)
-			norm1_layer = nn.LayerNorm(hidden_dim)
-			norm2_layer = nn.LayerNorm(hidden_dim)
+			norm1_layer = nn.RMSNorm(hidden_dim)
+			norm2_layer = nn.RMSNorm(hidden_dim)
+			# norm1_layer = nn.LayerNorm(hidden_dim)
+			# norm2_layer = nn.LayerNorm(hidden_dim)
 			if True:
 				ffn_layer = nn.Sequential(
 					nn.Linear(hidden_dim, 3 * hidden_dim, bias=False),
@@ -121,7 +123,7 @@ class SimpleCompModel(nn.Module):
 				xn = layer_block['norm1'](x)
 				attn_output = layer_block['attention'](xn, self.rope, mask)
 				x = x + attn_output
-				xn = layer_block['norm2'](attn_output) # NOTE: was x
+				xn = layer_block['norm2'](attn_output) # NOTE: could be x
 				ffn_output = layer_block['ffn'](xn)
 				x = x + ffn_output
 		return self.output_proj(x)
@@ -254,10 +256,12 @@ def calcLoss(pred, targets):
 	n_possible = 0
 	bs = pred.shape[0]
 	ntok = pred.shape[1]
-	loss = F.cross_entropy(pred[:,-1,:], targets[:,-1].long())
+	seq_pred = pred[:, -SEQ_L:, :].reshape(-1, pred.shape[-1])
+	seq_targets = targets[:, -SEQ_L:].long().reshape(-1)
+	loss = F.cross_entropy(seq_pred, seq_targets)
 	with torch.no_grad():
-		n_correct = torch.sum(torch.argmax(pred[:,-1,:], axis=-1) == targets[:,-1]).item()
-		n_possible = pred.shape[0]
+		n_correct = torch.sum(torch.argmax(seq_pred, dim=-1) == seq_targets).item()
+		n_possible = seq_targets.shape[0]
 	return loss, n_correct, n_possible
 
 def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl="", log_name="", save_model=False, replicate=1, no_amp=False, use_cuda_kernels=True):
@@ -273,20 +277,20 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	print(f"Using device: {device}")
 	
 	# for grokking, need to generate the (nearly) full table
-	train_s, test_s = gen_data('grok', max_d=1, V=2, P=113,L=1,data_size=120**2)
+	train_s, test_s = gen_data('grok', max_d=1, V=2, P=113, L=SEQ_L, data_size=120**2)
 	for i in range(5): print(f"Train: {train_s[i]}")
 	for i in range(5):  print(f"Test:  {test_s[i]}")
 	max_exprlen, train_np, test_np = to_numpy(train_s, test_s, 113)
 	x = train_np.copy() + 1
 	y = train_np + 1 # to_numpy uses -1 for the null tok
-	# x[:,-1] = 0 # mask off last token
-	x = x[:,:-1]
-	y = y[:,1:]
+	x[:,-1] = 0 # mask off last token
+	# x = x[:,:-1] # shift for autoregression
+	# y = y[:,1:]
 	x_v = test_np.copy() + 1
 	y_v = test_np + 1
-	# x_v[:,-1] = 0
-	x_v = x_v[:,:-1]
-	y_v = y_v[:,1:]
+	x_v[:,-1] = 0
+	# x_v = x_v[:,:-1]
+	# y_v = y_v[:,1:]
 
 	dataset = TensorDataset(torch.tensor(x), torch.tensor(y))
 	train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -298,8 +302,8 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 
 	is_hg = attn_impl == "hypergraph"
 	n_layers = 1
-	if attn_impl == "graph":
-		n_layers = 2
+	# if attn_impl == "graph":
+	# 	n_layers = 2
 	n_recurse = 1
 
 	dtype = torch.float32
