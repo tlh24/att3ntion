@@ -249,7 +249,7 @@ class GrokkingTransformer(nn.Module):
 		return h
 
 
-def calcLoss(task, pred, targets):
+def calcLoss(pred, targets):
 	n_correct = 0
 	n_possible = 0
 	bs = pred.shape[0]
@@ -260,7 +260,7 @@ def calcLoss(task, pred, targets):
 		n_possible = pred.shape[0]
 	return loss, n_correct, n_possible
 
-def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl="", log_name="", save_model=False, task=3, replicate=1, no_amp=False, use_cuda_kernels=True):
+def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl="", log_name="", save_model=False, replicate=1, no_amp=False, use_cuda_kernels=True):
 	
 	if device == 'auto':
 		if torch.cuda.is_available():
@@ -278,11 +278,15 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	for i in range(5):  print(f"Test:  {test_s[i]}")
 	max_exprlen, train_np, test_np = to_numpy(train_s, test_s, 113)
 	x = train_np.copy() + 1
-	x[:,-1] = 0 # mask off last token
 	y = train_np + 1 # to_numpy uses -1 for the null tok
+	# x[:,-1] = 0 # mask off last token
+	x = x[:,:-1]
+	y = y[:,1:]
 	x_v = test_np.copy() + 1
-	x_v[:,-1] = 0
 	y_v = test_np + 1
+	# x_v[:,-1] = 0
+	x_v = x_v[:,:-1]
+	y_v = y_v[:,1:]
 
 	dataset = TensorDataset(torch.tensor(x), torch.tensor(y))
 	train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -321,7 +325,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 		print("--- Running with Torch automatic mixed precision (fp32 weights) ---")
 
 	nam = {"hypergraph":"hg","graph":"g"}.get(attn_impl)
-	fd_losslog = open(f'losslog_{nam}_t{task}_{log_name}_r{replicate}.txt', 'w')
+	fd_losslog = open(f'losslog_{nam}_{log_name}_r{replicate}.txt', 'w')
 
 	print("\ntrain_model1 started...")
 	uu = 0
@@ -345,11 +349,11 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 
 			if no_amp:
 				pred = model(inputs, batch_indx)
-				loss, n_correct, n_possible = calcLoss(task, pred, targets)
+				loss, n_correct, n_possible = calcLoss(pred, targets)
 			else:
 				with autocast('cuda'):
 					pred = model(inputs)
-					loss, n_correct, n_possible = calcLoss(task, pred, targets)
+					loss, n_correct, n_possible = calcLoss(pred, targets)
 			correct_vals += n_correct
 
 			loss.backward()
@@ -377,11 +381,6 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 				return t.detach().cpu().squeeze().float().numpy()
 			def plot(r, c, t, blank=False):
 				g = mangle(t)
-				if task == 4 and blank: # mask areas with no loss
-					g[:,:5] = 0
-					mx = np.max(g[:,5:40], axis=-1)
-					mx = np.expand_dims(mx, -1)
-					g[:,5:40] = g[:,5:40] / (mx+1)
 				im = axs[r,c].imshow( g.T )
 				plt.colorbar(im, ax=axs[r,c])
 
@@ -420,11 +419,11 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 
 			if no_amp:
 				pred = model(inputs, 0)
-				loss, n_correct, n_possible = calcLoss(task, pred, targets)
+				loss, n_correct, n_possible = calcLoss(pred, targets)
 			else:
 				with autocast('cuda'):
 					pred = model(inputs)
-					loss, n_correct, n_possible = calcLoss(task, pred, targets)
+					loss, n_correct, n_possible = calcLoss(pred, targets)
 			correct_vals += n_correct
 
 			total += n_possible
@@ -456,7 +455,7 @@ if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='Train aritmetic model')
 	parser.add_argument('--device', type=str, default='auto',
 						help='Device to use (cpu, cuda, auto)')
-	parser.add_argument('--epochs', type=int, default=5, help='Number of epochs')
+	parser.add_argument('--epochs', type=int, default=40, help='Number of epochs')
 	parser.add_argument('--batch-size', type=int, default=32, help='Batch size for training')
 	parser.add_argument('--hidden', type=int, default=256, help='Hidden dimension size')
 	parser.add_argument('--heads', type=int, default=1, help='Number of attention heads')
@@ -466,7 +465,7 @@ if __name__ == '__main__':
 						help='postfix logname')
 	parser.add_argument('--save', action='store_true',
         help='Load and save model parameters.')
-	parser.add_argument('--task', type=int, help="what task to run the model on", required=True)
+	# parser.add_argument('--task', type=int, help="what task to run the model on", required=True)
 	parser.add_argument('--repl', type=int, default=1, help="what replicate this is",)
 	parser.add_argument('--no-amp', action='store_true', help='Disable Torch automatic mixed precision')
 	parser.add_argument('--use-cuda-kernels', action='store_true',
@@ -482,7 +481,6 @@ if __name__ == '__main__':
 		batch_size=args.batch_size,
 		log_name=args.log_name,
 		save_model=args.save,
-		task = args.task,
 		replicate = args.repl,
 		no_amp = args.no_amp,
 		use_cuda_kernels = args.use_cuda_kernels,
