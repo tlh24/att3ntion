@@ -298,7 +298,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 
 	is_hg = attn_impl == "hypergraph"
 	n_layers = 1
-	if attn_impl == "graph"
+	if attn_impl == "graph":
 		n_layers = 2
 	n_recurse = 1
 
