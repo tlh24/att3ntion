@@ -65,7 +65,7 @@ class SwiGLU(nn.Module):
 
 class SimpleCompModel(nn.Module):
 	"""Model with hypergraph attention layer."""
-	def __init__(self, input_vocab:int, hidden_dim:int, num_heads:int, n_layers:int, attn_impl:str='', n_recurse:int=1, use_cuda_kernels:bool=True):
+	def __init__(self, input_vocab:int, hidden_dim:int, n_heads:int, n_layers:int, attn_impl:str='', n_recurse:int=1, use_cuda_kernels:bool=True):
 		super().__init__()
 		self.input_vocab = input_vocab
 		self.embedding_proj = nn.Embedding(input_vocab, hidden_dim)
@@ -73,7 +73,7 @@ class SimpleCompModel(nn.Module):
 		self.attn_impl = attn_impl
 		self.n_recurse = n_recurse
 		self.d_model = hidden_dim
-		self.rope = RotaryEmbedding(dim = hidden_dim//num_heads)
+		self.rope = RotaryEmbedding(dim = hidden_dim//n_heads)
 
 		use_cuda = use_cuda_kernels and _cuda_kernels_available and attn_impl == "hypergraph"
 		if use_cuda:
@@ -85,11 +85,11 @@ class SimpleCompModel(nn.Module):
 		for _ in range(n_layers):
 			if attn_impl == "hypergraph":
 				if use_cuda:
-					attention_layer = _CudaHypergraphWrapper(hidden_dim, num_heads)
+					attention_layer = _CudaHypergraphWrapper(hidden_dim, n_heads)
 				else:
-					attention_layer = _HypergraphAttentionNaive(hidden_dim, num_heads, head_subspaces=True)
+					attention_layer = _HypergraphAttentionNaive(hidden_dim, n_heads, head_subspaces=True)
 			else:
-				attention_layer = _GraphAttentionNaive(hidden_dim, num_heads, head_subspaces=True)
+				attention_layer = _GraphAttentionNaive(hidden_dim, n_heads, head_subspaces=True)
 
 			norm1_layer = nn.RMSNorm(hidden_dim)
 			norm2_layer = nn.RMSNorm(hidden_dim)
@@ -266,7 +266,7 @@ def calcLoss(pred, targets):
 		n_possible = seq_targets.shape[0]
 	return loss, n_correct, n_possible
 
-def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, task, attn_impl="", log_name="", save_model=False, replicate=1, no_amp=False, use_cuda_kernels=True):
+def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_impl="", log_name="", save_model=False, replicate=1, no_amp=False, use_cuda_kernels=True):
 	
 	if device == 'auto':
 		if torch.cuda.is_available():
@@ -315,12 +315,14 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, task, attn
 		if attn_impl == "graph":
 			n_layers = 2
 		n_recurse = 1
+		n_heads = 1
 	if task == 2:
 		n_layers = 2
 		n_recurse = 2 # depends on the formula depth
+		n_heads = 4
 
 	dtype = torch.float32
-	model = SimpleCompModel(vocab_size, hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse, use_cuda_kernels=use_cuda_kernels).to(device=device, dtype=dtype)
+	model = SimpleCompModel(vocab_size, hidden_dim, n_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse, use_cuda_kernels=use_cuda_kernels).to(device=device, dtype=dtype)
 	# model = GrokkingTransformer(vocab_size, hidden_dim, 1, use_norm=True).to(device=device)
 	if save_model:
 		try:
@@ -498,7 +500,7 @@ if __name__ == '__main__':
 		num_epochs=args.epochs,
 		device=args.device,
 		hidden_dim=args.hidden,
-		num_heads=args.heads,
+		n_heads=args.heads,
 		task = args.task,
 		attn_impl=args.attn,
 		batch_size=args.batch_size,
