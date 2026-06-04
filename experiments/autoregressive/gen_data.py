@@ -218,12 +218,12 @@ if __name__ == "__main__":
 		if count >= 10: break
 
 	print("Generating Mode A (Grokking Split)...")
-	train_A, test_A = gen_data('grok', max_d=1, V=2, L=1, data_size=50)
+	train_A, test_A = gen_data('grok', max_d=2, V=2, L=1, data_size=50)
 	for row in train_A: print(f"Train: {row}")
 	for row in test_A:  print(f"Test:  {row}")
 
 	# check numpy conversion
-	max_exprlen, train_np, test_np = to_numpy(train_A, test_A, 113)
+	max_exprlen, train_np, test_np = to_numpy(train_A, test_A, 25)
 	fig,axs = plt.subplots(2, 1, figsize=(12, 6))
 	axs[0].imshow(train_np.T - 113)
 	axs[0].set_title('Train')

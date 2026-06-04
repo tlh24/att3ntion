@@ -266,7 +266,7 @@ def calcLoss(pred, targets):
 		n_possible = seq_targets.shape[0]
 	return loss, n_correct, n_possible
 
-def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl="", log_name="", save_model=False, replicate=1, no_amp=False, use_cuda_kernels=True):
+def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, task, attn_impl="", log_name="", save_model=False, replicate=1, no_amp=False, use_cuda_kernels=True):
 	
 	if device == 'auto':
 		if torch.cuda.is_available():
@@ -278,10 +278,15 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	
 	print(f"Using device: {device}")
 	
-	# for grokking, need to generate the (nearly) full table
-	train_s, test_s = gen_data('grok', max_d=1, V=2, P=113, L=SEQ_L, data_size=120**2)
+	if task == 1:
+		# for grokking, need to generate the (nearly) full table
+		train_s, test_s = gen_data('grok', max_d=1, V=2, P=113, L=SEQ_L, data_size=120**2)
+	if task == 2:
+		train_s, test_s = gen_data('formulas', max_d=2, V=2, P=113, L=SEQ_L, data_size=100_000)
 	for i in range(5): print(f"Train: {train_s[i]}")
 	for i in range(5):  print(f"Test:  {test_s[i]}")
+	print(f"Train size {len(train_s)} test size {len(test_s)}")
+
 	max_exprlen, train_np, test_np = to_numpy(train_s, test_s, 113)
 	x = train_np.copy() + 1
 	y = train_np + 1 # to_numpy uses -1 for the null tok
@@ -305,10 +310,14 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	vocab_size = np.max(x) + 1
 
 	is_hg = attn_impl == "hypergraph"
-	n_layers = 1
-	if attn_impl == "graph":
+	if task == 1:
+		n_layers = 1
+		if attn_impl == "graph":
+			n_layers = 2
+		n_recurse = 1
+	if task == 2:
 		n_layers = 2
-	n_recurse = 1
+		n_recurse = 2 # depends on the formula depth
 
 	dtype = torch.float32
 	model = SimpleCompModel(vocab_size, hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse, use_cuda_kernels=use_cuda_kernels).to(device=device, dtype=dtype)
@@ -475,7 +484,8 @@ if __name__ == '__main__':
 						help='postfix logname')
 	parser.add_argument('--save', action='store_true',
         help='Load and save model parameters.')
-	parser.add_argument('--seq-l', type=int, help="sequence length", required=True)
+	parser.add_argument('--seq-l', type=int, default=1, help="sequence length")
+	parser.add_argument('--task', type=int, default=1, help="what task to run. 1 = mod arith; 2 = formula generalization")
 	parser.add_argument('--repl', type=int, default=1, help="what replicate this is",)
 	parser.add_argument('--no-amp', action='store_true', help='Disable Torch automatic mixed precision')
 	parser.add_argument('--use-cuda-kernels', action='store_true',
@@ -489,6 +499,7 @@ if __name__ == '__main__':
 		device=args.device,
 		hidden_dim=args.hidden,
 		num_heads=args.heads,
+		task = args.task,
 		attn_impl=args.attn,
 		batch_size=args.batch_size,
 		log_name=args.log_name,

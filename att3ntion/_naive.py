@@ -117,10 +117,10 @@ class _HypergraphAttentionNaive(nn.Module):
 		Y_s = self.gelu(Y_s)
 		# y = torch.cat((Y_q, Y_r, Y_s), dim=-1)
 		y = Y_q + Y_r + Y_s
-		# note: cat -> projection, GeLU, and no GELU all more-or-less work well.
+		# NOTE: cat -> projection, GeLU, and no GELU all more-or-less work well.
 
 		if self.scatter:
-			# note: option for diamond op in scatter being 'add' removed.
+			# NOTE: option for diamond op in scatter being 'add' removed.
 			# (see README.md)
 			Y_q_ = torch.einsum('bhijk,bhjd,bhijk,bhkd->bhid', Ar, Vr_, As, Vs_)
 			Y_r_ = torch.einsum('bhijk,bhid,bhijk,bhkd->bhjd', Aq, Vq_, As, Vs_)
