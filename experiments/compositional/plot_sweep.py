@@ -1,5 +1,8 @@
 import glob, re, numpy as np, matplotlib.pyplot as plt
+from pathlib import Path
 from matplotlib.ticker import FuncFormatter, LogLocator
+
+LOSSLOG_DIR = Path(__file__).resolve().parent / "losslogs"
 
 # Define kernel
 window_size = 128
@@ -9,8 +12,7 @@ kernel /= np.sum(kernel)
 fig, axs = plt.subplots(1, 3, figsize=(12, 4), sharey=True)
 task_idx = {'3': 0, '4': 1, '7': 2}
 
-for f in glob.glob("losslog_*_t*_test_r*.txt"):
-	print("reading:", f)
+for f in glob.glob(str(LOSSLOG_DIR / "losslog_*_t*_test_r*.txt")):
 	c, t = re.search(r'_(g|hg)_t(3|4|7)_', f).groups()
 	x, y = np.loadtxt(f, usecols=(0, 1)).T
 
