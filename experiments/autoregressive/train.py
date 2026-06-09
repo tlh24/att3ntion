@@ -317,8 +317,8 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		n_recurse = 1
 		n_heads = 1
 	if task == 2:
-		n_layers = 2
-		n_recurse = 2 # depends on the formula depth
+		n_layers = 3
+		n_recurse = 1 # depends on the formula depth
 		n_heads = 4
 
 	dtype = torch.float32
@@ -337,7 +337,10 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 										weight_decay=weight_decay,
 										betas=betas,
 										amsgrad=True, eps=1e-5)
-	# model.printParamCount() FIXME
+	try:
+		model.printParamCount()
+	except:
+		print("\\ grokking transformer does not calculate number of parameters")
 	# model = torch.compile(model, backend="eager") # mode="max-autotune"
 
 	if no_amp:
@@ -394,36 +397,14 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 				amp_time = start_event.elapsed_time(end_event)
 				print("batch time:", amp_time, "ms")
 				fd_losslog.flush()
-
-		# plot the inputs / outputs
-		if epoch == (num_epochs-1) and False:
-			fig,axs = plt.subplots(2, 4, figsize=(13,10))
-			def mangle(t):
-				return t.detach().cpu().squeeze().float().numpy()
-			def plot(r, c, t, blank=False):
-				g = mangle(t)
-				im = axs[r,c].imshow( g.T )
-				plt.colorbar(im, ax=axs[r,c])
-
-			for j in range(2):
-				plot(j,0, inputs[j,...])
-				plot(j,1, targets[j,...])
-				plot(j,2, pred[j,...], True)
-				plot(j,3, pred[j,...] - targets[j,...], True)
-
-				axs[j,0].set_title('input')
-				axs[j,1].set_title('target')
-				axs[j,2].set_title('pred')
-				axs[j,3].set_title('err')
-			plt.show()
 		
 		avg_loss = total_loss / len(train_loader)
 		train_accuracy = 100 * correct_vals / total
 		print(f'Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Result Acc: {train_accuracy:.2f}%')
 
-		if save_model:
-			# save after each epoch
-			model.save_model(f"comp_model_{attn_impl}_r{replicate}.pt")
+		# if save_model:
+		# 	# save after each epoch
+		# 	model.save_model(f"comp_model_{attn_impl}_r{replicate}.pt")
 
 	fd_losslog.flush()
 	# validation!
