@@ -283,7 +283,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		train_s, test_s = gen_data('grok', max_d=1, V=2, P=113, L=SEQ_L, data_size=120**2)
 	if task == 2:
 		train_s, test_s = gen_data('formulas', max_d=2, V=2, P=113, L=SEQ_L, data_size=100_000)
-	for i in range(5): print(f"Train: {train_s[i]}")
+	for i in range(10): print(f"Train: {train_s[i]}")
 	for i in range(5):  print(f"Test:  {test_s[i]}")
 	print(f"Train size {len(train_s)} test size {len(test_s)}")
 
