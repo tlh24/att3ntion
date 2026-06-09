@@ -89,6 +89,7 @@ def _hypergraph_backward_fake(
 
 
 def _setup_context(ctx, inputs, output):
+    # this is the only backward API - stats must come from forward pass to ensure
     Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, _dropout, _Iv, _Jv, _Kv = inputs
     _, _, _, _, _, _, m_i, l_i, m_j, l_j, m_k, l_k = output
     ctx.save_for_backward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, m_i, l_i, m_j, l_j, m_k, l_k)
