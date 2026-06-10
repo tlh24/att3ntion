@@ -18,7 +18,7 @@ for d in [script_dir, project_root]:
         sys.path.insert(0, d)
 
 from att3ntion import _HypergraphAttentionNaive, _GraphAttentionNaive, QuickGELU
-from gen_data import gen_data, to_numpy
+from gen_data import gen_data, to_numpy, from_numpy
 
 SEQ_L = 1 # length of the output sequence
 MASKED = False # masked vs autoregressive training.
@@ -282,7 +282,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		# for grokking, need to generate the (nearly) full table
 		train_s, test_s = gen_data('grok', max_d=1, V=2, P=113, L=SEQ_L, data_size=120**2)
 	if task == 2:
-		train_s, test_s = gen_data('formulas', max_d=2, V=2, P=113, L=SEQ_L, data_size=100_000)
+		train_s, test_s = gen_data('grok', max_d=1, V=2, P=113, L=SEQ_L, data_size=6*120**2)
 	for i in range(10): print(f"Train: {train_s[i]}")
 	for i in range(5):  print(f"Test:  {test_s[i]}")
 	print(f"Train size {len(train_s)} test size {len(test_s)}")
@@ -317,9 +317,11 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		n_recurse = 1
 		n_heads = 1
 	if task == 2:
-		n_layers = 3
+		n_layers = 2
+		if attn_impl == "graph":
+			n_layers = 4
 		n_recurse = 1 # depends on the formula depth
-		n_heads = 4
+		# n_heads = 6 # use the command line arg
 
 	dtype = torch.float32
 	model = SimpleCompModel(vocab_size, hidden_dim, n_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse, use_cuda_kernels=use_cuda_kernels).to(device=device, dtype=dtype)
@@ -341,7 +343,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		model.printParamCount()
 	except:
 		print("\\ grokking transformer does not calculate number of parameters")
-	# model = torch.compile(model, backend="eager") # mode="max-autotune"
+	model = torch.compile(model, backend="eager") # mode="max-autotune"
 
 	if no_amp:
 		print("--- Running in full fp32 ---")
@@ -353,8 +355,10 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 
 	print("\ntrain_model1 started...")
 	uu = 0
+	model.train()
+	rng = np.random.default_rng()
+
 	for epoch in range(num_epochs):
-		model.train()
 		total_loss = 0
 		correct_ops = 0
 		correct_vals = 0
@@ -363,9 +367,18 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		start_event = torch.cuda.Event(enable_timing=True)
 		end_event = torch.cuda.Event(enable_timing=True)
 		
-		for batch_indx, (inputs_np,outputs_np) in enumerate(train_loader):
-			inputs = inputs_np.to(device=device)
-			targets = outputs_np.to(device=device)
+		# for batch_indx, (inputs_np,outputs_np) in enumerate(train_loader):
+
+		n_train = x.shape[0]
+		for batch_indx in range(n_train // batch_size):
+			mb_idx = rng.permutation(n_train)[:batch_size]
+			inputs = torch.tensor(x[mb_idx,:]).to(device=device)
+			targets = torch.tensor(y[mb_idx,:]).to(device=device)
+
+			if batch_indx == 0:
+				d = inputs[0:5, :].detach().cpu().numpy()
+				# print(d-1) # null token mapped to -1
+				print(from_numpy(d-1, 113))
 
 			if batch_indx % 100 == 0:
 				start_event.record()
@@ -385,6 +398,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 			optimizer.step()
 
 			lloss = loss.detach().cpu().item()
+			lloss = lloss / inputs.shape[0] # normalize by batch size
 			fd_losslog.write(f"{uu}\t{lloss}\t0.0\n")
 			uu += 1
 
@@ -457,10 +471,10 @@ if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='Train aritmetic model')
 	parser.add_argument('--device', type=str, default='auto',
 						help='Device to use (cpu, cuda, auto)')
-	parser.add_argument('--epochs', type=int, default=40, help='Number of epochs')
+	parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
 	parser.add_argument('--batch-size', type=int, default=32, help='Batch size for training')
 	parser.add_argument('--hidden', type=int, default=256, help='Hidden dimension size')
-	parser.add_argument('--heads', type=int, default=1, help='Number of attention heads')
+	parser.add_argument('--heads', type=int, default=4, help='Number of attention heads')
 	parser.add_argument('--attn', type=str, default='hypergraph', choices=['hypergraph', 'graph'],
 						help='Attention implementation to use')
 	parser.add_argument('--log-name', type=str,

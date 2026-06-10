@@ -5,7 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 OPS = ['+', '-', '*', '/']
-# OPS = ['+']
+# OPS = ['+', '-']
 COMMUTATIVE_OPS = {'+', '*'}
 
 @lru_cache(maxsize=None)
@@ -160,9 +160,10 @@ def gen_data(mode, max_d, V, P=113, L=1, data_size=1000, exact_v=True):
 
 	return train_data, test_data
 
+OP_MAP = {'+': 0, '-': 1, '*': 2, '/': 3, '(': 4, ')': 5}
+
 def to_numpy(train_data, test_data, P):
 	"""Maps expressions and sequences to an int32 numpy array, padding the expression."""
-	OP_MAP = {'+': 0, '-': 1, '*': 2, '/': 3, '(': 4, ')': 5}
 
 	def tokenize(expr):
 		# Safely separate parens so .split() works cleanly
@@ -191,6 +192,21 @@ def to_numpy(train_data, test_data, P):
 	# return the maximum expression length & np train test arrays.
 	return max_e, build_array(tr_parsed), build_array(te_parsed)
 
+def from_numpy(data, P):
+	# inefficiently convert from a numpy array to string
+	o = ""
+	for r in range(data.shape[0]):
+		for c in range(data.shape[1]):
+			v = data[r,c]
+			if v < P:
+				o += str(v) + " "
+			elif v < P + len(OP_MAP):
+				o += list(OP_MAP)[v-P] + " "
+			else:
+				o += f"x_{v - P - len(OP_MAP)} "
+		o += "\n"
+	return o
+
 if __name__ == "__main__":
 	V = 2 # Variables
 	D = 2 # Depth
@@ -217,22 +233,23 @@ if __name__ == "__main__":
 			if count >= 10: break
 		if count >= 10: break
 
-	print("Generating Mode A (Grokking Split)...")
-	train_A, test_A = gen_data('grok', max_d=2, V=2, L=1, data_size=50)
+	print("Generating max_d=2 V=2, L=1")
+	train_A, test_A = gen_data('formulas', max_d=2, V=2, L=1, data_size=50)
 	for row in train_A: print(f"Train: {row}")
 	for row in test_A:  print(f"Test:  {row}")
 
 	# check numpy conversion
-	max_exprlen, train_np, test_np = to_numpy(train_A, test_A, 25)
+	max_exprlen, train_np, test_np = to_numpy(train_A, test_A, 113)
 	fig,axs = plt.subplots(2, 1, figsize=(12, 6))
 	axs[0].imshow(train_np.T - 113)
 	axs[0].set_title('Train')
 	axs[1].imshow(test_np.T - 113)
 	axs[1].set_title('Test')
 	plt.show()
+	print(from_numpy(train_np[0:5,:], 113))
 
-	print("\nGenerating Mode B (Formula Split)...")
-	train_B, test_B = gen_data('B', max_d=1, V=2, L=2, data_size=5)
+	print("\nGenerating Mode B max_d=1, V=2, L=2")
+	train_B, test_B = gen_data('formulas', max_d=1, V=2, L=2, data_size=5)
 	for row in train_B: print(f"Train: {row}")
 	for row in test_B:  print(f"Test:  {row}")
 
