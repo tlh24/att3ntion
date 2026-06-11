@@ -1,17 +1,4 @@
 #!/usr/bin/bash
-# Sweep: hypergraph (gather-only) + hypergraph (gather + scatter) vs.
-# tree / strassen / tensor polyattention variants, on compositional tasks
-# 3, 4, 7, across N replicates. All variants share the same 1/sqrt(d)
-# scaling, the same data per (task, replicate), and the same architecture
-# scaffolding (RMSNorm, FFN, residuals, output proj).
-#
-# Loss logs land in experiments/compositional/losslogs/ regardless of where
-# this script is invoked from (train.py resolves the dir from __file__).
-#
-# Usage:
-#   ./run_comparison.sh                                                # all tasks, sequential
-#   ./run_comparison.sh --tasks 3 --parallel                           # task 3 only, attns × replicates in parallel
-#   ./run_comparison.sh --tasks 3 --nrepl 5 --parallel --epochs 20
 
 set -uo pipefail   # no -e: we don't want one failing child to kill a parallel batch
 
@@ -25,7 +12,6 @@ HIDDEN=256
 HEADS=8
 PARALLEL=0
 MAX_PARALLEL=0   # 0 = no cap (background all at once when --parallel is set)
-# Comma-separated list of attentions and tasks; override on the cli if needed.
 ATTNS="hypergraph,hypergraph_scatter,tree,strassen,tensor"
 TASKS="3,4,7"
 
@@ -97,17 +83,9 @@ run_one() {
 		--repl "$r"
 }
 
-# Forward Ctrl-C from the foreground bash to every backgrounded python.
 trap 'echo "[run_comparison] caught SIGINT, killing background jobs"; kill 0 2>/dev/null; exit 130' INT TERM
 
 if [[ "$PARALLEL" == "1" ]]; then
-	# Within each task, fan out (attn x replicate) cells concurrently.
-	# When --max-parallel N is set, use `wait -n` to keep at most N workers alive
-	# at any time — this prevents CPU-RAM OOM kills when launching e.g. 25 procs
-	# at once, each of which allocates the full training dataset before GPU upload.
-	# Per-line prefix '[tT_attn_rN]' lets you grep interleaved output.
-	# Loss curves are unaffected by GPU contention (each process has its own
-	# deterministic seed); only wall-clock batch times will be perturbed.
 	for task in "${TASK_ARR[@]}"; do
 		echo ""
 		if [[ "$MAX_PARALLEL" -gt 0 ]]; then
@@ -126,7 +104,6 @@ if [[ "$PARALLEL" == "1" ]]; then
 				running=$((running + 1))
 				job_idx=$((job_idx + 1))
 				if [[ "$MAX_PARALLEL" -gt 0 ]] && [[ "$running" -ge "$MAX_PARALLEL" ]]; then
-					# Block until any one of the running jobs finishes, then continue
 					wait -n
 					running=$((running - 1))
 				fi
@@ -136,9 +113,6 @@ if [[ "$PARALLEL" == "1" ]]; then
 		echo "==== task $task: all parallel runs complete ===="
 	done
 else
-	# Iteration order: replicate (outer), task, attn (inner). Gives you a full
-	# pass over every (task, attn) cell at replicate 1 first, so live_plot.py
-	# shows trends before the full sweep finishes.
 	job_idx=0
 	for r in $(seq 1 "$NREPL"); do
 		for task in "${TASK_ARR[@]}"; do

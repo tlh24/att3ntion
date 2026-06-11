@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Live-updating loss plot. Run from the experiments/compositional/ directory."""
 
 import argparse
 import numpy as np

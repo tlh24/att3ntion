@@ -4,7 +4,6 @@ from matplotlib.ticker import FuncFormatter, LogLocator
 
 LOSSLOG_DIR = Path(__file__).resolve().parent / "losslogs"
 
-# Define kernel
 window_size = 128
 kernel = 1 - np.cos(np.linspace(0, 2*np.pi, window_size))
 kernel /= np.sum(kernel)
@@ -16,7 +15,6 @@ for f in glob.glob(str(LOSSLOG_DIR / "losslog_*_t*_test_r*.txt")):
 	c, t = re.search(r'_(g|hg)_t(3|4|7)_', f).groups()
 	x, y = np.loadtxt(f, usecols=(0, 1)).T
 
-	# Apply sliding-window filter and align x-axis
 	y = np.convolve(y, kernel, mode='same')
 
 	axs[task_idx[t]].plot(x, y, color='r' if c == 'g' else 'b')
@@ -28,7 +26,6 @@ for t, i in task_idx.items():
 
 axs[0].set_ylabel("Loss")
 
-# Force ticks to integer powers of e and format nicely as e^x
 axs[0].yaxis.set_major_locator(LogLocator(base=np.e, subs=(1.0,)))
 axs[0].yaxis.set_major_formatter(FuncFormatter(lambda val, _: f"$e^{{{int(np.round(np.log(val)))}}}$"))
 

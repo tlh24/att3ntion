@@ -1,13 +1,3 @@
-"""Smoke tests for polyattention reference variants.
-
-Covers:
-  - PolyAttention (t=3) for polynomial in {tree, strassen, tensor}
-  - SelfAttention (reroutes to _GraphAttentionNaive with 1/d scaling)
-
-Verifies forward+backward run, output shape matches input, gradients are finite, and
-attention probabilities normalize correctly.
-Pure PyTorch — runs on CPU or CUDA.
-"""
 import pytest
 import torch
 
@@ -58,7 +48,6 @@ def test_polystandard_t2_forward_backward(head_subspaces):
 
 @pytest.mark.parametrize("polynomial", ["tree", "strassen", "tensor"])
 def test_polyattention_t3_softmax_normalizes(polynomial):
-    """For all three t=3 polynomials, softmax over (j,k) must sum to 1 per (b,h,i)."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     B, N, d_model, n_heads = 1, 8, 32, 2
 

@@ -27,7 +27,6 @@ from att3ntion import (
 	QuickGELU,
 )
 
-# CUDA-backed HypergraphAttention is optional; fall back gracefully if not built.
 _cuda_kernels_available = False
 try:
 	from att3ntion import HypergraphAttention
@@ -37,7 +36,6 @@ except (ImportError, OSError):
 
 
 class _HypergraphCudaWrapper(nn.Module):
-	"""Adapter so the CUDA HypergraphAttention slots into the (x, rotary_emb) call site."""
 	def __init__(self, d_model, n_heads, head_subspaces=True, **kwargs):
 		super().__init__()
 		if not _cuda_kernels_available:
@@ -55,7 +53,6 @@ class _HypergraphCudaWrapper(nn.Module):
 		return self.inner(x)
 
 	def calcFlops(self, x):
-		# Mirror _HypergraphAttentionNaive.calcFlops so the validation GFlops print works.
 		bs, ntok, d_model = x.shape
 		f = 0.0
 		f += 3 * bs * ntok * d_model**2 * self.n_heads * d_model
@@ -96,12 +93,8 @@ class SimpleCompModel(nn.Module):
 		self.repeated_layers = nn.ModuleList()
 		for _ in range(n_layers):
 			if attn_impl == "hypergraph":
-				# Gather-only: scatter=False (default) — Y_q_/Y_r_/Y_s_ are zero.
 				attention_layer = _HypergraphAttentionNaive(hidden_dim, num_heads, head_subspaces=True, scatter=False)
 			elif attn_impl == "hypergraph_scatter":
-				# Gather + scatter: scatter=True doubles the value-projection width
-				# and adds the bilinear-over-two-softmasks terms. Note this changes
-				# param count relative to "hypergraph" — report both.
 				attention_layer = _HypergraphAttentionNaive(hidden_dim, num_heads, head_subspaces=True, scatter=True)
 			elif attn_impl == "hypergraph_cuda":
 				attention_layer = _HypergraphCudaWrapper(hidden_dim, num_heads, head_subspaces=True)
@@ -112,7 +105,6 @@ class SimpleCompModel(nn.Module):
 			elif attn_impl == "strassen":
 				attention_layer = PolyAttention(hidden_dim, num_heads, head_subspaces=True, polynomial="strassen")
 			elif attn_impl == "tensor":
-				# 2-simplicial attention ≡ 3-tensor attention (Clift et al. 2020 / Sanford et al.)
 				attention_layer = PolyAttention(hidden_dim, num_heads, head_subspaces=True, polynomial="tensor")
 			elif attn_impl == "standard":
 				attention_layer = SelfAttention(hidden_dim, num_heads, head_subspaces=True)
@@ -285,14 +277,6 @@ def calcLoss(task, pred, targets):
 	return loss, n_correct, n_possible
 
 def setGlobalSeed(seed: int):
-	"""Seed every RNG that affects data / model init / DataLoader shuffling.
-
-	Called once per `trainModel` so that two runs with the same (task, replicate)
-	see the same data and the same initial weights, regardless of which `attn_impl`
-	is selected. Different impls draw different *amounts* of randomness from the
-	stream during nn.Module construction, but each impl's draws are reproducible
-	across reruns at the same seed.
-	"""
 	torch.manual_seed(seed)
 	np.random.seed(seed)
 	random.seed(seed)
@@ -311,8 +295,6 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	
 	print(f"Using device: {device}")
 
-	# Deterministic per-(task, replicate) seed so all attn_impls see the same
-	# data + init within a replicate, and replicates are independent across seeds.
 	seed = 1000 * task + replicate
 	setGlobalSeed(seed)
 	print(f"Seed: {seed}  (task={task}, replicate={replicate})")
@@ -338,10 +320,6 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 
 	input_dim = x.shape[2]
 
-	# Polyattention t=3 variants (tree/strassen/tensor) are all N^3 attentions, so they
-	# get the same n_layers as hypergraph for FLOPS-parity. standard is
-	# t=2 (standard self-attention recovered inside the polyattention framework), so it
-	# falls into the 2-way bucket and gets graph-style n_layers.
 	is_3way = attn_impl in (
 		"hypergraph", "hypergraph_scatter", "hypergraph_cuda", "hypergraph_cuda_scatter",
 		"tree", "strassen", "tensor",

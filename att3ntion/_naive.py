@@ -6,7 +6,6 @@ from att3ntion._autograd import QuickGELU
 
 
 def _normalize_self_attn_mask(mask, batch_size, ntok, device):
-	"""Normalize masks to bool tensor [B, N, N] for self-attention."""
 	if mask is None:
 		return None
 
@@ -34,7 +33,6 @@ def _normalize_self_attn_mask(mask, batch_size, ntok, device):
 
 
 class _HypergraphAttentionNaive(nn.Module):
-	"""Pure-PyTorch naive O(N^3) implementation for correctness testing."""
 	def __init__(
 			self, d_model, n_heads, dropout_rate=0,
 			head_subspaces=False,
@@ -72,9 +70,6 @@ class _HypergraphAttentionNaive(nn.Module):
 		self.gelu = QuickGELU()
 
 	def forward(self, x, rotary_emb, mask=None):
-		"""
-		mask: bool[batch, query, target] if provided
-		"""
 		out_dtype = x.dtype
 		x = x.float()
 		batch_size, ntok, d_model = x.shape
@@ -93,7 +88,6 @@ class _HypergraphAttentionNaive(nn.Module):
 		S = S.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
 
 		if self.scatter:
-			# split the values into scatter and gather components
 			Vq_full = self.Wv_q(x)
 			Vr_full = self.Wv_r(x)
 			Vs_full = self.Wv_s(x)
@@ -114,15 +108,10 @@ class _HypergraphAttentionNaive(nn.Module):
 
 		if mask is not None:
 			if mask.ndim == 2:
-				# mask is the standard 2D matrix (ntok, ntok)
-				# add in a (dummy, broadcasted) batch dim
 				mask = mask[None,:,:]
-			# otherwise can have a different mask per batch element
 			assert(mask.ndim == 3)
-			# any i can attend to j,k <= i (likewise for the other 2 permutations).
 			valid3 = (mask[:,:,:,None] & mask[:,:,None,:]).flatten(2, 3)
 			invalid3 = ~(valid3[:,None,:,:])
-			# the three dot_products are permuted and flattened so that the last dim is the softmax dim.
 			dot_product_q = dot_product_q.masked_fill(invalid3, float('-inf'))
 			dot_product_r = dot_product_r.masked_fill(invalid3, float('-inf'))
 			dot_product_s = dot_product_s.masked_fill(invalid3, float('-inf'))
@@ -147,8 +136,6 @@ class _HypergraphAttentionNaive(nn.Module):
 		y = Y_q + Y_r + Y_s
 
 		if self.scatter:
-			# note: option for diamond op in scatter being 'add' removed.
-			# (see README.md)
 			Y_q_ = torch.einsum('bhijk,bhjd,bhijk,bhkd->bhid', Ar, Vr_, As, Vs_)
 			Y_r_ = torch.einsum('bhijk,bhid,bhijk,bhkd->bhjd', Aq, Vq_, As, Vs_)
 			Y_s_ = torch.einsum('bhijk,bhid,bhijk,bhjd->bhkd', Aq, Vq_, Ar, Vr_)
@@ -179,8 +166,6 @@ class _HypergraphAttentionNaive(nn.Module):
 
 
 class PolyAttention(nn.Module):
-	"""Pure-PyTorch t=3 polyattention reference with tree/strassen/tensor logits."""
-
 	SUPPORTED_POLYNOMIALS = ("tree", "strassen", "tensor")
 
 	def __init__(self, d_model, n_heads, dropout_rate=0, head_subspaces=False,
@@ -215,13 +200,6 @@ class PolyAttention(nn.Module):
 		self.gelu = QuickGELU()
 
 	def _compute_logits(self, Q, R, S):
-		"""Assemble logits = (1/sqrt(d)) * h(Q_i, R_j, S_k) with shape [B, H, N, N, N].
-
-		NB: tree/strassen/tensor papers normalize by 1/d (variance argument for
-		bilinear/trilinear logits). We use 1/sqrt(d) here so all attentions in this
-		file share a single scaling convention with hypergraph (`_HypergraphAttentionNaive`),
-		isolating the polynomial structure as the only difference between variants.
-		"""
 		if self.polynomial == "tree":
 			Aqr = torch.einsum('bhid,bhjd->bhij', Q, R)
 			Ars = torch.einsum('bhjd,bhkd->bhjk', R, S)
@@ -302,10 +280,6 @@ class PolyAttention(nn.Module):
 
 
 class _GraphAttentionNaive(nn.Module):
-	"""Pure-PyTorch naive standard 2-way attention for comparison testing.
-
-	Uses 1/sqrt(d) scaling (standard self-attention convention).
-	"""
 	def __init__(
 		self,
 		d_model,
@@ -336,9 +310,6 @@ class _GraphAttentionNaive(nn.Module):
 		self.gelu = QuickGELU()
 
 	def forward(self, x, rotary_emb, mask=None):
-		"""
-		mask: bool[batch, query, target] if provided
-		"""
 		out_dtype = x.dtype
 		x = x.float()
 		batch_size, ntok, d_model = x.shape
@@ -387,7 +358,6 @@ class _GraphAttentionNaive(nn.Module):
 
 
 def SelfAttention(d_model, n_heads, dropout_rate=0, head_subspaces=False, **kwargs):
-	"""Self-attention wrapper that reroutes to `_GraphAttentionNaive` (1/sqrt(d) scaling)."""
 	return _GraphAttentionNaive(
 		d_model=d_model,
 		n_heads=n_heads,

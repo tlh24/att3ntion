@@ -22,7 +22,6 @@ benchmarks/benchmark_history.jsonl
 # Per-run training loss logs (machine-specific, large)
 experiments/compositional/losslogs/
 
-# Stray loss logs anywhere else (e.g. if train.py is invoked from repo root by mistake)
 losslog_*.txt
 
 # Per-run session narratives (reference per-machine bench numbers).
