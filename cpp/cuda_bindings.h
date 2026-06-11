@@ -26,6 +26,7 @@ forward_cuda(
     at::Tensor Vq_1, at::Tensor Vq_2,
     at::Tensor Vr_1, at::Tensor Vr_2,
     at::Tensor Vs_1, at::Tensor Vs_2,
+    at::Tensor mask,
     double dropout_rate = 0.0,
     int64_t I_valid = -1,
     int64_t J_valid = -1,
@@ -53,4 +54,5 @@ backward_cuda(
     at::Tensor m_i, at::Tensor l_i,
     at::Tensor m_j, at::Tensor l_j,
     at::Tensor m_k, at::Tensor l_k,
+    at::Tensor mask,
     double dropout_rate = 0.0);

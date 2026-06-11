@@ -46,6 +46,21 @@ constexpr int SCAT_ATTN_PAD = 2;
 constexpr int MIN_SPLIT_CHUNKS = 4;  // Only split loops across blocks when >= this many chunks
 constexpr int MAX_SPLIT_CHUNKS = 16; // Cap split workspace growth and reducer scratch.
 
+__device__ __forceinline__ bool mask_pair_allowed(
+    const bool* mask,
+    int N,
+    int b,
+    int anchor,
+    int a,
+    int c
+) {
+    if (mask == nullptr) {
+        return true;
+    }
+    const int64_t base = ((int64_t)b * N + anchor) * N;
+    return mask[base + a] && mask[base + c];
+}
+
 // Multi-i warp-parallel gather: 4 output vectors per block, warp-shuffle softmax
 //
 // I/J/K are the *padded* sizes (multiple of TILE_I/J/K) used for tile loops and
@@ -64,6 +79,7 @@ void Yq_gather(
     float*       __restrict__ Y,
     float*       __restrict__ m_i_out,
     float*       __restrict__ l_i_out,
+    const bool*  __restrict__ mask,
     int B, int H, int I, int J, int K, float scale,
     int num_j_chunks,
     int I_valid, int J_valid, int K_valid)
@@ -152,9 +168,15 @@ void Yq_gather(
                 if (cell_idx < TILE_J * TILE_K) {
                     int jt = cell_idx / TILE_K;
                     int kt = cell_idx % TILE_K;
+                    const int j_global = j0 + jt;
+                    const int k_global = k0 + kt;
                     
                     float dot = 0.0f;
-                    if (my_i_valid && j0 + jt < J_valid && k0 + kt < K_valid) {
+                    const bool cell_valid = my_i_valid
+                        && (j_global < J_valid)
+                        && (k_global < K_valid)
+                        && mask_pair_allowed(mask, I, b, my_i, j_global, k_global);
+                    if (cell_valid) {
                         float d_accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                         #pragma unroll 4
                         for (int d = 0; d < D_CONST; d += 4) {
@@ -199,7 +221,13 @@ void Yq_gather(
                 if (cell_idx < TILE_J * TILE_K) {
                     int jt = cell_idx / TILE_K;
                     int kt = cell_idx % TILE_K;
-                    if (my_i_valid && j0 + jt < J_valid && k0 + kt < K_valid) {
+                    const int j_global = j0 + jt;
+                    const int k_global = k0 + kt;
+                    const bool cell_valid = my_i_valid
+                        && (j_global < J_valid)
+                        && (k_global < K_valid)
+                        && mask_pair_allowed(mask, I, b, my_i, j_global, k_global);
+                    if (cell_valid) {
                         float p_val = expf(my_p[cell_idx] * scale - m_ij);
                         my_p[cell_idx] = p_val;
                         l_ij += p_val;
@@ -590,6 +618,7 @@ void Yr_gather(
     float*       __restrict__ Y,
     float*       __restrict__ m_j_out,
     float*       __restrict__ l_j_out,
+    const bool*  __restrict__ mask,
     int B, int H, int I, int J, int K, float scale,
     int num_i_chunks,
     int I_valid, int J_valid, int K_valid)
@@ -678,9 +707,15 @@ void Yr_gather(
                 if (cell_idx < TILE_I * TILE_K) {
                     int it = cell_idx / TILE_K;
                     int kt = cell_idx % TILE_K;
+                    const int i_global = i0 + it;
+                    const int k_global = k0 + kt;
                     
                     float dot = 0.0f;
-                    if (my_j_valid && i0 + it < I_valid && k0 + kt < K_valid) {
+                    const bool cell_valid = my_j_valid
+                        && (i_global < I_valid)
+                        && (k_global < K_valid)
+                        && mask_pair_allowed(mask, I, b, my_j, i_global, k_global);
+                    if (cell_valid) {
                         float d_accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                         #pragma unroll 4
                         for (int d = 0; d < D_CONST; d += 4) {
@@ -725,7 +760,13 @@ void Yr_gather(
                 if (cell_idx < TILE_I * TILE_K) {
                     int it = cell_idx / TILE_K;
                     int kt = cell_idx % TILE_K;
-                    if (my_j_valid && i0 + it < I_valid && k0 + kt < K_valid) {
+                    const int i_global = i0 + it;
+                    const int k_global = k0 + kt;
+                    const bool cell_valid = my_j_valid
+                        && (i_global < I_valid)
+                        && (k_global < K_valid)
+                        && mask_pair_allowed(mask, I, b, my_j, i_global, k_global);
+                    if (cell_valid) {
                         float p_val = expf(my_p[cell_idx] * scale - m_ij);
                         my_p[cell_idx] = p_val;
                         l_ij += p_val;
@@ -826,6 +867,7 @@ void Ys_gather(
     float*       __restrict__ Y,
     float*       __restrict__ m_k_out,
     float*       __restrict__ l_k_out,
+    const bool*  __restrict__ mask,
     int B, int H, int I, int J, int K, float scale,
     int num_i_chunks,
     int I_valid, int J_valid, int K_valid)
@@ -914,9 +956,15 @@ void Ys_gather(
                 if (cell_idx < TILE_I * TILE_J) {
                     int it = cell_idx / TILE_J;
                     int jt = cell_idx % TILE_J;
+                    const int i_global = i0 + it;
+                    const int j_global = j0 + jt;
                     
                     float dot = 0.0f;
-                    if (my_k_valid && i0 + it < I_valid && j0 + jt < J_valid) {
+                    const bool cell_valid = my_k_valid
+                        && (i_global < I_valid)
+                        && (j_global < J_valid)
+                        && mask_pair_allowed(mask, I, b, my_k, i_global, j_global);
+                    if (cell_valid) {
                         float d_accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                         #pragma unroll 4
                         for (int d = 0; d < D_CONST; d += 4) {
@@ -961,7 +1009,13 @@ void Ys_gather(
                 if (cell_idx < TILE_I * TILE_J) {
                     int it = cell_idx / TILE_J;
                     int jt = cell_idx % TILE_J;
-                    if (my_k_valid && i0 + it < I_valid && j0 + jt < J_valid) {
+                    const int i_global = i0 + it;
+                    const int j_global = j0 + jt;
+                    const bool cell_valid = my_k_valid
+                        && (i_global < I_valid)
+                        && (j_global < J_valid)
+                        && mask_pair_allowed(mask, I, b, my_k, i_global, j_global);
+                    if (cell_valid) {
                         float p_val = expf(my_p[cell_idx] * scale - m_ij);
                         my_p[cell_idx] = p_val;
                         l_ij += p_val;
@@ -1093,9 +1147,15 @@ void reduce_gather_partials(
     }
 
     float l_global = 0.0f;
-    for (int c = 0; c < num_chunks; c++) {
-        alpha_l[c] = expf(alpha_l[c] - m_global) * l_partial[ml_off + c];
-        l_global += alpha_l[c];
+    if (m_global > NEG_INF * 0.5f) {
+        for (int c = 0; c < num_chunks; c++) {
+            alpha_l[c] = expf(alpha_l[c] - m_global) * l_partial[ml_off + c];
+            l_global += alpha_l[c];
+        }
+    } else {
+        for (int c = 0; c < num_chunks; c++) {
+            alpha_l[c] = 0.0f;
+        }
     }
 
     // Pass 2: combine partial outputs
@@ -1187,6 +1247,7 @@ void Yq_scatter(
     const float* __restrict__ m_k_in,
     const float* __restrict__ l_k_in,
     float* __restrict__ Y_q_,
+    const bool* __restrict__ mask,
     int B, int H, int I, int J, int K, float scale,
     int num_j_chunks
 ) {
@@ -1267,8 +1328,14 @@ void Yq_scatter(
             }
         }
         if (tid < TILE_J && jt + tid < J) {
-            mj_tile[tid] = m_j_in[mj_bh_offset + jt + tid];
-            lj_tile[tid] = 1.0f / l_j_in[mj_bh_offset + jt + tid];
+            const float l = l_j_in[mj_bh_offset + jt + tid];
+            if (l <= DENOM_EPS) {
+                mj_tile[tid] = 0.0f;
+                lj_tile[tid] = 0.0f;
+            } else {
+                mj_tile[tid] = m_j_in[mj_bh_offset + jt + tid];
+                lj_tile[tid] = 1.0f / l;
+            }
         }
 
         // --- Inner Loop: Iterate Over K Tiles ---
@@ -1280,8 +1347,14 @@ void Yq_scatter(
                 }
             }
             if (tid < TILE_K && kt + tid < K) {
-                mk_tile[tid] = m_k_in[mk_bh_offset + kt + tid];
-                lk_tile[tid] = 1.0f / l_k_in[mk_bh_offset + kt + tid];
+                const float l = l_k_in[mk_bh_offset + kt + tid];
+                if (l <= DENOM_EPS) {
+                    mk_tile[tid] = 0.0f;
+                    lk_tile[tid] = 0.0f;
+                } else {
+                    mk_tile[tid] = m_k_in[mk_bh_offset + kt + tid];
+                    lk_tile[tid] = 1.0f / l;
+                }
             }
             __syncthreads();
 
@@ -1379,12 +1452,20 @@ void Yq_scatter(
                         const float ljt = lj_tile[ja * 4 + i1];
                         #pragma unroll
                         for (int i2 = 0; i2 < 4; i2++) {
+                            const int i_global = i_start + ia * 4 + i0;
+                            const int j_global = jt + ja * 4 + i1;
+                            const int k_global = kt + ka * 4 + i2;
+                            const bool cell_valid = (i_global < I)
+                                && (j_global < J)
+                                && (k_global < K)
+                                && mask_pair_allowed(mask, I, b, i_global, j_global, k_global);
                             const float mkt = mk_tile[ka * 4 + i2];
                             const float lkt = lk_tile[ka * 4 + i2];
-                            const float logit2 = acc[i0][i1][i2] * two_scale;
                             attn_tile[(ia * 4 + i0) * ATTN_I_STRIDE +
                                       (ja * 4 + i1) * ATTN_K_STRIDE +
-                                      (ka * 4 + i2)] = __expf(logit2 - mjt - mkt) * ljt * lkt;
+                                      (ka * 4 + i2)] = cell_valid
+                                        ? __expf(acc[i0][i1][i2] * two_scale - mjt - mkt) * ljt * lkt
+                                        : 0.0f;
                         }
                     }
                 }
@@ -1500,6 +1581,7 @@ void Yr_scatter(
     const float* __restrict__ m_k_in,
     const float* __restrict__ l_k_in,
     float* __restrict__ Y_r_,
+    const bool* __restrict__ mask,
     int B, int H, int I, int J, int K, float scale,
     int num_i_chunks
 ) {
@@ -1579,8 +1661,14 @@ void Yr_scatter(
             }
         }
         if (tid < TILE_I && it + tid < I) {
-            mi_tile[tid] = m_i_in[mi_bh_offset + it + tid];
-            li_tile[tid] = 1.0f / l_i_in[mi_bh_offset + it + tid];
+            const float l = l_i_in[mi_bh_offset + it + tid];
+            if (l <= DENOM_EPS) {
+                mi_tile[tid] = 0.0f;
+                li_tile[tid] = 0.0f;
+            } else {
+                mi_tile[tid] = m_i_in[mi_bh_offset + it + tid];
+                li_tile[tid] = 1.0f / l;
+            }
         }
 
         // --- Inner Loop: Iterate Over K Tiles ---
@@ -1592,8 +1680,14 @@ void Yr_scatter(
                 }
             }
             if (tid < TILE_K && kt + tid < K) {
-                mk_tile[tid] = m_k_in[mk_bh_offset + kt + tid];
-                lk_tile[tid] = 1.0f / l_k_in[mk_bh_offset + kt + tid];
+                const float l = l_k_in[mk_bh_offset + kt + tid];
+                if (l <= DENOM_EPS) {
+                    mk_tile[tid] = 0.0f;
+                    lk_tile[tid] = 0.0f;
+                } else {
+                    mk_tile[tid] = m_k_in[mk_bh_offset + kt + tid];
+                    lk_tile[tid] = 1.0f / l;
+                }
             }
             __syncthreads();
 
@@ -1691,12 +1785,20 @@ void Yr_scatter(
                     for (int i1 = 0; i1 < 4; i1++) {
                         #pragma unroll
                         for (int i2 = 0; i2 < 4; i2++) {
+                            const int i_global = it + ia * 4 + i0;
+                            const int j_global = j_start + ja * 4 + i1;
+                            const int k_global = kt + ka * 4 + i2;
+                            const bool cell_valid = (i_global < I)
+                                && (j_global < J)
+                                && (k_global < K)
+                                && mask_pair_allowed(mask, I, b, j_global, i_global, k_global);
                             const float mkt = mk_tile[ka * 4 + i2];
                             const float lkt = lk_tile[ka * 4 + i2];
-                            const float logit2 = acc[i0][i1][i2] * two_scale;
                             attn_tile[(ia * 4 + i0) * ATTN_I_STRIDE +
                                       (ja * 4 + i1) * ATTN_K_STRIDE +
-                                      (ka * 4 + i2)] = __expf(logit2 - mit - mkt) * lit * lkt;
+                                      (ka * 4 + i2)] = cell_valid
+                                        ? __expf(acc[i0][i1][i2] * two_scale - mit - mkt) * lit * lkt
+                                        : 0.0f;
                         }
                     }
                 }
@@ -1812,6 +1914,7 @@ void Ys_scatter(
     const float* __restrict__ m_j_in,
     const float* __restrict__ l_j_in,
     float* __restrict__ Y_s_,
+    const bool* __restrict__ mask,
     int B, int H, int I, int J, int K, float scale,
     int num_i_chunks
 ) {
@@ -1891,8 +1994,14 @@ void Ys_scatter(
             }
         }
         if (tid < TILE_I && it + tid < I) {
-            mi_tile[tid] = m_i_in[mi_bh_offset + it + tid];
-            li_tile[tid] = 1.0f / l_i_in[mi_bh_offset + it + tid];
+            const float l = l_i_in[mi_bh_offset + it + tid];
+            if (l <= DENOM_EPS) {
+                mi_tile[tid] = 0.0f;
+                li_tile[tid] = 0.0f;
+            } else {
+                mi_tile[tid] = m_i_in[mi_bh_offset + it + tid];
+                li_tile[tid] = 1.0f / l;
+            }
         }
 
         // --- Inner Loop: Iterate Over J Tiles ---
@@ -1910,8 +2019,14 @@ void Ys_scatter(
                 }
             }
             if (tid < TILE_J && jt + tid < J) {
-                mj_tile[tid] = m_j_in[mj_bh_offset + jt + tid];
-                lj_tile[tid] = 1.0f / l_j_in[mj_bh_offset + jt + tid];
+                const float l = l_j_in[mj_bh_offset + jt + tid];
+                if (l <= DENOM_EPS) {
+                    mj_tile[tid] = 0.0f;
+                    lj_tile[tid] = 0.0f;
+                } else {
+                    mj_tile[tid] = m_j_in[mj_bh_offset + jt + tid];
+                    lj_tile[tid] = 1.0f / l;
+                }
             }
             __syncthreads();
 
@@ -2011,10 +2126,18 @@ void Ys_scatter(
                         const float ljt = lj_tile[ja * 4 + i1];
                         #pragma unroll
                         for (int i2 = 0; i2 < 4; i2++) {
-                            const float logit2 = acc[i0][i1][i2] * two_scale;
+                            const int i_global = it + ia * 4 + i0;
+                            const int j_global = jt + ja * 4 + i1;
+                            const int k_global = k_start + ka * 4 + i2;
+                            const bool cell_valid = (i_global < I)
+                                && (j_global < J)
+                                && (k_global < K)
+                                && mask_pair_allowed(mask, I, b, k_global, i_global, j_global);
                             attn_tile[(ia * 4 + i0) * ATTN_I_STRIDE +
                                       (ja * 4 + i1) * ATTN_K_STRIDE +
-                                      (ka * 4 + i2)] = __expf(logit2 - mit - mjt) * lit * ljt;
+                                      (ka * 4 + i2)] = cell_valid
+                                        ? __expf(acc[i0][i1][i2] * two_scale - mit - mjt) * lit * ljt
+                                        : 0.0f;
                         }
                     }
                 }
@@ -2097,6 +2220,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     at::Tensor Vq_1, at::Tensor Vq_2,
     at::Tensor Vr_1, at::Tensor Vr_2,
     at::Tensor Vs_1, at::Tensor Vs_2,
+    at::Tensor mask,
     double dropout_rate,
     int64_t I_valid, int64_t J_valid, int64_t K_valid) {
     Q = Q.contiguous();  
@@ -2108,6 +2232,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     Vr_2 = Vr_2.contiguous();
     Vs_1 = Vs_1.contiguous();
     Vs_2 = Vs_2.contiguous();
+    if (mask.defined()) {
+        mask = mask.contiguous();
+    }
 
     const auto B = Q.size(0);
     const auto H = Q.size(1);
@@ -2115,6 +2242,17 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     const auto J = R.size(2);
     const auto K = S.size(2);
     const auto D = Q.size(3);
+    const bool use_mask = mask.defined() && mask.numel() > 0;
+    if (use_mask) {
+        TORCH_CHECK(mask.scalar_type() == at::kBool, "forward mask must be bool");
+        TORCH_CHECK(mask.is_cuda(), "forward mask must be on CUDA device");
+        TORCH_CHECK(mask.dim() == 3, "forward mask must have shape [B, N, N]");
+        TORCH_CHECK(I == J && J == K, "masked forward requires I == J == K");
+        TORCH_CHECK(mask.size(0) == B, "forward mask batch dim mismatch");
+        TORCH_CHECK(mask.size(1) == I && mask.size(2) == I,
+            "forward mask shape must be [B, N, N] with N matching padded sequence length");
+    }
+    const bool* mask_ptr = use_mask ? mask.data_ptr<bool>() : nullptr;
 
     // Default I_valid/J_valid/K_valid to the padded sizes (no masking) when
     // callers don't supply them. This preserves the legacy behavior where the
@@ -2266,6 +2404,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
             O_part_q.data_ptr<float>(),
             m_part_q.data_ptr<float>(),
             l_part_q.data_ptr<float>(),
+            mask_ptr,
             B, H, I, J, K, scale,
             num_j_chunks_q,
             (int)I_valid, (int)J_valid, (int)K_valid
@@ -2307,6 +2446,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
             O_part_r.data_ptr<float>(),
             m_part_r.data_ptr<float>(),
             l_part_r.data_ptr<float>(),
+            mask_ptr,
             B, H, I, J, K, scale,
             num_i_chunks_r,
             (int)I_valid, (int)J_valid, (int)K_valid
@@ -2348,6 +2488,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
             O_part_s.data_ptr<float>(),
             m_part_s.data_ptr<float>(),
             l_part_s.data_ptr<float>(),
+            mask_ptr,
             B, H, I, J, K, scale,
             num_i_chunks_s,
             (int)I_valid, (int)J_valid, (int)K_valid
@@ -2391,6 +2532,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
             m_j.data_ptr<float>(), l_j.data_ptr<float>(),
             m_k.data_ptr<float>(), l_k.data_ptr<float>(),
             Yq_scat_part.data_ptr<float>(),
+            mask_ptr,
             B, H, I, J, K, scale,
             scat_j_chunks_q
         );
@@ -2414,6 +2556,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
             m_i.data_ptr<float>(), l_i.data_ptr<float>(),
             m_k.data_ptr<float>(), l_k.data_ptr<float>(),
             Yr_scat_part.data_ptr<float>(),
+            mask_ptr,
             B, H, I, J, K, scale,
             scat_i_chunks_r
         );
@@ -2437,6 +2580,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
             m_i.data_ptr<float>(), l_i.data_ptr<float>(),
             m_j.data_ptr<float>(), l_j.data_ptr<float>(),
             Ys_scat_part.data_ptr<float>(),
+            mask_ptr,
             B, H, I, J, K, scale,
             scat_i_chunks_s
         );

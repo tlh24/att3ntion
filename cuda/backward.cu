@@ -35,6 +35,21 @@
 // these stats - this avoids redundant work.
 // =============================================================================
 
+__device__ __forceinline__ bool mask_pair_allowed(
+    const bool* mask,
+    int N,
+    int b,
+    int anchor,
+    int a,
+    int c
+) {
+    if (mask == nullptr) {
+        return true;
+    }
+    const int64_t base = ((int64_t)b * N + anchor) * N;
+    return mask[base + a] && mask[base + c];
+}
+
 // =============================================================================
 // Gradient Kernels for V Tensors (Gather Path)
 // =============================================================================
@@ -53,11 +68,14 @@ __global__ void Vq_gather_grad(
     const float* __restrict__ m_k,      // [B,H,N]
     const float* __restrict__ l_k,      // [B,H,N]
     float*       __restrict__ gradVq,   // [B,H,N,D]   (output)
+    const bool*  __restrict__ mask,
     int  N,
+    int  H,
     float scale )
 {
     /* ---- decode indices ------------------------------------------------ */
     int bh  = blockIdx.z;          // flattened (batch, head)
+    const int b = bh / H;
     int i0  = blockIdx.x * T_I + threadIdx.x;
     int k0  = blockIdx.y * T_K + threadIdx.y;
 
@@ -129,6 +147,7 @@ __global__ void Vq_gather_grad(
         /* ---- iterate inside loaded j-chunk (only active threads compute) */
         if (active) {
             for (int jOff=0; jOff<T_J && (jBase+jOff)<N; ++jOff){
+                const int jGlob = jBase + jOff;
                 // logits = (q*s) · r — halved FMA vs q*r*s (save 64 FMA per j)
                 float logits=0.f;
                 #pragma unroll
@@ -136,8 +155,10 @@ __global__ void Vq_gather_grad(
                     logits += qs_vec[d] * sh_R[jOff][d];
                 logits *= scale;
 
-                float wj = __expf(fminf(logits - sh_mj[jOff], EXP_CLIP)) * sh_lj_inv[jOff];
-                float wk = __expf(fminf(logits - mk,           EXP_CLIP)) * inv_lk;
+                const bool ar_valid = mask_pair_allowed(mask, N, b, jGlob, i0, k0);
+                const bool as_valid = mask_pair_allowed(mask, N, b, k0, i0, jGlob);
+                float wj = ar_valid ? (__expf(fminf(logits - sh_mj[jOff], EXP_CLIP)) * sh_lj_inv[jOff]) : 0.0f;
+                float wk = as_valid ? (__expf(fminf(logits - mk,           EXP_CLIP)) * inv_lk) : 0.0f;
 
                 #pragma unroll
                 for (int d=0; d<D_CONST; ++d){
@@ -171,10 +192,13 @@ __global__ void Vr_gather_grad(
     const float* __restrict__ m_k,      // [B,H,N]
     const float* __restrict__ l_k,      // [B,H,N]
     float*       __restrict__ gradVr,   // [B,H,N,D]
+    const bool*  __restrict__ mask,
     int  N,
+    int  H,
     float scale )
 {
     int bh  = blockIdx.z;
+    const int b = bh / H;
     int j0  = blockIdx.x * T_I + threadIdx.x;
     int k0  = blockIdx.y * T_K + threadIdx.y;
     
@@ -246,6 +270,7 @@ __global__ void Vr_gather_grad(
         // Only active threads compute
         if (active) {
             for (int iOff=0; iOff<T_J && (iBase+iOff)<N; ++iOff){
+                const int iGlob = iBase + iOff;
                 // logits = q · (r*s) — halved FMA vs q*r*s (save 64 FMA per i)
                 float logits=0.f;
                 #pragma unroll
@@ -253,8 +278,10 @@ __global__ void Vr_gather_grad(
                     logits += sh_Q[iOff][d] * rs_vec[d];
                 logits *= scale;
 
-                float wi = __expf(fminf(logits - sh_mi[iOff], EXP_CLIP)) * sh_li_inv[iOff];
-                float wk = __expf(fminf(logits - m_k_val,     EXP_CLIP)) * inv_l_k;
+                const bool aq_valid = mask_pair_allowed(mask, N, b, iGlob, j0, k0);
+                const bool as_valid = mask_pair_allowed(mask, N, b, k0, iGlob, j0);
+                float wi = aq_valid ? (__expf(fminf(logits - sh_mi[iOff], EXP_CLIP)) * sh_li_inv[iOff]) : 0.0f;
+                float wk = as_valid ? (__expf(fminf(logits - m_k_val,     EXP_CLIP)) * inv_l_k) : 0.0f;
 
                 #pragma unroll
                 for (int d=0; d<D_CONST; ++d){
@@ -288,10 +315,13 @@ __global__ void Vs_gather_grad(
     const float* __restrict__ m_j,      // [B,H,N]
     const float* __restrict__ l_j,      // [B,H,N]
     float*       __restrict__ gradVs,   // [B,H,N,D]
+    const bool*  __restrict__ mask,
     int  N,
+    int  H,
     float scale )
 {
     int bh  = blockIdx.z;
+    const int b = bh / H;
     int i0  = blockIdx.x * T_I + threadIdx.x;
     int k0  = blockIdx.y * T_K + threadIdx.y;
     
@@ -363,6 +393,7 @@ __global__ void Vs_gather_grad(
         // Only active threads compute
         if (active) {
             for (int jOff=0; jOff<T_J && (jBase+jOff)<N; ++jOff){
+                const int jGlob = jBase + jOff;
                 // logits = (q*s) · r — halved FMA vs q*r*s (save 64 FMA per j)
                 float logits=0.f;
                 #pragma unroll
@@ -370,8 +401,10 @@ __global__ void Vs_gather_grad(
                     logits += qs_vec[d] * sh_R[jOff][d];
                 logits *= scale;
 
-                float wi = __expf(fminf(logits - m_i_val,     EXP_CLIP)) * inv_l_i;
-                float wj = __expf(fminf(logits - sh_mj[jOff], EXP_CLIP)) * sh_lj_inv[jOff];
+                const bool aq_valid = mask_pair_allowed(mask, N, b, i0, jGlob, k0);
+                const bool ar_valid = mask_pair_allowed(mask, N, b, jGlob, i0, k0);
+                float wi = aq_valid ? (__expf(fminf(logits - m_i_val,     EXP_CLIP)) * inv_l_i) : 0.0f;
+                float wj = ar_valid ? (__expf(fminf(logits - sh_mj[jOff], EXP_CLIP)) * sh_lj_inv[jOff]) : 0.0f;
 
                 #pragma unroll
                 for (int d=0; d<D_CONST; ++d){
@@ -410,12 +443,14 @@ __global__ void Vq_scatter_grad(
     const float* __restrict__ m_k,    // [B,H,N]
     const float* __restrict__ l_k,    // [B,H,N]
     float*       __restrict__ gradVq, // [B,H,N,D]
-    int N, float scale)
+    const bool*  __restrict__ mask,
+    int N, int H, float scale)
 {
     /* threadblock organisation = (i,k) tile  --------------------------- */
     const int i0 = blockIdx.x * T_I + threadIdx.x;   // 0..N-1 (column)
     const int k0 = blockIdx.y * T_K + threadIdx.y;   // 0..N-1 (row)
     const int bh = blockIdx.z;                       // flattened (B,H)
+    const int b = bh / H;
     
     // ALL threads must participate in cooperative loading - use active flag instead of early return
     const bool active = (i0 < N && k0 < N);
@@ -480,6 +515,7 @@ __global__ void Vq_scatter_grad(
         // ---- loop inside J-tile (only active threads compute) --------
         if (active) {
             for (int jOff=0; jOff<T_J && (jBase+jOff)<N; ++jOff){
+                const int jGlob = jBase + jOff;
                 // dot(bf2f(Q[i]),bf2f(R[j]),bf2f(S[k]))
                 float dot = 0.f;
                 #pragma unroll
@@ -498,10 +534,15 @@ __global__ void Vq_scatter_grad(
                 float l_j_val = fmaxf(sh_lj[jOff], DENOM_EPS);
                 float l_k_val = fmaxf(l_kBH[k0_safe], DENOM_EPS);
 
-                // term 1: Aq*As = exp(log_Aq + log_As) / (l_i * l_k)
-                float w1 = __expf(fminf(log_Aq + log_As, EXP_CLIP)) / (l_i_val * l_k_val);
-                // term 2: Aq*Ar = exp(log_Aq + log_Ar) / (l_i * l_j)
-                float w2 = __expf(fminf(log_Aq + log_Ar, EXP_CLIP)) / (l_i_val * l_j_val);
+                const bool aq_valid = mask_pair_allowed(mask, N, b, i0, jGlob, k0);
+                const bool ar_valid = mask_pair_allowed(mask, N, b, jGlob, i0, k0);
+                const bool as_valid = mask_pair_allowed(mask, N, b, k0, i0, jGlob);
+                float w1 = (aq_valid && as_valid)
+                    ? (__expf(fminf(log_Aq + log_As, EXP_CLIP)) / (l_i_val * l_k_val))
+                    : 0.0f;
+                float w2 = (aq_valid && ar_valid)
+                    ? (__expf(fminf(log_Aq + log_Ar, EXP_CLIP)) / (l_i_val * l_j_val))
+                    : 0.0f;
 
                 // load vectors
                 const float* dYr_vec = &sh_gYr[jOff*D_CONST];
@@ -542,11 +583,13 @@ __global__ void Vr_scatter_grad(
     const float* __restrict__ m_k,    // [B,H,N]
     const float* __restrict__ l_k,    // [B,H,N]
     float*       __restrict__ gradVr, // [B,H,N,D]
-    int N, float scale)
+    const bool*  __restrict__ mask,
+    int N, int H, float scale)
 {
     const int j0 = blockIdx.x * T_I + threadIdx.x;
     const int k0 = blockIdx.y * T_K + threadIdx.y;
     const int bh = blockIdx.z;
+    const int b = bh / H;
     
     // ALL threads must participate in cooperative loading - use active flag instead of early return
     const bool active = (j0 < N && k0 < N);
@@ -610,6 +653,7 @@ __global__ void Vr_scatter_grad(
         // Only active threads compute
         if (active) {
             for (int iOff=0; iOff<T_J && (iBase+iOff)<N; ++iOff){
+                const int iGlob = iBase + iOff;
                 float dot = 0.f;
                 #pragma unroll
                 for (int d=0; d<D_CONST; ++d)
@@ -625,10 +669,15 @@ __global__ void Vr_scatter_grad(
                 float l_j_val = fmaxf(l_jBH[j0_safe], DENOM_EPS);
                 float l_k_val = fmaxf(l_kBH[k0_safe], DENOM_EPS);
 
-                // term 1: Ar*As = exp(log_Ar + log_As) / (l_j * l_k)
-                float w1 = __expf(fminf(log_Ar + log_As, EXP_CLIP)) / (l_j_val * l_k_val);
-                // term 2: Aq*Ar = exp(log_Aq + log_Ar) / (l_i * l_j)
-                float w2 = __expf(fminf(log_Aq + log_Ar, EXP_CLIP)) / (l_i_val * l_j_val);
+                const bool aq_valid = mask_pair_allowed(mask, N, b, iGlob, j0, k0);
+                const bool ar_valid = mask_pair_allowed(mask, N, b, j0, iGlob, k0);
+                const bool as_valid = mask_pair_allowed(mask, N, b, k0, iGlob, j0);
+                float w1 = (ar_valid && as_valid)
+                    ? (__expf(fminf(log_Ar + log_As, EXP_CLIP)) / (l_j_val * l_k_val))
+                    : 0.0f;
+                float w2 = (aq_valid && ar_valid)
+                    ? (__expf(fminf(log_Aq + log_Ar, EXP_CLIP)) / (l_i_val * l_j_val))
+                    : 0.0f;
 
                 const float* dy_q_vec = &sh_gYq[iOff*D_CONST];
                 const float* vq2_vec  = &sh_Vq2[iOff*D_CONST];
@@ -667,11 +716,13 @@ __global__ void Vs_scatter_grad(
     const float* __restrict__ m_k,    // [B,H,N]
     const float* __restrict__ l_k,    // [B,H,N]
     float*       __restrict__ gradVs, // [B,H,N,D]
-    int N, float scale)
+    const bool*  __restrict__ mask,
+    int N, int H, float scale)
 {
     const int i0 = blockIdx.x * T_I + threadIdx.x;
     const int k0 = blockIdx.y * T_K + threadIdx.y;
     const int bh = blockIdx.z;
+    const int b = bh / H;
     
     // ALL threads must participate in cooperative loading - use active flag instead of early return
     const bool active = (i0 < N && k0 < N);
@@ -736,6 +787,7 @@ __global__ void Vs_scatter_grad(
         // Only active threads compute
         if (active) {
             for (int jOff=0; jOff<T_J && (jBase+jOff)<N; ++jOff){
+                const int jGlob = jBase + jOff;
                 float dot = 0.f;
                 #pragma unroll
                 for (int d=0; d<D_CONST; ++d)
@@ -751,10 +803,15 @@ __global__ void Vs_scatter_grad(
                 float l_j_val = fmaxf(sh_lj[jOff], DENOM_EPS);
                 float l_k_val = fmaxf(l_kBH[k0_safe], DENOM_EPS);
 
-                // term 1: Ar*As = exp(log_Ar + log_As) / (l_j * l_k)
-                float w1 = __expf(fminf(log_Ar + log_As, EXP_CLIP)) / (l_j_val * l_k_val);
-                // term 2: Aq*As = exp(log_Aq + log_As) / (l_i * l_k)
-                float w2 = __expf(fminf(log_Aq + log_As, EXP_CLIP)) / (l_i_val * l_k_val);
+                const bool aq_valid = mask_pair_allowed(mask, N, b, i0, jGlob, k0);
+                const bool ar_valid = mask_pair_allowed(mask, N, b, jGlob, i0, k0);
+                const bool as_valid = mask_pair_allowed(mask, N, b, k0, i0, jGlob);
+                float w1 = (ar_valid && as_valid)
+                    ? (__expf(fminf(log_Ar + log_As, EXP_CLIP)) / (l_j_val * l_k_val))
+                    : 0.0f;
+                float w2 = (aq_valid && as_valid)
+                    ? (__expf(fminf(log_Aq + log_As, EXP_CLIP)) / (l_i_val * l_k_val))
+                    : 0.0f;
 
                 const float* vr2_vec = &sh_Vr2[jOff*D_CONST];
                 const float* dy_r_vec = &sh_gYr[jOff*D_CONST];
@@ -833,11 +890,13 @@ __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
     float* __restrict__ sum_s,
     float* __restrict__ gradQ,
     float* __restrict__ gradS,
-    int  N, float scale)
+    const bool* __restrict__ mask,
+    int  N, int H, float scale)
 {
     const int i0 = blockIdx.x * BLOCK_I + threadIdx.x;
     const int k0 = blockIdx.y * BLOCK_K + threadIdx.y;
     const int bh = blockIdx.z;
+    const int b = bh / H;
     const bool valid = (i0 < N && k0 < N);
 
     // Per (B,H) base pointers
@@ -1084,11 +1143,15 @@ __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
             for (int jj = 0; jj < J_SUB; jj++) {
                 const int jOff = jSub + jj;
                 if (jBase + jOff >= N) break;
+                const int jGlob = jBase + jOff;
 
                 const float logits = dot_j[jj] * scale;
-                const float Aq = __expf(fminf(logits - mi, EXP_CLIP)) / fmaxf(li, DENOM_EPS);
-                const float Ar = __expf(fminf(logits - sh_mj[jOff], EXP_CLIP)) / fmaxf(sh_lj[jOff], DENOM_EPS);
-                const float As = __expf(fminf(logits - mk, EXP_CLIP)) / fmaxf(lk, DENOM_EPS);
+                const bool aq_valid = valid && mask_pair_allowed(mask, N, b, i0, jGlob, k0);
+                const bool ar_valid = valid && mask_pair_allowed(mask, N, b, jGlob, i0, k0);
+                const bool as_valid = valid && mask_pair_allowed(mask, N, b, k0, i0, jGlob);
+                const float Aq = aq_valid ? (__expf(fminf(logits - mi, EXP_CLIP)) / fmaxf(li, DENOM_EPS)) : 0.0f;
+                const float Ar = ar_valid ? (__expf(fminf(logits - sh_mj[jOff], EXP_CLIP)) / fmaxf(sh_lj[jOff], DENOM_EPS)) : 0.0f;
+                const float As = as_valid ? (__expf(fminf(logits - mk, EXP_CLIP)) / fmaxf(lk, DENOM_EPS)) : 0.0f;
 
                 const float gAq = d1_j[jj] + d5_j[jj] * As + d6_j[jj] * Ar;
                 const float gAr = d2_j[jj] + d4_j[jj] * As + d6_j[jj] * Aq;
@@ -1187,11 +1250,13 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
     const float* __restrict__ m_k, const float* __restrict__ l_k,
     float* __restrict__ sum_q, float* __restrict__ sum_r, float* __restrict__ sum_s,
     float* __restrict__ gradR,
-    int N, float scale)
+    const bool* __restrict__ mask,
+    int N, int H, float scale)
 {
     const int j0 = blockIdx.x * BLOCK_J + threadIdx.x;
     const int k0 = blockIdx.y * BLOCK_K + threadIdx.y;
     const int bh = blockIdx.z;
+    const int b = bh / H;
     const bool valid = (j0 < N && k0 < N);
 
     // Per (B,H) base pointers
@@ -1459,13 +1524,17 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
             for (int ii = 0; ii < I_SUB; ++ii) {
                 const int iOff = iSub + ii;
                 if (iBase + iOff >= N) break;
+                const int iGlob = iBase + iOff;
                 const float mi = sh_mi[iOff];
                 const float li = sh_li[iOff];
 
                 const float logits = dot_i[ii] * scale;
-                const float Aq = __expf(fminf(logits - mi, EXP_CLIP)) / fmaxf(li, DENOM_EPS);
-                const float Ar = __expf(fminf(logits - mj, EXP_CLIP)) / fmaxf(lj, DENOM_EPS);
-                const float As = __expf(fminf(logits - mk, EXP_CLIP)) / fmaxf(lk, DENOM_EPS);
+                const bool aq_valid = valid && mask_pair_allowed(mask, N, b, iGlob, j0, k0);
+                const bool ar_valid = valid && mask_pair_allowed(mask, N, b, j0, iGlob, k0);
+                const bool as_valid = valid && mask_pair_allowed(mask, N, b, k0, iGlob, j0);
+                const float Aq = aq_valid ? (__expf(fminf(logits - mi, EXP_CLIP)) / fmaxf(li, DENOM_EPS)) : 0.0f;
+                const float Ar = ar_valid ? (__expf(fminf(logits - mj, EXP_CLIP)) / fmaxf(lj, DENOM_EPS)) : 0.0f;
+                const float As = as_valid ? (__expf(fminf(logits - mk, EXP_CLIP)) / fmaxf(lk, DENOM_EPS)) : 0.0f;
                 const float gAr = d2_i[ii] + d4_i[ii] * As + d6_i[ii] * Aq;
 
                 if constexpr (CORRECTION_ONLY) {
@@ -1564,6 +1633,7 @@ backward_impl(torch::Tensor grad_Y_q,
               torch::Tensor l_j,
               torch::Tensor m_k,
               torch::Tensor l_k,
+              torch::Tensor mask,
               double dropout_rate) {
                 
   // ============================================================================
@@ -1597,6 +1667,16 @@ backward_impl(torch::Tensor grad_Y_q,
   const int K = S.size(2);
   const int D = Q.size(3);
   const float scale = 1.0f / sqrtf(static_cast<float>(D));
+  const bool use_mask = mask.defined() && mask.numel() > 0;
+  if (use_mask) {
+      TORCH_CHECK(mask.scalar_type() == at::kBool, "backward mask must be bool");
+      TORCH_CHECK(mask.is_cuda(), "backward mask must be on CUDA device");
+      TORCH_CHECK(mask.dim() == 3, "backward mask must have shape [B, N, N]");
+      TORCH_CHECK(mask.size(0) == B, "backward mask batch dim mismatch");
+      TORCH_CHECK(mask.size(1) == N && mask.size(2) == N,
+          "backward mask shape must be [B, N, N] with N matching padded sequence length");
+  }
+  const bool* mask_ptr = use_mask ? mask.data_ptr<bool>() : nullptr;
 
   // ============================================================================
   // 2. ALLOCATE GRADIENT TENSORS
@@ -1641,7 +1721,7 @@ backward_impl(torch::Tensor grad_Y_q,
           m_k.data_ptr<float>(),
           l_k.data_ptr<float>(),
           grad_Vq_1.data_ptr<float>(),
-          N, scale);
+          mask_ptr, N, H, scale);
     }
 
     // --- grad_Vr_1 ---
@@ -1659,7 +1739,7 @@ backward_impl(torch::Tensor grad_Y_q,
           m_k.data_ptr<float>(),
           l_k.data_ptr<float>(),
           grad_Vr_1.data_ptr<float>(),
-          N, scale);
+          mask_ptr, N, H, scale);
     }
 
     // --- grad_Vs_1 ---
@@ -1677,7 +1757,7 @@ backward_impl(torch::Tensor grad_Y_q,
           m_j.data_ptr<float>(),
           l_j.data_ptr<float>(),
           grad_Vs_1.data_ptr<float>(),
-          N, scale);
+          mask_ptr, N, H, scale);
     }
   });
 
@@ -1708,7 +1788,7 @@ backward_impl(torch::Tensor grad_Y_q,
         m_k.data_ptr<float>(),
         l_k.data_ptr<float>(),
         grad_Vq_2.data_ptr<float>(),
-        N, scale);
+        mask_ptr, N, H, scale);
 
     // --- grad_Vr_2 ---
     Vr_scatter_grad<D_TMPL><<<grid_dim, block_dim, shmem_scatter, at::cuda::getCurrentCUDAStream()>>>(
@@ -1726,7 +1806,7 @@ backward_impl(torch::Tensor grad_Y_q,
         m_k.data_ptr<float>(),
         l_k.data_ptr<float>(),
         grad_Vr_2.data_ptr<float>(),
-        N, scale);
+        mask_ptr, N, H, scale);
 
     // --- grad_Vs_2 ---
     Vs_scatter_grad<D_TMPL><<<grid_dim, block_dim, shmem_scatter, at::cuda::getCurrentCUDAStream()>>>(
@@ -1744,7 +1824,7 @@ backward_impl(torch::Tensor grad_Y_q,
         m_k.data_ptr<float>(),
         l_k.data_ptr<float>(),
         grad_Vs_2.data_ptr<float>(),
-        N, scale);
+        mask_ptr, N, H, scale);
   });
   AT_CUDA_CHECK(cudaGetLastError());
 
@@ -1805,7 +1885,7 @@ backward_impl(torch::Tensor grad_Y_q,
               sum_s.data_ptr<float>(),
               nullptr,  // gradQ not used in correction mode
               nullptr,  // gradS not used in correction mode
-              N, scale);
+              mask_ptr, N, H, scale);
 
       AT_CUDA_CHECK(cudaGetLastError());
     }
@@ -1861,7 +1941,7 @@ backward_impl(torch::Tensor grad_Y_q,
               sum_s.data_ptr<float>(),
               grad_Q.data_ptr<float>(),
               grad_S.data_ptr<float>(),
-              N, scale);
+              mask_ptr, N, H, scale);
 
       AT_CUDA_CHECK(cudaGetLastError());
     }
@@ -1927,7 +2007,7 @@ backward_impl(torch::Tensor grad_Y_q,
               // the gradient we want to compute
               grad_R.data_ptr<float>(),
 
-              N, scale);
+              mask_ptr, N, H, scale);
 
       AT_CUDA_CHECK(cudaGetLastError());
     }
@@ -1977,6 +2057,7 @@ backward_cuda(torch::Tensor grad_Y_q,
               torch::Tensor l_j,
               torch::Tensor m_k,
               torch::Tensor l_k,
+              torch::Tensor mask,
               double dropout_rate) {
                 
   // Ensure all tensors are contiguous
@@ -2001,11 +2082,14 @@ backward_cuda(torch::Tensor grad_Y_q,
   l_j = l_j.contiguous();
   m_k = m_k.contiguous();
   l_k = l_k.contiguous();
+  if (mask.defined()) {
+    mask = mask.contiguous();
+  }
 
   // Call the internal implementation directly with provided stats
   return backward_impl(
       grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_,
       Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
-                       m_i, l_i, m_j, l_j, m_k, l_k, dropout_rate);
+      m_i, l_i, m_j, l_j, m_k, l_k, mask, dropout_rate);
 }
 

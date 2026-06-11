@@ -24,6 +24,33 @@ def _pad_to_multiple(tensor, multiple, dim=2):
     return torch.nn.functional.pad(tensor, pad), pad_size
 
 
+def _normalize_self_attn_mask(mask, batch_size, ntok, device):
+    if mask is None:
+        return None
+
+    if mask.ndim == 2:
+        if mask.shape != (ntok, ntok):
+            raise ValueError(
+                f"2D mask must have shape {(ntok, ntok)}, got {tuple(mask.shape)}"
+            )
+        mask = mask.unsqueeze(0)
+    elif mask.ndim != 3:
+        raise ValueError(f"mask must have ndim 2 or 3, got ndim={mask.ndim}")
+
+    if mask.shape[-2:] != (ntok, ntok):
+        raise ValueError(
+            f"mask must have trailing shape {(ntok, ntok)}, got {tuple(mask.shape)}"
+        )
+    if mask.shape[0] not in (1, batch_size):
+        raise ValueError(
+            f"mask batch dim must be 1 or {batch_size}, got {mask.shape[0]}"
+        )
+    if mask.shape[0] == 1 and batch_size > 1:
+        mask = mask.expand(batch_size, -1, -1)
+
+    return mask.to(device=device, dtype=torch.bool).contiguous()
+
+
 class _HypergraphAttentionAutograd(Function):
     """
     Bridge between PyTorch autograd and the manual C++ forward/backward passes.
@@ -42,6 +69,7 @@ class _HypergraphAttentionAutograd(Function):
         Vr_2,
         Vs_1,
         Vs_2,
+        mask,
         dropout_rate=0.0,
         scatter=False,
     ):
@@ -57,6 +85,10 @@ class _HypergraphAttentionAutograd(Function):
         TILE_SIZE = 16
         orig_seq_len = Q.size(2)
         input_dtype = Q.dtype
+        batch_size = Q.size(0)
+        if mask is not None and (R.size(2) != orig_seq_len or S.size(2) != orig_seq_len):
+            raise ValueError("masked CUDA hypergraph attention requires equal sequence lengths")
+        mask = _normalize_self_attn_mask(mask, batch_size, orig_seq_len, Q.device)
 
         # CUDA forward kernels are BF16 I/O. Cast at the autograd boundary so
         # callers can remain dtype-agnostic.
@@ -69,9 +101,18 @@ class _HypergraphAttentionAutograd(Function):
         Vr_2, _ = _pad_to_multiple(Vr_2.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
         Vs_1, _ = _pad_to_multiple(Vs_1.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
         Vs_2, _ = _pad_to_multiple(Vs_2.contiguous().to(torch.bfloat16), TILE_SIZE, dim=2)
+        if mask is None:
+            mask_tensor = torch.empty(0, device=Q.device, dtype=torch.bool)
+        else:
+            pad_n = Q.size(2) - orig_seq_len
+            if pad_n > 0:
+                mask_tensor = torch.nn.functional.pad(mask, (0, pad_n, 0, pad_n), value=False)
+            else:
+                mask_tensor = mask
+            mask_tensor = mask_tensor.contiguous()
 
         outputs_tuple = torch.ops.att3ntion.hypergraph_forward(
-            Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate,
+            Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, mask_tensor, dropout_rate,
             orig_seq_len, orig_seq_len, orig_seq_len,
         )
 
@@ -97,7 +138,7 @@ class _HypergraphAttentionAutograd(Function):
             Y_s_ = Y_s_.to(input_dtype)
 
         ctx.save_for_backward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
-                              m_i, l_i, m_j, l_j, m_k, l_k)
+                              m_i, l_i, m_j, l_j, m_k, l_k, mask_tensor)
         ctx.orig_seq_len = orig_seq_len
         ctx.input_dtype = input_dtype
 
@@ -118,7 +159,7 @@ class _HypergraphAttentionAutograd(Function):
             ).
         """
         Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, \
-            m_i, l_i, m_j, l_j, m_k, l_k = ctx.saved_tensors
+            m_i, l_i, m_j, l_j, m_k, l_k, mask_tensor = ctx.saved_tensors
         orig_seq_len = ctx.orig_seq_len
 
         out_dtype = getattr(ctx, "input_dtype", Q.dtype)
@@ -143,7 +184,7 @@ class _HypergraphAttentionAutograd(Function):
         grad_tuple = torch.ops.att3ntion.hypergraph_backward(
             grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_,
             Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
-            m_i, l_i, m_j, l_j, m_k, l_k
+            m_i, l_i, m_j, l_j, m_k, l_k, mask_tensor
         )
 
         if not (isinstance(grad_tuple, tuple) and len(grad_tuple) == 9):
@@ -195,6 +236,7 @@ class _HypergraphAttentionAutograd(Function):
             grad_Vr_2,
             grad_Vs_1,
             grad_Vs_2,
+            None,
             None,
             None,
         )
@@ -278,7 +320,9 @@ class HypergraphAttention(nn.Module):
             error_msgs,
         )
         
-    def forward(self, x):
+    def forward(self, x, rotary_emb=None, mask=None):
+        if rotary_emb is not None:
+            raise ValueError("CUDA HypergraphAttention does not support rotary embeddings")
         batch_size, ntok, d_model = x.shape
         
         Q = self.Wq(x)
@@ -309,6 +353,7 @@ class HypergraphAttention(nn.Module):
             Vq_1, Vq_2,
             Vr_1, Vr_2,
             Vs_1, Vs_2,
+            mask,
             self.dropout.p,
             self.scatter,
         )

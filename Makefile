@@ -5,6 +5,7 @@
 #   make build              			  Build/install the extension
 #   make test               		      Run quick correctness tests
 #   make test-full        				  Run detailed correctness tests
+#   make test-mask                       Run mask-specific tests (naive + CUDA)
 #   make bench              			  Benchmark (test + run)
 #   make bench BUILD=1                    Rebuild before benchmarking
 #   make bench-save NOTE="desc"           Save benchmark with note
@@ -44,6 +45,9 @@ test-quiet: maybe-build
 
 test-full: maybe-build
 	$(PYTHON) tests/test_kernel_correctness.py --continue-on-failure -v
+
+test-mask: maybe-build
+	$(PYTHON) -m pytest tests/test_naive_mask.py tests/test_cuda_mask.py -q
 
 # --- Benchmarks: Regression Tracking ---
 
@@ -142,7 +146,7 @@ clean:
 	find . -name "*.so" -delete
 	@echo "Cleaned build artifacts."
 
-.PHONY: build maybe-build test test-quiet test-full \
+.PHONY: build maybe-build test test-quiet test-full test-mask \
         bench bench-save bench-quick bench-large bench-forward bench-backward bench-complexity \
         bench-scaling bench-scaling-quick bench-compare bench-compare-quick \
         profile-timeline profile-kernel history history-h100 \
