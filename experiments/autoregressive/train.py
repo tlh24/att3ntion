@@ -21,7 +21,7 @@ from att3ntion import _HypergraphAttentionNaive, _GraphAttentionNaive, QuickGELU
 from gen_data import gen_data, to_numpy, from_numpy
 
 SEQ_L = 1 # length of the output sequence
-MASKED = False # masked vs autoregressive training.
+MASKED = True # masked vs autoregressive training.
 		# if False, use autoregressive training
 
 # Try to import CUDA-backed hypergraph attention; fall back to naive if not built.
@@ -282,7 +282,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		# for grokking, need to generate the (nearly) full table
 		train_s, test_s = gen_data('grok', max_d=1, V=2, P=113, L=SEQ_L, data_size=120**2)
 	if task == 2:
-		train_s, test_s = gen_data('grok', max_d=1, V=2, P=113, L=SEQ_L, data_size=6*120**2)
+		train_s, test_s = gen_data('formula', max_d=2, V=2, P=113, L=SEQ_L, data_size=100_000)
 	for i in range(10): print(f"Train: {train_s[i]}")
 	for i in range(5):  print(f"Test:  {test_s[i]}")
 	print(f"Train size {len(train_s)} test size {len(test_s)}")
@@ -317,10 +317,10 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		n_recurse = 1
 		n_heads = 1
 	if task == 2:
-		n_layers = 2
+		n_layers = 3
 		if attn_impl == "graph":
-			n_layers = 4
-		n_recurse = 1 # depends on the formula depth
+			n_layers = 6
+		n_recurse = 2 # depends on the formula depth
 		# n_heads = 6 # use the command line arg
 
 	dtype = torch.float32
@@ -454,6 +454,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 				fd_losslog.flush()
 
 			lloss = loss.detach().cpu().item()
+			lloss = lloss / inputs.shape[0] # normalize by batch size
 			fd_losslog.write(f"{uu}\t{lloss}\t0.0\n")
 			uu += 1
 

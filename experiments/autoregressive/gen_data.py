@@ -4,8 +4,8 @@ import random
 import numpy as np
 import matplotlib.pyplot as plt
 
-OPS = ['+', '-', '*', '/']
-# OPS = ['+', '-']
+# OPS = ['+', '-', '*', '/']
+OPS = ['+', '-', '*']
 COMMUTATIVE_OPS = {'+', '*'}
 
 @lru_cache(maxsize=None)
