@@ -25,14 +25,10 @@ def _test_jacobian(cls) -> bool:
 
 @torch.compile
 def test_HypergraphAttentionNaive():
-	passed = _test_jacobian(_naive._HypergraphAttentionNaive)
-	result = 'passed' if passed else 'failed'
-	print(f"test: HypergraphAttentionNaive: {result}")
+	assert bool(_test_jacobian(_naive._HypergraphAttentionNaive))
 
 def test_GraphAttentionNaive():
-	passed = _test_jacobian(_naive._GraphAttentionNaive)
-	result = 'passed' if passed else 'failed'
-	print(f"test: GraphAttentionNaive: {result}")
+	assert bool(_test_jacobian(_naive._GraphAttentionNaive))
 
 if __name__ == "__main__":
 	torch.set_printoptions(linewidth=220, threshold=10000)
