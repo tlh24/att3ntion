@@ -1,4 +1,5 @@
 import numpy as np
+import math
 import argparse
 import inspect
 import torch
@@ -252,7 +253,6 @@ class GrokkingTransformer(nn.Module):
 
 		return h
 
-
 def calcLoss(pred, targets):
 	n_correct = 0
 	n_possible = 0
@@ -280,9 +280,9 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 	
 	if task == 1:
 		# for grokking, need to generate the (nearly) full table
-		train_s, test_s = gen_data('grok', max_d=1, V=2, P=113, L=SEQ_L, data_size=120**2)
+		train_s, test_s = gen_data('grok', max_d=1, V=2, C=0, P=113, L=SEQ_L, exact_v=True, data_size=120**2)
 	if task == 2:
-		train_s, test_s = gen_data('formula', max_d=2, V=2, P=113, L=SEQ_L, data_size=100_000)
+		train_s, test_s = gen_data('grok', max_d=1, V=3, C=0, P=113, L=SEQ_L, exact_v=False, data_size=100_000)
 	for i in range(10): print(f"Train: {train_s[i]}")
 	for i in range(5):  print(f"Test:  {test_s[i]}")
 	print(f"Train size {len(train_s)} test size {len(test_s)}")
@@ -343,7 +343,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		model.printParamCount()
 	except:
 		print("\\ grokking transformer does not calculate number of parameters")
-	model = torch.compile(model, backend="eager") # mode="max-autotune"
+	model = torch.compile(model) # mode="max-autotune" or backend="eager"
 
 	if no_amp:
 		print("--- Running in full fp32 ---")
@@ -355,20 +355,18 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 
 	print("\ntrain_model1 started...")
 	uu = 0
-	model.train()
 	rng = np.random.default_rng()
+	validation_loss = 1.0
+	validation_top1_err = 1.0
 
 	for epoch in range(num_epochs):
 		total_loss = 0
-		correct_ops = 0
 		correct_vals = 0
 		total = 0
 
 		start_event = torch.cuda.Event(enable_timing=True)
 		end_event = torch.cuda.Event(enable_timing=True)
-		
-		# for batch_indx, (inputs_np,outputs_np) in enumerate(train_loader):
-
+		model.train()
 		n_train = x.shape[0]
 		for batch_indx in range(n_train // batch_size):
 			mb_idx = rng.permutation(n_train)[:batch_size]
@@ -391,19 +389,18 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 				with autocast('cuda'):
 					pred = model(inputs)
 					loss, n_correct, n_possible = calcLoss(pred, targets)
-			correct_vals += n_correct
-
 			loss.backward()
 			torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 			optimizer.step()
 
-			lloss = loss.detach().cpu().item()
-			lloss = lloss / inputs.shape[0] # normalize by batch size
-			fd_losslog.write(f"{uu}\t{lloss}\t0.0\n")
-			uu += 1
-
-			total_loss += loss.item()
+			correct_vals += n_correct
 			total += n_possible
+			lloss = loss.detach().cpu().item()
+			total_loss += lloss
+			lloss = lloss / inputs.shape[0] # normalize by batch size
+			top1_err = 1 - (n_correct / n_possible)
+			fd_losslog.write(f"{uu}\t{lloss}\t{top1_err*math.exp(1)}\t{validation_loss}\t{validation_top1_err*math.exp(1)}\n")
+			uu += 1
 			
 			if batch_indx % 200 == 0:
 				end_event.record()
@@ -414,55 +411,39 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		
 		avg_loss = total_loss / len(train_loader)
 		train_accuracy = 100 * correct_vals / total
-		print(f'Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Result Acc: {train_accuracy:.2f}%')
+		print(f'Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Train Acc: {train_accuracy:.2f}%')
 
-		# if save_model:
-		# 	# save after each epoch
-		# 	model.save_model(f"comp_model_{attn_impl}_r{replicate}.pt")
+		# validation!
+		total_loss = 0
+		correct_vals = 0
+		total = 0
+		with torch.no_grad():
+			for batch_indx, (inputs_np,outputs_np) in enumerate(loader_v):
+				inputs = inputs_np.to(device=device)
+				targets = outputs_np.to(device=device)
 
-	fd_losslog.flush()
-	# validation!
-	total_loss = 0
-	correct_vals = 0
-	total = 0
-	with torch.no_grad():
-		for batch_indx, (inputs_np,outputs_np) in enumerate(loader_v):
-			inputs = inputs_np.to(device=device)
-			targets = outputs_np.to(device=device)
-
-			if batch_indx % 100 == 0:
-				start_event.record()
-
-			if no_amp:
-				pred = model(inputs, 0)
-				loss, n_correct, n_possible = calcLoss(pred, targets)
-			else:
-				with autocast('cuda'):
-					pred = model(inputs)
+				if no_amp:
+					pred = model(inputs, 0)
 					loss, n_correct, n_possible = calcLoss(pred, targets)
-			correct_vals += n_correct
+				else:
+					with autocast('cuda'):
+						pred = model(inputs)
+						loss, n_correct, n_possible = calcLoss(pred, targets)
+				correct_vals += n_correct
+				total += n_possible
+				lloss = loss.detach().cpu().item()
+				lloss = lloss / inputs.shape[0]
+				top1_err = 1 - (correct_vals / n_possible)
+				if epoch == num_epochs-1:
+					fd_losslog.write(f"{uu}\t{-1.0}\t{-1.0}\t{lloss}\t{top1_err*math.exp(1)}\n")
+					uu += 1
+				total_loss += lloss
 
-			total += n_possible
-
-			if batch_indx % 200 == 0:
-				end_event.record()
-				torch.cuda.synchronize()
-				amp_time = start_event.elapsed_time(end_event)
-				print("batch time:", amp_time, "ms")
-				# f = model.calcFlops(inputs)
-				# print(f"{(f/1e9) / (amp_time / 1000.0)} GFlops approx")
-				fd_losslog.flush()
-
-			lloss = loss.detach().cpu().item()
-			lloss = lloss / inputs.shape[0] # normalize by batch size
-			fd_losslog.write(f"{uu}\t{lloss}\t0.0\n")
-			uu += 1
-
-			total_loss += loss.item()
-
-		avg_loss = total_loss / len(loader_v) 
-		val_accuracy = 100 * correct_vals / total
-		print(f'Validation Loss: {avg_loss:.4f}, accuracy {val_accuracy}')
+			avg_loss = total_loss / len(loader_v)
+			val_accuracy = 100 * correct_vals / total
+			print(f'Validation Loss: {avg_loss:.4f}, accuracy {val_accuracy}')
+			validation_loss = avg_loss
+			validation_top1_err = 1 - correct_vals / total
 
 	fd_losslog.flush()
 	fd_losslog.close()
