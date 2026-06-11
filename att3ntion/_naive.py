@@ -35,7 +35,14 @@ def _normalize_self_attn_mask(mask, batch_size, ntok, device):
 
 class _HypergraphAttentionNaive(nn.Module):
 	"""Pure-PyTorch naive O(N^3) implementation for correctness testing."""
-	def __init__(self, d_model, n_heads, dropout_rate=0, head_subspaces=False, scatter=False, **kwargs):
+	def __init__(
+			self, d_model, n_heads, dropout_rate=0,
+			head_subspaces=False,
+			scatter=False,
+			qrs_bias=False,
+			value_bias=False,
+			out_bias=False,
+			**kwargs):
 		super().__init__()
 
 		self.d_model = d_model
@@ -48,14 +55,16 @@ class _HypergraphAttentionNaive(nn.Module):
 		self.d_val = self.d_head*1
 		self.scatter = scatter
 
-		self.Wq = nn.Linear(d_model, self.d_head*n_heads, bias=False, **kwargs)
-		self.Wr = nn.Linear(d_model, self.d_head*n_heads, bias=False, **kwargs)
-		self.Ws = nn.Linear(d_model, self.d_head*n_heads, bias=False, **kwargs)
+		self.Wq = nn.Linear(d_model, self.d_head*n_heads, bias=qrs_bias, **kwargs)
+		self.Wr = nn.Linear(d_model, self.d_head*n_heads, bias=qrs_bias, **kwargs)
+		self.Ws = nn.Linear(d_model, self.d_head*n_heads, bias=qrs_bias, **kwargs)
 
 		value_proj_multiplier = 2 if self.scatter else 1
-		self.Wv_q = nn.Linear(d_model, self.d_val*n_heads*value_proj_multiplier, bias=True, **kwargs)
-		self.Wv_r = nn.Linear(d_model, self.d_val*n_heads*value_proj_multiplier, bias=True, **kwargs)
-		self.Wv_s = nn.Linear(d_model, self.d_val*n_heads*value_proj_multiplier, bias=True, **kwargs)
+		self.Wv_q = nn.Linear(d_model, self.d_val*n_heads*value_proj_multiplier, bias=value_bias, **kwargs)
+		self.Wv_r = nn.Linear(d_model, self.d_val*n_heads*value_proj_multiplier, bias=value_bias, **kwargs)
+		self.Wv_s = nn.Linear(d_model, self.d_val*n_heads*value_proj_multiplier, bias=value_bias, **kwargs)
+
+		self.Wo = nn.Linear(self.d_model, d_model, bias=out_bias, **kwargs)
 
 		self.Wo = nn.Linear(self.d_model, d_model, bias=True, **kwargs)
 
@@ -63,6 +72,9 @@ class _HypergraphAttentionNaive(nn.Module):
 		self.gelu = QuickGELU()
 
 	def forward(self, x, rotary_emb, mask=None):
+		"""
+		mask: bool[batch, query, target] if provided
+		"""
 		out_dtype = x.dtype
 		x = x.float()
 		batch_size, ntok, d_model = x.shape
@@ -96,18 +108,24 @@ class _HypergraphAttentionNaive(nn.Module):
 		dot_product = torch.einsum('bhid,bhjd,bhkd->bhijk', Q, R, S)
 		dot_product = dot_product / (math.sqrt(self.d_head))
 
-		dot_product_q = dot_product.flatten(3, 4)  # B H i (j*k)
-		dot_product_r = dot_product.permute(0, 1, 3, 2, 4).flatten(3, 4)  # B H j (i*k)
-		dot_product_s = dot_product.permute(0, 1, 4, 2, 3).flatten(3, 4)  # B H k (i*j)
+		dot_product_q = dot_product.flatten(3, 4) # BHI(JK)
+		dot_product_r = dot_product.permute(0, 1, 3, 2, 4).flatten(3, 4) # BHJ(IK)
+		dot_product_s = dot_product.permute(0, 1, 4, 2, 3).flatten(3, 4) # BHK(IJ)
 
-		mask = _normalize_self_attn_mask(mask, batch_size, ntok, x.device)
 		if mask is not None:
-			# For each row token r, allow pair (a, b) iff r->a and r->b are both valid.
-			valid_pair = (mask[:, :, :, None] & mask[:, :, None, :]).flatten(2, 3)
-			invalid_pair = (~valid_pair).unsqueeze(1)  # [B,1,N,N*N]
-			dot_product_q = dot_product_q.masked_fill(invalid_pair, float("-inf"))
-			dot_product_r = dot_product_r.masked_fill(invalid_pair, float("-inf"))
-			dot_product_s = dot_product_s.masked_fill(invalid_pair, float("-inf"))
+			if mask.ndim == 2:
+				# mask is the standard 2D matrix (ntok, ntok)
+				# add in a (dummy, broadcasted) batch dim
+				mask = mask[None,:,:]
+			# otherwise can have a different mask per batch element
+			assert(mask.ndim == 3)
+			# any i can attend to j,k <= i (likewise for the other 2 permutations).
+			valid3 = (mask[:,:,:,None] & mask[:,:,None,:]).flatten(2, 3)
+			invalid3 = ~(valid3[:,None,:,:])
+			# the three dot_products are permuted and flattened so that the last dim is the softmax dim.
+			dot_product_q = dot_product_q.masked_fill(invalid3, float('-inf'))
+			dot_product_r = dot_product_r.masked_fill(invalid3, float('-inf'))
+			dot_product_s = dot_product_s.masked_fill(invalid3, float('-inf'))
 
 		Aq = torch.softmax(dot_product_q, dim=-1).reshape(dot_product.shape)
 		Aq = torch.nan_to_num(Aq, nan=0.0)
@@ -318,6 +336,9 @@ class _GraphAttentionNaive(nn.Module):
 		self.gelu = QuickGELU()
 
 	def forward(self, x, rotary_emb, mask=None):
+		"""
+		mask: bool[batch, query, target] if provided
+		"""
 		out_dtype = x.dtype
 		x = x.float()
 		batch_size, ntok, d_model = x.shape
@@ -335,12 +356,13 @@ class _GraphAttentionNaive(nn.Module):
 
 		V = V.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
 
-		A = torch.einsum('bhid,bhjd->bhij', Q, K) / math.sqrt(self.d_head)
-		mask = _normalize_self_attn_mask(mask, batch_size, ntok, x.device)
+		A = torch.einsum('bhid,bhjd->bhij', Q, K)
 		if mask is not None:
-			A = A.masked_fill((~mask).unsqueeze(1), float("-inf"))
+			mask = mask[:,None,:,:] # unsqueeze head dimension
+			invalid = ~mask
+			A = A.masked_fill(invalid, -torch.inf)
 		A = torch.softmax(A, dim=-1)
-		A = torch.nan_to_num(A, nan=0.0)
+		A = torch.nan_to_num(A, nan=0.0) # needed if all positions of mask are False
 		y = torch.einsum('bhij,bhjd->bhid', A, V)
 
 		if self.head_subspaces:
