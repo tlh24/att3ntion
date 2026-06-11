@@ -48,9 +48,9 @@ class _HypergraphCudaWrapper(nn.Module):
 		self.n_heads = n_heads
 		self.inner = HypergraphAttention(d_model, n_heads, scatter=kwargs.get('scatter', False))
 
-	def forward(self, x, rotary_emb):
+	def forward(self, x, rotary_emb, mask=None):
 		assert rotary_emb is None, "to consider later: CUDA HypergraphAttention does not support rotary embeddings"
-		return self.inner(x)
+		return self.inner(x, mask=mask)
 
 	def calcFlops(self, x):
 		bs, ntok, d_model = x.shape
@@ -141,8 +141,7 @@ class SimpleCompModel(nn.Module):
 	def forward(self, x, b):
 		# # skip = b % (self.n_recurse)
 		bs, ntok, d_model = x.shape
-		mask = torch.tril(torch.ones(ntok, ntok))
-		mask = mask.to(x.device)
+		mask = torch.tril(torch.ones(ntok, ntok, device=x.device, dtype=torch.bool))
 		skip = 0
 		if skip > 0:
 			with torch.no_grad():

@@ -62,6 +62,7 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim,
 
     fwd_inputs = tuple(t.to(torch.bfloat16) for t in (Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2))
     bwd_inputs = fwd_inputs
+    empty_mask = torch.empty(0, dtype=torch.bool, device='cuda')
 
     # --- Forward Pass ---
     # forward returns 12 values: Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_,
@@ -71,7 +72,7 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim,
         (Y_q_mc, Y_r_mc, Y_s_mc, Y_q__mc, Y_r__mc, Y_s__mc,
          m_i, l_i, m_j, l_j, m_k, l_k) = \
             _cuda_kernels.forward(
-                *fwd_inputs, dropout_rate
+                *fwd_inputs, dropout_rate, -1, -1, -1, empty_mask
             )
     else:
         # Still need forward outputs to feed backward
@@ -79,7 +80,7 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim,
             (Y_q_mc, Y_r_mc, Y_s_mc, Y_q__mc, Y_r__mc, Y_s__mc,
              m_i, l_i, m_j, l_j, m_k, l_k) = \
                 _cuda_kernels.forward(
-                    *fwd_inputs, dropout_rate
+                    *fwd_inputs, dropout_rate, -1, -1, -1, empty_mask
                 )
 
     # --- Backward Pass ---
@@ -98,7 +99,8 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim,
             m_i, l_i,
             m_j, l_j,
             m_k, l_k,
-            dropout_rate
+            dropout_rate,
+            empty_mask
         )
 
     torch.cuda.synchronize()
