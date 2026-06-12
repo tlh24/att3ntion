@@ -318,10 +318,10 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		n_recurse = 1
 		n_heads = 1
 	if task == 2:
-		n_layers = 3
+		n_layers = 2
 		if attn_impl == "graph":
-			n_layers = 6
-		n_recurse = 1 # depends on the formula depth
+			n_layers = 4
+		n_recurse = 2 # depends on the formula depth
 		# n_heads = 6 # use the command line arg
 
 	dtype = torch.float32
