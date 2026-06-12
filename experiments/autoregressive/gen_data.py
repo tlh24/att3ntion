@@ -4,30 +4,38 @@ import random
 import numpy as np
 import matplotlib.pyplot as plt
 
-OPS = ['+', '-', '*', '/']
-# OPS = ['+']
+# OPS = ['+', '-', '*', '/']
+# OPS = ['+', '-', '*']
+OPS = ['+']
 COMMUTATIVE_OPS = {'+', '*'}
 
 @lru_cache(maxsize=None)
-def generate_ast(d, v):
+def count_c(node):
+	"""Tersely count constant nodes in the AST structure."""
+	if isinstance(node, str): return int(node == 'C')
+	return count_c(node[1]) + count_c(node[2])
+
+@lru_cache(maxsize=None)
+def generate_ast(d, V, C):
 	"""Generates optimal DAG of abstract syntax trees."""
 	if d == 0:
-		return [f"x_{i+1}" for i in range(v)] + ["C"]
+		return [f"x_{i+1}" for i in range(V)] + (["C"] if C > 0 else [])
+
 	trees = []
 	for op in OPS:
 		is_comm = op in COMMUTATIVE_OPS
 		for dl, dr in itertools.product(range(d), repeat=2):
-			if max(dl, dr) != d - 1 or (is_comm and dl > dr):
-				continue
+			if max(dl, dr) != d - 1 or (is_comm and dl > dr): continue
 
-			lefts, rights = generate_ast(dl, v), generate_ast(dr, v)
+			lefts, rights = generate_ast(dl, V, C), generate_ast(dr, V, C)
 			pairs = itertools.combinations_with_replacement(lefts, 2) if (is_comm and dl == dr) \
 					else itertools.product(lefts, rights)
 
 			for L, R in pairs:
 				if L == 'C' and R == 'C': continue # Fold constants
 				if op in ('-', '/') and L == R: continue # Fold identities
-				trees.append((op, L, R))
+				if count_c(L) + count_c(R) <= C:   # <-- Efficiently prune bounded constants!
+					trees.append((op, L, R))
 
 	return trees
 
@@ -90,20 +98,20 @@ def evaluate_autoregressive(func, init_X, C_vals, L=10, P=113):
 
 	return seq
 
-def gen_data(mode, max_d, V, P=113, L=1, data_size=1000, exact_v=True):
+def gen_data(mode, max_d, V, C, P=113, L=1, data_size=1000, exact_v=True):
 	"""
 	mode 'grok': Formulas shared. Inputs (init_conditions & constants) split 60/40. (Grokking)
 	mode 'formulas': Formulas split 60/40. Inputs sampled uniformly. (Formula generalization)
 	max_d : maximum formula depth
-	V :  number of variables
+	V :  upper limit of variables
+	C :  upper limit of constants
 	L : length of autoregressive roll-out
 	"""
 	# 1. Compile all valid formulas from ASTs
 	formulas = []
 	for d in range(max_d + 1):
-		for ast in generate_ast(d, V):
+		for ast in generate_ast(d, V, C):
 			expr_str, num_c, num_v, func = compile_ast(ast)
-			# Strict enforcement of exactly V variables
 			if exact_v and num_v != V:
 				continue
 			formulas.append((expr_str, num_c, func))
@@ -160,9 +168,10 @@ def gen_data(mode, max_d, V, P=113, L=1, data_size=1000, exact_v=True):
 
 	return train_data, test_data
 
+OP_MAP = {'+': 0, '-': 1, '*': 2, '/': 3, '(': 4, ')': 5}
+
 def to_numpy(train_data, test_data, P):
 	"""Maps expressions and sequences to an int32 numpy array, padding the expression."""
-	OP_MAP = {'+': 0, '-': 1, '*': 2, '/': 3, '(': 4, ')': 5}
 
 	def tokenize(expr):
 		# Safely separate parens so .split() works cleanly
@@ -191,8 +200,24 @@ def to_numpy(train_data, test_data, P):
 	# return the maximum expression length & np train test arrays.
 	return max_e, build_array(tr_parsed), build_array(te_parsed)
 
+def from_numpy(data, P):
+	# inefficiently convert from a numpy array to string
+	o = ""
+	for r in range(data.shape[0]):
+		for c in range(data.shape[1]):
+			v = data[r,c]
+			if v < P:
+				o += str(v) + " "
+			elif v < P + len(OP_MAP):
+				o += list(OP_MAP)[v-P] + " "
+			else:
+				o += f"x_{v - P - len(OP_MAP)} "
+		o += "\n"
+	return o
+
 if __name__ == "__main__":
 	V = 2 # Variables
+	C = 1 # Constant
 	D = 2 # Depth
 
 	init_conditions = [1, 2] # x_2(t-2) = 1, x_1(t-1) = 2
@@ -200,7 +225,7 @@ if __name__ == "__main__":
 
 	count = 0
 	for d in range(D + 1):
-		for ast in generate_ast(d, V):
+		for ast in generate_ast(d, V, C):
 			expr_str, num_c, num_vars, func = compile_ast(ast)
 
 			# Slice only the constants this specific formula requires
@@ -217,22 +242,23 @@ if __name__ == "__main__":
 			if count >= 10: break
 		if count >= 10: break
 
-	print("Generating Mode A (Grokking Split)...")
-	train_A, test_A = gen_data('grok', max_d=2, V=2, L=1, data_size=50)
+	print("Generating max_d=2 V=3, C=0, L=1")
+	train_A, test_A = gen_data('formulas', max_d=2, V=3, C=0, L=1, data_size=50)
 	for row in train_A: print(f"Train: {row}")
 	for row in test_A:  print(f"Test:  {row}")
 
 	# check numpy conversion
-	max_exprlen, train_np, test_np = to_numpy(train_A, test_A, 25)
+	max_exprlen, train_np, test_np = to_numpy(train_A, test_A, 113)
 	fig,axs = plt.subplots(2, 1, figsize=(12, 6))
 	axs[0].imshow(train_np.T - 113)
 	axs[0].set_title('Train')
 	axs[1].imshow(test_np.T - 113)
 	axs[1].set_title('Test')
 	plt.show()
+	print(from_numpy(train_np[0:5,:], 113))
 
-	print("\nGenerating Mode B (Formula Split)...")
-	train_B, test_B = gen_data('B', max_d=1, V=2, L=2, data_size=5)
-	for row in train_B: print(f"Train: {row}")
-	for row in test_B:  print(f"Test:  {row}")
+	# print("\nGenerating Mode B max_d=2, V=2, C=0, L=2")
+	# train_B, test_B = gen_data('formulas', max_d=2, V=3, C=0, L=2, data_size=5)
+	# for row in train_B: print(f"Train: {row}")
+	# for row in test_B:  print(f"Test:  {row}")
 

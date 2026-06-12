@@ -1,4 +1,5 @@
 import numpy as np
+import math
 import argparse
 import inspect
 import torch
@@ -18,10 +19,10 @@ for d in [script_dir, project_root]:
         sys.path.insert(0, d)
 
 from att3ntion import _HypergraphAttentionNaive, _GraphAttentionNaive, QuickGELU
-from gen_data import gen_data, to_numpy
+from gen_data import gen_data, to_numpy, from_numpy
 
 SEQ_L = 1 # length of the output sequence
-MASKED = False # masked vs autoregressive training.
+MASKED = True # masked vs autoregressive training.
 		# if False, use autoregressive training
 
 # Try to import CUDA-backed hypergraph attention; fall back to naive if not built.
@@ -117,8 +118,9 @@ class SimpleCompModel(nn.Module):
 		
 	def forward(self, x):
 		bs, ntok = x.shape
-		mask = torch.tril(torch.ones(ntok, ntok))
-		mask = mask.to(x.device)
+		# mask = torch.tril(torch.ones(ntok, ntok))
+		# mask = mask.to(x.device)
+		mask = None
 		x = self.embedding_proj(x)
 		for r in range(self.n_recurse):
 			for layer_block in self.repeated_layers:
@@ -252,7 +254,6 @@ class GrokkingTransformer(nn.Module):
 
 		return h
 
-
 def calcLoss(pred, targets):
 	n_correct = 0
 	n_possible = 0
@@ -280,9 +281,9 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 	
 	if task == 1:
 		# for grokking, need to generate the (nearly) full table
-		train_s, test_s = gen_data('grok', max_d=1, V=2, P=113, L=SEQ_L, data_size=120**2)
+		train_s, test_s = gen_data('grok', max_d=1, V=2, C=0, P=113, L=SEQ_L, exact_v=True, data_size=120**2)
 	if task == 2:
-		train_s, test_s = gen_data('formulas', max_d=2, V=2, P=113, L=SEQ_L, data_size=100_000)
+		train_s, test_s = gen_data('grok', max_d=1, V=3, C=0, P=113, L=SEQ_L, exact_v=False, data_size=100_000)
 	for i in range(10): print(f"Train: {train_s[i]}")
 	for i in range(5):  print(f"Test:  {test_s[i]}")
 	print(f"Train size {len(train_s)} test size {len(test_s)}")
@@ -318,8 +319,10 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		n_heads = 1
 	if task == 2:
 		n_layers = 2
+		if attn_impl == "graph":
+			n_layers = 4
 		n_recurse = 2 # depends on the formula depth
-		n_heads = 4
+		# n_heads = 6 # use the command line arg
 
 	dtype = torch.float32
 	model = SimpleCompModel(vocab_size, hidden_dim, n_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse, use_cuda_kernels=use_cuda_kernels).to(device=device, dtype=dtype)
@@ -337,8 +340,11 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 										weight_decay=weight_decay,
 										betas=betas,
 										amsgrad=True, eps=1e-5)
-	# model.printParamCount() FIXME
-	# model = torch.compile(model, backend="eager") # mode="max-autotune"
+	try:
+		model.printParamCount()
+	except:
+		print("\\ grokking transformer does not calculate number of parameters")
+	model = torch.compile(model) # mode="max-autotune" or backend="eager"
 
 	if no_amp:
 		print("--- Running in full fp32 ---")
@@ -350,19 +356,31 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 
 	print("\ntrain_model1 started...")
 	uu = 0
+	rng = np.random.default_rng()
+	validation_loss = 1.0
+	validation_top1_err = 1.0
+
 	for epoch in range(num_epochs):
-		model.train()
 		total_loss = 0
-		correct_ops = 0
 		correct_vals = 0
 		total = 0
 
 		start_event = torch.cuda.Event(enable_timing=True)
 		end_event = torch.cuda.Event(enable_timing=True)
-		
-		for batch_indx, (inputs_np,outputs_np) in enumerate(train_loader):
-			inputs = inputs_np.to(device=device)
-			targets = outputs_np.to(device=device)
+		model.train()
+		n_train = x.shape[0]
+		for batch_indx in range(n_train // batch_size):
+			mb_idx = rng.permutation(n_train)[:batch_size]
+			inputs = torch.tensor(x[mb_idx,:]).to(device=device)
+			targets = torch.tensor(y[mb_idx,:]).to(device=device)
+
+			if batch_indx == 0:
+				d = inputs[0:5, :].detach().cpu().numpy()
+				# print(d-1) # null token mapped to -1
+				print(from_numpy(d-1, 113))
+				print("targets:")
+				d = targets[0:5, :].detach().cpu().numpy()
+				print(from_numpy(d-1, 113))
 
 			if batch_indx % 100 == 0:
 				start_event.record()
@@ -375,18 +393,18 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 				with autocast('cuda'):
 					pred = model(inputs)
 					loss, n_correct, n_possible = calcLoss(pred, targets)
-			correct_vals += n_correct
-
 			loss.backward()
 			torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 			optimizer.step()
 
-			lloss = loss.detach().cpu().item()
-			fd_losslog.write(f"{uu}\t{lloss}\t0.0\n")
-			uu += 1
-
-			total_loss += loss.item()
+			correct_vals += n_correct
 			total += n_possible
+			lloss = loss.detach().cpu().item()
+			total_loss += lloss
+			lloss = lloss / inputs.shape[0] # normalize by batch size
+			top1_err = 1 - (n_correct / n_possible)
+			fd_losslog.write(f"{uu}\t{lloss}\t{top1_err*math.exp(1)}\t{validation_loss}\t{validation_top1_err*math.exp(1)}\n")
+			uu += 1
 			
 			if batch_indx % 200 == 0:
 				end_event.record()
@@ -394,79 +412,42 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 				amp_time = start_event.elapsed_time(end_event)
 				print("batch time:", amp_time, "ms")
 				fd_losslog.flush()
-
-		# plot the inputs / outputs
-		if epoch == (num_epochs-1) and False:
-			fig,axs = plt.subplots(2, 4, figsize=(13,10))
-			def mangle(t):
-				return t.detach().cpu().squeeze().float().numpy()
-			def plot(r, c, t, blank=False):
-				g = mangle(t)
-				im = axs[r,c].imshow( g.T )
-				plt.colorbar(im, ax=axs[r,c])
-
-			for j in range(2):
-				plot(j,0, inputs[j,...])
-				plot(j,1, targets[j,...])
-				plot(j,2, pred[j,...], True)
-				plot(j,3, pred[j,...] - targets[j,...], True)
-
-				axs[j,0].set_title('input')
-				axs[j,1].set_title('target')
-				axs[j,2].set_title('pred')
-				axs[j,3].set_title('err')
-			plt.show()
 		
 		avg_loss = total_loss / len(train_loader)
 		train_accuracy = 100 * correct_vals / total
-		print(f'Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Result Acc: {train_accuracy:.2f}%')
+		print(f'Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Train Acc: {train_accuracy:.2f}%')
 
-		if save_model:
-			# save after each epoch
-			model.save_model(f"comp_model_{attn_impl}_r{replicate}.pt")
+		# validation!
+		total_loss = 0
+		correct_vals = 0
+		total = 0
+		with torch.no_grad():
+			for batch_indx, (inputs_np,outputs_np) in enumerate(loader_v):
+				inputs = inputs_np.to(device=device)
+				targets = outputs_np.to(device=device)
 
-	fd_losslog.flush()
-	# validation!
-	total_loss = 0
-	correct_vals = 0
-	total = 0
-	with torch.no_grad():
-		for batch_indx, (inputs_np,outputs_np) in enumerate(loader_v):
-			inputs = inputs_np.to(device=device)
-			targets = outputs_np.to(device=device)
-
-			if batch_indx % 100 == 0:
-				start_event.record()
-
-			if no_amp:
-				pred = model(inputs, 0)
-				loss, n_correct, n_possible = calcLoss(pred, targets)
-			else:
-				with autocast('cuda'):
-					pred = model(inputs)
+				if no_amp:
+					pred = model(inputs, 0)
 					loss, n_correct, n_possible = calcLoss(pred, targets)
-			correct_vals += n_correct
+				else:
+					with autocast('cuda'):
+						pred = model(inputs)
+						loss, n_correct, n_possible = calcLoss(pred, targets)
+				correct_vals += n_correct
+				total += n_possible
+				lloss = loss.detach().cpu().item()
+				lloss = lloss / inputs.shape[0]
+				top1_err = 1 - (correct_vals / n_possible)
+				if epoch == num_epochs-1:
+					fd_losslog.write(f"{uu}\t{-1.0}\t{-1.0}\t{lloss}\t{top1_err*math.exp(1)}\n")
+					uu += 1
+				total_loss += lloss
 
-			total += n_possible
-
-			if batch_indx % 200 == 0:
-				end_event.record()
-				torch.cuda.synchronize()
-				amp_time = start_event.elapsed_time(end_event)
-				print("batch time:", amp_time, "ms")
-				# f = model.calcFlops(inputs)
-				# print(f"{(f/1e9) / (amp_time / 1000.0)} GFlops approx")
-				fd_losslog.flush()
-
-			lloss = loss.detach().cpu().item()
-			fd_losslog.write(f"{uu}\t{lloss}\t0.0\n")
-			uu += 1
-
-			total_loss += loss.item()
-
-		avg_loss = total_loss / len(loader_v) 
-		val_accuracy = 100 * correct_vals / total
-		print(f'Validation Loss: {avg_loss:.4f}, accuracy {val_accuracy}')
+			avg_loss = total_loss / len(loader_v)
+			val_accuracy = 100 * correct_vals / total
+			print(f'Validation Loss: {avg_loss:.4f}, accuracy {val_accuracy}')
+			validation_loss = avg_loss
+			validation_top1_err = 1 - correct_vals / total
 
 	fd_losslog.flush()
 	fd_losslog.close()
@@ -476,10 +457,10 @@ if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='Train aritmetic model')
 	parser.add_argument('--device', type=str, default='auto',
 						help='Device to use (cpu, cuda, auto)')
-	parser.add_argument('--epochs', type=int, default=40, help='Number of epochs')
+	parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
 	parser.add_argument('--batch-size', type=int, default=32, help='Batch size for training')
 	parser.add_argument('--hidden', type=int, default=256, help='Hidden dimension size')
-	parser.add_argument('--heads', type=int, default=1, help='Number of attention heads')
+	parser.add_argument('--heads', type=int, default=4, help='Number of attention heads')
 	parser.add_argument('--attn', type=str, default='hypergraph', choices=['hypergraph', 'graph'],
 						help='Attention implementation to use')
 	parser.add_argument('--log-name', type=str,
