@@ -3,6 +3,7 @@ from functools import lru_cache
 import random
 import numpy as np
 import matplotlib.pyplot as plt
+import pdb
 
 # OPS = ['+', '-', '*', '/']
 # OPS = ['+', '-', '*']
@@ -75,7 +76,7 @@ def compile_ast(ast):
 	expr_str, code_str = build(ast)
 	func = eval(f"lambda X, C, P: {code_str}")
 
-	return expr_str, c_idx, len(used_vars), func
+	return expr_str+' =', c_idx, len(used_vars), func
 
 def evaluate_autoregressive(func, init_X, C_vals, L=10, P=113):
 	"""
@@ -168,7 +169,7 @@ def gen_data(mode, max_d, V, C, P=113, L=1, data_size=1000, exact_v=True):
 
 	return train_data, test_data
 
-OP_MAP = {'+': 0, '-': 1, '*': 2, '/': 3, '(': 4, ')': 5}
+OP_MAP = {'+': 0, '-': 1, '*': 2, '/': 3, '(': 4, ')': 5, '=':6}
 
 def to_numpy(train_data, test_data, P):
 	"""Maps expressions and sequences to an int32 numpy array, padding the expression."""
@@ -242,8 +243,8 @@ if __name__ == "__main__":
 			if count >= 10: break
 		if count >= 10: break
 
-	print("Generating max_d=2 V=3, C=0, L=1")
-	train_A, test_A = gen_data('formulas', max_d=2, V=3, C=0, L=1, data_size=50)
+	print("Generating max_d=0 V=3, C=0, L=1")
+	train_A, test_A = gen_data('grok', max_d=0, V=3, C=0, L=1, data_size=50, exact_v=False)
 	for row in train_A: print(f"Train: {row}")
 	for row in test_A:  print(f"Test:  {row}")
 

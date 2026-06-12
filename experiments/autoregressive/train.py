@@ -120,7 +120,7 @@ class SimpleCompModel(nn.Module):
 		bs, ntok = x.shape
 		# mask = torch.tril(torch.ones(ntok, ntok))
 		# mask = mask.to(x.device)
-		mask = None
+		mask = None # non-autoregressive now
 		x = self.embedding_proj(x)
 		for r in range(self.n_recurse):
 			for layer_block in self.repeated_layers:
@@ -283,6 +283,9 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		# for grokking, need to generate the (nearly) full table
 		train_s, test_s = gen_data('grok', max_d=1, V=2, C=0, P=113, L=SEQ_L, exact_v=True, data_size=120**2)
 	if task == 2:
+		# copy task
+		train_s, test_s = gen_data('grok', max_d=0, V=3, C=0, P=113, L=SEQ_L, exact_v=False, data_size=120**2)
+	if task == 3:
 		train_s, test_s = gen_data('grok', max_d=1, V=3, C=0, P=113, L=SEQ_L, exact_v=False, data_size=100_000)
 	for i in range(10): print(f"Train: {train_s[i]}")
 	for i in range(5):  print(f"Test:  {test_s[i]}")
@@ -311,13 +314,13 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 	vocab_size = np.max(x) + 1
 
 	is_hg = attn_impl == "hypergraph"
-	if task == 1:
+	if task == 1 or task == 2:
 		n_layers = 1
 		if attn_impl == "graph":
 			n_layers = 2
 		n_recurse = 1
 		n_heads = 1
-	if task == 2:
+	if task == 3:
 		n_layers = 2
 		if attn_impl == "graph":
 			n_layers = 4
@@ -406,7 +409,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 			fd_losslog.write(f"{uu}\t{lloss}\t{top1_err*math.exp(1)}\t{validation_loss}\t{validation_top1_err*math.exp(1)}\n")
 			uu += 1
 			
-			if batch_indx % 200 == 0:
+			if batch_indx % 500 == 0:
 				end_event.record()
 				torch.cuda.synchronize()
 				amp_time = start_event.elapsed_time(end_event)
@@ -468,7 +471,7 @@ if __name__ == '__main__':
 	parser.add_argument('--save', action='store_true',
         help='Load and save model parameters.')
 	parser.add_argument('--seq-l', type=int, default=1, help="sequence length")
-	parser.add_argument('--task', type=int, default=1, help="what task to run. 1 = mod arith; 2 = formula generalization")
+	parser.add_argument('--task', type=int, default=1, help="what task to run. 1 = mod arith; 2 = copy task; 3 = formula generalization")
 	parser.add_argument('--repl', type=int, default=1, help="what replicate this is",)
 	parser.add_argument('--no-amp', action='store_true', help='Disable Torch automatic mixed precision')
 	parser.add_argument('--use-cuda-kernels', action='store_true',
