@@ -118,8 +118,9 @@ class SimpleCompModel(nn.Module):
 		
 	def forward(self, x):
 		bs, ntok = x.shape
-		mask = torch.tril(torch.ones(ntok, ntok))
-		mask = mask.to(x.device)
+		# mask = torch.tril(torch.ones(ntok, ntok))
+		# mask = mask.to(x.device)
+		mask = None
 		x = self.embedding_proj(x)
 		for r in range(self.n_recurse):
 			for layer_block in self.repeated_layers:
@@ -320,7 +321,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		n_layers = 3
 		if attn_impl == "graph":
 			n_layers = 6
-		n_recurse = 2 # depends on the formula depth
+		n_recurse = 1 # depends on the formula depth
 		# n_heads = 6 # use the command line arg
 
 	dtype = torch.float32
@@ -376,6 +377,9 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 			if batch_indx == 0:
 				d = inputs[0:5, :].detach().cpu().numpy()
 				# print(d-1) # null token mapped to -1
+				print(from_numpy(d-1, 113))
+				print("targets:")
+				d = targets[0:5, :].detach().cpu().numpy()
 				print(from_numpy(d-1, 113))
 
 			if batch_indx % 100 == 0:

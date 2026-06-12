@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import math
 import att3ntion._custom_op  # noqa: F401 — registers torch.ops.att3ntion.hypergraph_{forward,backward}
-import att3ntion._torch_kernels as _torch_kernels
+# import att3ntion._torch_kernels as _torch_kernels
 from torch.autograd import Function
 
 _CHECK_GRAD_FINITE = os.getenv("ATT3NTION_CHECK_GRADS", "0").lower() in {"1", "true", "yes", "on"}
