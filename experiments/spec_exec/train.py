@@ -276,23 +276,20 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 
 			with autocast('cuda'):
 				if not no_samp:
-					# run the sampling step
+					# run the sampling step - all n_samp candidates in one forward pass
 					with torch.no_grad():
-						Ans, losses = [], []
-						for a in range(4):
-							An = torch.randn((4,batch_size,n_heads,n_tok,n_tok,n_tok)).to(device=device)*0.25
-							pred, _ = model(inputs, An)
-							loss, _, _ = calcLoss(pred, targets)
-							Ans.append(An)
-							losses.append(loss)
-						# need to sort Ans by loss
-						stacked_losses = torch.stack(losses)
-						best_indices = torch.argmin(stacked_losses, dim=0)
-						stacked_Ans = torch.stack(Ans)
-						view_shape = [1, 1, stacked_Ans.size(2)] + [1] * (stacked_Ans.ndim - 3)
-						broadcast_indices = best_indices.view(*view_shape)
-						gather_indices = broadcast_indices.expand_as(stacked_Ans[:1])
-						best_Ans = torch.gather(stacked_Ans, dim=0, index=gather_indices).squeeze(0).detach()
+						n_samp = 8
+						inputs_tiled = inputs.repeat(n_samp, 1)
+						targets_tiled = targets.repeat(n_samp, 1)
+						An = torch.randn((4, n_samp * batch_size, n_heads, n_tok, n_tok, n_tok), device=device) * 0.25
+						pred, _ = model(inputs_tiled, An)
+						loss, _, _ = calcLoss(pred, targets_tiled)  # (n_samp * batch_size,)
+						loss_per_samp = loss.view(n_samp, batch_size)
+						best_indices = torch.argmin(loss_per_samp, dim=0)  # (batch_size,)
+						An_reshaped = An.view(4, n_samp, batch_size, *An.shape[2:])
+						idx = best_indices.view(1, 1, batch_size, *([1] * (An_reshaped.ndim - 3)))
+						idx = idx.expand(4, 1, batch_size, *An_reshaped.shape[3:])
+						best_Ans = torch.gather(An_reshaped, 1, idx).squeeze(1).detach()
 				else:
 					best_Ans = None
 
@@ -302,16 +299,24 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 				t_loss, n_correct, n_possible = calcLoss(pred, targets)
 				t_loss = t_loss.sum()
 
+				if torch.isnan(t_loss) or torch.isinf(t_loss):
+					print(f"NaN/Inf in t_loss at batch {batch_indx}")
+					pdb.set_trace()
+				if not no_samp:
+					if torch.isnan(a_loss) or a_loss < 1e-8:
+						print(f"a_loss={a_loss.item():.2e}, scl={scl.item():.2e} at batch {batch_indx}")
+
 				if not no_samp:
 					with torch.no_grad():
 						best_Ans = best_Ans + A
 					a_loss = F.mse_loss(A, best_Ans)
 					t_loss_ema = t_loss.detach().cpu().item() * 0.01 + 0.99 * t_loss_ema
 					a_loss_ema = a_loss.detach().cpu().item() * 0.01 + 0.99 * a_loss_ema
-					scl = t_loss / (27*a_loss) # normalize the effect of a_loss
+					scl = (t_loss / (27*a_loss)).clamp(0,400) # normalize the effect of a_loss
 					loss = t_loss + scl*a_loss
 				else:
 					loss = t_loss
+
 
 			loss.backward()
 			torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
