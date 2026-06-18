@@ -334,11 +334,10 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 				with torch.no_grad():
 					best_Ans = best_Ans + A
 				a_loss = F.mse_loss(A, best_Ans)
-				t_loss = t_loss.mean()
 				# need to add some loss scaling here so they are balanced..
 				# if the token loss is low, we don't need to push on the attention loss.
 				# also need to avoid NaNs here!
-				loss = t_loss.mean() + 10*a_loss
+				loss = t_loss.sum() + batch_size*10*a_loss
 
 			loss.backward()
 			torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
