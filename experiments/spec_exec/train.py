@@ -25,31 +25,6 @@ SEQ_L = 1 # length of the output sequence
 MASKED = True # masked vs autoregressive training.
 		# if False, use autoregressive training
 
-# Try to import CUDA-backed hypergraph attention; fall back to naive if not built.
-_cuda_kernels_available = False
-try:
-	from att3ntion import HypergraphAttention as _HypergraphAttentionCuda
-	_cuda_kernels_available = True
-except (ImportError, OSError):
-	pass
-
-if _cuda_kernels_available:
-	class _CudaHypergraphWrapper(_HypergraphAttentionCuda):
-		"""HypergraphAttention adapted to the (x, rotary_emb) call convention used here."""
-		def forward(self, x, rotary_emb=None):
-			return super().forward(x)
-
-		def calcFlops(self, x):
-			bs, ntok, d_model = x.shape
-			f = 0.0
-			f += 3 * bs * ntok * d_model**2 * self.n_heads * d_model
-			f += 3 * bs * ntok * d_model**2 * self.n_heads * d_model * 2
-			f += bs * self.n_heads * ntok**3 * self.head_dim * 2
-			f += bs * self.n_heads * ntok**3 * 2 * 3
-			f += bs * self.n_heads * ntok**3 * self.head_dim * 6
-			f += bs * self.n_heads * ntok * self.head_dim * (6 + 6)
-			f += bs * ntok * d_model**2
-			return f
 
 class SwiGLU(nn.Module):
 	"""
@@ -66,7 +41,7 @@ class SwiGLU(nn.Module):
 
 class SimpleCompModel(nn.Module):
 	"""Model with hypergraph attention layer."""
-	def __init__(self, input_vocab:int, hidden_dim:int, n_heads:int, n_layers:int, attn_impl:str='', n_recurse:int=1, use_cuda_kernels:bool=True):
+	def __init__(self, input_vocab:int, hidden_dim:int, n_heads:int, n_layers:int, attn_impl:str='', n_recurse:int=1):
 		super().__init__()
 		self.input_vocab = input_vocab
 		self.embedding_proj = nn.Embedding(input_vocab, hidden_dim)
@@ -76,19 +51,10 @@ class SimpleCompModel(nn.Module):
 		self.d_model = hidden_dim
 		self.rope = RotaryEmbedding(dim = hidden_dim//n_heads)
 
-		use_cuda = use_cuda_kernels and _cuda_kernels_available and attn_impl == "hypergraph"
-		if use_cuda:
-			print("Using CUDA hypergraph attention kernels.")
-		elif attn_impl == "hypergraph":
-			print("Using naive (PyTorch) hypergraph attention.")
-
 		self.repeated_layers = nn.ModuleList()
 		for _ in range(n_layers):
 			if attn_impl == "hypergraph":
-				if use_cuda:
-					attention_layer = _CudaHypergraphWrapper(hidden_dim, n_heads)
-				else:
-					attention_layer = _HypergraphAttentionNaive(hidden_dim, n_heads, head_subspaces=True)
+				attention_layer = _HypergraphAttentionNaive(hidden_dim, n_heads, head_subspaces=True)
 			else:
 				attention_layer = _GraphAttentionNaive(hidden_dim, n_heads, head_subspaces=True)
 
@@ -183,7 +149,7 @@ def calcLoss(pred, targets):
 		n_possible = seq_targets.shape[0]
 	return loss, n_correct, n_possible
 
-def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_impl="", log_name="", save_model=False, replicate=1, no_amp=False, use_cuda_kernels=True):
+def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_impl="", log_name="", save_model=False, replicate=1, no_amp=False, no_samp=False):
 	
 	if device == 'auto':
 		if torch.cuda.is_available():
@@ -244,7 +210,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		# n_heads = 6 # use the command line arg
 
 	dtype = torch.float32
-	model = SimpleCompModel(vocab_size, hidden_dim, n_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse, use_cuda_kernels=use_cuda_kernels).to(device=device, dtype=dtype)
+	model = SimpleCompModel(vocab_size, hidden_dim, n_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse).to(device=device, dtype=dtype)
 	# model = GrokkingTransformer(vocab_size, hidden_dim, 1, use_norm=True).to(device=device)
 	if save_model:
 		try:
@@ -271,7 +237,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		print("--- Running with Torch automatic mixed precision (fp32 weights) ---")
 
 	nam = {"hypergraph":"hg","graph":"g"}.get(attn_impl)
-	fd_losslog = open(f'losslog_{nam}_{log_name}_s{SEQ_L}_r{replicate}.txt', 'w')
+	fd_losslog = open(f'losslog_{nam}_{log_name}_samp{not no_samp}_r{replicate}.txt', 'w')
 
 	print("\ntrain_model1 started...")
 	uu = 0
@@ -309,35 +275,43 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 			optimizer.zero_grad()
 
 			with autocast('cuda'):
-				# run the sampling step
-				with torch.no_grad():
-					Ans, losses = [], []
-					for a in range(4):
-						An = torch.randn((4,batch_size,n_heads,n_tok,n_tok,n_tok)).to(device=device)*0.125
-						pred, _ = model(inputs, An)
-						loss, _, _ = calcLoss(pred, targets)
-						Ans.append(An)
-						losses.append(loss)
-					# need to sort Ans by loss
-					stacked_losses = torch.stack(losses)
-					best_indices = torch.argmin(stacked_losses, dim=0)
-					stacked_Ans = torch.stack(Ans)
-					view_shape = [1, 1, stacked_Ans.size(2)] + [1] * (stacked_Ans.ndim - 3)
-					broadcast_indices = best_indices.view(*view_shape)
-					gather_indices = broadcast_indices.expand_as(stacked_Ans[:1])
-					best_Ans = torch.gather(stacked_Ans, dim=0, index=gather_indices).squeeze(0).detach()
+				if not no_samp:
+					# run the sampling step
+					with torch.no_grad():
+						Ans, losses = [], []
+						for a in range(4):
+							An = torch.randn((4,batch_size,n_heads,n_tok,n_tok,n_tok)).to(device=device)*0.25
+							pred, _ = model(inputs, An)
+							loss, _, _ = calcLoss(pred, targets)
+							Ans.append(An)
+							losses.append(loss)
+						# need to sort Ans by loss
+						stacked_losses = torch.stack(losses)
+						best_indices = torch.argmin(stacked_losses, dim=0)
+						stacked_Ans = torch.stack(Ans)
+						view_shape = [1, 1, stacked_Ans.size(2)] + [1] * (stacked_Ans.ndim - 3)
+						broadcast_indices = best_indices.view(*view_shape)
+						gather_indices = broadcast_indices.expand_as(stacked_Ans[:1])
+						best_Ans = torch.gather(stacked_Ans, dim=0, index=gather_indices).squeeze(0).detach()
+				else:
+					best_Ans = None
 
 				# now run the normal forward pass,
 				# with attention noise added.
 				pred, A = model(inputs, best_Ans) # returns the pre-noise attn
 				t_loss, n_correct, n_possible = calcLoss(pred, targets)
-				with torch.no_grad():
-					best_Ans = best_Ans + A
-				a_loss = F.mse_loss(A, best_Ans)
-				# need to add some loss scaling here so they are balanced..
-				# if the token loss is low, we don't need to push on the attention loss.
-				# also need to avoid NaNs here!
-				loss = t_loss.sum() + batch_size*10*a_loss
+				t_loss = t_loss.sum()
+
+				if not no_samp:
+					with torch.no_grad():
+						best_Ans = best_Ans + A
+					a_loss = F.mse_loss(A, best_Ans)
+					t_loss_ema = t_loss.detach().cpu().item() * 0.01 + 0.99 * t_loss_ema
+					a_loss_ema = a_loss.detach().cpu().item() * 0.01 + 0.99 * a_loss_ema
+					scl = t_loss / (27*a_loss) # normalize the effect of a_loss
+					loss = t_loss + scl*a_loss
+				else:
+					loss = t_loss
 
 			loss.backward()
 			torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -384,9 +358,9 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 				lloss = loss.sum().detach().cpu().item()
 				lloss = lloss / inputs.shape[0]
 				top1_err = 1 - (correct_vals / n_possible)
-				if epoch == num_epochs-1:
-					fd_losslog.write(f"{uu}\t{-1.0}\t{-1.0}\t{lloss}\t{top1_err*math.exp(1)}\n")
-					uu += 1
+				# if epoch == num_epochs-1:
+				# 	fd_losslog.write(f"{uu}\t{-1.0}\t{-1.0}\t{lloss}\t{top1_err*math.exp(1)}\n")
+				# 	uu += 1
 				total_loss += lloss
 
 			avg_loss = total_loss / len(loader_v)
@@ -414,11 +388,11 @@ if __name__ == '__main__':
 	parser.add_argument('--save', action='store_true',
         help='Load and save model parameters.')
 	parser.add_argument('--seq-l', type=int, default=1, help="sequence length")
-	parser.add_argument('--task', type=int, default=1, help="what task to run. 1 = mod arith; 2 = copy task; 3 = formula generalization")
+	parser.add_argument('--task', type=int, default=3, help="what task to run. 1 = mod arith; 2 = copy task; 3 = formula generalization")
 	parser.add_argument('--repl', type=int, default=1, help="what replicate this is",)
 	parser.add_argument('--no-amp', action='store_true', help='Disable Torch automatic mixed precision')
-	parser.add_argument('--use-cuda-kernels', action='store_true',
-						help='Use CUDA kernels')
+	parser.add_argument('--no-samp', action='store_true',
+						help='no sampling attention')
 	args = parser.parse_args()
 
 	SEQ_L = args.seq_l # sorry about the global
@@ -435,6 +409,6 @@ if __name__ == '__main__':
 		save_model=args.save,
 		replicate = args.repl,
 		no_amp = args.no_amp,
-		use_cuda_kernels = args.use_cuda_kernels,
+		no_samp = args.no_samp,
 	)
 
