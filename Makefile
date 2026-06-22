@@ -1,6 +1,4 @@
 
-# att3ntion Makefile
-#
 # Usage:
 #   make build              			  Build/install the extension
 #   make test               		      Run quick correctness tests
