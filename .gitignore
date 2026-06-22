@@ -1,59 +1,43 @@
-myenv
+# Python and build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.so
+build/
+myenv/
 
+# Model/checkpoint artifacts
 *.pt
 *.tar.gz
 
-# Build artifacts
-build/
-*.so
-*.egg-info/
-
-# Python cache
-__pycache__/
-*.py[cod]
-
-# Profiling reports (machine-specific, large binaries)
+# Profiling and benchmark outputs
 *.ncu-rep
+benchmarks/benchmark_history.jsonl
 profiling_reports/
 
-# Benchmark results (machine-specific timings)
-benchmarks/benchmark_history.jsonl
-
-# Per-run training loss logs (machine-specific, large)
+# Experiment run logs and outputs
 experiments/compositional/losslogs/
-
+experiments/recogs/losslogs/
+experiments/recogs/runs/
+experiments/recogs/sweep_logs/
+experiments/recogs/docs/*.png
 losslog_*.txt
-
-# Per-run session narratives (reference per-machine bench numbers).
-# NOTE: optimization_log/changelog.jsonl IS committed — team-shared history
-# of what's been tried, avoids repeat work.
 optimization_log/sessions/
 
-# Agent-generated state artifacts (machine-specific profile snapshots)
+# Local agent/tool state
 .agent/state/
-
-# Python tooling caches
-.pytest_cache/
-
-# User-local Claude/Cursor configs (but commit project skills + rules)
-.claude/settings.local.json
-.claude/logs/
+.claude/
 .cursor/settings.json
+CLAUDE.md
 
-# Editor / OS noise (for teammates on other setups)
-.vscode/
-.idea/
+# Editor and OS noise
 .DS_Store
+.idea/
+.vscode/
 *.swp
 *.swo
 
-# Env files (safety — may contain secrets)
+# Environment files
 .env
 .env.*
 !.env.example
-
-
-# CLAUDE (personal, gitignored)
-CLAUDE.md
-.claude/
-.cursor/
