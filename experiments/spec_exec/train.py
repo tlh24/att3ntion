@@ -286,7 +286,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 				
 				if sgd_steps > 0:
 					An.requires_grad = True
-					sgd_l1 = 1/500.0  # static L1 coefficient to prevent overfitting
+					sgd_l1 = 1/100.0  # static L1 coefficient to prevent overfitting
 					for sgd_step in range(sgd_steps):
 						pred, _ = model(inputs_tiled, An)
 						loss, _, _ = calcLoss(pred, targets_tiled)
