@@ -7,7 +7,7 @@ import pdb
 
 # OPS = ['+', '-', '*', '/']
 # OPS = ['+', '-', '*']
-OPS = ['-']
+OPS = ['+']
 COMMUTATIVE_OPS = {'+', '*'}
 
 @lru_cache(maxsize=None)
@@ -78,7 +78,7 @@ def compile_ast(ast):
 
 	return expr_str+' =', c_idx, len(used_vars), func
 
-def evaluate_autoregressive(func, init_X, C_vals, L=10, P=113):
+def evaluate_autoregressive(func, init_X, C_vals, L=1, P=113):
 	"""
 	Evaluates the compiled function autoregressively.
 	init_X: e.g., [1, 2] -> x_2(t-2)=1, x_1(t-1)=2.
@@ -169,9 +169,9 @@ def gen_data(mode, max_d, V, C, P=113, L=1, data_size=1000, exact_v=True):
 
 	return train_data, test_data
 
-OP_MAP = {'+': 0, '-': 1, '*': 2, '/': 3, '(': 4, ')': 5, '=':6}
+OP_MAP = {'+': 0, '-': 1, '*': 2, '/': 3, '(': 4, ')': 5,'=':6,'_':7}
 
-def to_numpy(train_data, test_data, P):
+def to_numpy(train_data, test_data, P, L=1, n_pad=2):
 	"""Maps expressions and sequences to an int32 numpy array, padding the expression."""
 
 	def tokenize(expr):
@@ -184,19 +184,23 @@ def to_numpy(train_data, test_data, P):
 			for t in expr.split()
 		]
 	# Pre-parse to compute the max expression length
-	tr_parsed = [(tokenize(e), seq) for e, _, seq in train_data]
-	te_parsed = [(tokenize(e), seq) for e, _, seq in test_data]
+	tr_parsed = [(tokenize(e), ic, seq[-L:]) for e, ic, seq in train_data]
+	te_parsed = [(tokenize(e), ic, seq[-L:]) for e, ic, seq in test_data]
+	# initial conditions are absorbed into seq
 
-	max_e = max((len(e) for e, _ in tr_parsed + te_parsed), default=0)
-	seq_l = len(tr_parsed[0][1]) # train and test must be the same len
-	total_len = max_e + seq_l
+	max_e = max((len(e) for e,_,_ in tr_parsed + te_parsed), default=0)
+	ic_l = len(tr_parsed[0][1])
+	seq_l = len(tr_parsed[0][2])# train and test must be the same len
+	total_len = max_e + ic_l + seq_l + n_pad
 
 	def build_array(parsed_data):
 		# Pre-allocate contiguous array filled with -1
 		arr = np.full((len(parsed_data), total_len), -1, dtype=np.int32)
-		for i, (e_toks, seq) in enumerate(parsed_data):
+		for i, (e_toks, ic, seq) in enumerate(parsed_data):
 			arr[i, :len(e_toks)] = e_toks  # Drop expression at the start
-			arr[i, max_e:] = seq           # Drop sequence at the exact end
+			arr[i, max_e:max_e+ic_l] = ic
+			arr[i, max_e+ic_l:max_e+ic_l+n_pad] = P + OP_MAP['_']
+			arr[i,-seq_l:] = seq
 		return arr
 	# return the maximum expression length & np train test arrays.
 	return max_e, build_array(tr_parsed), build_array(te_parsed)
@@ -257,4 +261,9 @@ if __name__ == "__main__":
 	axs[1].set_title('Test')
 	plt.show()
 	print(from_numpy(train_np[0:5,:], 113))
+
+	# print("\nGenerating Mode B max_d=2, V=2, C=0, L=2")
+	# train_B, test_B = gen_data('formulas', max_d=2, V=3, C=0, L=2, data_size=5)
+	# for row in train_B: print(f"Train: {row}")
+	# for row in test_B:  print(f"Test:  {row}")
 
