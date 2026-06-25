@@ -257,8 +257,3 @@ if __name__ == "__main__":
 	plt.show()
 	print(from_numpy(train_np[0:5,:], 113))
 
-	# print("\nGenerating Mode B max_d=2, V=2, C=0, L=2")
-	# train_B, test_B = gen_data('formulas', max_d=2, V=3, C=0, L=2, data_size=5)
-	# for row in train_B: print(f"Train: {row}")
-	# for row in test_B:  print(f"Test:  {row}")
-
