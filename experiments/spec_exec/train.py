@@ -149,7 +149,7 @@ def calcLoss(pred, targets):
 		n_possible = seq_targets.shape[0]
 	return loss, n_correct, n_possible
 
-def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_impl="", log_name="", save_model=False, replicate=1, no_amp=False, no_samp=False):
+def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_impl="", log_name="", save_model=False, replicate=1, no_amp=False, no_samp=False, sgd_steps=0, sgd_lr=0.1):
 	
 	if device == 'auto':
 		if torch.cuda.is_available():
@@ -160,6 +160,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		device = torch.device(device)
 	
 	print(f"Using device: {device}")
+	torch.set_float32_matmul_precision('high')
 	
 	if task == 1:
 		# for grokking, need to generate the (nearly) full table
@@ -203,10 +204,10 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		n_recurse = 1
 		n_heads = 1
 	if task == 3:
-		n_layers = 2
+		n_layers = 3
 		if attn_impl == "graph":
 			n_layers = 4
-		n_recurse = 2 # depends on the formula depth
+		n_recurse = 1 # depends on the formula depth
 		# n_heads = 6 # use the command line arg
 
 	dtype = torch.float32
@@ -237,7 +238,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		print("--- Running with Torch automatic mixed precision (fp32 weights) ---")
 
 	nam = {"hypergraph":"hg","graph":"g"}.get(attn_impl)
-	fd_losslog = open(f'losslog_{nam}_{log_name}_samp{not no_samp}_r{replicate}.txt', 'w')
+	fd_losslog = open(f'losslog_{nam}_{log_name}_samp{not no_samp}_sgd{sgd_steps}_r{replicate}.txt', 'w')
 
 	print("\ntrain_model1 started...")
 	uu = 0
@@ -274,48 +275,62 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 				start_event.record()
 			optimizer.zero_grad()
 
-			with autocast('cuda'):
-				if not no_samp:
-					# run the sampling step - all n_samp candidates in one forward pass
-					with torch.no_grad():
-						n_samp = 8
-						inputs_tiled = inputs.repeat(n_samp, 1)
-						targets_tiled = targets.repeat(n_samp, 1)
-						An = torch.randn((4, n_samp * batch_size, n_heads, n_tok, n_tok, n_tok), device=device) * 0.25
+			# with autocast('cuda'):
+			if not no_samp:
+				# run the sampling step - all n_samp candidates in one forward pass
+				n_samp = 8
+				layers_repeat = n_layers * n_recurse
+				inputs_tiled = inputs.repeat(n_samp, 1)
+				targets_tiled = targets.repeat(n_samp, 1)
+				An = torch.randn((layers_repeat, n_samp * batch_size, n_heads, n_tok, n_tok, n_tok), device=device) * 0.25
+				
+				if sgd_steps > 0:
+					An.requires_grad = True
+					sgd_l1 = 1/500.0  # static L1 coefficient to prevent overfitting
+					for sgd_step in range(sgd_steps):
 						pred, _ = model(inputs_tiled, An)
-						loss, _, _ = calcLoss(pred, targets_tiled)  # (n_samp * batch_size,)
-						loss_per_samp = loss.view(n_samp, batch_size)
-						best_indices = torch.argmin(loss_per_samp, dim=0)  # (batch_size,)
-						An_reshaped = An.view(4, n_samp, batch_size, *An.shape[2:])
-						idx = best_indices.view(1, 1, batch_size, *([1] * (An_reshaped.ndim - 3)))
-						idx = idx.expand(4, 1, batch_size, *An_reshaped.shape[3:])
-						best_Ans = torch.gather(An_reshaped, 1, idx).squeeze(1).detach()
-				else:
-					best_Ans = None
+						loss, _, _ = calcLoss(pred, targets_tiled)
+						total_loss = loss.sum() + sgd_l1 * An.abs().sum()
+						grad_An, = torch.autograd.grad(total_loss, An)
+						with torch.no_grad():
+							An -= sgd_lr * grad_An
+				
+				with torch.no_grad():
+					pred, _ = model(inputs_tiled, An)
+					loss, _, _ = calcLoss(pred, targets_tiled)
+					loss_per_element = loss.view(n_samp * batch_size, -1).mean(dim=1)
+					loss_per_samp = loss_per_element.view(n_samp, batch_size)
+					best_indices = torch.argmin(loss_per_samp, dim=0)  # (batch_size,)
+					An_reshaped = An.view(layers_repeat, n_samp, batch_size, *An.shape[2:])
+					idx = best_indices.view(1, 1, batch_size, *([1] * (An_reshaped.ndim - 3)))
+					idx = idx.expand(layers_repeat, 1, batch_size, *An_reshaped.shape[3:])
+					best_Ans = torch.gather(An_reshaped, 1, idx).squeeze(1).detach()
+			else:
+				best_Ans = None
 
-				# now run the normal forward pass,
-				# with attention noise added.
-				pred, A = model(inputs, best_Ans) # returns the pre-noise attn
-				t_loss, n_correct, n_possible = calcLoss(pred, targets)
-				t_loss = t_loss.sum()
+			# now run the normal forward pass,
+			# with attention noise added.
+			pred, A = model(inputs, best_Ans) # returns the pre-noise attn
+			t_loss, n_correct, n_possible = calcLoss(pred, targets)
+			t_loss = t_loss.sum()
 
-				if torch.isnan(t_loss) or torch.isinf(t_loss):
-					print(f"NaN/Inf in t_loss at batch {batch_indx}")
-					pdb.set_trace()
-				if not no_samp:
-					if torch.isnan(a_loss) or a_loss < 1e-8:
-						print(f"a_loss={a_loss.item():.2e}, scl={scl.item():.2e} at batch {batch_indx}")
+			if not no_samp:
+				with torch.no_grad():
+					best_Ans = best_Ans + A
+				a_loss = F.mse_loss(A, best_Ans)
+				t_loss_ema = t_loss.detach().cpu().item() * 0.01 + 0.99 * t_loss_ema
+				a_loss_ema = a_loss.detach().cpu().item() * 0.01 + 0.99 * a_loss_ema
+				scl = (t_loss / (27*a_loss)).clamp(0,400) # normalize the effect of a_loss
+				loss = t_loss + scl*a_loss
+			else:
+				loss = t_loss
 
-				if not no_samp:
-					with torch.no_grad():
-						best_Ans = best_Ans + A
-					a_loss = F.mse_loss(A, best_Ans)
-					t_loss_ema = t_loss.detach().cpu().item() * 0.01 + 0.99 * t_loss_ema
-					a_loss_ema = a_loss.detach().cpu().item() * 0.01 + 0.99 * a_loss_ema
-					scl = (t_loss / (27*a_loss)).clamp(0,400) # normalize the effect of a_loss
-					loss = t_loss + scl*a_loss
-				else:
-					loss = t_loss
+			if torch.isnan(t_loss) or torch.isinf(t_loss):
+				print(f"NaN/Inf in t_loss at batch {batch_indx}")
+				pdb.set_trace()
+			if not no_samp:
+				if torch.isnan(a_loss) or a_loss < 1e-8:
+					print(f"a_loss={a_loss.item():.2e}, scl={scl.item():.2e} at batch {batch_indx}")
 
 
 			loss.backward()
@@ -398,6 +413,10 @@ if __name__ == '__main__':
 	parser.add_argument('--no-amp', action='store_true', help='Disable Torch automatic mixed precision')
 	parser.add_argument('--no-samp', action='store_true',
 						help='no sampling attention')
+	parser.add_argument('--sgd-steps', type=int, default=0,
+						help='number of inner SGD steps to optimize attention noise')
+	parser.add_argument('--sgd-lr', type=float, default=0.01,
+						help='learning rate for inner SGD steps')
 	args = parser.parse_args()
 
 	SEQ_L = args.seq_l # sorry about the global
@@ -415,5 +434,7 @@ if __name__ == '__main__':
 		replicate = args.repl,
 		no_amp = args.no_amp,
 		no_samp = args.no_samp,
+		sgd_steps=args.sgd_steps,
+		sgd_lr=args.sgd_lr,
 	)
 

@@ -379,7 +379,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 
 			if batch_indx == 0:
 				d = inputs[0:5, :].detach().cpu().numpy()
-				# print(d-1) # null token mapped to -1
+				print(d-1) # null token mapped to -1
 				print(from_numpy(d-1, 113))
 				print("targets:")
 				d = targets[0:5, :].detach().cpu().numpy()
@@ -441,9 +441,9 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 				lloss = loss.detach().cpu().item()
 				lloss = lloss / inputs.shape[0]
 				top1_err = 1 - (correct_vals / n_possible)
-				if epoch == num_epochs-1:
-					fd_losslog.write(f"{uu}\t{-1.0}\t{-1.0}\t{lloss}\t{top1_err*math.exp(1)}\n")
-					uu += 1
+				# if epoch == num_epochs-1:
+				# 	fd_losslog.write(f"{uu}\t{-1.0}\t{-1.0}\t{lloss}\t{top1_err*math.exp(1)}\n")
+				# 	uu += 1
 				total_loss += lloss
 
 			avg_loss = total_loss / len(loader_v)
