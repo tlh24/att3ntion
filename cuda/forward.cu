@@ -137,18 +137,21 @@ void Yq_gather(
     __syncthreads();
 
     for (int j0 = j_start; j0 < j_end; j0 += TILE_J) {
-        for (int k0 = 0; k0 < K; k0 += TILE_K) {
-            
-            for (int idx = tid; idx < TILE_J * D_CONST; idx += block_size) {
-                int jt = idx / D_CONST;
-                int d = idx % D_CONST;
-                int j_global = j0 + jt;
-                if (j_global < J) {
-                    const int64_t r_off = (((int64_t)b * H + h) * J + j_global) * D_CONST + d;
-                    r_tile[jt * DP + d] = R_bf[r_off];
-                    v1_tile[jt * DP + d] = V1_bf[r_off];
-                }
+        // R / V1 depend only on j0, so load them once per j-tile rather than
+        // re-fetching on every k0 iteration (the inner loop only varies k).
+        for (int idx = tid; idx < TILE_J * D_CONST; idx += block_size) {
+            int jt = idx / D_CONST;
+            int d = idx % D_CONST;
+            int j_global = j0 + jt;
+            if (j_global < J) {
+                const int64_t r_off = (((int64_t)b * H + h) * J + j_global) * D_CONST + d;
+                r_tile[jt * DP + d] = R_bf[r_off];
+                v1_tile[jt * DP + d] = V1_bf[r_off];
             }
+        }
+        __syncthreads();
+
+        for (int k0 = 0; k0 < K; k0 += TILE_K) {
             
             for (int idx = tid; idx < TILE_K * D_CONST; idx += block_size) {
                 int kt = idx / D_CONST;
