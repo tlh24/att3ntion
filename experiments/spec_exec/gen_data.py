@@ -30,7 +30,7 @@ def generate_ast(d, V, C):
 
 			lefts, rights = generate_ast(dl, V, C), generate_ast(dr, V, C)
 			pairs = itertools.combinations_with_replacement(lefts, 2) if (is_comm and dl == dr) \
-					else itertools.product(lefts, rights)
+				else itertools.product(lefts, rights)
 
 			for L, R in pairs:
 				if L == 'C' and R == 'C': continue # Fold constants

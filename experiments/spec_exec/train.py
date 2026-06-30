@@ -149,7 +149,7 @@ def calcLoss(pred, targets):
 		n_possible = seq_targets.shape[0]
 	return loss, n_correct, n_possible
 
-def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_impl="", log_name="", save_model=False, replicate=1, no_amp=False, no_samp=False, sgd_steps=0, sgd_lr=0.1):
+def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_impl="", log_name="", save_model=False, replicate=1, no_amp=False, nsamp=0, sgd_steps=0, sgd_lr=0.1):
 	
 	if device == 'auto':
 		if torch.cuda.is_available():
@@ -230,7 +230,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		model.printParamCount()
 	except:
 		print("\\ grokking transformer does not calculate number of parameters")
-	model = torch.compile(model) # mode="max-autotune" or backend="eager"
+	# model = torch.compile(model) # mode="max-autotune" or backend="eager"
 
 	if no_amp:
 		print("--- Running in full fp32 ---")
@@ -238,7 +238,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		print("--- Running with Torch automatic mixed precision (fp32 weights) ---")
 
 	nam = {"hypergraph":"hg","graph":"g"}.get(attn_impl)
-	fd_losslog = open(f'losslog_{nam}_{log_name}_samp{not no_samp}_sgd{sgd_steps}_r{replicate}.txt', 'w')
+	fd_losslog = open(f'losslog_{nam}_{log_name}_samp{nsamp}_sgd{sgd_steps}_r{replicate}.txt', 'w')
 
 	print("\ntrain_model1 started...")
 	uu = 0
@@ -258,6 +258,9 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		model.train()
 		n_train = x.shape[0]
 		n_tok = x.shape[-1]
+		# if epoch > 0:
+		# 	torch.autograd.set_detect_anomaly(True)
+
 		for batch_indx in range(n_train // batch_size):
 			mb_idx = rng.permutation(n_train)[:batch_size]
 			inputs = torch.tensor(x[mb_idx,:]).to(device=device)
@@ -276,13 +279,13 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 			optimizer.zero_grad()
 
 			# with autocast('cuda'):
-			if not no_samp:
-				# run the sampling step - all n_samp candidates in one forward pass
-				n_samp = 8
+			if nsamp > 0:
+				# run the sampling step - all nsamp candidates in one forward pass
 				layers_repeat = n_layers * n_recurse
-				inputs_tiled = inputs.repeat(n_samp, 1)
-				targets_tiled = targets.repeat(n_samp, 1)
-				An = torch.randn((layers_repeat, n_samp * batch_size, n_heads, n_tok, n_tok, n_tok), device=device) * 0.25
+				inputs_tiled = inputs.repeat(nsamp, 1)
+				targets_tiled = targets.repeat(nsamp, 1)
+				# An = torch.randn((layers_repeat, nsamp * batch_size, n_heads, n_tok, n_tok, n_tok), device=device) * 0.25
+				An = torch.poisson( torch.ones((layers_repeat, nsamp*batch_size, n_heads, n_tok, n_tok, n_tok), device=device)*0.05)*0.01
 				
 				if sgd_steps > 0:
 					An.requires_grad = True
@@ -298,10 +301,10 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 				with torch.no_grad():
 					pred, _ = model(inputs_tiled, An)
 					loss, _, _ = calcLoss(pred, targets_tiled)
-					loss_per_element = loss.view(n_samp * batch_size, -1).mean(dim=1)
-					loss_per_samp = loss_per_element.view(n_samp, batch_size)
+					loss_per_element = loss.view(nsamp * batch_size, -1).mean(dim=1)
+					loss_per_samp = loss_per_element.view(nsamp, batch_size)
 					best_indices = torch.argmin(loss_per_samp, dim=0)  # (batch_size,)
-					An_reshaped = An.view(layers_repeat, n_samp, batch_size, *An.shape[2:])
+					An_reshaped = An.view(layers_repeat, nsamp, batch_size, *An.shape[2:])
 					idx = best_indices.view(1, 1, batch_size, *([1] * (An_reshaped.ndim - 3)))
 					idx = idx.expand(layers_repeat, 1, batch_size, *An_reshaped.shape[3:])
 					best_Ans = torch.gather(An_reshaped, 1, idx).squeeze(1).detach()
@@ -314,13 +317,15 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 			t_loss, n_correct, n_possible = calcLoss(pred, targets)
 			t_loss = t_loss.sum()
 
-			if not no_samp:
+			if nsamp > 0:
 				with torch.no_grad():
 					best_Ans = best_Ans + A
-				a_loss = F.mse_loss(A, best_Ans)
+				# only 'pull up' on attention; otherwise it collapses.
+				a_loss = torch.sum(((A - best_Ans) * (best_Ans > 0))**2)
 				t_loss_ema = t_loss.detach().cpu().item() * 0.01 + 0.99 * t_loss_ema
 				a_loss_ema = a_loss.detach().cpu().item() * 0.01 + 0.99 * a_loss_ema
-				scl = (t_loss / (27*a_loss)).clamp(0,400) # normalize the effect of a_loss
+				scl = (t_loss_ema / (27*(a_loss_ema + 0.001))) # normalize the effect of a_loss
+				scl = np.clip(scl, 0, 400)
 				loss = t_loss + scl*a_loss
 			else:
 				loss = t_loss
@@ -328,10 +333,10 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 			if torch.isnan(t_loss) or torch.isinf(t_loss):
 				print(f"NaN/Inf in t_loss at batch {batch_indx}")
 				pdb.set_trace()
-			if not no_samp:
+			if nsamp > 0:
 				if torch.isnan(a_loss) or a_loss < 1e-8:
 					print(f"a_loss={a_loss.item():.2e}, scl={scl.item():.2e} at batch {batch_indx}")
-
+					pdb.set_trace()
 
 			loss.backward()
 			torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -411,8 +416,8 @@ if __name__ == '__main__':
 	parser.add_argument('--task', type=int, default=3, help="what task to run. 1 = mod arith; 2 = copy task; 3 = formula generalization")
 	parser.add_argument('--repl', type=int, default=1, help="what replicate this is",)
 	parser.add_argument('--no-amp', action='store_true', help='Disable Torch automatic mixed precision')
-	parser.add_argument('--no-samp', action='store_true',
-						help='no sampling attention')
+	parser.add_argument('--nsamp', type=int, default=0,
+						help='number of attention noise samlples')
 	parser.add_argument('--sgd-steps', type=int, default=0,
 						help='number of inner SGD steps to optimize attention noise')
 	parser.add_argument('--sgd-lr', type=float, default=0.01,
@@ -433,7 +438,7 @@ if __name__ == '__main__':
 		save_model=args.save,
 		replicate = args.repl,
 		no_amp = args.no_amp,
-		no_samp = args.no_samp,
+		nsamp = args.nsamp,
 		sgd_steps=args.sgd_steps,
 		sgd_lr=args.sgd_lr,
 	)
