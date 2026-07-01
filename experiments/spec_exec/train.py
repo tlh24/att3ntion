@@ -84,7 +84,8 @@ class SimpleCompModel(nn.Module):
 		
 	def forward(self, x, An):
 		bs, ntok = x.shape
-		mask = None # non-autoregressive now
+		mask = torch.tril(torch.ones(ntok, ntok, device=x.device))
+		# mask = None # non-autoregressive now
 		x = self.embedding_proj(x)
 		An_list = []
 		k = 0
@@ -212,7 +213,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 
 	dtype = torch.float32
 	model = SimpleCompModel(vocab_size, hidden_dim, n_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse).to(device=device, dtype=dtype)
-	# model = GrokkingTransformer(vocab_size, hidden_dim, 1, use_norm=True).to(device=device)
+
 	if save_model:
 		try:
 			model.load_model(f"comp_model_{attn_impl}_r{replicate}.pt", device)
@@ -230,7 +231,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		model.printParamCount()
 	except:
 		print("\\ grokking transformer does not calculate number of parameters")
-	# model = torch.compile(model) # mode="max-autotune" or backend="eager"
+	model = torch.compile(model) # mode="max-autotune" or backend="eager"
 
 	if no_amp:
 		print("--- Running in full fp32 ---")
@@ -274,7 +275,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 				d = targets[0:5, :].detach().cpu().numpy()
 				print(from_numpy(d-1, 113))
 
-			if batch_indx % 100 == 0:
+			if batch_indx % ((32*512) // batch_size) == 0:
 				start_event.record()
 			optimizer.zero_grad()
 
@@ -285,7 +286,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 				inputs_tiled = inputs.repeat(nsamp, 1)
 				targets_tiled = targets.repeat(nsamp, 1)
 				# An = torch.randn((layers_repeat, nsamp * batch_size, n_heads, n_tok, n_tok, n_tok), device=device) * 0.25
-				An = torch.poisson( torch.ones((layers_repeat, nsamp*batch_size, n_heads, n_tok, n_tok, n_tok), device=device)*0.05)*0.01
+				An = torch.poisson( torch.ones((layers_repeat, nsamp*batch_size, n_heads, n_tok, n_tok, n_tok), device=device)*0.05)
 				
 				if sgd_steps > 0:
 					An.requires_grad = True
@@ -318,13 +319,17 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 			t_loss = t_loss.sum()
 
 			if nsamp > 0:
+				# need to center per sample
 				with torch.no_grad():
-					best_Ans = best_Ans + A
+					Ans_mean = torch.mean(best_Ans, dim=[3,4,5], keepdim=True)
+					best_Ans = best_Ans - Ans_mean + A
+					# An is added to atten, when calculating values.
 				# only 'pull up' on attention; otherwise it collapses.
-				a_loss = torch.sum(((A - best_Ans) * (best_Ans > 0))**2)
+				# a_loss = torch.sum(((A - best_Ans) * (best_Ans > 0))**2)
+				a_loss = F.mse_loss(A, best_Ans)
 				t_loss_ema = t_loss.detach().cpu().item() * 0.01 + 0.99 * t_loss_ema
 				a_loss_ema = a_loss.detach().cpu().item() * 0.01 + 0.99 * a_loss_ema
-				scl = (t_loss_ema / (27*(a_loss_ema + 0.001))) # normalize the effect of a_loss
+				scl = (t_loss_ema / (25*(a_loss_ema + 0.001))) # normalize the effect of a_loss
 				scl = np.clip(scl, 0, 400)
 				loss = t_loss + scl*a_loss
 			else:
@@ -351,7 +356,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 			fd_losslog.write(f"{uu}\t{lloss}\t{top1_err*math.exp(1)}\t{validation_loss}\t{validation_top1_err*math.exp(1)}\n")
 			uu += 1
 			
-			if batch_indx % 500 == 0:
+			if batch_indx % ((32*512) // batch_size) == 0:
 				end_event.record()
 				torch.cuda.synchronize()
 				amp_time = start_event.elapsed_time(end_event)

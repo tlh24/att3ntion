@@ -118,7 +118,7 @@ class SimpleCompModel(nn.Module):
 		
 	def forward(self, x):
 		bs, ntok = x.shape
-		# mask = torch.tril(torch.ones(ntok, ntok))
+		# # mask = torch.tril(torch.ones(ntok, ntok))
 		# mask = mask.to(x.device)
 		mask = None # non-autoregressive now
 		x = self.embedding_proj(x)
