@@ -20,7 +20,7 @@ def count_c(node):
 def generate_ast(d, V, C):
 	"""Generates optimal DAG of abstract syntax trees."""
 	if d == 0:
-		return [f"x_{i+1}" for i in range(V)] + (["C"] if C > 0 else [])
+		return [f"x_{i+1}" for i in range(V)] + (["C"]*C if C > 0 else [])
 
 	trees = []
 	for op in OPS:
@@ -33,7 +33,7 @@ def generate_ast(d, V, C):
 				else itertools.product(lefts, rights)
 
 			for L, R in pairs:
-				if L == 'C' and R == 'C': continue # Fold constants
+				# if L == 'C' and R == 'C': continue # Fold constants
 				if op in ('-', '/') and L == R: continue # Fold identities
 				if count_c(L) + count_c(R) <= C:   # <-- Efficiently prune bounded constants!
 					trees.append((op, L, R))
@@ -248,7 +248,7 @@ if __name__ == "__main__":
 		if count >= 10: break
 
 	print("Generating max_d=0 V=3, C=0, L=1")
-	train_A, test_A = gen_data('grok', max_d=0, V=3, C=0, L=1, data_size=50, exact_v=False)
+	train_A, test_A = gen_data('grok', max_d=1, V=3, C=2, L=1, data_size=50, exact_v=False)
 	for row in train_A: print(f"Train: {row}")
 	for row in test_A:  print(f"Test:  {row}")
 
