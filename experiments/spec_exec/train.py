@@ -102,7 +102,7 @@ class SimpleCompModel(nn.Module):
 				ffn_output = layer_block['ffn'](xn)
 				x = x + ffn_output
 				k += 1
-		return self.output_proj(x), torch.stack(An_list)
+		return self.output_proj(x), torch.stack(An_list) if An is not None else None
 
 	def save_model(self, path: str):
 		"""Saves the model's configuration and state dictionary."""
@@ -207,7 +207,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 	if task == 3:
 		n_layers = 3
 		if attn_impl == "graph":
-			n_layers = 4
+			n_layers = 6
 		n_recurse = 1 # depends on the formula depth
 		# n_heads = 6 # use the command line arg
 
