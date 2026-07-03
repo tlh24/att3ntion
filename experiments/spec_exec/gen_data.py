@@ -7,7 +7,7 @@ import pdb
 
 # OPS = ['+', '-', '*', '/']
 # OPS = ['+', '-', '*']
-OPS = ['+']
+OPS = ['+', '*']
 COMMUTATIVE_OPS = {'+', '*'}
 
 @lru_cache(maxsize=None)
