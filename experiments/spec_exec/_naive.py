@@ -29,6 +29,8 @@ class _HypergraphAttentionNaive(nn.Module):
 		self.head_subspaces = head_subspaces
 		self.d_val = self.d_head*1
 		self.scatter = scatter
+		self.qrs_norm = nn.LayerNorm(self.d_head)
+		self.log_beta = nn.Parameter(torch.full((n_heads,), math.log(14))) # from CLIP
 
 		self.Wq = nn.Linear(d_model, self.d_head*n_heads, bias=qrs_bias, **kwargs)
 		self.Wr = nn.Linear(d_model, self.d_head*n_heads, bias=qrs_bias, **kwargs)
@@ -64,6 +66,11 @@ class _HypergraphAttentionNaive(nn.Module):
 		Q = Q.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
 		R = R.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
 		S = S.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
+
+		beta = self.log_beta.clamp(max=math.log(100)).exp()
+		Q = self.qrs_norm(Q) * beta[None,:,None,None]
+		R = self.qrs_norm(R) * beta[None,:,None,None]
+		S = self.qrs_norm(S) * beta[None,:,None,None]
 
 		if self.scatter:
 			# split the values into scatter and gather components
