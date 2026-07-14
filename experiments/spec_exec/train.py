@@ -102,7 +102,7 @@ class SimpleCompModel(nn.Module):
 				ffn_output = layer_block['ffn'](xn)
 				x = x + ffn_output
 				k += 1
-		return self.output_proj(x), torch.stack(An_list)
+		return self.output_proj(x), torch.stack(An_list) if An is not None else None
 
 	def save_model(self, path: str):
 		"""Saves the model's configuration and state dictionary."""
@@ -170,7 +170,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		# copy task
 		train_s, test_s = gen_data('grok', max_d=0, V=3, C=0, P=113, L=SEQ_L, exact_v=False, data_size=120**2)
 	if task == 3:
-		train_s, test_s = gen_data('grok', max_d=1, V=3, C=0, P=113, L=SEQ_L, exact_v=False, data_size=100_000)
+		train_s, test_s = gen_data('grok', max_d=1, V=3, C=2, P=113, L=SEQ_L, exact_v=False, data_size=100_000)
 	for i in range(10): print(f"Train: {train_s[i]}")
 	for i in range(5):  print(f"Test:  {test_s[i]}")
 	print(f"Train size {len(train_s)} test size {len(test_s)}")
@@ -207,7 +207,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 	if task == 3:
 		n_layers = 3
 		if attn_impl == "graph":
-			n_layers = 4
+			n_layers = 6
 		n_recurse = 1 # depends on the formula depth
 		# n_heads = 6 # use the command line arg
 

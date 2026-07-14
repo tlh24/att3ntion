@@ -186,7 +186,7 @@ class _GraphAttentionNaive(nn.Module):
 		nn.init.normal_(self.Wo.weight, std=1.0 / np.sqrt(d_model))
 		self.gelu = QuickGELU()
 
-	def forward(self, x, rotary_emb, mask=None):
+	def forward(self, x, rotary_emb, mask=None, a_noise=None):
 		"""
 		mask: bool[batch, query, target] if provided
 		"""
@@ -225,7 +225,7 @@ class _GraphAttentionNaive(nn.Module):
 			y = y.permute(0, 2, 3, 1).sum(dim=3).squeeze()
 		# y = self.gelu(y)
 		# y = self.Wo(y)
-		return y.to(out_dtype)
+		return y.to(out_dtype), None
 
 	def calcFlops(self, x):
 		bs, ntok, d_model = x.shape
