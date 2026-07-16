@@ -17,6 +17,7 @@ class _HypergraphAttentionNaive(nn.Module):
 			qrs_bias=False,
 			value_bias=False,
 			out_bias=False,
+			headnorm=False,
 			**kwargs):
 		super().__init__()
 
@@ -29,8 +30,12 @@ class _HypergraphAttentionNaive(nn.Module):
 		self.head_subspaces = head_subspaces
 		self.d_val = self.d_head*1
 		self.scatter = scatter
-		self.qrs_norm = nn.LayerNorm(self.d_head)
-		self.log_beta = nn.Parameter(torch.full((n_heads,), math.log(14))) # from CLIP
+		self.headnorm = headnorm
+		if headnorm:
+			self.log_beta = nn.Parameter(torch.full((n_heads,), math.log(14))) # from CLIP
+			self.Q_norm = nn.RMSNorm(self.d_head)
+			self.R_norm = nn.RMSNorm(self.d_head)
+			self.S_norm = nn.RMSNorm(self.d_head)
 
 		self.Wq = nn.Linear(d_model, self.d_head*n_heads, bias=qrs_bias, **kwargs)
 		self.Wr = nn.Linear(d_model, self.d_head*n_heads, bias=qrs_bias, **kwargs)
@@ -66,11 +71,10 @@ class _HypergraphAttentionNaive(nn.Module):
 		Q = Q.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
 		R = R.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
 		S = S.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
-
-		beta = self.log_beta.clamp(max=math.log(100)).exp()
-		Q = self.qrs_norm(Q) * beta[None,:,None,None]
-		R = self.qrs_norm(R) * beta[None,:,None,None]
-		S = self.qrs_norm(S) * beta[None,:,None,None]
+		if self.headnorm:
+			Q = self.Q_norm(Q)
+			R = self.R_norm(R)
+			S = self.S_norm(S)
 
 		if self.scatter:
 			# split the values into scatter and gather components
@@ -86,7 +90,8 @@ class _HypergraphAttentionNaive(nn.Module):
 			Vs = self.Wv_s(x).reshape(batch_size, ntok, self.n_heads, self.d_val).permute(0, 2, 1, 3)
 
 		A = torch.einsum('bhid,bhjd,bhkd->bhijk', Q, R, S)
-		A = A / (math.sqrt(self.d_head))
+		if not self.headnorm:
+			A = A / (math.sqrt(self.d_head)) # not needed with QRS norm / scaling
 		if a_noise is not None:
 			A_ = A + a_noise # run multiple passes to get samples; can vectorize later
 		else:

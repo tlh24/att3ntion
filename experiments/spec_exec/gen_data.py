@@ -247,8 +247,8 @@ if __name__ == "__main__":
 			if count >= 10: break
 		if count >= 10: break
 
-	print("Generating max_d=0 V=3, C=0, L=1")
-	train_A, test_A = gen_data('grok', max_d=1, V=3, C=2, L=1, data_size=50, exact_v=False)
+	print("Generating max_d=2 V=4, C=3, L=1")
+	train_A, test_A = gen_data('grok', max_d=2, V=4, C=3, L=1, data_size=500, exact_v=False)
 	for row in train_A: print(f"Train: {row}")
 	for row in test_A:  print(f"Test:  {row}")
 
@@ -261,9 +261,4 @@ if __name__ == "__main__":
 	axs[1].set_title('Test')
 	plt.show()
 	print(from_numpy(train_np[0:5,:], 113))
-
-	# print("\nGenerating Mode B max_d=2, V=2, C=0, L=2")
-	# train_B, test_B = gen_data('formulas', max_d=2, V=3, C=0, L=2, data_size=5)
-	# for row in train_B: print(f"Train: {row}")
-	# for row in test_B:  print(f"Test:  {row}")
 

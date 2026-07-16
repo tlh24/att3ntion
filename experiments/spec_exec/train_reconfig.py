@@ -49,12 +49,12 @@ class SimpleCompModel(nn.Module):
 		self.attn_impl = attn_impl
 		self.n_recurse = n_recurse
 		self.d_model = hidden_dim
-		self.rope = RotaryEmbedding(dim = hidden_dim//n_heads)
+		self.rope = RotaryEmbedding(dim = hidden_dim// (2*n_heads)) # *partial RoPE*, as used in GLM
 
 		self.repeated_layers = nn.ModuleList()
 		for _ in range(n_layers):
 			if attn_impl == "hypergraph":
-				attention_layer = _HypergraphAttentionNaive(hidden_dim, n_heads, head_subspaces=True)
+				attention_layer = _HypergraphAttentionNaive(hidden_dim, n_heads, head_subspaces=True, headnorm=True)
 			else:
 				attention_layer = _GraphAttentionNaive(hidden_dim, n_heads, head_subspaces=True)
 
@@ -81,6 +81,7 @@ class SimpleCompModel(nn.Module):
 				)
 		self.output_proj = nn.Linear(hidden_dim, input_vocab, bias=False)
 		self.gelu = QuickGELU()
+		self.final_norm = nn.RMSNorm(hidden_dim)
 		
 	def forward(self, x, An):
 		bs, ntok = x.shape
@@ -92,17 +93,13 @@ class SimpleCompModel(nn.Module):
 		for r in range(self.n_recurse):
 			for layer_block in self.repeated_layers:
 				xn = layer_block['norm1'](x)
-				if An is not None:
-					attn_output, Aout = layer_block['attention'](xn, self.rope, mask, a_noise=An[k,...].squeeze())
-				else:
-					attn_output, Aout = layer_block['attention'](xn, self.rope, mask, a_noise=None)
-				An_list.append(Aout)
+				attn_output, Aout = layer_block['attention'](xn, self.rope, mask, a_noise=None)
 				x = x + attn_output
 				xn = layer_block['norm2'](x) # NOTE: could be attn_output
 				ffn_output = layer_block['ffn'](xn)
 				x = x + ffn_output
 				k += 1
-		return self.output_proj(x), torch.stack(An_list) if An is not None else None
+		return self.output_proj(self.final_norm(x)), None
 
 	def save_model(self, path: str):
 		"""Saves the model's configuration and state dictionary."""
@@ -171,6 +168,13 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		train_s, test_s = gen_data('grok', max_d=0, V=3, C=0, P=113, L=SEQ_L, exact_v=False, data_size=120**2)
 	if task == 3:
 		train_s, test_s = gen_data('grok', max_d=1, V=3, C=2, P=113, L=SEQ_L, exact_v=False, data_size=100_000)
+	if task == 4:
+		train_s, test_s = [], []
+		for d in range(3):
+			train, test = gen_data('grok', max_d=d, V=4, C=3, P=59, L=SEQ_L, exact_v=False, data_size=50000)
+			train_s.extend(train)
+			test_s.extend(test)
+		# order will be shuffled during training; test doesn't need a shuffle.
 
 	for i in range(10): print(f"Train: {train_s[i]}")
 	for i in range(5):  print(f"Test:  {test_s[i]}")
@@ -211,6 +215,11 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 			n_layers = 6
 		n_recurse = 1 # depends on the formula depth
 		# n_heads = 6 # use the command line arg
+	if task == 4:
+		n_layers = 3
+		if attn_impl == "graph":
+			n_layers = 6
+		n_recurse = 3 # depends on the formula depth
 
 	dtype = torch.float32
 	model = SimpleCompModel(vocab_size, hidden_dim, n_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse).to(device=device, dtype=dtype)
