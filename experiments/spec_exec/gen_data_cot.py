@@ -3,6 +3,7 @@ from functools import lru_cache
 import random
 import numpy as np
 import matplotlib.pyplot as plt
+import re
 import pdb
 
 # OPS = ['+', '-', '*', '/']
@@ -46,7 +47,6 @@ def compile_ast(ast):
 	1. The readable string expression.
 	2. The number of constants required.
 	3. The number of variables used.
-	4. A fast compiled lambda function: func(X, C, P)
 	"""
 	c_idx = 0
 	used_vars = set() # Track unique variables
@@ -74,32 +74,35 @@ def compile_ast(ast):
 		return expr_str, code
 
 	expr_str, code_str = build(ast)
-	func = eval(f"lambda X, C, P: {code_str}")
 
-	return expr_str+' =', c_idx, len(used_vars), func
+	return expr_str+' =', c_idx, len(used_vars)
 
-def evaluate_autoregressive(func, init_X, C_vals, L=1, P=113):
-	"""
-	Evaluates the compiled function autoregressively.
-	init_X: e.g., [1, 2] -> x_2(t-2)=1, x_1(t-1)=2.
-	"""
-	# X represents the sliding window: [x_1, x_2, ...] -> [2, 1]
-	X = list(reversed(init_X))
-	seq = list(init_X)
+def reduce_solve(expr, init_X, P):
+	"""Generates a literal chain of thought progressively reducing an RPN expression."""
+	expr = expr.replace('=', '').strip()
 
-	for _ in range(L):
-		try:
-			next_val = func(X, C_vals, P)
-		except ValueError:
-			return None # pow(0, -1, P) throws ValueError (Division by Zero)
+	# Substitute variables in reverse order to seamlessly avoid string aliasing like 'x_11' vs 'x_1'
+	for i, v in reversed(list(enumerate(reversed(init_X), 1))):
+		expr = expr.replace(f"x_{i}", str(v))
 
-		seq.append(next_val)
-		# Shift the autoregressive window efficiently
-		X = [next_val] + X[:-1]
+	steps = [expr]
+	def ev(m):
+		a, b, op = int(m[1]), int(m[2]), m[3]
+		if op == '+': return str((a + b) % P)
+		if op == '-': return str((a - b) % P)
+		if op == '*': return str((a * b) % P)
+		return str((a * pow(b, -1, P)) % P) # mod division
 
-	return seq
+	while True:
+		# Reduces innermost parentheses natively, or cleanly handles root reductions
+		print(steps[-1])
+		nex = re.sub(r'(?:^|\(\s*)(\d+)\s+(\d+)\s+([+\-*/])(?:\s*\)|$)', ev, steps[-1])
+		if nex == steps[-1]: break
+		steps.append(nex)
 
-def gen_data(mode, max_d, V, C, P=113, L=1, data_size=1000, exact_v=True):
+	return " = ".join(steps)
+
+def gen_data(mode, max_d, V, C, P=59, L=1, data_size=1000, exact_v=True):
 	"""
 	mode 'grok': Formulas shared. Inputs (init_conditions & constants) split 60/40. (Grokking)
 	mode 'formulas': Formulas split 60/40. Inputs sampled uniformly. (Formula generalization)
@@ -112,10 +115,10 @@ def gen_data(mode, max_d, V, C, P=113, L=1, data_size=1000, exact_v=True):
 	formulas = []
 	for d in range(max_d + 1):
 		for ast in generate_ast(d, V, C):
-			expr_str, num_c, num_v, func = compile_ast(ast)
+			expr_str, num_c, num_v = compile_ast(ast)
 			if exact_v and num_v != V:
 				continue
-			formulas.append((expr_str, num_c, func))
+			formulas.append((expr_str, num_c))
 
 	# 2. Assign formulas to Train/Test (Mode B only)
 	if mode != 'grok':
@@ -128,7 +131,7 @@ def gen_data(mode, max_d, V, C, P=113, L=1, data_size=1000, exact_v=True):
 
 	while len(train_data) + len(test_data) < data_size and patience < 5000:
 		# Sample uniformly
-		expr_str, num_c, func = random.choice(formulas)
+		expr_str, num_c = random.choice(formulas)
 		inputs = tuple(random.randrange(P) for _ in range(V + num_c))
 
 		# Deduplication
@@ -140,18 +143,14 @@ def gen_data(mode, max_d, V, C, P=113, L=1, data_size=1000, exact_v=True):
 		seen.add(key)
 		patience = 0
 
-		# Evaluate
 		init_X, C_vals = inputs[:V], inputs[V:]
-		seq = evaluate_autoregressive(func, init_X, C_vals, L, P)
-
-		if seq is None:
-			continue # discard formulas that hit Division by Zero
 
 		# Replace constants in the string safely (reverse order avoids const_10 -> const_1 bug)
 		final_str = expr_str
 		for i in reversed(range(num_c)):
 			final_str = final_str.replace(f"const_{i+1}", str(C_vals[i]))
 
+		seq = reduce_solve(final_str, init_X, P)
 		record = (final_str, init_X, seq)
 
 		# 3. Route to Train or Test based on the Mode rules
@@ -171,7 +170,7 @@ def gen_data(mode, max_d, V, C, P=113, L=1, data_size=1000, exact_v=True):
 
 OP_MAP = {'+': 0, '-': 1, '*': 2, '/': 3, '(': 4, ')': 5,'=':6,'_':7}
 
-def to_numpy(train_data, test_data, P, L=1, n_pad=2):
+def to_numpy(train_data, test_data, P, n_pad=1):
 	"""Maps expressions and sequences to an int32 numpy array, padding the expression."""
 
 	def tokenize(expr):
@@ -184,14 +183,14 @@ def to_numpy(train_data, test_data, P, L=1, n_pad=2):
 			for t in expr.split()
 		]
 	# Pre-parse to compute the max expression length
-	tr_parsed = [(tokenize(e), ic, seq[-L:]) for e, ic, seq in train_data]
-	te_parsed = [(tokenize(e), ic, seq[-L:]) for e, ic, seq in test_data]
+	tr_parsed = [(tokenize(e), ic, tokenize(seq)) for e, ic, seq in train_data]
+	te_parsed = [(tokenize(e), ic, tokenize(seq)) for e, ic, seq in test_data]
 	# initial conditions are absorbed into seq
 
 	max_e = max((len(e) for e,_,_ in tr_parsed + te_parsed), default=0)
+	max_s = max((len(s) for _,_,s in tr_parsed + te_parsed), default=0)
 	ic_l = len(tr_parsed[0][1])
-	seq_l = len(tr_parsed[0][2])# train and test must be the same len
-	total_len = max_e + ic_l + seq_l + n_pad
+	total_len = max_e + ic_l + n_pad + max_s
 
 	def build_array(parsed_data):
 		# Pre-allocate contiguous array filled with -1
@@ -199,11 +198,13 @@ def to_numpy(train_data, test_data, P, L=1, n_pad=2):
 		for i, (e_toks, ic, seq) in enumerate(parsed_data):
 			arr[i, :len(e_toks)] = e_toks  # Drop expression at the start
 			arr[i, max_e:max_e+ic_l] = ic
-			arr[i, max_e+ic_l:max_e+ic_l+n_pad] = P + OP_MAP['_']
-			arr[i,-seq_l:] = seq
+			j = max_e+ic_l
+			arr[i, j:j+n_pad] = P + OP_MAP['_']
+			j += n_pad
+			arr[i,j:j+len(seq)] = seq
 		return arr
-	# return the maximum expression length & np train test arrays.
-	return max_e, build_array(tr_parsed), build_array(te_parsed)
+	# return the maximum expression length (for masking) & np train test arrays.
+	return max_e + ic_l, build_array(tr_parsed), build_array(te_parsed)
 
 def from_numpy(data, P):
 	# inefficiently convert from a numpy array to string
@@ -221,44 +222,19 @@ def from_numpy(data, P):
 	return o
 
 if __name__ == "__main__":
-	V = 2 # Variables
-	C = 1 # Constant
-	D = 2 # Depth
-
-	init_conditions = [1, 2] # x_2(t-2) = 1, x_1(t-1) = 2
-	c_vals = [3, 5, 7]       # Plentiful constants for 'C' mapping
-
-	count = 0
-	for d in range(D + 1):
-		for ast in generate_ast(d, V, C):
-			expr_str, num_c, num_vars, func = compile_ast(ast)
-
-			# Slice only the constants this specific formula requires
-			formula_constants = c_vals[:num_c]
-
-			# Run the autoregression!
-			seq = evaluate_autoregressive(func, init_conditions, formula_constants, L=5)
-
-			# Only print formulas that survived (didn't divide by zero)
-			if seq is not None:
-				print(f"{expr_str:<30} | Consts: {formula_constants} | Seq: {seq}")
-				count += 1
-
-			if count >= 10: break
-		if count >= 10: break
-
 	print("Generating max_d=2 V=4, C=3, L=1")
-	train_A, test_A = gen_data('grok', max_d=2, V=4, C=3, L=1, data_size=50, exact_v=False)
+	train_A, test_A = gen_data('grok', max_d=1, V=4, C=3, L=1, data_size=50, exact_v=False)
 	for row in train_A: print(f"Train: {row}")
 	for row in test_A:  print(f"Test:  {row}")
 
 	# check numpy conversion
-	max_exprlen, train_np, test_np = to_numpy(train_A, test_A, 113)
+	max_exprlen, train_np, test_np = to_numpy(train_A, test_A, 59)
 	fig,axs = plt.subplots(2, 1, figsize=(12, 6))
-	axs[0].imshow(train_np.T - 113)
+	axs[0].imshow(train_np.T - 59)
 	axs[0].set_title('Train')
-	axs[1].imshow(test_np.T - 113)
+	axs[1].imshow(test_np.T - 59)
 	axs[1].set_title('Test')
 	plt.show()
-	print(from_numpy(train_np[0:5,:], 113))
+	print(from_numpy(train_np[0:5,:], 59))
+	print('max_exprlen ', max_exprlen)
 
