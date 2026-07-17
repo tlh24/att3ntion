@@ -85,7 +85,7 @@ class SimpleCompModel(nn.Module):
 		bs, ntok = x.shape
 		mask = torch.tril(torch.ones(ntok, ntok, device=x.device))
 		mask[:EXPR_LEN, :EXPR_LEN] = 1 # full cross-attention on the expression
-		pdb.set_trace()
+		# pdb.set_trace()
 		x = self.embedding_proj(x)
 		An_list = []
 		k = 0
@@ -168,14 +168,14 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 	if task == 3:
 		train_s, test_s = gen_data('grok', max_d=1, V=3, C=2, P=113, L=SEQ_L, exact_v=False, data_size=100_000)
 	if task == 4:
-		train_s, test_s = gen_data('grok', max_d=2, V=4, C=3, P=59, L=SEQ_L, exact_v=False, data_size=5_000)
+		train_s, test_s = gen_data('grok', max_d=2, V=4, C=3, P=59, L=SEQ_L, exact_v=False, data_size=100_000)
 
 	for i in range(10): print(f"Train: {train_s[i]}")
 	for i in range(5):  print(f"Test:  {test_s[i]}")
 	print(f"Train size {len(train_s)} test size {len(test_s)}")
 
 	EXPR_LEN, train_np, test_np = to_numpy(train_s, test_s, 113)
-	pdb.set_trace()
+	# pdb.set_trace()
 	x = train_np.copy() + 1
 	y = train_np + 1 # to_numpy uses -1 for the null tok
 	x_v = test_np.copy() + 1
@@ -211,7 +211,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		n_layers = 3
 		if attn_impl == "graph":
 			n_layers = 6
-		n_recurse = 3 # depends on the formula depth
+		n_recurse = 2 # depends on the formula depth
 
 	dtype = torch.float32
 	model = SimpleCompModel(vocab_size, hidden_dim, n_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse).to(device=device, dtype=dtype)
@@ -233,7 +233,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		model.printParamCount()
 	except:
 		print("\\ grokking transformer does not calculate number of parameters")
-	# model = torch.compile(model) # mode="max-autotune" or backend="eager"
+	model = torch.compile(model) # mode="max-autotune" or backend="eager"
 
 	if no_amp:
 		print("--- Running in full fp32 ---")
@@ -320,11 +320,11 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 				targets = outputs_np.to(device=device)
 
 				if no_amp:
-					pred = model(inputs, 0)
+					pred = model(inputs)
 					loss, n_correct, n_possible = calcLoss(pred, targets)
 				else:
 					with autocast('cuda'):
-						pred,_ = model(inputs, None)
+						pred = model(inputs)
 						loss, n_correct, n_possible = calcLoss(pred, targets)
 				correct_vals += n_correct
 				total += n_possible

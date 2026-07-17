@@ -95,7 +95,7 @@ def reduce_solve(expr, init_X, P):
 
 	while True:
 		# Reduces innermost parentheses natively, or cleanly handles root reductions
-		print(steps[-1])
+		# print(steps[-1])
 		nex = re.sub(r'(?:^|\(\s*)(\d+)\s+(\d+)\s+([+\-*/])(?:\s*\)|$)', ev, steps[-1])
 		if nex == steps[-1]: break
 		steps.append(nex)
