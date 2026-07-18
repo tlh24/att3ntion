@@ -146,7 +146,7 @@ def calcLoss(pred, targets):
 		n_possible = seq_targets.shape[0]
 	return loss, n_correct, n_possible
 
-def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_impl="", log_name="", save_model=False, replicate=1, no_amp=False, nsamp=0, sgd_steps=0, sgd_lr=0.1):
+def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_impl="", log_name="", save_model=False, replicate=1, no_amp=False, nloop=1):
 	
 	if device == 'auto':
 		if torch.cuda.is_available():
@@ -210,8 +210,8 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 	if task == 4:
 		n_layers = 3
 		if attn_impl == "graph":
-			n_layers = 6
-		n_recurse = 2 # depends on the formula depth
+			n_layers = 5 # slightly more parameters
+		n_recurse = nloop # depends on the formula depth
 
 	dtype = torch.float32
 	model = SimpleCompModel(vocab_size, hidden_dim, n_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse).to(device=device, dtype=dtype)
@@ -235,13 +235,16 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 		print("\\ grokking transformer does not calculate number of parameters")
 	model = torch.compile(model) # mode="max-autotune" or backend="eager"
 
+
 	if no_amp:
 		print("--- Running in full fp32 ---")
 	else:
 		print("--- Running with Torch automatic mixed precision (fp32 weights) ---")
 
 	nam = {"hypergraph":"hg","graph":"g"}.get(attn_impl)
-	fd_losslog = open(f'losslog_{nam}_{log_name}_r{replicate}.txt', 'w')
+	log_suffix = f'{nam}_{log_name}_d{hidden_dim}_h{n_heads}_l_{nloop}_r{replicate}.txt'
+	fd_losslog = open(f'losslog_{log_suffix}', 'w')
+	fd_validlog = open(f'validlog_{log_suffix}', 'w')
 
 	print("\ntrain_model1 started...")
 	uu = 0
@@ -296,7 +299,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 			total_loss += lloss
 			lloss = lloss / inputs.shape[0] # normalize by batch size
 			top1_err = 1 - (n_correct / n_possible)
-			fd_losslog.write(f"{uu}\t{lloss}\t{top1_err*math.exp(1)}\t{validation_loss}\t{validation_top1_err*math.exp(1)}\n")
+			fd_losslog.write(f"{uu}\t{lloss}\t{top1_err*math.exp(1)}\n")
 			uu += 1
 			
 			if batch_indx % ((32*512) // batch_size) == 0:
@@ -341,9 +344,12 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 			print(f'Validation Loss: {avg_loss:.4f}, accuracy {val_accuracy}')
 			validation_loss = avg_loss
 			validation_top1_err = 1 - correct_vals / total
+			fd_validlog.write(f"{epoch}\t{validation_loss}\t{validation_top1_err*math.exp(1)}\n")
+			fd_validlog.flush()
 
 	fd_losslog.flush()
 	fd_losslog.close()
+	fd_validlog.close()
 	return model
 
 if __name__ == '__main__':
@@ -364,12 +370,8 @@ if __name__ == '__main__':
 	parser.add_argument('--task', type=int, default=4, help="what task to run. 1 = mod arith; 2 = copy task; 3 = formula generalization")
 	parser.add_argument('--repl', type=int, default=1, help="what replicate this is",)
 	parser.add_argument('--no-amp', action='store_true', help='Disable Torch automatic mixed precision')
-	parser.add_argument('--nsamp', type=int, default=0,
-						help='number of attention noise samlples')
-	parser.add_argument('--sgd-steps', type=int, default=0,
-						help='number of inner SGD steps to optimize attention noise')
-	parser.add_argument('--sgd-lr', type=float, default=0.01,
-						help='learning rate for inner SGD steps')
+	parser.add_argument('--nloop', type=int, default=1,
+						help='number of model loops')
 	args = parser.parse_args()
 
 	SEQ_L = args.seq_l # sorry about the global
@@ -386,8 +388,6 @@ if __name__ == '__main__':
 		save_model=args.save,
 		replicate = args.repl,
 		no_amp = args.no_amp,
-		nsamp = args.nsamp,
-		sgd_steps=args.sgd_steps,
-		sgd_lr=args.sgd_lr,
+		nloop = args.nloop
 	)
 

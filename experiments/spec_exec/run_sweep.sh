@@ -6,7 +6,16 @@
 # {%} - 1 converts the slot (1-indexed) to the GPU number, so that no two runs are simultaneously executing on the same GPU.
 
 
-parallel -j 16 -u 'python {1}.py --batch-size 16 --epochs 30 --log-name addmul_{1} --heads 6 --hidden 384 --repl {2} --attn {3} --device cuda:$(( ({%} - 1) % 8 ))' ::: train train_reconfig ::: 5 6 7 8 ::: graph hypergraph
+# parallel -j 16 -u 'python {1}.py --batch-size 16 --epochs 30 --log-name addmul_{1} --heads 6 --hidden 384 --repl {2} --attn {3} --device cuda:$(( ({%} - 1) % 8 ))' ::: train train_reconfig ::: 5 6 7 8 ::: graph hypergraph
+
+# python train_reconfig.py --attn hypergraph --heads 6 --hidden 384 --log-name h6d384
+
+parallel -j 24 -u 'python train_reconfig.py --batch-size 16 --epochs 30 --log-name addmulcot --heads {1} --hidden {2} --nloop {3} --repl {4} --attn {5} --device cuda:$(( ({%} - 1) % 8 ))' \
+  ::: 2 2 3 4 4 6 8 6 8 \
+  :::+ 96 128 192 256 384 384 512 768 1024 \
+  ::: 1 2 \
+  ::: 1 2 3 4 5 \
+  ::: graph hypergraph
 
 # Note:
 # 'add' is for 3 layer HG, 4 layer graph.
