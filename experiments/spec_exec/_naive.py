@@ -32,7 +32,6 @@ class _HypergraphAttentionNaive(nn.Module):
 		self.scatter = scatter
 		self.headnorm = headnorm
 		if headnorm:
-			self.log_beta = nn.Parameter(torch.full((n_heads,), math.log(14))) # from CLIP
 			self.Q_norm = nn.RMSNorm(self.d_head)
 			self.R_norm = nn.RMSNorm(self.d_head)
 			self.S_norm = nn.RMSNorm(self.d_head)
