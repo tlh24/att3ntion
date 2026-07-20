@@ -223,7 +223,7 @@ def from_numpy(data, P):
 
 if __name__ == "__main__":
 	print("Generating max_d=2 V=4, C=3, L=1")
-	train_A, test_A = gen_data('grok', max_d=1, V=4, C=3, L=1, data_size=50, exact_v=False)
+	train_A, test_A = gen_data('grok', max_d=2, V=4, C=3, L=1, data_size=50, exact_v=False)
 	for row in train_A: print(f"Train: {row}")
 	for row in test_A:  print(f"Test:  {row}")
 
