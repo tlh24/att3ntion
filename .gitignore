@@ -16,14 +16,17 @@ benchmarks/benchmark_history.jsonl
 profiling_reports/
 
 # Experiment run logs and outputs
+*.log
 experiments/compositional/losslogs/
 experiments/recogs/losslogs/
 experiments/recogs/runs/
 experiments/recogs/sweep_logs/
 experiments/recogs/docs/*.png
 
-# Personal, cluster-specific operations runbook (kept local, not open-sourced)
+# Personal, cluster-specific operations runbooks (kept local, not open-sourced)
 experiments/recogs/docs/RUNBOOK.md
+experiments/recogs/docs/PLAYBOOK.md
+experiments/recogs/docs/POD_RUNBOOK.md
 
 # Recogs one-off / throwaway scripts (not part of the shared pipeline)
 experiments/recogs/_ckpt_steps.py
