@@ -9,7 +9,7 @@ RECOGS_DIR = PROJECT_ROOT / "experiments" / "recogs"
 if str(RECOGS_DIR) not in sys.path:
     sys.path.insert(0, str(RECOGS_DIR))
 
-from recogs_eval import semantic_exact_match
+from metrics import semantic_exact_match
 from evaluate import greedy_decode_one, greedy_decode_batch
 from model import RecogsDecoderLM
 

@@ -26,7 +26,6 @@ from evaluate import evaluate_split_generation
 from model import RecogsDecoderLM
 
 
-LOSSLOG_DIR = Path(__file__).resolve().parent / "losslogs"
 
 
 def set_global_seed(seed: int) -> None:
@@ -333,12 +332,11 @@ def main() -> None:
         args.out_dir.mkdir(parents=True, exist_ok=True)
         run_dir.mkdir(parents=True, exist_ok=True)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
-        LOSSLOG_DIR.mkdir(parents=True, exist_ok=True)
 
     losslog = None
     eval_curve = None
     if is_main:
-        losslog_path = LOSSLOG_DIR / f"losslog_{_attn_tag(args.attn)}_recogs_{args.log_name}_s{args.seed}.txt"
+        losslog_path = run_dir / "losslog.txt"
         losslog = losslog_path.open("w", encoding="utf-8")
         print(f"writing loss log to {losslog_path}")
 

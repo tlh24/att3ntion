@@ -18,10 +18,9 @@ profiling_reports/
 # Experiment run logs and outputs
 *.log
 experiments/compositional/losslogs/
-experiments/recogs/losslogs/
-experiments/recogs/runs/
-experiments/recogs/sweep_logs/
-experiments/recogs/docs/*.png
+experiments/recogs/exp/*/runs/
+experiments/recogs/exp/_legacy_logs/
+experiments/recogs/analysis/aggregate_summary.json
 
 # Personal, cluster-specific operations runbooks (kept local, not open-sourced)
 experiments/recogs/docs/RUNBOOK.md
@@ -29,10 +28,7 @@ experiments/recogs/docs/PLAYBOOK.md
 experiments/recogs/docs/POD_RUNBOOK.md
 
 # Recogs one-off / throwaway scripts (not part of the shared pipeline)
-experiments/recogs/_ckpt_steps.py
-experiments/recogs/_extract_results.py
-experiments/recogs/diagnose_scatter.py
-experiments/recogs/truncation_report.py
+experiments/recogs/scratch/
 losslog_*.txt
 optimization_log/sessions/
 

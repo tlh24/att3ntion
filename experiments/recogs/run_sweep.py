@@ -58,8 +58,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seeds", type=str, default="1,2,3")
     parser.add_argument("--gpus", type=str, default="0,1,2,3")
     parser.add_argument("--train-script", type=Path, default=Path(__file__).parent / "train.py")
-    parser.add_argument("--out-dir", type=Path, default=Path(__file__).parent / "runs")
-    parser.add_argument("--log-dir", type=Path, default=Path(__file__).parent / "sweep_logs")
+    parser.add_argument("--out-dir", type=Path, required=True, help="run output dir, e.g. exp/v9_title/runs")
+    parser.add_argument("--log-dir", type=Path, default=None, help="job/driver logs dir (default: <out-dir>/driver_logs)")
     parser.add_argument("--skip-existing", action="store_true", help="skip (arm,seed) with final_metrics.json")
 
     # Training regime (v2 plan: 512 + long train toward dev plateau).
@@ -147,6 +147,8 @@ def main() -> None:
         if arm not in ARMS:
             raise ValueError(f"Unknown arm {arm!r}; choices: {sorted(ARMS)}")
 
+    if args.log_dir is None:
+        args.log_dir = args.out_dir / "driver_logs"
     args.log_dir.mkdir(parents=True, exist_ok=True)
     args.out_dir.mkdir(parents=True, exist_ok=True)
 

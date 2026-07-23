@@ -213,7 +213,10 @@ vs hypergraph `L=3`); parity is approximate, not exact.
 - Each run writes `config.json` and a per-step loss log.
 - With `--eval-at-end`: reloads `best.pt` and decodes dev/test/gen into
   `final_metrics.json` plus per-example records for paired significance tests.
-- Runs live in `runs/{log_name}_{attn}_s{seed}/`.
+- Runs live in `exp/<experiment>/runs/{log_name}_{attn}_s{seed}/`, alongside a
+  per-step `losslog.txt`. Each experiment folder under `exp/` bundles its
+  write-up (`RUN_N.md`), driver script, plot scripts, figures, and run
+  artifacts — see `exp/README.md` for the index.
 
 ## Evaluation
 
@@ -225,7 +228,7 @@ invariances ReCOGS defines:
 2. **Variable renaming** — the specific integer ids, up to a consistent
    (bijective) renaming between predicted and gold variables.
 
-### Implementation (`recogs_eval.py`)
+### Implementation (`metrics.py`)
 
 `semantic_exact_match(pred_lf, gold_lf)` resolves these invariances:
 
@@ -257,10 +260,6 @@ normalizes whitespace only. They diverge solely on LFs with duplicate identical
 conjuncts (absent from gold LFs), where this version is marginally stricter. It
 assumes the gold LFs are canonically pre-spaced (one space around every `(`, `)`,
 `,`, `;`, `AND`), matching the tokenizer's convention.
-
-> **Note:** `canonical_atoms` in `recogs_eval.py` is unused. Its first-occurrence
-> renaming is order-dependent, so it should stay out of scoring. Candidate for
-> removal.
 
 ## Generation / OOD
 

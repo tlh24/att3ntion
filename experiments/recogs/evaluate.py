@@ -15,7 +15,7 @@ from data import (
     build_tokenizer_from_train,
 )
 from model import RecogsDecoderLM
-from recogs_eval import score_predictions, semantic_exact_match
+from metrics import score_predictions, semantic_exact_match
 
 
 @torch.no_grad()
