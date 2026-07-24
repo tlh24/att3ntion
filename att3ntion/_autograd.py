@@ -206,9 +206,6 @@ class QuickGELU(nn.Module):
 class HypergraphAttention(nn.Module):
     """
     3-way hypergraph attention layer backed by hand-written CUDA kernels.
-
-    This is the primary public API for att3ntion.  Drop it into any
-    transformer-style model in place of standard multi-head attention.
     """
     def __init__(self, d_model, n_heads, dropout_rate=0, scatter=False):
         super().__init__()

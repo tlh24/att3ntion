@@ -1,6 +1,7 @@
 import numpy as np
 import argparse
 import inspect
+import random
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -16,34 +17,53 @@ for d in [script_dir, project_root]:
     if d not in sys.path:
         sys.path.insert(0, d)
 
-from att3ntion import _HypergraphAttentionNaive, _GraphAttentionNaive, QuickGELU
+LOSSLOG_DIR = current_script_path.parent / "losslogs"
 
-# Try to import CUDA-backed hypergraph attention; fall back to naive if not built.
+from att3ntion import (
+	_HypergraphAttentionNaive,
+	_GraphAttentionNaive,
+	PolyAttention,
+	SelfAttention,
+	QuickGELU,
+)
+
 _cuda_kernels_available = False
 try:
-	from att3ntion import HypergraphAttention as _HypergraphAttentionCuda
+	from att3ntion import HypergraphAttention
 	_cuda_kernels_available = True
 except (ImportError, OSError):
-	pass
+	HypergraphAttention = None
 
-if _cuda_kernels_available:
-	class _CudaHypergraphWrapper(_HypergraphAttentionCuda):
-		"""HypergraphAttention adapted to the (x, rotary_emb) call convention used here."""
-		def forward(self, x, rotary_emb=None):
-			return super().forward(x)
 
-		def calcFlops(self, x):
-			bs, ntok, d_model = x.shape
-			f = 0.0
-			f += 3 * bs * ntok * d_model**2 * self.n_heads * d_model
-			f += 3 * bs * ntok * d_model**2 * self.n_heads * d_model * 2
-			f += bs * self.n_heads * ntok**3 * self.head_dim * 2
-			f += bs * self.n_heads * ntok**3 * 2 * 3
-			f += bs * self.n_heads * ntok**3 * self.head_dim * 6
-			f += bs * self.n_heads * ntok * self.head_dim * (6 + 6)
-			f += bs * ntok * d_model**2
-			return f
+class _HypergraphCudaWrapper(nn.Module):
+	def __init__(self, d_model, n_heads, head_subspaces=True, **kwargs):
+		super().__init__()
+		if not _cuda_kernels_available:
+			raise RuntimeError(
+				"CUDA HypergraphAttention kernels are not built; "
+				"use attn_impl='hypergraph' for naive PyTorch."
+			)
+		assert head_subspaces, "CUDA HypergraphAttention only supports head_subspaces=True"
+		self.d_model = d_model
+		self.n_heads = n_heads
+		self.inner = HypergraphAttention(d_model, n_heads, scatter=kwargs.get('scatter', False))
 
+	def forward(self, x, rotary_emb):
+		assert rotary_emb is None, "to consider later: CUDA HypergraphAttention does not support rotary embeddings"
+		return self.inner(x)
+
+	def calcFlops(self, x):
+		bs, ntok, d_model = x.shape
+		f = 0.0
+		f += 3 * bs * ntok * d_model**2 * self.n_heads * d_model
+		f += 3 * bs * ntok * d_model**2 * self.n_heads * d_model * 2
+		f += bs * self.n_heads * ntok**3 * d_model * 2
+		f += bs * self.n_heads * ntok**3 * 2 * 3
+		f += bs * self.n_heads * ntok**3 * d_model * 3
+		f += bs * self.n_heads * ntok**3 * d_model * 3 * 3
+		f += bs * self.n_heads * ntok * d_model * (6 + 6)
+		f += bs * self.n_heads * ntok * d_model**2
+		return f
 from gen_data_comp import genData3, genData4, genData7
 
 
@@ -62,7 +82,7 @@ class SwiGLU(nn.Module):
 
 class SimpleCompModel(nn.Module):
 	"""Model with hypergraph attention layer."""
-	def __init__(self, input_dim:int, hidden_dim:int, num_heads:int, n_layers:int, attn_impl:str='', n_recurse:int=1, use_cuda_kernels:bool=True):
+	def __init__(self, input_dim:int, hidden_dim:int, num_heads:int, n_layers:int, attn_impl:str='', n_recurse:int=1):
 		super().__init__()
 		self.input_dim = input_dim
 		self.embedding_proj = nn.Linear(self.input_dim, hidden_dim)
@@ -70,21 +90,28 @@ class SimpleCompModel(nn.Module):
 		self.n_recurse = n_recurse
 		self.d_model = hidden_dim
 
-		use_cuda = use_cuda_kernels and _cuda_kernels_available and attn_impl == "hypergraph"
-		if use_cuda:
-			print("Using CUDA hypergraph attention kernels.")
-		elif attn_impl == "hypergraph":
-			print("Using naive (PyTorch) hypergraph attention.")
-
 		self.repeated_layers = nn.ModuleList()
 		for _ in range(n_layers):
 			if attn_impl == "hypergraph":
-				if use_cuda:
-					attention_layer = _CudaHypergraphWrapper(hidden_dim, num_heads)
-				else:
-					attention_layer = _HypergraphAttentionNaive(hidden_dim, num_heads, head_subspaces=True)
-			else:
+				attention_layer = _HypergraphAttentionNaive(hidden_dim, num_heads, head_subspaces=True, scatter=False)
+			elif attn_impl == "hypergraph_scatter":
+				attention_layer = _HypergraphAttentionNaive(hidden_dim, num_heads, head_subspaces=True, scatter=True)
+			elif attn_impl == "hypergraph_cuda":
+				attention_layer = _HypergraphCudaWrapper(hidden_dim, num_heads, head_subspaces=True)
+			elif attn_impl == "hypergraph_cuda_scatter":
+				attention_layer = _HypergraphCudaWrapper(hidden_dim, num_heads, head_subspaces=True, scatter=True)
+			elif attn_impl == "tree":
+				attention_layer = PolyAttention(hidden_dim, num_heads, head_subspaces=True, polynomial="tree")
+			elif attn_impl == "strassen":
+				attention_layer = PolyAttention(hidden_dim, num_heads, head_subspaces=True, polynomial="strassen")
+			elif attn_impl == "tensor":
+				attention_layer = PolyAttention(hidden_dim, num_heads, head_subspaces=True, polynomial="tensor")
+			elif attn_impl == "standard":
+				attention_layer = SelfAttention(hidden_dim, num_heads, head_subspaces=True)
+			elif attn_impl == "graph":
 				attention_layer = _GraphAttentionNaive(hidden_dim, num_heads, head_subspaces=True)
+			else:
+				raise ValueError(f"Unsupported attn_impl: {attn_impl!r}")
 
 			norm1_layer = nn.RMSNorm(hidden_dim) # was LayerNorm
 			norm2_layer = nn.RMSNorm(hidden_dim)
@@ -251,8 +278,15 @@ def calcLoss(task, pred, targets):
 			n_possible = torch.sum( targets[:,:,0] ).item()
 	return loss, n_correct, n_possible
 
-def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl="", log_name="", save_model=False, task=3, replicate=1, no_amp=False, use_cuda_kernels=True):
-	
+def setGlobalSeed(seed: int):
+	torch.manual_seed(seed)
+	np.random.seed(seed)
+	random.seed(seed)
+	if torch.cuda.is_available():
+		torch.cuda.manual_seed_all(seed)
+
+
+def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl="", log_name="", save_model=False, task=3, replicate=1, no_amp=False):
 	if device == 'auto':
 		if torch.cuda.is_available():
 			device = torch.device('cuda')
@@ -262,7 +296,11 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 		device = torch.device(device)
 	
 	print(f"Using device: {device}")
-	
+
+	seed = 1000 * task + replicate
+	setGlobalSeed(seed)
+	print(f"Seed: {seed}  (task={task}, replicate={replicate})")
+
 	if task == 3:
 		gen_func = genData3
 		nsamples = 1500
@@ -284,8 +322,11 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 
 	input_dim = x.shape[2]
 
-	is_hg = attn_impl == "hypergraph"
-	if is_hg:
+	is_3way = attn_impl in (
+		"hypergraph", "hypergraph_scatter", "hypergraph_cuda", "hypergraph_cuda_scatter",
+		"tree", "strassen", "tensor",
+	)
+	if is_3way:
 		n_layers = 3
 	else:
 		n_layers = 6 # match the number of parameters and (approx) model complexity.  (But not flops, of course!)
@@ -293,13 +334,13 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 
 	if task == 4:
 		n_recurse = 5
-		if is_hg:
+		if is_3way:
 			n_layers = 2
 		else:
 			n_layers = 4 # Positive control: these converge at the same rate.
 
 	dtype = torch.float32
-	model = SimpleCompModel(input_dim, hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse, use_cuda_kernels=use_cuda_kernels).to(device=device, dtype=dtype)
+	model = SimpleCompModel(input_dim, hidden_dim, num_heads, n_layers=n_layers, attn_impl=attn_impl, n_recurse=n_recurse).to(device=device, dtype=dtype)
 	if save_model:
 		try:
 			model.load_model(f"comp_model_{attn_impl}_r{replicate}.pt", device)
@@ -320,8 +361,21 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 	else:
 		print("--- Running with Torch automatic mixed precision (fp32 weights) ---")
 
-	nam = {"hypergraph":"hg","graph":"g"}.get(attn_impl)
-	fd_losslog = open(f'losslog_{nam}_t{task}_{log_name}_r{replicate}.txt', 'w')
+	nam = {
+		"hypergraph": "hg",
+		"hypergraph_scatter": "hgs",
+		"hypergraph_cuda": "hgc",
+		"hypergraph_cuda_scatter": "hgcs",
+		"graph": "g",
+		"tree": "tree",
+		"strassen": "strassen",
+		"tensor": "tensor",
+		"standard": "standard",
+	}.get(attn_impl)
+	LOSSLOG_DIR.mkdir(parents=True, exist_ok=True)
+	losslog_path = LOSSLOG_DIR / f'losslog_{nam}_t{task}_{log_name}_r{replicate}.txt'
+	fd_losslog = open(losslog_path, 'w')
+	print(f"writing loss log to {losslog_path}")
 
 	print("\ntrain_model1 started...")
 	uu = 0
@@ -347,7 +401,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 				pred = model(inputs, batch_indx)
 				loss, n_correct, n_possible = calcLoss(task, pred, targets)
 			else:
-				with autocast('cuda'):
+				with autocast('cuda', dtype=torch.bfloat16):
 					pred = model(inputs, batch_indx)
 					loss, n_correct, n_possible = calcLoss(task, pred, targets)
 			correct_vals += n_correct
@@ -422,7 +476,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 				pred = model(inputs, 0)
 				loss, n_correct, n_possible = calcLoss(task, pred, targets)
 			else:
-				with autocast('cuda'):
+				with autocast('cuda', dtype=torch.bfloat16):
 					pred = model(inputs, 0)
 					loss, n_correct, n_possible = calcLoss(task, pred, targets)
 			correct_vals += n_correct
@@ -442,7 +496,7 @@ def trainModel(num_epochs, batch_size, hidden_dim, num_heads, device, attn_impl=
 			fd_losslog.write(f"{uu}\t{lloss}\t0.0\n")
 			uu += 1
 
-			total_loss += loss.item()
+			total_loss += loss.item() #this forces cpu-gpu sync each batch, which is slow so do only if needed 
 
 		avg_loss = total_loss / len(loader_v) 
 		val_accuracy = 100 * correct_vals / total
@@ -460,7 +514,14 @@ if __name__ == '__main__':
 	parser.add_argument('--batch-size', type=int, default=32, help='Batch size for training')
 	parser.add_argument('--hidden', type=int, default=256, help='Hidden dimension size')
 	parser.add_argument('--heads', type=int, default=8, help='Number of attention heads')
-	parser.add_argument('--attn', type=str, default='hypergraph', choices=['hypergraph', 'graph'],
+	parser.add_argument('--attn', type=str, default='hypergraph',
+						choices=[
+							'hypergraph', 'hypergraph_scatter', 'hypergraph_cuda', 'hypergraph_cuda_scatter', 'graph',
+							'tree',
+							'strassen',
+							'tensor',
+							'standard',
+						],
 						help='Attention implementation to use')
 	parser.add_argument('--log-name', type=str,
 						help='postfix logname')
@@ -469,8 +530,6 @@ if __name__ == '__main__':
 	parser.add_argument('--task', type=int, help="what task to run the model on", required=True)
 	parser.add_argument('--repl', type=int, default=1, help="what replicate this is",)
 	parser.add_argument('--no-amp', action='store_true', help='Disable Torch automatic mixed precision')
-	parser.add_argument('--no-cuda-kernels', action='store_true',
-						help='Force naive PyTorch hypergraph attention even if CUDA kernels are built')
 	args = parser.parse_args()
 	
 	model = trainModel(
@@ -485,6 +544,5 @@ if __name__ == '__main__':
 		task = args.task,
 		replicate = args.repl,
 		no_amp = args.no_amp,
-		use_cuda_kernels = not args.no_cuda_kernels,
 	)
 
