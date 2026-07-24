@@ -284,10 +284,15 @@ def trainModel(num_epochs, batch_size, hidden_dim, n_heads, device, task, attn_i
 				start_event.record()
 			optimizer.zero_grad()
 
-			with autocast('cuda'):
+			if no_amp:
 				pred = model(inputs)
 				loss, n_correct, n_possible = calcLoss(pred, targets)
 				loss = loss.sum()
+			else:
+				with autocast('cuda'):
+					pred = model(inputs)
+					loss, n_correct, n_possible = calcLoss(pred, targets)
+					loss = loss.sum()
 
 			loss.backward()
 			torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
