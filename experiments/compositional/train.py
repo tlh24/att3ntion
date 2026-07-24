@@ -137,7 +137,7 @@ class SimpleCompModel(nn.Module):
 				)
 		self.output_proj = nn.Linear(hidden_dim, self.input_dim)
 		self.gelu = QuickGELU()
-		
+
 	def forward(self, x, b):
 		# # skip = b % (self.n_recurse)
 		bs, ntok, d_model = x.shape
@@ -167,13 +167,15 @@ class SimpleCompModel(nn.Module):
 					attn_output = layer_block['attention'](xn, None, mask)
 					x = x + attn_output
 					xn = layer_block['norm2'](x)
+						# attn_output input above slows hg conv. on task 3.
+						# but it accelerates performance w g attn
 					ffn_output = layer_block['ffn'](xn)
 					x = x + ffn_output
 					# attn_output = layer_block['attention'](x, None)
 					# x = layer_block['norm1'](x + attn_output)
 					# ffn_output = layer_block['ffn'](x)
 					# x = layer_block['norm2'](x + ffn_output)
-		
+
 		return self.output_proj(x)
 
 	def save_model(self, path: str):

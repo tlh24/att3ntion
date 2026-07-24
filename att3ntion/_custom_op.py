@@ -1,7 +1,23 @@
 import torch
 from torch.library import custom_op
 
-import att3ntion._cuda_kernels as _cuda_kernels
+_cuda_import_error = None
+try:
+    import att3ntion._cuda_kernels as _cuda_kernels
+    _CUDA_AVAILABLE = True
+except ImportError as _e:
+    _cuda_kernels = None
+    _CUDA_AVAILABLE = False
+    _cuda_import_error = _e
+
+
+def _require_cuda():
+    if not _CUDA_AVAILABLE:
+        raise ImportError(
+            f"att3ntion CUDA kernels are not available on this machine: {_cuda_import_error}\n"
+            "HypergraphAttention requires compiled CUDA extensions. "
+            "Use _HypergraphAttentionNaive or _GraphAttentionNaive for CPU-only operation."
+        ) from _cuda_import_error
 
 
 @custom_op("att3ntion::hypergraph_forward", mutates_args=())
@@ -20,6 +36,7 @@ def hypergraph_forward(
     torch.Tensor, torch.Tensor, torch.Tensor,
     torch.Tensor, torch.Tensor, torch.Tensor,
 ]:
+    _require_cuda()
     return _cuda_kernels.forward(
         Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate,
         I_valid, J_valid, K_valid,
@@ -67,6 +84,7 @@ def hypergraph_backward(
     torch.Tensor, torch.Tensor, torch.Tensor,
     torch.Tensor, torch.Tensor, torch.Tensor,
 ]:
+    _require_cuda()
     return _cuda_kernels.backward(
         grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_,
         Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,

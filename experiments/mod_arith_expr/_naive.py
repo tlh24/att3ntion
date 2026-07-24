@@ -4,37 +4,12 @@ import math
 import pdb
 import numpy as np
 
-from att3ntion._autograd import QuickGELU
-
-
-def _normalize_self_attn_mask(mask, batch_size, ntok, device):
-	if mask is None:
-		return None
-
-	if mask.ndim == 2:
-		if mask.shape != (ntok, ntok):
-			raise ValueError(
-				f"2D mask must have shape {(ntok, ntok)}, got {tuple(mask.shape)}"
-			)
-		mask = mask.unsqueeze(0)
-	elif mask.ndim != 3:
-		raise ValueError(f"mask must have ndim 2 or 3, got ndim={mask.ndim}")
-
-	if mask.shape[-2:] != (ntok, ntok):
-		raise ValueError(
-			f"mask must have trailing shape {(ntok, ntok)}, got {tuple(mask.shape)}"
-		)
-	if mask.shape[0] not in (1, batch_size):
-		raise ValueError(
-			f"mask batch dim must be 1 or {batch_size}, got {mask.shape[0]}"
-		)
-	if mask.shape[0] == 1 and batch_size > 1:
-		mask = mask.expand(batch_size, -1, -1)
-
-	return mask.to(device=device, dtype=torch.bool)
-
+class QuickGELU(nn.Module):
+	def forward(self, x: torch.Tensor):
+		return x * torch.sigmoid(1.702 * x)
 
 class _HypergraphAttentionNaive(nn.Module):
+	"""Pure-PyTorch naive O(N^3) implementation for correctness testing."""
 	def __init__(
 			self, d_model, n_heads, dropout_rate=0,
 			head_subspaces=False,
@@ -42,6 +17,7 @@ class _HypergraphAttentionNaive(nn.Module):
 			qrs_bias=False,
 			value_bias=False,
 			out_bias=False,
+			headnorm=False,
 			**kwargs):
 		super().__init__()
 
@@ -54,6 +30,11 @@ class _HypergraphAttentionNaive(nn.Module):
 		self.head_subspaces = head_subspaces
 		self.d_val = self.d_head*1
 		self.scatter = scatter
+		self.headnorm = headnorm
+		if headnorm:
+			self.Q_norm = nn.RMSNorm(self.d_head)
+			self.R_norm = nn.RMSNorm(self.d_head)
+			self.S_norm = nn.RMSNorm(self.d_head)
 
 		self.Wq = nn.Linear(d_model, self.d_head*n_heads, bias=qrs_bias, **kwargs)
 		self.Wr = nn.Linear(d_model, self.d_head*n_heads, bias=qrs_bias, **kwargs)
@@ -70,7 +51,9 @@ class _HypergraphAttentionNaive(nn.Module):
 		self.dropout = nn.Dropout(dropout_rate)
 		self.gelu = QuickGELU()
 
-	def forward(self, x, rotary_emb, mask=None):
+	def forward(self, x, rotary_emb, mask=None, a_noise=None):
+		# noise is assumed to be Gumbel distributed
+		# is broadcast added to the attention before the softmax.
 		out_dtype = x.dtype
 		x = x.float()
 		batch_size, ntok, d_model = x.shape
@@ -87,8 +70,13 @@ class _HypergraphAttentionNaive(nn.Module):
 		Q = Q.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
 		R = R.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
 		S = S.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
+		if self.headnorm:
+			Q = self.Q_norm(Q)
+			R = self.R_norm(R)
+			S = self.S_norm(S)
 
 		if self.scatter:
+			# split the values into scatter and gather components
 			Vq_full = self.Wv_q(x)
 			Vr_full = self.Wv_r(x)
 			Vs_full = self.Wv_s(x)
@@ -100,31 +88,42 @@ class _HypergraphAttentionNaive(nn.Module):
 			Vr = self.Wv_r(x).reshape(batch_size, ntok, self.n_heads, self.d_val).permute(0, 2, 1, 3)
 			Vs = self.Wv_s(x).reshape(batch_size, ntok, self.n_heads, self.d_val).permute(0, 2, 1, 3)
 
-		dot_product = torch.einsum('bhid,bhjd,bhkd->bhijk', Q, R, S)
-		dot_product = dot_product / (math.sqrt(self.d_head))
+		A = torch.einsum('bhid,bhjd,bhkd->bhijk', Q, R, S)
+		if not self.headnorm:
+			A = A / (math.sqrt(self.d_head)) # not needed with QRS norm / scaling
+		if a_noise is not None:
+			A_ = A + a_noise # run multiple passes to get samples; can vectorize later
+		else:
+			A_ = A
 
-		dot_product_q = dot_product.flatten(3, 4) # BHI(JK)
-		dot_product_r = dot_product.permute(0, 1, 3, 2, 4).flatten(3, 4) # BHJ(IK)
-		dot_product_s = dot_product.permute(0, 1, 4, 2, 3).flatten(3, 4) # BHK(IJ)
+		dot_product_q = A_.flatten(3, 4) # BHI(JK)
+		dot_product_r = A_.permute(0, 1, 3, 2, 4).flatten(3, 4) # BHJ(IK)
+		dot_product_s = A_.permute(0, 1, 4, 2, 3).flatten(3, 4) # BHK(IJ)
 
 		if mask is not None:
 			if mask.ndim == 2:
+				# mask is the standard 2D matrix (ntok, ntok)
+				# add in a (dummy, broadcasted) batch dim
 				mask = mask[None,:,:]
+			# otherwise can have a different mask per batch element
 			assert(mask.ndim == 3)
-			valid3 = (mask[:,:,:,None] & mask[:,:,None,:]).flatten(2, 3)
+			valid = mask > 0 # convert to boolean (byte)
+			# any i can attend to j,k <= i (likewise for the other 2 permutations).
+			valid3 = (valid[:,:,:,None] & valid[:,:,None,:]).flatten(2, 3)
 			invalid3 = ~(valid3[:,None,:,:])
+			# the three dot_products are permuted and flattened so that the last dim is the softmax dim.
 			dot_product_q = dot_product_q.masked_fill(invalid3, float('-inf'))
 			dot_product_r = dot_product_r.masked_fill(invalid3, float('-inf'))
 			dot_product_s = dot_product_s.masked_fill(invalid3, float('-inf'))
 
-		Aq = torch.softmax(dot_product_q, dim=-1).reshape(dot_product.shape)
+		Aq = torch.softmax(dot_product_q, dim=-1).reshape(A_.shape)
 		Aq = torch.nan_to_num(Aq, nan=0.0)
 
-		Ar = torch.softmax(dot_product_r, dim=-1).reshape(dot_product.shape)
+		Ar = torch.softmax(dot_product_r, dim=-1).reshape(A_.shape)
 		Ar = Ar.permute(0, 1, 3, 2, 4)
 		Ar = torch.nan_to_num(Ar, nan=0.0)
 
-		As = torch.softmax(dot_product_s, dim=-1).reshape(dot_product.shape)
+		As = torch.softmax(dot_product_s, dim=-1).reshape(A_.shape)
 		As = As.permute(0, 1, 3, 4, 2)
 		As = torch.nan_to_num(As, nan=0.0)
 
@@ -150,13 +149,13 @@ class _HypergraphAttentionNaive(nn.Module):
 			# y = y + torch.cat((Y_q_, Y_r_, Y_s_), dim=-1)
 			y = Y_q_ + Y_r_ + Y_s_
 
-		# y = self.Wo(y) # required w torch.cat
+		# y = self.Wo(y) # required w/ torch.cat
 		if self.head_subspaces:
 			y = y.permute(0, 2, 1, 3).reshape(batch_size, ntok, self.d_model)
 		else:
 			y = y.permute(0, 2, 1, 3).sum(dim=2).squeeze()
 
-		return y.to(out_dtype)
+		return y.to(out_dtype), A
 
 	def calcFlops(self, x):
 		bs, ntok, d_model = x.shape
@@ -171,130 +170,9 @@ class _HypergraphAttentionNaive(nn.Module):
 		f += bs * self.n_heads * ntok * d_model**2
 		return f
 
-
-class PolyAttention(nn.Module):
-	SUPPORTED_POLYNOMIALS = ("tree", "strassen", "tensor")
-
-	def __init__(self, d_model, n_heads, dropout_rate=0, head_subspaces=False,
-		polynomial="tree", **kwargs):
-		super().__init__()
-
-		if polynomial not in self.SUPPORTED_POLYNOMIALS:
-			raise ValueError(
-				f"polynomial must be one of {self.SUPPORTED_POLYNOMIALS}, got {polynomial!r}"
-			)
-		self.polynomial = polynomial
-
-		self.d_model = d_model
-		self.n_heads = n_heads
-		if head_subspaces:
-			self.d_head = d_model // n_heads
-		else:
-			self.d_head = d_model
-		self.head_subspaces = head_subspaces
-		self.d_val = self.d_head
-
-		self.Wq = nn.Linear(d_model, self.d_head * n_heads, bias=False, **kwargs)
-		self.Wr = nn.Linear(d_model, self.d_head * n_heads, bias=False, **kwargs)
-		self.Ws = nn.Linear(d_model, self.d_head * n_heads, bias=False, **kwargs)
-
-		self.Wv_r = nn.Linear(d_model, self.d_val * n_heads, bias=True, **kwargs)
-		self.Wv_s = nn.Linear(d_model, self.d_val * n_heads, bias=True, **kwargs)
-
-		self.Wo = nn.Linear(self.d_model, d_model, bias=True, **kwargs)
-
-		self.dropout = nn.Dropout(dropout_rate)
-		self.gelu = QuickGELU()
-
-	def _compute_logits(self, Q, R, S):
-		if self.polynomial == "tree":
-			Aqr = torch.einsum('bhid,bhjd->bhij', Q, R)
-			Ars = torch.einsum('bhjd,bhkd->bhjk', R, S)
-			logits = Aqr.unsqueeze(-1) + Ars.unsqueeze(2)
-		elif self.polynomial == "strassen":
-			Aqr = torch.einsum('bhid,bhjd->bhij', Q, R)
-			Ars = torch.einsum('bhjd,bhkd->bhjk', R, S)
-			Aqs = torch.einsum('bhid,bhkd->bhik', Q, S)
-			logits = Aqr.unsqueeze(-1) + Ars.unsqueeze(2) + Aqs.unsqueeze(3)
-		elif self.polynomial == "tensor":
-			logits = torch.einsum('bhid,bhjd,bhkd->bhijk', Q, R, S)
-		else:
-			raise RuntimeError(f"unreachable: bad polynomial {self.polynomial!r}")
-		return logits / math.sqrt(self.d_head)
-
-	def forward(self, x, rotary_emb, mask=None):
-		out_dtype = x.dtype
-		x = x.float()
-		batch_size, ntok, d_model = x.shape
-
-		if rotary_emb is not None:
-			Q = rotary_emb.rotate_queries_or_keys(self.Wq(x))
-			R = rotary_emb.rotate_queries_or_keys(self.Wr(x))
-			S = rotary_emb.rotate_queries_or_keys(self.Ws(x))
-		else:
-			Q = self.Wq(x)
-			R = self.Wr(x)
-			S = self.Ws(x)
-
-		Vr = self.Wv_r(x)
-		Vs = self.Wv_s(x)
-
-		Q = Q.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
-		R = R.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
-		S = S.reshape(batch_size, ntok, self.n_heads, self.d_head).permute(0, 2, 1, 3)
-		Vr = Vr.reshape(batch_size, ntok, self.n_heads, self.d_val).permute(0, 2, 1, 3)
-		Vs = Vs.reshape(batch_size, ntok, self.n_heads, self.d_val).permute(0, 2, 1, 3)
-
-		logits = self._compute_logits(Q, R, S)
-		flat_logits = logits.flatten(3, 4)
-
-		mask = _normalize_self_attn_mask(mask, batch_size, ntok, x.device)
-		if mask is not None:
-			valid_pair = (mask[:, :, :, None] & mask[:, :, None, :]).flatten(2, 3)
-			invalid_pair = (~valid_pair).unsqueeze(1)
-			flat_logits = flat_logits.masked_fill(invalid_pair, float("-inf"))
-
-		P = torch.softmax(flat_logits, dim=-1).reshape(logits.shape)
-		P = torch.nan_to_num(P, nan=0.0)
-
-		Y = torch.einsum('bhijk,bhjd,bhkd->bhid', P, Vr, Vs)
-		Y = self.gelu(Y)
-
-		if self.head_subspaces:
-			y = Y.permute(0, 2, 1, 3).reshape(batch_size, ntok, self.d_model)
-		else:
-			y = Y.permute(0, 2, 1, 3).sum(dim=2).squeeze()
-		y = self.Wo(y)
-		return y.to(out_dtype)
-
-	def calcFlops(self, x):
-		bs, ntok, d_model = x.shape
-		f = 0.0
-		f += 3 * bs * ntok * d_model * self.n_heads * self.d_head * 2
-		f += 2 * bs * ntok * d_model * self.n_heads * self.d_val * 2
-		if self.polynomial == "tree":
-			f += 2 * 2 * bs * self.n_heads * ntok * ntok * self.d_head
-			f += bs * self.n_heads * ntok**3 * 2
-		elif self.polynomial == "strassen":
-			f += 3 * 2 * bs * self.n_heads * ntok * ntok * self.d_head
-			f += bs * self.n_heads * ntok**3 * 3
-		elif self.polynomial == "tensor":
-			f += bs * self.n_heads * ntok**3 * self.d_head * 3
-		f += bs * self.n_heads * ntok**3 * 3
-		f += bs * self.n_heads * ntok**3 * self.d_val * 3
-		f += bs * ntok * self.d_model * self.d_model * 2
-		return f
-
-
 class _GraphAttentionNaive(nn.Module):
-	def __init__(
-		self,
-		d_model,
-		n_heads,
-		dropout_rate=0,
-		head_subspaces=False,
-		**kwargs,
-	):
+	"""Pure-PyTorch naive standard 2-way attention for comparison testing."""
+	def __init__(self, d_model, n_heads, dropout_rate=0, head_subspaces=False, **kwargs):
 		super().__init__()
 
 		self.d_model = d_model
@@ -304,7 +182,6 @@ class _GraphAttentionNaive(nn.Module):
 		else:
 			self.d_head = d_model
 		self.head_subspaces = head_subspaces
-		self.d_val = self.d_head
 
 		self.Wq = nn.Linear(d_model, self.d_head*n_heads, bias=True, **kwargs)
 		self.Wk = nn.Linear(d_model, self.d_head*n_heads, bias=True, **kwargs)
@@ -313,7 +190,7 @@ class _GraphAttentionNaive(nn.Module):
 		nn.init.normal_(self.Wo.weight, std=1.0 / np.sqrt(d_model))
 		self.gelu = QuickGELU()
 
-	def forward(self, x, rotary_emb, mask=None):
+	def forward(self, x, rotary_emb, mask=None, a_noise=None):
 		"""
 		mask: bool[batch, query, target] if provided
 		"""
@@ -352,7 +229,7 @@ class _GraphAttentionNaive(nn.Module):
 			y = y.permute(0, 2, 3, 1).sum(dim=3).squeeze()
 		# y = self.gelu(y)
 		# y = self.Wo(y)
-		return y.to(out_dtype)
+		return y.to(out_dtype), None
 
 	def calcFlops(self, x):
 		bs, ntok, d_model = x.shape
@@ -364,17 +241,3 @@ class _GraphAttentionNaive(nn.Module):
 		f += bs * self.n_heads * ntok * d_model * (2 + 6)
 		f += bs * ntok * d_model**2
 		return f
-
-
-def SelfAttention(d_model, n_heads, dropout_rate=0, head_subspaces=False, **kwargs):
-	return _GraphAttentionNaive(
-		d_model=d_model,
-		n_heads=n_heads,
-		dropout_rate=dropout_rate,
-		head_subspaces=head_subspaces,
-		**kwargs,
-	)
-
-
-_PolyAttentionNaive = PolyAttention
-_PolyStandardAttentionNaive = SelfAttention
