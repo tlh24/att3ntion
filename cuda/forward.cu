@@ -14,6 +14,8 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
+#include <cstdlib>
+
 #include "common.cuh"
 #include "../cpp/cuda_bindings.h"
 
@@ -299,6 +301,358 @@ void Yq_gather(
         m_i_out[stats_idx] = my_ml[0];
         l_i_out[stats_idx] = my_ml[1];
     }
+}
+
+// ===================== tensor-core Yq gather (D=64, K<=256) ======================
+//
+// FlashAttention-style reformulation (cuda_docs/README.md): one CTA owns one
+// (b, h, i). Absorbing scale*Q[i,:] as a diagonal rescale of R turns both heavy
+// stages into tensor-core GEMMs:
+//
+//   Qp[j,d] = scale * Q[i,d] * R[j,d]
+//   x[j,k]  = (Qp @ S^T)[j,k]                        GEMM 1 (mma.m16n8k16)
+//   U[j,d]  = sum_k exp(x[j,k] - m_j) * V2[k,d]      GEMM 2, per-row online softmax
+//   Yq[i,d] = sum_j exp(m_j - M) * V1[j,d] * U[j,d] / L,   L = sum_j exp(m_j-M) l_j
+//
+// The joint (j,k) softmax is recovered exactly by the log-sum-exp reweighting of
+// rows in the epilogue, so split-J partials and the reducer pass disappear: the
+// kernel writes Y_q (bf16) and the m_i / l_i stats directly, with semantics
+// identical to reduce_gather_partials (backward consumes them unchanged).
+//
+// S and a transposed copy of V2 stay resident in shared memory for the whole CTA
+// (K <= TC_MAX_K specialization). j is processed in blocks of TC_BJ rows, one
+// m16 row-tile per warp. GEMM 1 accumulator fragments feed GEMM 2 A fragments
+// directly in registers (the C-frag/A-frag layouts coincide), so P never
+// round-trips through shared memory.
+
+constexpr int TC_BJ = 128;        // j rows per block iteration (8 warps x 16)
+constexpr int TC_BK = 64;         // k columns per inner iteration
+constexpr int TC_WARPS = 8;
+constexpr int TC_MAX_K = 256;     // S/V2T must fit in shared memory
+// A GEMM-1 accumulator this negative marks a masked cell (valid |scores| are
+// bounded far below this; NEG_INF itself is -1e30).
+constexpr float TC_MASKED_THRESH = -5e29f;
+
+__device__ __forceinline__ void mma_bf16_m16n8k16(
+    float c[4], const uint32_t a[4], const uint32_t b[2])
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]));
+#endif
+}
+
+__device__ __forceinline__ uint32_t pack_bf162(float x, float y) {
+    __nv_bfloat162 h = __floats2bfloat162_rn(x, y);
+    return *reinterpret_cast<uint32_t*>(&h);
+}
+
+// MASKED=false is the fast path for the common case (no attention mask, no
+// J/K padding): score masking, kmul/jmul reads, and the masked-exp selects
+// drop out of the hot loop entirely.
+template<int D_CONST, bool MASKED>
+__global__ __launch_bounds__(TC_WARPS * 32)
+void Yq_gather_tc(
+    const bf16* __restrict__ Q_bf,
+    const bf16* __restrict__ R_bf,
+    const bf16* __restrict__ S_bf,
+    const bf16* __restrict__ V1_bf,
+    const bf16* __restrict__ V2_bf,
+    bf16*  __restrict__ Y,          // [B,H,I,D] final output (no reducer pass)
+    float* __restrict__ m_i_out,    // [B,H,I]
+    float* __restrict__ l_i_out,    // [B,H,I]
+    const bool* __restrict__ mask,  // [B,N,N] or null
+    int H, int I, int J, int K, int K_pad, float scale,
+    int J_valid, int K_valid)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    static_assert(D_CONST == 64, "Yq_gather_tc supports D=64 only");
+    constexpr int D = D_CONST;
+    constexpr int DPAD = D + 8;     // bf16 row stride: 144 B, conflict-free for frags
+
+    const int i = blockIdx.x;
+    const int h = blockIdx.y;
+    const int b = blockIdx.z;
+
+    const int tid  = threadIdx.x;
+    const int warp = tid / 32;
+    const int lane = tid % 32;
+    const int g    = lane / 4;      // mma group id (row within a fragment)
+    const int tig  = lane % 4;      // thread-in-group (column pairs)
+
+    const int KP2 = K_pad + 8;      // bf16 row stride of V2T
+
+    extern __shared__ char smem_raw[];
+    bf16* qp_sm  = reinterpret_cast<bf16*>(smem_raw);           // [TC_BJ][DPAD]
+    bf16* v1_sm  = qp_sm + TC_BJ * DPAD;                        // [TC_BJ][DPAD]
+    bf16* s_sm   = v1_sm + TC_BJ * DPAD;                        // [K_pad][DPAD]
+    bf16* v2t_sm = s_sm + K_pad * DPAD;                         // [D][KP2]
+    float* kmul  = reinterpret_cast<float*>(v2t_sm + D * KP2);  // [K_pad]
+    float* jmul  = kmul + K_pad;                                // [TC_BJ]
+    float* wN    = jmul + TC_BJ;                                // [TC_WARPS][D]
+    float* wML   = wN + TC_WARPS * D;                           // [TC_WARPS][2]
+    float* redN  = wML + TC_WARPS * 2;                          // [D]
+    float* redML = redN + D;                                    // {M_run, L_run}
+    float* q_sm  = redML + 2;                                   // [D] fp32 scale*q
+
+    const int64_t bh = (int64_t)b * H + h;
+    const bool* mrow = (mask != nullptr) ? (mask + ((int64_t)b * I + i) * I) : nullptr;
+
+    // ---- one-time loads: scale*q, k-validity, resident S and transposed V2 ----
+    const int64_t q_off = (bh * I + i) * D;
+    for (int d = tid; d < D; d += blockDim.x) {
+        q_sm[d] = scale * bf2f(Q_bf[q_off + d]);
+    }
+    if constexpr (MASKED) {
+        for (int k = tid; k < K_pad; k += blockDim.x) {
+            kmul[k] = (k < K_valid && (mrow == nullptr || mrow[k])) ? 1.0f : 0.0f;
+        }
+    }
+    const int64_t sv_off = bh * K * D;
+    for (int idx = tid; idx < K_pad * D; idx += blockDim.x) {
+        int k = idx / D, d = idx % D;
+        bf16 sv = f2bf(0.0f), vv = f2bf(0.0f);
+        if (k < K) {
+            sv = S_bf[sv_off + (int64_t)k * D + d];
+            vv = V2_bf[sv_off + (int64_t)k * D + d];
+        }
+        s_sm[k * DPAD + d] = sv;
+        v2t_sm[d * KP2 + k] = vv;
+    }
+    if (tid == 0) { redML[0] = NEG_INF; redML[1] = 0.0f; }
+    for (int d = tid; d < D; d += blockDim.x) redN[d] = 0.0f;
+
+    // ---- j blocks of TC_BJ rows, one 16-row tile per warp ----
+    for (int j0 = 0; j0 < J; j0 += TC_BJ) {
+        __syncthreads();  // previous iteration's smem reads (and initial loads) done
+
+        for (int idx = tid; idx < TC_BJ * D; idx += blockDim.x) {
+            int jl = idx / D, d = idx % D;
+            int j = j0 + jl;
+            float rv = 0.0f, v1v = 0.0f;
+            if (j < J) {
+                const int64_t off = (bh * J + j) * D + d;
+                rv  = bf2f(R_bf[off]);
+                v1v = bf2f(V1_bf[off]);
+            }
+            qp_sm[jl * DPAD + d] = f2bf(q_sm[d] * rv);
+            v1_sm[jl * DPAD + d] = f2bf(v1v);
+        }
+        if constexpr (MASKED) {
+            for (int jl = tid; jl < TC_BJ; jl += blockDim.x) {
+                int j = j0 + jl;
+                jmul[jl] = (j < J_valid && (mrow == nullptr || mrow[j])) ? 1.0f : 0.0f;
+            }
+        }
+        __syncthreads();
+
+        const int jw = warp * 16;   // warp's row-tile base within the block
+        const float jm0 = MASKED ? jmul[jw + g] : 1.0f;
+        const float jm1 = MASKED ? jmul[jw + g + 8] : 1.0f;
+
+        // GEMM-1 A fragments (Qp rows) are k-invariant: hoist all 4 k-steps.
+        uint32_t aQ[4][4];
+        {
+            const bf16* r0p = qp_sm + (jw + g) * DPAD;
+            const bf16* r1p = qp_sm + (jw + g + 8) * DPAD;
+            #pragma unroll
+            for (int ks = 0; ks < 4; ks++) {
+                const int c = ks * 16 + 2 * tig;
+                aQ[ks][0] = *reinterpret_cast<const uint32_t*>(r0p + c);
+                aQ[ks][1] = *reinterpret_cast<const uint32_t*>(r1p + c);
+                aQ[ks][2] = *reinterpret_cast<const uint32_t*>(r0p + c + 8);
+                aQ[ks][3] = *reinterpret_cast<const uint32_t*>(r1p + c + 8);
+            }
+        }
+
+        float m0 = NEG_INF, m1 = NEG_INF;   // rows g / g+8 (replicated in quad)
+        float l0 = 0.0f, l1 = 0.0f;         // per-lane partials, quad-reduced later
+        float U[8][4];                      // GEMM-2 accumulators over D
+        #pragma unroll
+        for (int nt = 0; nt < 8; nt++) {
+            U[nt][0] = U[nt][1] = U[nt][2] = U[nt][3] = 0.0f;
+        }
+
+        for (int k0 = 0; k0 < K_pad; k0 += TC_BK) {
+            // GEMM 1: x[16 j][TC_BK k] as 8 n-tiles of accumulator fragments
+            float acc[8][4];
+            #pragma unroll
+            for (int nt = 0; nt < 8; nt++) {
+                acc[nt][0] = acc[nt][1] = acc[nt][2] = acc[nt][3] = 0.0f;
+                const bf16* bp = s_sm + (k0 + nt * 8 + g) * DPAD + 2 * tig;
+                #pragma unroll
+                for (int ks = 0; ks < 4; ks++) {
+                    uint32_t bfr[2];
+                    bfr[0] = *reinterpret_cast<const uint32_t*>(bp + ks * 16);
+                    bfr[1] = *reinterpret_cast<const uint32_t*>(bp + ks * 16 + 8);
+                    mma_bf16_m16n8k16(acc[nt], aQ[ks], bfr);
+                }
+            }
+
+            // Mask invalid cells to NEG_INF, take the running row max.
+            float mt0 = NEG_INF, mt1 = NEG_INF;
+            #pragma unroll
+            for (int nt = 0; nt < 8; nt++) {
+                if constexpr (MASKED) {
+                    const int kc = k0 + nt * 8 + 2 * tig;
+                    const float k0f = kmul[kc], k1f = kmul[kc + 1];
+                    acc[nt][0] = (jm0 * k0f > 0.5f) ? acc[nt][0] : NEG_INF;
+                    acc[nt][1] = (jm0 * k1f > 0.5f) ? acc[nt][1] : NEG_INF;
+                    acc[nt][2] = (jm1 * k0f > 0.5f) ? acc[nt][2] : NEG_INF;
+                    acc[nt][3] = (jm1 * k1f > 0.5f) ? acc[nt][3] : NEG_INF;
+                }
+                mt0 = fmaxf(mt0, fmaxf(acc[nt][0], acc[nt][1]));
+                mt1 = fmaxf(mt1, fmaxf(acc[nt][2], acc[nt][3]));
+            }
+            #pragma unroll
+            for (int off = 1; off <= 2; off <<= 1) {
+                mt0 = fmaxf(mt0, __shfl_xor_sync(0xFFFFFFFF, mt0, off));
+                mt1 = fmaxf(mt1, __shfl_xor_sync(0xFFFFFFFF, mt1, off));
+            }
+
+            // Online-softmax rescale of the running state.
+            const float mn0 = fmaxf(m0, mt0), mn1 = fmaxf(m1, mt1);
+            const float a0 = __expf(m0 - mn0), a1 = __expf(m1 - mn1);
+            l0 *= a0; l1 *= a1;
+            #pragma unroll
+            for (int nt = 0; nt < 8; nt++) {
+                U[nt][0] *= a0; U[nt][1] *= a0;
+                U[nt][2] *= a1; U[nt][3] *= a1;
+            }
+            m0 = mn0; m1 = mn1;
+
+            // exp + repack: two adjacent GEMM-1 C tiles form one GEMM-2 A
+            // fragment (identical thread layouts) — no shuffles, no smem.
+            uint32_t pfr[4][4];
+            #pragma unroll
+            for (int s2 = 0; s2 < 4; s2++) {
+                #pragma unroll
+                for (int half = 0; half < 2; half++) {
+                    const int nt = 2 * s2 + half;
+                    float p0, p1, p2, p3;
+                    if constexpr (MASKED) {
+                        p0 = (acc[nt][0] < TC_MASKED_THRESH) ? 0.0f : __expf(acc[nt][0] - mn0);
+                        p1 = (acc[nt][1] < TC_MASKED_THRESH) ? 0.0f : __expf(acc[nt][1] - mn0);
+                        p2 = (acc[nt][2] < TC_MASKED_THRESH) ? 0.0f : __expf(acc[nt][2] - mn1);
+                        p3 = (acc[nt][3] < TC_MASKED_THRESH) ? 0.0f : __expf(acc[nt][3] - mn1);
+                    } else {
+                        p0 = __expf(acc[nt][0] - mn0);
+                        p1 = __expf(acc[nt][1] - mn0);
+                        p2 = __expf(acc[nt][2] - mn1);
+                        p3 = __expf(acc[nt][3] - mn1);
+                    }
+                    l0 += p0 + p1;
+                    l1 += p2 + p3;
+                    pfr[s2][2 * half + 0] = pack_bf162(p0, p1);
+                    pfr[s2][2 * half + 1] = pack_bf162(p2, p3);
+                }
+            }
+
+            // GEMM 2: U += P @ V2 (V2T resident, B fragments read directly).
+            #pragma unroll
+            for (int s2 = 0; s2 < 4; s2++) {
+                #pragma unroll
+                for (int dn = 0; dn < 8; dn++) {
+                    const bf16* bp = v2t_sm + (dn * 8 + g) * KP2 + k0 + s2 * 16 + 2 * tig;
+                    uint32_t bfr[2];
+                    bfr[0] = *reinterpret_cast<const uint32_t*>(bp);
+                    bfr[1] = *reinterpret_cast<const uint32_t*>(bp + 8);
+                    mma_bf16_m16n8k16(U[dn], pfr[s2], bfr);
+                }
+            }
+        }
+
+        // ---- epilogue: V1-weighted row collapse of this warp's 16 rows ----
+        #pragma unroll
+        for (int off = 1; off <= 2; off <<= 1) {
+            l0 += __shfl_xor_sync(0xFFFFFFFF, l0, off);
+            l1 += __shfl_xor_sync(0xFFFFFFFF, l1, off);
+        }
+        float Mw = fmaxf(m0, m1);
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            Mw = fmaxf(Mw, __shfl_xor_sync(0xFFFFFFFF, Mw, off));
+        }
+        const float w0 = __expf(m0 - Mw), w1 = __expf(m1 - Mw);
+
+        float Lw = w0 * l0 + w1 * l1;
+        #pragma unroll
+        for (int off = 4; off <= 16; off <<= 1) {
+            Lw += __shfl_xor_sync(0xFFFFFFFF, Lw, off);
+        }
+
+        float nacc[16];
+        const bf16* v1r0 = v1_sm + (jw + g) * DPAD + 2 * tig;
+        const bf16* v1r1 = v1_sm + (jw + g + 8) * DPAD + 2 * tig;
+        #pragma unroll
+        for (int nt = 0; nt < 8; nt++) {
+            const float2 v10 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(v1r0 + nt * 8));
+            const float2 v11 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(v1r1 + nt * 8));
+            nacc[2 * nt + 0] = w0 * v10.x * U[nt][0] + w1 * v11.x * U[nt][2];
+            nacc[2 * nt + 1] = w0 * v10.y * U[nt][1] + w1 * v11.y * U[nt][3];
+        }
+        #pragma unroll
+        for (int off = 4; off <= 16; off <<= 1) {
+            #pragma unroll
+            for (int e = 0; e < 16; e++) {
+                nacc[e] += __shfl_xor_sync(0xFFFFFFFF, nacc[e], off);
+            }
+        }
+
+        if (lane < 4) {
+            #pragma unroll
+            for (int nt = 0; nt < 8; nt++) {
+                wN[warp * D + nt * 8 + 2 * lane]     = nacc[2 * nt + 0];
+                wN[warp * D + nt * 8 + 2 * lane + 1] = nacc[2 * nt + 1];
+            }
+        }
+        if (lane == 0) {
+            wML[warp * 2]     = Mw;
+            wML[warp * 2 + 1] = Lw;
+        }
+        __syncthreads();
+
+        // ---- fold the 8 warp results into the CTA running (M, L, N) ----
+        const float Mold = redML[0], Lold = redML[1];
+        float Mnew = Mold;
+        #pragma unroll
+        for (int wd = 0; wd < TC_WARPS; wd++) Mnew = fmaxf(Mnew, wML[wd * 2]);
+        const float aR = __expf(Mold - Mnew);
+        float nNew = 0.0f;
+        if (tid < D) {
+            nNew = redN[tid] * aR;
+            #pragma unroll
+            for (int wd = 0; wd < TC_WARPS; wd++) {
+                nNew += __expf(wML[wd * 2] - Mnew) * wN[wd * D + tid];
+            }
+        }
+        float lNew = Lold * aR;
+        #pragma unroll
+        for (int wd = 0; wd < TC_WARPS; wd++) {
+            lNew += __expf(wML[wd * 2] - Mnew) * wML[wd * 2 + 1];
+        }
+        __syncthreads();
+        if (tid < D) redN[tid] = nNew;
+        if (tid == 0) { redML[0] = Mnew; redML[1] = lNew; }
+    }
+    __syncthreads();
+
+    // ---- final normalize + direct output (reducer semantics) ----
+    const float Lfin = redML[1];
+    const float inv = (Lfin > 1e-20f) ? (1.0f / Lfin) : 0.0f;
+    const int64_t ybase = bh * I + i;
+    for (int d = tid; d < D; d += blockDim.x) {
+        Y[ybase * D + d] = f2bf(redN[d] * inv);
+    }
+    if (tid == 0) {
+        if (m_i_out) m_i_out[ybase] = redML[0];
+        if (l_i_out) l_i_out[ybase] = Lfin;
+    }
+#endif  // __CUDA_ARCH__ >= 800
 }
 
 // Multi-j warp-parallel gather: 4 output vectors per block, warp-shuffle softmax
@@ -2070,8 +2424,70 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
             TILE_K + TILE_K                // m2_tile, l2_tile (second stats dim)
         );
 
-    // GATHER: Y_q on stream 0 (split over J)
-    {
+    // GATHER: Y_q on stream 0.
+    // Tensor-core fast path for D=64, K<=256 (cuda_docs/README.md): fused
+    // FlashAttention-style kernel writes Y_q/m_i/l_i directly, no reducer.
+    // Disable with ATT3_YQ_TC=0. Falls back to the split-J kernel otherwise.
+    bool yq_tc_done = false;
+    if constexpr (D_TMPL == 64) {
+        static const bool tc_enabled = []() {
+            const char* e = std::getenv("ATT3_YQ_TC");
+            return !(e && e[0] == '0');
+        }();
+        if (tc_enabled && K <= TC_MAX_K) {
+            const int K_pad = ceil_div((int)K, TC_BK) * TC_BK;
+            const int KP2 = K_pad + 8;
+            constexpr int TC_DPAD = D_TMPL + 8;
+            const size_t smem_tc =
+                sizeof(bf16) * ((size_t)2 * TC_BJ * TC_DPAD + (size_t)K_pad * TC_DPAD
+                                + (size_t)D_TMPL * KP2) +
+                sizeof(float) * ((size_t)K_pad + TC_BJ + TC_WARPS * D_TMPL
+                                 + TC_WARPS * 2 + D_TMPL + 2 + D_TMPL);
+            static int max_smem_optin = []() {
+                int dev = 0, v = 0;
+                cudaGetDevice(&dev);
+                cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+                return v;
+            }();
+            if (smem_tc <= (size_t)max_smem_optin) {
+                static size_t smem_attr_set = 0;
+                if (smem_tc > smem_attr_set) {
+                    AT_CUDA_CHECK(cudaFuncSetAttribute(
+                        Yq_gather_tc<64, false>,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        (int)smem_tc));
+                    AT_CUDA_CHECK(cudaFuncSetAttribute(
+                        Yq_gather_tc<64, true>,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        (int)smem_tc));
+                    smem_attr_set = smem_tc;
+                }
+                // Fast path also requires whole j-blocks: a partial block's
+                // zero-filled Qp rows must be masked out of the softmax.
+                const bool tc_masked = (mask_ptr != nullptr)
+                    || (J_valid < J) || (K_valid < K) || (K_pad != K)
+                    || (J % TC_BJ != 0);
+                auto* tc_kernel = tc_masked ? Yq_gather_tc<64, true>
+                                            : Yq_gather_tc<64, false>;
+                dim3 grid_tc(I, H, B);
+                tc_kernel<<<grid_tc, dim3(TC_WARPS * 32), smem_tc, streams[0]>>>(
+                    reinterpret_cast<const bf16*>(Q.data_ptr<at::BFloat16>()),
+                    reinterpret_cast<const bf16*>(R.data_ptr<at::BFloat16>()),
+                    reinterpret_cast<const bf16*>(S.data_ptr<at::BFloat16>()),
+                    reinterpret_cast<const bf16*>(Vr_1.data_ptr<at::BFloat16>()),
+                    reinterpret_cast<const bf16*>(Vs_1.data_ptr<at::BFloat16>()),
+                    reinterpret_cast<bf16*>(Y_q.data_ptr<at::BFloat16>()),
+                    m_i.data_ptr<float>(),
+                    l_i.data_ptr<float>(),
+                    mask_ptr,
+                    H, I, J, K, K_pad, scale,
+                    (int)J_valid, (int)K_valid
+                );
+                yq_tc_done = true;
+            }
+        }
+    }
+    if (!yq_tc_done) {
         const int num_i_tiles = (I + N_I_GATHER - 1) / N_I_GATHER;
         dim3 grid_yq(num_i_tiles * num_j_chunks_q, H, B);
         
