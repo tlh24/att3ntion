@@ -9,7 +9,7 @@ import argparse
 # ── Complete list of all CUDA kernels in the project ──
 ALL_KERNELS = [
     # Forward gather
-    "Yq_gather", "Yr_gather", "Ys_gather",
+    "Y_gather", "Y_gather_tc",
     # Forward scatter
     "Yq_scatter", "Yr_scatter", "Ys_scatter",
     # Backward V gradients (gather)
@@ -203,10 +203,10 @@ Examples:
   python %(prog)s --forward-only
 
   # Combine options:
-  python %(prog)s --kernel Yq_gather --dims 1,8,512,512,512,64 --output-file big_gather_test
+  python %(prog)s --kernel Y_gather_tc --dims 1,8,512,512,512,64 --output-file big_gather_test
 
 Available kernels:
-  Forward:  Yq_gather, Yr_gather, Ys_gather,
+  Forward:  Y_gather, Y_gather_tc,
             Yq_scatter, Yr_scatter, Ys_scatter
   Backward: Vq_gather_grad, Vr_gather_grad, Vs_gather_grad,
             Vq_scatter_grad, Vr_scatter_grad, Vs_scatter_grad,
