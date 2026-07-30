@@ -94,3 +94,50 @@ __device__ __forceinline__ bf16 f2bf(float x) {
     return __float2bfloat16(x);
 }
 
+// =============================================================================
+// Tensor-core primitives (sm_80+), shared by Y_gather_tc and Bwd_gather_tc
+// =============================================================================
+
+__device__ __forceinline__ void mma_bf16_m16n8k16(
+    float c[4], const uint32_t a[4], const uint32_t b[2])
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]));
+#endif
+}
+
+__device__ __forceinline__ uint32_t pack_bf162(float x, float y) {
+    __nv_bfloat162 h = __floats2bfloat162_rn(x, y);
+    return *reinterpret_cast<uint32_t*>(&h);
+}
+
+__device__ __forceinline__ void ldmatrix_x4(uint32_t r[4], const bf16* p) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(p));
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+#endif
+}
+
+__device__ __forceinline__ void ldmatrix_x4_trans(uint32_t r[4], const bf16* p) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(p));
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+#endif
+}
+
+__device__ __forceinline__ void cp_async16(bf16* dst, const bf16* src) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const uint32_t d = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(d), "l"(src));
+#endif
+}
+

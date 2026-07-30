@@ -835,6 +835,376 @@ __global__ void Vs_scatter_grad(
 }
 
 // =============================================================================
+// Tensor-core backward (gather-only path, cuda_docs/backward_tensor_cores.md)
+// =============================================================================
+// Engaged when the scatter cotangents are all zero (scatter unused): the cross
+// terms d4/d5/d6 vanish, so every correction sum collapses FlashAttention-style
+// to rowsum(dY o Y), computed host-side with ATen. What remains is ONE cube
+// pass, run three times with permuted roles exactly like Y_gather_tc:
+//
+//   anchor a (one CTA per (b,h,a)) / rows r (16-row warp tiles) / cols c
+//   (shared-memory resident). Score-shaped GEMMs per (r,c) tile, D contracted:
+//
+//     x   = scale * sum_d Xa[d]  * Xr[r,d]  * Xc[c,d]      (logits)
+//     d_a =         sum_d gYa[d] * Vr[r,d]  * Vc[c,d]
+//     d_r =         sum_d Va[d]  * gYr[r,d] * Vc[c,d]
+//     d_c =         sum_d Va[d]  * Vr[r,d]  * gYc[c,d]
+//
+//   The anchor vector is folded into the A operand as a diagonal rescale of
+//   raw row fragments in registers (packed bf16 __hmul2), so the four A
+//   operands need no extra shared-memory buffers. Softmax weights come
+//   straight from the forward stats (no online pass):
+//
+//     P_a = exp(x - m_a)/l_a    P_r = exp(x - m_r[r])/l_r[r]    P_c likewise
+//     grad_A = (d_a - sum_a)*P_a + (d_r - sum_r[r])*P_r + (d_c - sum_c[c])*P_c
+//
+//   Output GEMMs contract c, with score C-fragments feeding A fragments in
+//   registers (identical layouts, the FA2 trick):
+//
+//     Ug += grad_A @ Xc     U1 += P_r @ Vc     U2 += P_c @ gYc
+//
+//   and a Hadamard row-collapse epilogue emits both outputs with direct
+//   stores (no atomics):
+//
+//     gradXa[a,d] = scale * sum_r Xr[r,d]*Ug[r,d]
+//     gradVa[a,d] =         sum_r gYr[r,d]*U1[r,d] + Vr[r,d]*U2[r,d]
+//
+// Padded rows/cols (N not a multiple of the tile) are zero-filled with their
+// inv-l set to 0, which zeroes P_r/P_c there; the epilogue's raw-row factors
+// zero any remaining garbage. Masked calls fall back to the scalar path.
+
+constexpr int BTC_BJ = 128;       // rows per block iteration (8 warps x 16)
+constexpr int BTC_BK = 32;        // cols per inner iteration
+constexpr int BTC_WARPS = 8;
+constexpr int BTC_MAX_K = 256;    // resident col-side must fit in smem
+
+template<int D_CONST>
+__global__ __launch_bounds__(BTC_WARPS * 32, 1)
+void Bwd_gather_tc(
+    const bf16* __restrict__ Xa_bf,  // anchor side [B,H,N,D]
+    const bf16* __restrict__ Va_bf,
+    const bf16* __restrict__ gYa_bf,
+    const bf16* __restrict__ Xr_bf,  // row side
+    const bf16* __restrict__ Vr_bf,
+    const bf16* __restrict__ gYr_bf,
+    const bf16* __restrict__ Xc_bf,  // col side (smem resident)
+    const bf16* __restrict__ Vc_bf,
+    const bf16* __restrict__ gYc_bf,
+    const float* __restrict__ m_a, const float* __restrict__ l_a, const float* __restrict__ sum_a,
+    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,
+    const float* __restrict__ m_c, const float* __restrict__ l_c, const float* __restrict__ sum_c,
+    float* __restrict__ gradXa,      // [B,H,N,D] fp32, direct store
+    float* __restrict__ gradVa,      // [B,H,N,D] fp32, direct store
+    int H, int N, int K_pad, float scale)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    static_assert(D_CONST == 64, "Bwd_gather_tc supports D=64 only");
+    constexpr int D = D_CONST;
+    constexpr int DPAD = D + 8;
+
+    const int a = blockIdx.x;
+    const int h = blockIdx.y;
+    const int b = blockIdx.z;
+
+    const int tid  = threadIdx.x;
+    const int warp = tid / 32;
+    const int lane = tid % 32;
+    const int g    = lane / 4;
+    const int tig  = lane % 4;
+    const int lrow  = (lane & 7) + ((lane >> 3) & 1) * 8;
+    const int lcol8 = (lane >> 4) * 8;
+    const int brow  = (lane & 7) + ((lane >> 4) & 1) * 8;
+    const int bcol8 = ((lane >> 3) & 1) * 8;
+
+    extern __shared__ char smem_raw[];
+    bf16* xr_sm  = reinterpret_cast<bf16*>(smem_raw);            // [BTC_BJ][DPAD]
+    bf16* vr_sm  = xr_sm + BTC_BJ * DPAD;
+    bf16* gyr_sm = vr_sm + BTC_BJ * DPAD;
+    bf16* xc_sm  = gyr_sm + BTC_BJ * DPAD;                       // [K_pad][DPAD]
+    bf16* vc_sm  = xc_sm + K_pad * DPAD;
+    bf16* gyc_sm = vc_sm + K_pad * DPAD;
+    float* anchX = reinterpret_cast<float*>(gyc_sm + K_pad * DPAD);  // [D] scale*Xa
+    float* anchV = anchX + D;                                    // [D]
+    float* anchG = anchV + D;                                    // [D]
+    float* mc_sm = anchG + D;                                    // [K_pad]
+    float* ilc_sm = mc_sm + K_pad;
+    float* sc_sm  = ilc_sm + K_pad;
+    float* mr_sm  = sc_sm + K_pad;                               // [BTC_BJ]
+    float* ilr_sm = mr_sm + BTC_BJ;
+    float* sr_sm  = ilr_sm + BTC_BJ;
+    float* wOut   = sr_sm + BTC_BJ;                              // [BTC_WARPS][2*D]
+    float* redOut = wOut + BTC_WARPS * 2 * D;                    // [2*D]
+
+    const int64_t bh = (int64_t)b * H + h;
+    const int64_t nd_off = bh * N * D;
+    const int64_t a_off  = nd_off + (int64_t)a * D;
+    const int64_t st_off = bh * N;
+
+    // ---- one-time loads: resident col side (async), anchor, col stats ----
+    constexpr int DV = D / 8;
+    for (int idx = tid; idx < K_pad * DV; idx += blockDim.x) {
+        const int k = idx / DV, dv = (idx % DV) * 8;
+        if (k < N) {
+            const int64_t off = nd_off + (int64_t)k * D + dv;
+            cp_async16(xc_sm + k * DPAD + dv, Xc_bf + off);
+            cp_async16(vc_sm + k * DPAD + dv, Vc_bf + off);
+            cp_async16(gyc_sm + k * DPAD + dv, gYc_bf + off);
+        } else {
+            const uint4 z = make_uint4(0, 0, 0, 0);
+            *reinterpret_cast<uint4*>(xc_sm + k * DPAD + dv) = z;
+            *reinterpret_cast<uint4*>(vc_sm + k * DPAD + dv) = z;
+            *reinterpret_cast<uint4*>(gyc_sm + k * DPAD + dv) = z;
+        }
+    }
+    for (int d = tid; d < D; d += blockDim.x) {
+        anchX[d] = scale * bf2f(Xa_bf[a_off + d]);
+        anchV[d] = bf2f(Va_bf[a_off + d]);
+        anchG[d] = bf2f(gYa_bf[a_off + d]);
+    }
+    for (int k = tid; k < K_pad; k += blockDim.x) {
+        if (k < N) {
+            mc_sm[k]  = m_c[st_off + k];
+            ilc_sm[k] = 1.0f / fmaxf(l_c[st_off + k], DENOM_EPS);
+            sc_sm[k]  = sum_c[st_off + k];
+        } else {
+            mc_sm[k] = 0.0f; ilc_sm[k] = 0.0f; sc_sm[k] = 0.0f;
+        }
+    }
+    if (tid < 2 * D) redOut[tid] = 0.0f;
+
+    const float ma  = m_a[st_off + a];
+    const float ila = 1.0f / fmaxf(l_a[st_off + a], DENOM_EPS);
+    const float sa  = sum_a[st_off + a];
+
+    asm volatile("cp.async.wait_all;\n" ::);
+    __syncthreads();
+
+    // ---- row blocks of BTC_BJ rows, one 16-row tile per warp ----
+    for (int j0 = 0; j0 < N; j0 += BTC_BJ) {
+        __syncthreads();  // previous iteration's smem reads done
+
+        for (int idx = tid; idx < BTC_BJ * DV; idx += blockDim.x) {
+            const int jl = idx / DV, dv = (idx % DV) * 8;
+            const int j = j0 + jl;
+            uint4 xq = make_uint4(0, 0, 0, 0), vq = xq, gq = xq;
+            if (j < N) {
+                const int64_t off = nd_off + (int64_t)j * D + dv;
+                xq = *reinterpret_cast<const uint4*>(Xr_bf + off);
+                vq = *reinterpret_cast<const uint4*>(Vr_bf + off);
+                gq = *reinterpret_cast<const uint4*>(gYr_bf + off);
+            }
+            *reinterpret_cast<uint4*>(xr_sm + jl * DPAD + dv) = xq;
+            *reinterpret_cast<uint4*>(vr_sm + jl * DPAD + dv) = vq;
+            *reinterpret_cast<uint4*>(gyr_sm + jl * DPAD + dv) = gq;
+        }
+        for (int jl = tid; jl < BTC_BJ; jl += blockDim.x) {
+            const int j = j0 + jl;
+            if (j < N) {
+                mr_sm[jl]  = m_r[st_off + j];
+                ilr_sm[jl] = 1.0f / fmaxf(l_r[st_off + j], DENOM_EPS);
+                sr_sm[jl]  = sum_r[st_off + j];
+            } else {
+                mr_sm[jl] = 0.0f; ilr_sm[jl] = 0.0f; sr_sm[jl] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+        const int jw = warp * 16;
+        const float mr0 = mr_sm[jw + g],     ilr0 = ilr_sm[jw + g],     sr0 = sr_sm[jw + g];
+        const float mr1 = mr_sm[jw + g + 8], ilr1 = ilr_sm[jw + g + 8], sr1 = sr_sm[jw + g + 8];
+        // Zero-filled pad rows produce x = 0, which with extreme stats can
+        // push exp(x - m)/l past bf16 range (inf -> 0*inf = NaN downstream).
+        // Forcing pad cells to NEG_INF zeroes all three weights exactly.
+        const bool rpad0 = (j0 + jw + g)     >= N;
+        const bool rpad1 = (j0 + jw + g + 8) >= N;
+
+        // Raw row fragments are col-invariant: load once, rescale into the
+        // four A operands (A1/A3 share the Vr fragment). The rescale is done
+        // in fp32 with a single bf16 rounding, matching Y_gather_tc's Qp
+        // precision. A-fragment register e covers columns
+        // ks*16 + (e<2 ? 0 : 8) + {2*tig, 2*tig+1}, identical for both rows.
+        uint32_t A0[4][4], A1[4][4], A2[4][4], A3[4][4];
+        #pragma unroll
+        for (int ks = 0; ks < 4; ks++) {
+            const int c0 = ks * 16 + 2 * tig;
+            const float aX[4] = {anchX[c0], anchX[c0 + 1], anchX[c0 + 8], anchX[c0 + 9]};
+            const float aV[4] = {anchV[c0], anchV[c0 + 1], anchV[c0 + 8], anchV[c0 + 9]};
+            const float aG[4] = {anchG[c0], anchG[c0 + 1], anchG[c0 + 8], anchG[c0 + 9]};
+            uint32_t rX[4], rV[4], rG[4];
+            const int roff = (jw + lrow) * DPAD + ks * 16 + lcol8;
+            ldmatrix_x4(rX, xr_sm + roff);
+            ldmatrix_x4(rV, vr_sm + roff);
+            ldmatrix_x4(rG, gyr_sm + roff);
+            #pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int hf = (e >> 1) * 2;
+                const float2 fX = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rX[e]));
+                const float2 fV = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rV[e]));
+                const float2 fG = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rG[e]));
+                A0[ks][e] = pack_bf162(fX.x * aX[hf], fX.y * aX[hf + 1]);
+                A1[ks][e] = pack_bf162(fV.x * aG[hf], fV.y * aG[hf + 1]);
+                A2[ks][e] = pack_bf162(fG.x * aV[hf], fG.y * aV[hf + 1]);
+                A3[ks][e] = pack_bf162(fV.x * aV[hf], fV.y * aV[hf + 1]);
+            }
+        }
+
+        float Ug[8][4], U1[8][4], U2[8][4];
+        #pragma unroll
+        for (int nt = 0; nt < 8; nt++) {
+            #pragma unroll
+            for (int e = 0; e < 4; e++) { Ug[nt][e] = 0.0f; U1[nt][e] = 0.0f; U2[nt][e] = 0.0f; }
+        }
+
+        for (int k0 = 0; k0 < K_pad; k0 += BTC_BK) {
+            // Score-shaped GEMMs: 4 accumulator sets over BTC_BK cols.
+            float ax[4][4], ada[4][4], adr[4][4], adc[4][4];
+            #pragma unroll
+            for (int nt = 0; nt < 4; nt++) {
+                #pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    ax[nt][e] = 0.0f; ada[nt][e] = 0.0f; adr[nt][e] = 0.0f; adc[nt][e] = 0.0f;
+                }
+            }
+            #pragma unroll
+            for (int p = 0; p < BTC_BK / 16; p++) {
+                const bf16* bx = xc_sm + (k0 + p * 16 + brow) * DPAD + bcol8;
+                const bf16* bv = vc_sm + (k0 + p * 16 + brow) * DPAD + bcol8;
+                const bf16* bg = gyc_sm + (k0 + p * 16 + brow) * DPAD + bcol8;
+                #pragma unroll
+                for (int ks = 0; ks < 4; ks++) {
+                    uint32_t bfr[4];
+                    ldmatrix_x4(bfr, bx + ks * 16);
+                    mma_bf16_m16n8k16(ax[2 * p],     A0[ks], bfr);
+                    mma_bf16_m16n8k16(ax[2 * p + 1], A0[ks], bfr + 2);
+                    ldmatrix_x4(bfr, bv + ks * 16);   // shared by d_a and d_r
+                    mma_bf16_m16n8k16(ada[2 * p],     A1[ks], bfr);
+                    mma_bf16_m16n8k16(ada[2 * p + 1], A1[ks], bfr + 2);
+                    mma_bf16_m16n8k16(adr[2 * p],     A2[ks], bfr);
+                    mma_bf16_m16n8k16(adr[2 * p + 1], A2[ks], bfr + 2);
+                    ldmatrix_x4(bfr, bg + ks * 16);
+                    mma_bf16_m16n8k16(adc[2 * p],     A3[ks], bfr);
+                    mma_bf16_m16n8k16(adc[2 * p + 1], A3[ks], bfr + 2);
+                }
+            }
+
+            // Elementwise: weights from forward stats, Jacobian-corrected
+            // grad_A; repack C-fragments as output-GEMM A-fragments.
+            uint32_t gAf[BTC_BK / 16][4], Prf[BTC_BK / 16][4], Pcf[BTC_BK / 16][4];
+            #pragma unroll
+            for (int nt = 0; nt < 4; nt++) {
+                const int c = k0 + nt * 8 + 2 * tig;
+                const float mc0 = mc_sm[c],     ilc0 = ilc_sm[c],     sc0 = sc_sm[c];
+                const float mc1 = mc_sm[c + 1], ilc1 = ilc_sm[c + 1], sc1 = sc_sm[c + 1];
+                float gA[4], Pr[4], Pc[4];
+                #pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const bool pad = ((e >= 2) ? rpad1 : rpad0)
+                                   | (c + (e & 1) >= N);
+                    const float x   = pad ? NEG_INF : ax[nt][e];
+                    const float mrr = (e >= 2) ? mr1 : mr0;
+                    const float ilr = (e >= 2) ? ilr1 : ilr0;
+                    const float srr = (e >= 2) ? sr1 : sr0;
+                    const float mcc = (e & 1) ? mc1 : mc0;
+                    const float ilc = (e & 1) ? ilc1 : ilc0;
+                    const float scc = (e & 1) ? sc1 : sc0;
+                    const float Pa = __expf(x - ma) * ila;
+                    Pr[e] = __expf(x - mrr) * ilr;
+                    Pc[e] = __expf(x - mcc) * ilc;
+                    gA[e] = (ada[nt][e] - sa) * Pa
+                          + (adr[nt][e] - srr) * Pr[e]
+                          + (adc[nt][e] - scc) * Pc[e];
+                }
+                const int s2 = nt >> 1, hf = nt & 1;
+                gAf[s2][2 * hf + 0] = pack_bf162(gA[0], gA[1]);
+                gAf[s2][2 * hf + 1] = pack_bf162(gA[2], gA[3]);
+                Prf[s2][2 * hf + 0] = pack_bf162(Pr[0], Pr[1]);
+                Prf[s2][2 * hf + 1] = pack_bf162(Pr[2], Pr[3]);
+                Pcf[s2][2 * hf + 0] = pack_bf162(Pc[0], Pc[1]);
+                Pcf[s2][2 * hf + 1] = pack_bf162(Pc[2], Pc[3]);
+            }
+
+            // Output GEMMs: contract cols (B fragments via ldmatrix.trans).
+            #pragma unroll
+            for (int s2 = 0; s2 < BTC_BK / 16; s2++) {
+                const bf16* px = xc_sm + (k0 + s2 * 16 + lrow) * DPAD + lcol8;
+                const bf16* pv = vc_sm + (k0 + s2 * 16 + lrow) * DPAD + lcol8;
+                const bf16* pg = gyc_sm + (k0 + s2 * 16 + lrow) * DPAD + lcol8;
+                #pragma unroll
+                for (int np = 0; np < 4; np++) {
+                    uint32_t bfr[4];
+                    ldmatrix_x4_trans(bfr, px + np * 16);
+                    mma_bf16_m16n8k16(Ug[2 * np],     gAf[s2], bfr);
+                    mma_bf16_m16n8k16(Ug[2 * np + 1], gAf[s2], bfr + 2);
+                    ldmatrix_x4_trans(bfr, pv + np * 16);
+                    mma_bf16_m16n8k16(U1[2 * np],     Prf[s2], bfr);
+                    mma_bf16_m16n8k16(U1[2 * np + 1], Prf[s2], bfr + 2);
+                    ldmatrix_x4_trans(bfr, pg + np * 16);
+                    mma_bf16_m16n8k16(U2[2 * np],     Pcf[s2], bfr);
+                    mma_bf16_m16n8k16(U2[2 * np + 1], Pcf[s2], bfr + 2);
+                }
+            }
+        }
+
+        // ---- epilogue: Hadamard row-collapse of this warp's 16 rows ----
+        float ng[16], nv[16];
+        const bf16* xr0 = xr_sm + (jw + g) * DPAD + 2 * tig;
+        const bf16* xr1 = xr_sm + (jw + g + 8) * DPAD + 2 * tig;
+        const bf16* vr0 = vr_sm + (jw + g) * DPAD + 2 * tig;
+        const bf16* vr1 = vr_sm + (jw + g + 8) * DPAD + 2 * tig;
+        const bf16* gy0 = gyr_sm + (jw + g) * DPAD + 2 * tig;
+        const bf16* gy1 = gyr_sm + (jw + g + 8) * DPAD + 2 * tig;
+        #pragma unroll
+        for (int nt = 0; nt < 8; nt++) {
+            const float2 x0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(xr0 + nt * 8));
+            const float2 x1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(xr1 + nt * 8));
+            const float2 v0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(vr0 + nt * 8));
+            const float2 v1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(vr1 + nt * 8));
+            const float2 g0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(gy0 + nt * 8));
+            const float2 g1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(gy1 + nt * 8));
+            ng[2 * nt + 0] = x0.x * Ug[nt][0] + x1.x * Ug[nt][2];
+            ng[2 * nt + 1] = x0.y * Ug[nt][1] + x1.y * Ug[nt][3];
+            nv[2 * nt + 0] = g0.x * U1[nt][0] + g1.x * U1[nt][2]
+                           + v0.x * U2[nt][0] + v1.x * U2[nt][2];
+            nv[2 * nt + 1] = g0.y * U1[nt][1] + g1.y * U1[nt][3]
+                           + v0.y * U2[nt][1] + v1.y * U2[nt][3];
+        }
+        #pragma unroll
+        for (int off = 4; off <= 16; off <<= 1) {
+            #pragma unroll
+            for (int e = 0; e < 16; e++) {
+                ng[e] += __shfl_xor_sync(0xFFFFFFFF, ng[e], off);
+                nv[e] += __shfl_xor_sync(0xFFFFFFFF, nv[e], off);
+            }
+        }
+        if (lane < 4) {
+            #pragma unroll
+            for (int nt = 0; nt < 8; nt++) {
+                wOut[warp * 2 * D + nt * 8 + 2 * lane]         = ng[2 * nt + 0];
+                wOut[warp * 2 * D + nt * 8 + 2 * lane + 1]     = ng[2 * nt + 1];
+                wOut[warp * 2 * D + D + nt * 8 + 2 * lane]     = nv[2 * nt + 0];
+                wOut[warp * 2 * D + D + nt * 8 + 2 * lane + 1] = nv[2 * nt + 1];
+            }
+        }
+        __syncthreads();
+        if (tid < 2 * D) {
+            float acc = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < BTC_WARPS; w++) acc += wOut[w * 2 * D + tid];
+            redOut[tid] += acc;
+        }
+    }
+    __syncthreads();
+
+    // ---- direct stores: this CTA exclusively owns row a of both outputs ----
+    if (tid < D) {
+        gradXa[a_off + tid] = scale * redOut[tid];
+    } else if (tid < 2 * D) {
+        gradVa[a_off + tid - D] = redOut[tid];
+    }
+#endif  // __CUDA_ARCH__ >= 800
+}
+
+// =============================================================================
 // NOTE: The old 3D jacobian_corrections kernel has been replaced by two-pass
 // 2D-tiled correction passes using QS_grad_kernel<true> and R_grad_kernel<true>.
 // This eliminates the 3D thread grid (8192 blocks) in favor of 2D grids
@@ -1634,8 +2004,11 @@ backward_impl(torch::Tensor grad_Y_q,
               torch::Tensor m_k,
               torch::Tensor l_k,
               torch::Tensor mask,
-              double dropout_rate) {
-                
+              double dropout_rate,
+              torch::Tensor Y_q,
+              torch::Tensor Y_r,
+              torch::Tensor Y_s) {
+
   // ============================================================================
   // 1. EXTRACT DIMENSIONS AND CONSTANTS
   // ============================================================================
@@ -1695,6 +2068,100 @@ backward_impl(torch::Tensor grad_Y_q,
   auto sum_q = torch::zeros({B, H, N}, options_fp32);
   auto sum_r = torch::zeros({B, H, N}, options_fp32);
   auto sum_s = torch::zeros({B, H, N}, options_fp32);
+
+  // ============================================================================
+  // 2b. TENSOR-CORE FAST PATH (gather-only; see Bwd_gather_tc above)
+  // ============================================================================
+  // Requires the forward outputs Y_q/Y_r/Y_s (for the collapsed correction
+  // sums) and all-zero scatter cotangents. Anything else takes the scalar
+  // path below unchanged. Disable with ATT3_BWD_TC=0.
+  if (D == 64 && I == J && J == K && (N % 16 == 0) && !use_mask
+      && Y_q.defined() && Y_r.defined() && Y_s.defined()) {
+    static const bool tc_enabled = []() {
+        const char* e = std::getenv("ATT3_BWD_TC");
+        return !(e && e[0] == '0');
+    }();
+    static const int max_smem_optin = []() {
+        int dev = 0, major = 0, v = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        if (major < 8) return 0;
+        cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        return v;
+    }();
+    const int K_pad = ceil_div(N, BTC_BK) * BTC_BK;
+    constexpr int TC_DPAD = 64 + 8;
+    const size_t smem_tc =
+        sizeof(bf16) * ((size_t)3 * BTC_BJ * TC_DPAD + (size_t)3 * K_pad * TC_DPAD) +
+        sizeof(float) * (3 * 64 + (size_t)3 * K_pad + 3 * BTC_BJ
+                         + BTC_WARPS * 2 * 64 + 2 * 64);
+    if (tc_enabled && N <= BTC_MAX_K && smem_tc <= (size_t)max_smem_optin) {
+      // Single host round-trip for the gate.
+      const bool scatter_active =
+          (grad_Y_q_.ne(0).any() | grad_Y_r_.ne(0).any() | grad_Y_s_.ne(0).any())
+              .item<bool>();
+      if (!scatter_active) {
+        // With no scatter cross terms every correction sum collapses to
+        // rowsum(dY o Y) — the FA2 shortcut (probe-validated).
+        sum_q = (grad_Y_q.to(at::kFloat) * Y_q.to(at::kFloat)).sum(-1).contiguous();
+        sum_r = (grad_Y_r.to(at::kFloat) * Y_r.to(at::kFloat)).sum(-1).contiguous();
+        sum_s = (grad_Y_s.to(at::kFloat) * Y_s.to(at::kFloat)).sum(-1).contiguous();
+
+        static size_t smem_attr_set = 0;
+        if (smem_tc > smem_attr_set) {
+            AT_CUDA_CHECK(cudaFuncSetAttribute(
+                Bwd_gather_tc<64>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_tc));
+            smem_attr_set = smem_tc;
+        }
+        auto stream = at::cuda::getCurrentCUDAStream();
+        const dim3 grid_tc(N, H, B), block_tc(BTC_WARPS * 32);
+        auto bp = [](const torch::Tensor& t) {
+            return reinterpret_cast<const bf16*>(t.data_ptr<at::BFloat16>());
+        };
+        auto launch = [&](const torch::Tensor& Xa, const torch::Tensor& Va, const torch::Tensor& gYa,
+                          const torch::Tensor& Xr, const torch::Tensor& Vr, const torch::Tensor& gYr,
+                          const torch::Tensor& Xc, const torch::Tensor& Vc, const torch::Tensor& gYc,
+                          const torch::Tensor& ma, const torch::Tensor& la, const torch::Tensor& sa,
+                          const torch::Tensor& mr, const torch::Tensor& lr, const torch::Tensor& sr,
+                          const torch::Tensor& mc, const torch::Tensor& lc, const torch::Tensor& sc,
+                          torch::Tensor& gX, torch::Tensor& gV) {
+            Bwd_gather_tc<64><<<grid_tc, block_tc, smem_tc, stream>>>(
+                bp(Xa), bp(Va), bp(gYa), bp(Xr), bp(Vr), bp(gYr), bp(Xc), bp(Vc), bp(gYc),
+                ma.data_ptr<float>(), la.data_ptr<float>(), sa.data_ptr<float>(),
+                mr.data_ptr<float>(), lr.data_ptr<float>(), sr.data_ptr<float>(),
+                mc.data_ptr<float>(), lc.data_ptr<float>(), sc.data_ptr<float>(),
+                gX.data_ptr<float>(), gV.data_ptr<float>(),
+                H, N, K_pad, scale);
+        };
+        // Role table (anchor / rows / cols), one launch per gradient family:
+        launch(Q, Vq_1, grad_Y_q,  R, Vr_1, grad_Y_r,  S, Vs_1, grad_Y_s,
+               m_i, l_i, sum_q,  m_j, l_j, sum_r,  m_k, l_k, sum_s,
+               grad_Q, grad_Vq_1);
+        launch(R, Vr_1, grad_Y_r,  Q, Vq_1, grad_Y_q,  S, Vs_1, grad_Y_s,
+               m_j, l_j, sum_r,  m_i, l_i, sum_q,  m_k, l_k, sum_s,
+               grad_R, grad_Vr_1);
+        launch(S, Vs_1, grad_Y_s,  Q, Vq_1, grad_Y_q,  R, Vr_1, grad_Y_r,
+               m_k, l_k, sum_s,  m_i, l_i, sum_q,  m_j, l_j, sum_r,
+               grad_S, grad_Vs_1);
+        AT_CUDA_CHECK(cudaGetLastError());
+        // No device sync: everything above is ordered on the current stream,
+        // so the usual PyTorch stream semantics cover consumers.
+
+        // Scatter value grads are identically zero here (their cotangents are).
+        return std::make_tuple(
+            grad_Q.to(at::kBFloat16),
+            grad_R.to(at::kBFloat16),
+            grad_S.to(at::kBFloat16),
+            grad_Vq_1.to(at::kBFloat16),
+            grad_Vq_2.to(at::kBFloat16),
+            grad_Vr_1.to(at::kBFloat16),
+            grad_Vr_2.to(at::kBFloat16),
+            grad_Vs_1.to(at::kBFloat16),
+            grad_Vs_2.to(at::kBFloat16));
+      }
+    }
+  }
 
   // ============================================================================
   // 3. COMPUTE grad_{Vq,Vr,Vs}_1 (GATHER-GRAD KERNELS)
@@ -2058,8 +2525,11 @@ backward_cuda(torch::Tensor grad_Y_q,
               torch::Tensor m_k,
               torch::Tensor l_k,
               torch::Tensor mask,
-              double dropout_rate) {
-                
+              double dropout_rate,
+              torch::Tensor Y_q,
+              torch::Tensor Y_r,
+              torch::Tensor Y_s) {
+
   // Ensure all tensors are contiguous
   grad_Y_q = grad_Y_q.contiguous();
   grad_Y_r = grad_Y_r.contiguous();
@@ -2085,11 +2555,14 @@ backward_cuda(torch::Tensor grad_Y_q,
   if (mask.defined()) {
     mask = mask.contiguous();
   }
+  if (Y_q.defined()) Y_q = Y_q.contiguous();
+  if (Y_r.defined()) Y_r = Y_r.contiguous();
+  if (Y_s.defined()) Y_s = Y_s.contiguous();
 
   // Call the internal implementation directly with provided stats
   return backward_impl(
       grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_,
       Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
-      m_i, l_i, m_j, l_j, m_k, l_k, mask, dropout_rate);
+      m_i, l_i, m_j, l_j, m_k, l_k, mask, dropout_rate, Y_q, Y_r, Y_s);
 }
 

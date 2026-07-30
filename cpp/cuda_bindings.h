@@ -37,6 +37,11 @@ forward_cuda(
 // numerical consistency and avoid redundant O(N²) computation.
 // Upstream grads include gather (grad_Y_q/r/s) and scatter (grad_Y_q_/r_/s_)
 // branches separately.
+//
+// Y_q/Y_r/Y_s are the forward's gather outputs; when provided (and the scatter
+// cotangents are all zero) the tensor-core fast path computes its Jacobian
+// correction sums as rowsum(dY o Y) instead of a full cube pass. Passing
+// undefined tensors keeps the scalar path.
 std::tuple<at::Tensor, at::Tensor, at::Tensor,
            at::Tensor, at::Tensor, at::Tensor,
            at::Tensor, at::Tensor, at::Tensor>
@@ -55,4 +60,7 @@ backward_cuda(
     at::Tensor m_j, at::Tensor l_j,
     at::Tensor m_k, at::Tensor l_k,
     at::Tensor mask,
-    double dropout_rate = 0.0);
+    double dropout_rate = 0.0,
+    at::Tensor Y_q = at::Tensor(),
+    at::Tensor Y_r = at::Tensor(),
+    at::Tensor Y_s = at::Tensor());

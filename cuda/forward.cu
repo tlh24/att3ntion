@@ -48,7 +48,7 @@ __device__ __forceinline__ bool mask_pair_allowed(
 // =============================================================================
 // Tensor-core gather (Yq/Yr/Ys, D=64, resident dim <= TC_MAX_K)
 // =============================================================================
-// FlashAttention-style reformulation (cuda_docs/README.md), written in Yq terms
+// FlashAttention-style reformulation (cuda_docs/gather_readme.md), written in Yq terms
 // below; the trilinear score is symmetric in Q/R/S, so Yr and Ys launch the
 // same kernel with permuted roles (anchor=R rows=Q resident=S, and
 // anchor=S rows=Q resident=R). One CTA owns one (b, h, i). Absorbing
@@ -80,48 +80,8 @@ constexpr int TC_MAX_K = 256;     // S/V2 must fit in shared memory
 // bounded far below this; NEG_INF itself is -1e30).
 constexpr float TC_MASKED_THRESH = -5e29f;
 
-__device__ __forceinline__ void mma_bf16_m16n8k16(
-    float c[4], const uint32_t a[4], const uint32_t b[2])
-{
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
-          "r"(b[0]), "r"(b[1]));
-#endif
-}
-
-__device__ __forceinline__ uint32_t pack_bf162(float x, float y) {
-    __nv_bfloat162 h = __floats2bfloat162_rn(x, y);
-    return *reinterpret_cast<uint32_t*>(&h);
-}
-
-__device__ __forceinline__ void ldmatrix_x4(uint32_t r[4], const bf16* p) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(p));
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-        : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
-#endif
-}
-
-__device__ __forceinline__ void ldmatrix_x4_trans(uint32_t r[4], const bf16* p) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(p));
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-        : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
-#endif
-}
-
-__device__ __forceinline__ void cp_async16(bf16* dst, const bf16* src) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    const uint32_t d = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(d), "l"(src));
-#endif
-}
+// mma_bf16_m16n8k16 / pack_bf162 / ldmatrix_x4 / ldmatrix_x4_trans /
+// cp_async16 live in common.cuh (shared with the tensor-core backward).
 
 // MASKED=false is the fast path for the common case (no attention mask, no
 // J/K padding): score masking, kmul/jmul reads, and the masked-exp selects
@@ -1973,7 +1933,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
             TILE_K + TILE_K                // m2_tile, l2_tile (second stats dim)
         );
 
-    // Tensor-core fast path for D=64 and resident dim <= 256 (cuda_docs/README.md):
+    // Tensor-core fast path for D=64 and resident dim <= 256 (cuda_docs/gather_readme.md):
     // the fused FlashAttention-style kernel writes Y/m/l directly, no reducer.
     // All three gathers use it with permuted roles. Disable with ATT3_YQ_TC=0.
     bool yq_tc_done = false, yr_tc_done = false, ys_tc_done = false;
@@ -2127,6 +2087,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     }
 
     // SCATTER kernels (split outer loops for occupancy, additive reduce).
+    // When all V2 operands are zero (scatter unused) the scatter outputs are
+    // identically zero; Y_q_/Y_r_/Y_s_ are zero-initialized, so the kernels
+    // can be skipped outright. Single host round-trip, mirrors the backward's
+    // scatter gate.
+    const bool scatter_used =
+        (Vq_2.ne(0).any() | Vr_2.ne(0).any() | Vs_2.ne(0).any()).item<bool>();
+    if (scatter_used) {
+
     TORCH_CHECK(I == J && J == K, "Scatter requires I == J == K");
     TORCH_CHECK(I % TILE_I == 0, "Scatter requires I to be a multiple of TILE_I (16)");
 
@@ -2203,6 +2171,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
             K, scat_i_chunks_s
         );
     }
+
+    } // end if (scatter_used)
 
     }); // end FWD_DISPATCH_D
 

@@ -64,12 +64,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            at::Tensor m_j, at::Tensor l_j,
            at::Tensor m_k, at::Tensor l_k,
            double dropout_rate,
-           c10::optional<at::Tensor> mask_opt) {
+           c10::optional<at::Tensor> mask_opt,
+           c10::optional<at::Tensor> Y_q_opt,
+           c10::optional<at::Tensor> Y_r_opt,
+           c10::optional<at::Tensor> Y_s_opt) {
             at::Tensor mask = mask_opt.has_value() ? *mask_opt : at::Tensor();
+            at::Tensor Y_q = Y_q_opt.has_value() ? *Y_q_opt : at::Tensor();
+            at::Tensor Y_r = Y_r_opt.has_value() ? *Y_r_opt : at::Tensor();
+            at::Tensor Y_s = Y_s_opt.has_value() ? *Y_s_opt : at::Tensor();
             return backward_cuda(
                 grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_,
                 Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
-                m_i, l_i, m_j, l_j, m_k, l_k, mask, dropout_rate
+                m_i, l_i, m_j, l_j, m_k, l_k, mask, dropout_rate,
+                Y_q, Y_r, Y_s
             );
         },
         "Hypergraph Attention backward (requires pre-computed softmax stats from forward pass)",
@@ -95,6 +102,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("m_k"),
         py::arg("l_k"),
         py::arg("dropout_rate") = 0.0,
-        py::arg("mask") = py::none()
+        py::arg("mask") = py::none(),
+        py::arg("Y_q") = py::none(),
+        py::arg("Y_r") = py::none(),
+        py::arg("Y_s") = py::none()
     );
 }
