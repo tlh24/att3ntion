@@ -12,12 +12,14 @@ ALL_KERNELS = [
     "Y_gather", "Y_gather_tc",
     # Forward scatter
     "Yq_scatter", "Yr_scatter", "Ys_scatter",
-    # Backward V gradients (gather)
+    # Backward tensor-core fast path (gather-only; needs zero scatter grads)
+    "Bwd_gather_tc",
+    # Backward scalar path: V gradients (gather)
     "Vq_gather_grad", "Vr_gather_grad", "Vs_gather_grad",
-    # Backward V gradients (scatter)
+    # Backward scalar path: V gradients (scatter)
     "Vq_scatter_grad", "Vr_scatter_grad", "Vs_scatter_grad",
-    # Backward Jacobian + query/key gradients
-    "jacobian_corrections", "QS_grad_fused", "R_grad",
+    # Backward scalar path: Jacobian corrections + Q/S and R gradients
+    "QS_grad_kernel", "R_grad_kernel",
 ]
 
 DEFAULT_DIMS = (1, 2, 128, 128, 128, 64)
@@ -87,7 +89,12 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim,
     if not forward_only:
         print("Running backward pass...")
         grad_Y_q, grad_Y_r, grad_Y_s = get_grad_outputs_cuda(Y_q_mc, Y_r_mc, Y_s_mc)
-        grad_Y_q_, grad_Y_r_, grad_Y_s_ = get_grad_outputs_cuda(Y_q__mc, Y_r__mc, Y_s__mc)
+        # Scatter is unused in current models: zero cotangents. Passing the
+        # forward's Y enables the tensor-core backward path (Bwd_gather_tc);
+        # set ATT3_BWD_TC=0 to profile the legacy scalar kernels instead.
+        grad_Y_q_ = torch.zeros_like(Y_q__mc)
+        grad_Y_r_ = torch.zeros_like(Y_r__mc)
+        grad_Y_s_ = torch.zeros_like(Y_s__mc)
         _cuda_kernels.backward(
             grad_Y_q,
             grad_Y_r,
@@ -100,7 +107,8 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim,
             m_j, l_j,
             m_k, l_k,
             dropout_rate,
-            empty_mask
+            empty_mask,
+            Y_q_mc, Y_r_mc, Y_s_mc,
         )
 
     torch.cuda.synchronize()

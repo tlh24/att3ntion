@@ -121,6 +121,10 @@ class _HypergraphAttentionAutograd(Function):
         else:
             raise TypeError(f"C++ forward expected to return a tuple of 12 Tensors, but got {type(outputs_tuple)} with len {len(outputs_tuple) if isinstance(outputs_tuple, tuple) else 'N/A'}")
 
+        # Padded bf16 gather outputs, kept for the backward's collapsed
+        # correction sums (rowsum(dY * Y) on the tensor-core path).
+        Y_q_pad, Y_r_pad, Y_s_pad = Y_q, Y_r, Y_s
+
         if orig_seq_len != Y_q.size(2):
             Y_q  = Y_q [:, :, :orig_seq_len, :]
             Y_r  = Y_r [:, :, :orig_seq_len, :]
@@ -138,7 +142,8 @@ class _HypergraphAttentionAutograd(Function):
             Y_s_ = Y_s_.to(input_dtype)
 
         ctx.save_for_backward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
-                              m_i, l_i, m_j, l_j, m_k, l_k, mask_tensor)
+                              m_i, l_i, m_j, l_j, m_k, l_k, mask_tensor,
+                              Y_q_pad, Y_r_pad, Y_s_pad)
         ctx.orig_seq_len = orig_seq_len
         ctx.input_dtype = input_dtype
 
@@ -159,7 +164,8 @@ class _HypergraphAttentionAutograd(Function):
             ).
         """
         Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, \
-            m_i, l_i, m_j, l_j, m_k, l_k, mask_tensor = ctx.saved_tensors
+            m_i, l_i, m_j, l_j, m_k, l_k, mask_tensor, \
+            Y_q_pad, Y_r_pad, Y_s_pad = ctx.saved_tensors
         orig_seq_len = ctx.orig_seq_len
 
         out_dtype = getattr(ctx, "input_dtype", Q.dtype)
@@ -184,7 +190,8 @@ class _HypergraphAttentionAutograd(Function):
         grad_tuple = torch.ops.att3ntion.hypergraph_backward(
             grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_,
             Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
-            m_i, l_i, m_j, l_j, m_k, l_k, mask_tensor
+            m_i, l_i, m_j, l_j, m_k, l_k, mask_tensor,
+            Y_q_pad, Y_r_pad, Y_s_pad
         )
 
         if not (isinstance(grad_tuple, tuple) and len(grad_tuple) == 9):

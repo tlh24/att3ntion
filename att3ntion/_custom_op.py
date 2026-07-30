@@ -64,6 +64,7 @@ def hypergraph_backward(
     m_j: torch.Tensor, l_j: torch.Tensor,
     m_k: torch.Tensor, l_k: torch.Tensor,
     mask: torch.Tensor,
+    Y_q: torch.Tensor, Y_r: torch.Tensor, Y_s: torch.Tensor,
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor,
     torch.Tensor, torch.Tensor, torch.Tensor,
@@ -72,7 +73,7 @@ def hypergraph_backward(
     return _cuda_kernels.backward(
         grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_,
         Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
-        m_i, l_i, m_j, l_j, m_k, l_k, 0.0, mask,
+        m_i, l_i, m_j, l_j, m_k, l_k, 0.0, mask, Y_q, Y_r, Y_s,
     )
 
 
@@ -80,7 +81,7 @@ def hypergraph_backward(
 def _hypergraph_backward_fake(
     grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_,
     Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
-    m_i, l_i, m_j, l_j, m_k, l_k, mask,
+    m_i, l_i, m_j, l_j, m_k, l_k, mask, Y_q, Y_r, Y_s,
 ):
     return (
         torch.empty_like(Q), torch.empty_like(R), torch.empty_like(S),
@@ -92,8 +93,9 @@ def _hypergraph_backward_fake(
 
 def _setup_context(ctx, inputs, output):
     Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, mask, _dropout, _Iv, _Jv, _Kv = inputs
-    _, _, _, _, _, _, m_i, l_i, m_j, l_j, m_k, l_k = output
-    ctx.save_for_backward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, m_i, l_i, m_j, l_j, m_k, l_k, mask)
+    Y_q, Y_r, Y_s, _, _, _, m_i, l_i, m_j, l_j, m_k, l_k = output
+    ctx.save_for_backward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
+                          m_i, l_i, m_j, l_j, m_k, l_k, mask, Y_q, Y_r, Y_s)
 
 
 def _backward(
@@ -101,7 +103,8 @@ def _backward(
     grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_,
     grad_m_i, grad_l_i, grad_m_j, grad_l_j, grad_m_k, grad_l_k,
 ):
-    Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, m_i, l_i, m_j, l_j, m_k, l_k, mask = ctx.saved_tensors
+    Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, \
+        m_i, l_i, m_j, l_j, m_k, l_k, mask, Y_q, Y_r, Y_s = ctx.saved_tensors
     if grad_Y_q is None:
         grad_Y_q = torch.zeros_like(Q)
     if grad_Y_r is None:
@@ -118,7 +121,7 @@ def _backward(
         *hypergraph_backward(
             grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_,
             Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
-            m_i, l_i, m_j, l_j, m_k, l_k, mask,
+            m_i, l_i, m_j, l_j, m_k, l_k, mask, Y_q, Y_r, Y_s,
         ),
         None,  # mask
         None,  # dropout_rate

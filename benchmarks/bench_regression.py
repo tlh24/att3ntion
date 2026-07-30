@@ -113,9 +113,12 @@ def benchmark_backward(cuda_ext, ref_ext, config: BenchConfig, warmup=5, iters=2
     m_i, l_i, m_j, l_j, m_k, l_k = fwd_out[6:12]
 
     def run_cuda_backward():
+        # Y passed so the tensor-core backward engages (as it does via
+        # autograd); scatter cotangents above are zero to match real usage.
         return cuda_ext.backward(
             grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_, *cuda_bwd_inputs,
-            m_i, l_i, m_j, l_j, m_k, l_k, 0.0
+            m_i, l_i, m_j, l_j, m_k, l_k, 0.0,
+            None, fwd_out[0], fwd_out[1], fwd_out[2]
         )
 
     def run_ref_backward():
