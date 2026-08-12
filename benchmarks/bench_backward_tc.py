@@ -8,8 +8,13 @@ Usage:
     python benchmarks/bench_backward_tc.py --dims 2,2,256,256,256,64
 """
 import argparse
+import os
+import sys
 import torch
 import att3ntion._cuda_kernels as ck
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _bench_utils import MASK_KINDS, make_mask
 
 
 def main():
@@ -20,6 +25,8 @@ def main():
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--scatter-grads", action="store_true",
                    help="feed nonzero scatter cotangents (legacy full path)")
+    p.add_argument("--mask", default="none", choices=MASK_KINDS,
+                   help="attention mask kind (drives Bwd_gather_tc<64,true>)")
     args = p.parse_args()
     B, H, I, J, K, D = (int(x) for x in args.dims.split(","))
     assert I == J == K, "benchmark assumes I == J == K"
@@ -31,7 +38,9 @@ def main():
     Q, R, S = mk(), mk(), mk()
     Vq1, Vq2, Vr1, Vr2, Vs1, Vs2 = mk(), mk(), mk(), mk(), mk(), mk()
 
-    out = ck.forward(Q, R, S, Vq1, Vq2, Vr1, Vr2, Vs1, Vs2, 0.0)
+    mask = make_mask(args.mask, B, N, dev)
+
+    out = ck.forward(Q, R, S, Vq1, Vq2, Vr1, Vr2, Vs1, Vs2, 0.0, mask=mask)
     Yq, Yr, Ys = out[0], out[1], out[2]
     m_i, l_i, m_j, l_j, m_k, l_k = out[6:12]
 
@@ -48,7 +57,7 @@ def main():
         return ck.backward(gYq, gYr, gYs, gYq_, gYr_, gYs_,
                            Q, R, S, Vq1, Vq2, Vr1, Vr2, Vs1, Vs2,
                            m_i, l_i, m_j, l_j, m_k, l_k, 0.0,
-                           None, Yq, Yr, Ys)
+                           mask, Yq, Yr, Ys)
 
     for _ in range(args.warmup):
         run()
@@ -67,7 +76,8 @@ def main():
     times.sort()
     wall_us = times[len(times) // 2] * 1e6
     print(f"backward() wall: {wall_us:.1f} us median (min {times[0]*1e6:.1f})  "
-          f"(dims {args.dims}, scatter_grads={args.scatter_grads})")
+          f"(dims {args.dims}, scatter_grads={args.scatter_grads}, "
+          f"mask={args.mask})")
 
     from torch.profiler import profile, ProfilerActivity
     with profile(activities=[ProfilerActivity.CUDA]) as prof:

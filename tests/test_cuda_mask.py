@@ -93,3 +93,20 @@ def test_cuda_mask_all_masked_row_is_finite_and_matches_naive():
     y_naive = naive_mod(x, None, mask)
     assert torch.isfinite(y_cuda).all()
     assert torch.isfinite(y_naive).all()
+
+
+# The tests above run at d_head = 64/2 = 32, so they exercise only the scalar
+# kernels. These use d_model=128 / n_heads=2 -> d_head=64, the one shape the
+# tensor-core forward and backward accept, driving the masked TC path through
+# the real autograd plumbing (padded mask, collapsed correction sums, ragged N).
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("N", [19, 32, 64])
+def test_cuda_mask_tc_head_dim_64_parity(N):
+    torch.manual_seed(4 + N)
+    B, D, H = 2, 128, 2
+    cuda_mod, naive_mod = _build_pair(scatter=False, d_model=D, n_heads=H)
+    x = torch.randn(B, N, D, device="cuda", dtype=torch.float32)
+    mask = torch.tril(torch.ones(B, N, N, device="cuda", dtype=torch.bool))
+    mask[:, 5, :] = False          # a fully masked query row
+    _assert_forward_backward_close(cuda_mod, naive_mod, x, mask,
+                                   atol=5e-2, rtol=5e-2)

@@ -15,6 +15,43 @@ def create_inputs(B: int, H: int, N: int, D: int,
     )
 
 
+MASK_KINDS = ("none", "causal", "all_true", "random", "dead_rows", "prefix_lm_pad")
+
+
+def make_mask(kind: str, B: int, N: int, device='cuda') -> Optional[torch.Tensor]:
+    """Attention mask of the given kind, or None for 'none'.
+
+    Mirrors `_make_mask` in tests/test_backward_tc.py so benchmark and
+    correctness runs exercise the same shapes.
+    """
+    if kind == "none":
+        return None
+    eye = torch.arange(N, device=device)
+    tri = torch.tril(torch.ones(B, N, N, device=device, dtype=torch.bool))
+    if kind == "causal":
+        return tri
+    if kind == "all_true":
+        return torch.ones(B, N, N, device=device, dtype=torch.bool)
+    if kind == "random":
+        m = torch.randint(0, 2, (B, N, N), device=device, dtype=torch.bool)
+        m[:, eye, eye] = True          # keep every anchor's denominator alive
+        return m
+    if kind == "dead_rows":
+        m = tri.clone()
+        m[:, 5, :] = False
+        m[:, N - 1, :] = False
+        return m
+    if kind == "prefix_lm_pad":
+        P = N // 2
+        m = torch.zeros(B, N, N, device=device, dtype=torch.bool)
+        m[:, :, :P] = True
+        m |= tri
+        m[:, :, N - 4:] = False
+        m[:, N - 4:, :] = False
+        return m
+    raise ValueError(f"unknown mask kind: {kind}")
+
+
 # --- Timing ---
 
 def benchmark_fn(fn, warmup=5, iters=20):

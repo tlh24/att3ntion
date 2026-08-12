@@ -6,6 +6,9 @@ import datetime
 import os
 import argparse
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _bench_utils import MASK_KINDS, make_mask
+
 # ── Complete list of all CUDA kernels in the project ──
 ALL_KERNELS = [
     # Forward gather
@@ -37,7 +40,7 @@ def get_grad_outputs_cuda(Y_q, Y_r, Y_s):
 
 
 def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim,
-                    forward_only=False, backward_only=False):
+                    forward_only=False, backward_only=False, mask_kind="none"):
     """
     Core logic for running the CUDA kernels. This is what ncu measures.
     """
@@ -64,7 +67,13 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim,
 
     fwd_inputs = tuple(t.to(torch.bfloat16) for t in (Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2))
     bwd_inputs = fwd_inputs
-    empty_mask = torch.empty(0, dtype=torch.bool, device='cuda')
+    # A mask selects the MASKED=true kernel instantiations (I == J == K only).
+    if mask_kind != "none":
+        assert I_dim == J_dim == K_dim, "--mask requires I == J == K"
+        mask = make_mask(mask_kind, B, I_dim, 'cuda')
+        print(f"Mask: {mask_kind}")
+    else:
+        mask = torch.empty(0, dtype=torch.bool, device='cuda')
 
     # --- Forward Pass ---
     # forward returns 12 values: Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_,
@@ -74,7 +83,7 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim,
         (Y_q_mc, Y_r_mc, Y_s_mc, Y_q__mc, Y_r__mc, Y_s__mc,
          m_i, l_i, m_j, l_j, m_k, l_k) = \
             _cuda_kernels.forward(
-                *fwd_inputs, dropout_rate, -1, -1, -1, empty_mask
+                *fwd_inputs, dropout_rate, -1, -1, -1, mask
             )
     else:
         # Still need forward outputs to feed backward
@@ -82,7 +91,7 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim,
             (Y_q_mc, Y_r_mc, Y_s_mc, Y_q__mc, Y_r__mc, Y_s__mc,
              m_i, l_i, m_j, l_j, m_k, l_k) = \
                 _cuda_kernels.forward(
-                    *fwd_inputs, dropout_rate, -1, -1, -1, empty_mask
+                    *fwd_inputs, dropout_rate, -1, -1, -1, mask
                 )
 
     # --- Backward Pass ---
@@ -107,7 +116,7 @@ def run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim,
             m_j, l_j,
             m_k, l_k,
             dropout_rate,
-            empty_mask,
+            mask,
             Y_q_mc, Y_r_mc, Y_s_mc,
         )
 
@@ -167,6 +176,8 @@ def launch_profiler(args):
         ncu_command.append("--forward-only")
     if args.backward_only:
         ncu_command.append("--backward-only")
+    if args.mask != "none":
+        ncu_command += ["--mask", args.mask]
 
     print(f"\n{'='*70}")
     print(f"  NCU Profiling Command")
@@ -234,6 +245,9 @@ Available kernels:
                             help="Only run forward pass kernels.")
         parser.add_argument("--backward-only", action="store_true",
                             help="Only run backward pass kernels.")
+        parser.add_argument("--mask", default="none", choices=MASK_KINDS,
+                            help="Run with an attention mask, which selects the "
+                                 "MASKED kernel instantiations (needs I==J==K).")
 
         args = parser.parse_args()
 
@@ -245,7 +259,8 @@ Available kernels:
             B, H, I_dim, J_dim, K_dim, D_dim = args.dims
             run_kernel_pass(B, H, I_dim, J_dim, K_dim, D_dim,
                             forward_only=args.forward_only,
-                            backward_only=args.backward_only)
+                            backward_only=args.backward_only,
+                            mask_kind=args.mask)
         else:
             launch_profiler(args)
 
