@@ -1,3 +1,4 @@
+import os
 from setuptools import setup
 import torch
 from torch.utils.cpp_extension import CppExtension, BuildExtension, CUDAExtension
@@ -8,26 +9,34 @@ def get_cuda_arch_flags():
 	Produces SASS for each detected arch AND embeds PTX for the highest
 	detected arch to enable forward compatibility with newer GPUs
 	(e.g., code compiled on sm_89 can JIT-compile for sm_120 at load time).
+	PTX only JITs forward, so a build cannot run on an arch older than the
+	oldest one it was compiled for.
+
+	Returns [] when TORCH_CUDA_ARCH_LIST is set, handing control to
+	torch.utils.cpp_extension -- the standard way to target cards that are not
+	present at build time, e.g. TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;12.0+PTX".
+	sm_120 (Blackwell consumer, RTX 50xx) additionally needs CUDA >= 12.8.
 	"""
-	# Default to sm_89 (Ada Lovelace / RTX 4080) if no GPU detected
+	if os.environ.get('TORCH_CUDA_ARCH_LIST'):
+		return []
+
 	seen_archs = set()
 	device_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
 	for i in range(device_count):
-		major, minor = torch.cuda.get_device_capability(i)
-		seen_archs.add(f'{major}{minor}')
+		seen_archs.add(torch.cuda.get_device_capability(i))
 
+	# No GPU at build time (containers, CI): cover every arch the tensor-core
+	# path supports rather than guessing one and stranding the rest.
 	if not seen_archs:
-		seen_archs.add('89')
+		seen_archs = {(8, 0), (8, 6), (8, 9), (9, 0)}
 
-	flags = []
-	max_arch = max(seen_archs)
-	for arch in sorted(seen_archs):
-		# Emit SASS for each detected architecture
-		flags.append(f'-gencode=arch=compute_{arch},code=sm_{arch}')
+	flags = [f'-gencode=arch=compute_{M}{m},code=sm_{M}{m}'
+	         for M, m in sorted(seen_archs)]
 
-	# Also embed PTX for the highest arch for forward compatibility
-	# This allows the CUDA driver to JIT-compile for future architectures
-	flags.append(f'-gencode=arch=compute_{max_arch},code=compute_{max_arch}')
+	# Embed PTX for the newest arch so future cards JIT at load time. Compared
+	# as tuples, not strings: '120' < '89' lexically but sm_120 is newer.
+	M, m = max(seen_archs)
+	flags.append(f'-gencode=arch=compute_{M}{m},code=compute_{M}{m}')
 
 	return flags
 

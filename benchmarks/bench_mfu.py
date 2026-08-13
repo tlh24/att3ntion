@@ -3,7 +3,12 @@
 MFU (Model FLOP Utilization) per-kernel and total.
 
 Wall-clock timing for total pass MFU; torch.profiler for per-kernel MFU.
-Peak is fp32 TFLOPS (CUDA cores, matches our fp32 kernels).
+
+Peak is dense bf16 tensor-core TFLOPS: the kernels take bf16 in and out, and at
+D=64 with the resident dim within TC_MAX_K the gather forward and backward run
+on tensor cores. The scalar fallbacks (D != 64, longer sequences) issue the same
+bf16 operands through the CUDA cores, so they are measured against the same
+peak and simply score lower -- which is the comparison worth reporting.
 """
 
 import os, sys
@@ -17,7 +22,7 @@ if PROJECT_ROOT not in sys.path:
 import att3ntion._cuda_kernels as cuda_ext
 from benchmarks._bench_utils import (
     create_inputs, get_gpu_specs,
-    calc_forward_flops, calc_backward_flops, benchmark_fn,
+    calc_forward_flops, benchmark_fn,
 )
 
 
@@ -49,7 +54,20 @@ def build_flop_map(B, H, N, D):
         "QS_grad_kernel_FALSE": base * 48 * D,
         # R_grad<false>:  grad_R = B*H*N³*24D  (no R_grad<true> exists)
         "R_grad_kernel_FALSE":  base * 24 * D,
+        # Y_gather_tc: same function as one scalar gather, two GEMMs per anchor.
+        "Y_gather_tc":          base * (4*D + 3),
+        # Bwd_gather_tc: per anchor, 4 score GEMMs (logits, d_a, d_r, d_c) and
+        # 3 output GEMMs (Ug, U1, U2), each contracting one dim = 2*N²*D.
+        "Bwd_gather_tc":        base * 14 * D,
     }
+
+
+def calc_backward_gather_flops(B, H, N, D):
+    """bwd_fn below zeroes the scatter cotangents, which is exactly the gate for
+    the TC backward: the cross terms vanish and every correction sum collapses
+    to a rowsum, so calc_backward_flops (which prices the full scalar
+    decomposition, ~120*B*H*N³*D) overstates this call by roughly 3x."""
+    return 3 * B * H * N**3 * 14 * D
 
 
 def match_kernel(name: str, flop_map: dict):
@@ -98,9 +116,13 @@ def main():
     B, H, N, D = args.B, args.H, args.N, args.D
 
     specs = get_gpu_specs()
-    peak = specs["fp32_tflops"]
+    peak = specs["bf16_tflops"]
+    if peak is None:
+        sys.exit(f"No tensor-core peak on record for {specs['name']}; add it to "
+                 "KNOWN_GPUS in benchmarks/_bench_utils.py before quoting MFU.")
     print(f"\nGPU : {specs['name']}")
-    print(f"Peak: {peak} TFLOPS (fp32, CUDA cores)")
+    print(f"Peak: {peak} TFLOPS (bf16 tensor core, dense) | "
+          f"{specs['fp32_tflops']} TFLOPS (fp32, CUDA cores)")
     print(f"Config: B={B} H={H} N={N} D={D}\n")
 
     # ── inputs ────────────────────────────────────────────────────────────────
@@ -126,7 +148,7 @@ def main():
     fwd_ms = benchmark_fn(fwd_fn, warmup=5, iters=20)[0]
     bwd_ms = benchmark_fn(bwd_fn, warmup=5, iters=20)[0]
     fwd_flops = calc_forward_flops(B, H, N, D)
-    bwd_flops = calc_backward_flops(B, H, N, D)
+    bwd_flops = calc_backward_gather_flops(B, H, N, D)
 
     W = 70
     print("=" * W)
