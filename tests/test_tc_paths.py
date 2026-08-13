@@ -380,8 +380,9 @@ def test_tc_variants_finite(N, kind):
     out = ck.forward(*[bf[n] for n in names], 0.0, mask=mask)
     grads = ck.backward(*g, zero, zero, zero, *[bf[n] for n in names],
                         *out[6:12], 0.0, mask, out[0], out[1], out[2])
-    out_names = ["Y_q", "Y_r", "Y_s", "Y_q_", "Y_r_", "Y_s_"]
-    for name, t in zip(out_names + GRAD_NAMES, list(out[:6]) + list(grads)):
+    out_names = ["Y_q", "Y_r", "Y_s", "Y_q_", "Y_r_", "Y_s_",
+                 "m_i", "l_i", "m_j", "l_j", "m_k", "l_k"]
+    for name, t in zip(out_names + GRAD_NAMES, list(out[:12]) + list(grads)):
         assert torch.isfinite(t).all(), f"{name}: non-finite (N={N} mask={kind})"
 
 
