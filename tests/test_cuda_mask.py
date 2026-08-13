@@ -100,7 +100,7 @@ def test_cuda_mask_all_masked_row_is_finite_and_matches_naive():
 # tensor-core forward and backward accept, driving the masked TC path through
 # the real autograd plumbing (padded mask, collapsed correction sums, ragged N).
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("N", [19, 32, 64])
+@pytest.mark.parametrize("N", [16, 19, 32, 64])
 def test_cuda_mask_tc_head_dim_64_parity(N):
     torch.manual_seed(4 + N)
     B, D, H = 2, 128, 2

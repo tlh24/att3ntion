@@ -9,8 +9,8 @@ Forward kernels: Y_q, Y_r, Y_s (gather), Y_q_, Y_r_, Y_s_ (scatter)
 Backward kernels: grad_Q, grad_R, grad_S, grad_Vq_1, grad_Vq_2, grad_Vr_1, grad_Vr_2, grad_Vs_1, grad_Vs_2
 
 Constraints (optimized kernels):
-    - N must be a multiple of 32
-    - D must be a multiple of 32 and <= 64 (shared memory limit)
+    - N must be a multiple of 16
+    - D must be one of 16, 32, or 64
     - I == J == K (enforced by using N for all)
 """
 import os
@@ -64,8 +64,11 @@ class TestConfig:
         return f"{self.name}: B={self.B} H={self.H} N={self.N} D={self.D}{scale_str}"
 
 
-# All configs use N and D as multiples of 32 for optimized kernel requirements
+# N=16 pads the forward tensor-core resident dim to 64; N=128 is the smallest
+# shape reaching the unmasked Y_gather_tc variant.
 QUICK_CONFIGS = [
+    TestConfig("small_N16_D64",     B=1, H=2, N=16,  D=64),
+    TestConfig("small_N128_D64",    B=1, H=2, N=128, D=64),
     TestConfig("small_N32_D32",     B=1, H=2, N=32, D=32),
     TestConfig("small_N64_D32",     B=1, H=2, N=64, D=32),
     TestConfig("small_N32_D64",     B=1, H=2, N=32, D=64),

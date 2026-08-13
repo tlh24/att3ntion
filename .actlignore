@@ -1,0 +1,4 @@
+# Keep the DevSpace initial scan fast: these two dirs are ~22 GiB of the repo
+# and are not needed for CUDA build / test / bench / profile work on the pod.
+experiments/
+myenv/

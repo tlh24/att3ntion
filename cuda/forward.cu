@@ -596,7 +596,11 @@ void Y_gather(
             float alpha = expf(m_old - m_new);
             float beta = expf(m_ij - m_new);
             float l_new = alpha * l_old + beta * l_ij;
-            
+
+            // Every lane read my_ml above; lane 0 is about to overwrite it.
+            // Independent thread scheduling lets lane 0 run ahead, so the
+            // reads need a fence of their own (racecheck flags this).
+            __syncwarp();
             if (lane_id == 0) {
                 my_ml[0] = m_new;
                 my_ml[1] = l_new;

@@ -38,6 +38,8 @@ GRAD_NAMES = ["grad_Q", "grad_R", "grad_S",
 
 CONFIGS = [
     # (B, H, N, D, input_scale)
+    # N=16 forces K_pad=32 and exercises the padded resident rows.
+    (1, 2, 16, 64, 1.0),
     (1, 1, 32, 64, 1.0),
     (2, 2, 32, 64, 1.0),
     (1, 2, 64, 64, 1.0),
@@ -328,6 +330,34 @@ def test_masked_tc_path_actually_engages(N):
     assert not all(torch.equal(tc[i], sc[i]) for i in range(3)), (
         f"masked TC path did not engage at N={N} (results bitwise identical "
         "to the scalar path)")
+
+
+# One pass through each tensor-core instantiation, cheap enough to run under
+# compute-sanitizer (the full suite is not). N=128/256 are the only shapes that
+# reach Y_gather_tc<64,false>; N=16 exercises the padded resident rows.
+TC_VARIANTS = [(16, None), (96, None), (128, None), (256, None),
+               (16, "causal"), (128, "causal"), (128, "prefix_lm_pad")]
+
+
+@pytest.mark.parametrize("N,kind", TC_VARIANTS)
+def test_tc_variants_finite(N, kind):
+    B, H, D = 1, 1, 64
+    dev = "cuda"
+    torch.manual_seed(7 + N)
+    mask = _make_mask(kind, B, N, dev) if kind else None
+    names = ["Q", "R", "S", "Vq_1", "Vq_2", "Vr_1", "Vr_2", "Vs_1", "Vs_2"]
+    bf = {n: (torch.randn(B, H, N, D, device=dev) * 0.5).to(torch.bfloat16)
+          for n in names}
+    g = [(torch.randn(B, H, N, D, device=dev) * 0.5).to(torch.bfloat16)
+         for _ in range(3)]
+    zero = torch.zeros(B, H, N, D, device=dev, dtype=torch.bfloat16)
+
+    out = ck.forward(*[bf[n] for n in names], 0.0, mask=mask)
+    grads = ck.backward(*g, zero, zero, zero, *[bf[n] for n in names],
+                        *out[6:12], 0.0, mask, out[0], out[1], out[2])
+    out_names = ["Y_q", "Y_r", "Y_s", "Y_q_", "Y_r_", "Y_s_"]
+    for name, t in zip(out_names + GRAD_NAMES, list(out[:6]) + list(grads)):
+        assert torch.isfinite(t).all(), f"{name}: non-finite (N={N} mask={kind})"
 
 
 @pytest.mark.parametrize("N", [32, 64])
