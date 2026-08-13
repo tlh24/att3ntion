@@ -35,18 +35,19 @@
 // these stats - this avoids redundant work.
 // =============================================================================
 
+// Both members of a pair must be visible from mask row `row`.
 __device__ __forceinline__ bool mask_pair_allowed(
     const bool* mask,
     int N,
     int b,
-    int anchor,
+    int row,
     int a,
     int c
 ) {
     if (mask == nullptr) {
         return true;
     }
-    const int64_t base = ((int64_t)b * N + anchor) * N;
+    const int64_t base = ((int64_t)b * N + row) * N;
     return mask[base + a] && mask[base + c];
 }
 
@@ -54,12 +55,11 @@ __device__ __forceinline__ bool mask_pair_allowed(
 // Gradient Kernels for V Tensors (Gather Path)
 // =============================================================================
 
-// The trilinear score is symmetric in Q/R/S, so grad_Vq_1 / grad_Vr_1 /
-// grad_Vs_1 are one kernel with permuted roles: `out` is the mode whose V
-// gradient this launch accumulates, `reg` is the register-resident partner
-// mode, `loop` is the mode streamed through shared memory. Each output picks
-// up one term from each of the other two Y gathers. OUT_IS_Y puts the out mode
-// on thread y, making the atomicAdd address warp-uniform.
+// Split V_1 gradients (grad_Vq_1 / grad_Vr_1 / grad_Vs_1), one kernel with
+// roles permuted: `out` is the mode whose V gradient this launch accumulates,
+// `reg` its register-resident partner, `loop` the mode streamed through shared
+// memory. Each output picks up one term from each of the other two Y gathers.
+// OUT_IS_Y puts out on thread y, keeping the atomicAdd address warp-uniform.
 template<int D_CONST, bool OUT_IS_Y>
 __global__ void V_gather_grad(
     const bf16* __restrict__ X_out,     // [B,H,N,D]
@@ -73,59 +73,55 @@ __global__ void V_gather_grad(
     const float* __restrict__ l_loop,   // [B,H,N]
     const float* __restrict__ m_reg,    // [B,H,N]
     const float* __restrict__ l_reg,    // [B,H,N]
-    float*       __restrict__ gradV_out,// [B,H,N,D]   (output)
+    float*       __restrict__ gradV_out, // [B,H,N,D] (output)
     const bool*  __restrict__ mask,
-    int  N,
-    int  H,
-    float scale )
+    int N, int H, float scale)
 {
-    /* ---- decode indices ------------------------------------------------ */
-    int bh  = blockIdx.z;          // flattened (batch, head)
+    const int bh = blockIdx.z;          // flattened (batch, head)
     const int b = bh / H;
     const int tx = blockIdx.x * T_I + threadIdx.x;
     const int ty = blockIdx.y * T_K + threadIdx.y;
     const int out0 = OUT_IS_Y ? ty : tx;
     const int reg0 = OUT_IS_Y ? tx : ty;
 
-    // Track if this thread should compute (DON'T return early - need all threads for shared mem loading)
+    // No early return: every thread is needed for the cooperative loads.
     const bool active = (out0 < N && reg0 < N);
 
     const int64_t stride_BH = (int64_t)N * D_CONST;
-    const bf16* XoBH  = X_out   + bh * stride_BH;
-    const bf16* XrBH  = X_reg   + bh * stride_BH;
-    const bf16* XlBH  = X_loop  + bh * stride_BH;
-    const bf16* VrBH  = V_reg   + bh * stride_BH;
-    const bf16* VlBH  = V_loop  + bh * stride_BH;
-    const bf16* gYlBH = gY_loop + bh * stride_BH;
-    const bf16* gYrBH = gY_reg  + bh * stride_BH;
-    const float* mlBH = m_loop  + (int64_t)bh * N;
-    const float* llBH = l_loop  + (int64_t)bh * N;
-    const float* mrBH = m_reg   + (int64_t)bh * N;
-    const float* lrBH = l_reg   + (int64_t)bh * N;
-          float* gVBH = gradV_out + bh * stride_BH;
+    const bf16* X_outBH   = X_out   + bh * stride_BH;
+    const bf16* X_regBH   = X_reg   + bh * stride_BH;
+    const bf16* X_loopBH  = X_loop  + bh * stride_BH;
+    const bf16* V_regBH   = V_reg   + bh * stride_BH;
+    const bf16* V_loopBH  = V_loop  + bh * stride_BH;
+    const bf16* gY_loopBH = gY_loop + bh * stride_BH;
+    const bf16* gY_regBH  = gY_reg  + bh * stride_BH;
+    const float* m_loopBH = m_loop  + (int64_t)bh * N;
+    const float* l_loopBH = l_loop  + (int64_t)bh * N;
+    const float* m_regBH  = m_reg   + (int64_t)bh * N;
+    const float* l_regBH  = l_reg   + (int64_t)bh * N;
+          float* gV_outBH = gradV_out + bh * stride_BH;
 
-    /* ---- per-thread vectors: fused prod = X_out*X_reg (drops separate scalars in inner loop)
-            v_reg_vec stays in regs (reg-only, hot for the Y_loop path)
-            gy_reg_vec = gY_reg[reg0,:] hoisted out of the loop-mode loop */
+    // Fusing prod = X_out*X_reg halves the inner-loop FMAs; the reg-side rows
+    // are hoisted out of the loop-mode sweep.
     float prod_vec[D_CONST];
     float v_reg_vec[D_CONST];
     float gy_reg_vec[D_CONST];
     float grad_acc[D_CONST] = {0.0f};
 
-    // Clamp indices for safe memory access (inactive threads load from valid location)
+    // Inactive threads still load, from a clamped row.
     const int out_safe = min(out0, N-1);
     const int reg_safe = min(reg0, N-1);
 
     #pragma unroll
     for (int d=0; d<D_CONST; ++d){
-        prod_vec[d]   = bf2f(XoBH[out_safe*D_CONST + d]) * bf2f(XrBH[reg_safe*D_CONST + d]);
-        v_reg_vec[d]  = bf2f(VrBH[reg_safe*D_CONST + d]);
-        gy_reg_vec[d] = bf2f(gYrBH[reg_safe*D_CONST + d]);
+        prod_vec[d]   = bf2f(X_outBH[out_safe*D_CONST + d]) * bf2f(X_regBH[reg_safe*D_CONST + d]);
+        v_reg_vec[d]  = bf2f(V_regBH[reg_safe*D_CONST + d]);
+        gy_reg_vec[d] = bf2f(gY_regBH[reg_safe*D_CONST + d]);
     }
 
     // Hoist reg-only stats out of the loop; pre-invert l_reg once.
-    const float m_reg_val = mrBH[reg_safe];
-    const float inv_l_reg = 1.0f / fmaxf(lrBH[reg_safe], DENOM_EPS);
+    const float m_reg_val = m_regBH[reg_safe];
+    const float inv_l_reg = 1.0f / fmaxf(l_regBH[reg_safe], DENOM_EPS);
 
     __shared__ float sh_X [T_J][D_CONST];
     __shared__ float sh_V [T_J][D_CONST];
@@ -133,26 +129,24 @@ __global__ void V_gather_grad(
     __shared__ float sh_m[T_J];
     __shared__ float sh_l_inv[T_J];      // pre-inverted, multiply not divide
 
-    /* ---- loop over the loop mode in chunks ----------------------------- */
     for (int lBase=0; lBase<N; lBase+=T_J){
-        // Cooperative loading: ALL threads participate to cover all D dimensions
-        int lt = threadIdx.y;                       // 0 … T_K-1 (≤T_J)
+        // Cooperative load: all threads together cover the D range.
+        int lt = threadIdx.y;                       // 0..T_K-1 (<= T_J)
         if (lt < T_J && (lBase+lt) < N){
             int lGlob = lBase + lt;
             #pragma unroll
             for (int d=threadIdx.x; d<D_CONST; d+=T_I){
-                sh_X [lt][d] = bf2f(XlBH[lGlob*D_CONST + d]);
-                sh_V [lt][d] = bf2f(VlBH[lGlob*D_CONST + d]);
-                sh_gY[lt][d] = bf2f(gYlBH[lGlob*D_CONST + d]);
+                sh_X [lt][d] = bf2f(X_loopBH[lGlob*D_CONST + d]);
+                sh_V [lt][d] = bf2f(V_loopBH[lGlob*D_CONST + d]);
+                sh_gY[lt][d] = bf2f(gY_loopBH[lGlob*D_CONST + d]);
             }
             if (threadIdx.x == 0){
-                sh_m[lt]     = mlBH[lGlob];
-                sh_l_inv[lt] = 1.0f / fmaxf(llBH[lGlob], DENOM_EPS);
+                sh_m[lt]     = m_loopBH[lGlob];
+                sh_l_inv[lt] = 1.0f / fmaxf(l_loopBH[lGlob], DENOM_EPS);
             }
         }
         __syncthreads();
 
-        /* ---- iterate inside loaded chunk (only active threads compute) -- */
         if (active) {
             for (int lOff=0; lOff<T_J && (lBase+lOff)<N; ++lOff){
                 const int lGlob = lBase + lOff;
@@ -178,18 +172,19 @@ __global__ void V_gather_grad(
         __syncthreads();
     }
 
-    /* ---- atomic add to global grad (only active threads) --------------- */
     if (active) {
         #pragma unroll
         for (int d=0; d<D_CONST; ++d)
-            atomicAdd(&gVBH[out0*D_CONST + d], grad_acc[d]);
+            atomicAdd(&gV_outBH[out0*D_CONST + d], grad_acc[d]);
     }
 }
 
-// ===================== scatter-grad Vq2, Vr2, Vs2 ======================
+// =============================================================================
+// Gradient Kernels for V Tensors (Scatter Path)
+// =============================================================================
 
-// Same role permutation as V_gather_grad, but each scatter output is a product
-// of two attention weights, so the out mode's own stats are consumed too.
+// Same roles as V_gather_grad, but each scatter output is a product of two
+// attention weights, so the out mode's own stats are consumed as well.
 template<int D_CONST, bool OUT_IS_Y>
 __global__ void V_scatter_grad(
     const bf16* __restrict__ X_out,     // [B,H,N,D]
@@ -205,62 +200,58 @@ __global__ void V_scatter_grad(
     const float* __restrict__ l_loop,   // [B,H,N]
     const float* __restrict__ m_reg,    // [B,H,N]
     const float* __restrict__ l_reg,    // [B,H,N]
-    float*       __restrict__ gradV_out,// [B,H,N,D]
+    float*       __restrict__ gradV_out, // [B,H,N,D]
     const bool*  __restrict__ mask,
     int N, int H, float scale)
 {
-    /* threadblock organisation = (out,reg) tile ------------------------- */
     const int tx = blockIdx.x * T_I + threadIdx.x;     // 0..N-1 (column)
     const int ty = blockIdx.y * T_K + threadIdx.y;     // 0..N-1 (row)
     const int out0 = OUT_IS_Y ? ty : tx;
     const int reg0 = OUT_IS_Y ? tx : ty;
-    const int bh = blockIdx.z;                         // flattened (B,H)
+    const int bh = blockIdx.z;          // flattened (batch, head)
     const int b = bh / H;
 
-    // ALL threads must participate in cooperative loading - use active flag instead of early return
+    // No early return: every thread is needed for the cooperative loads.
     const bool active = (out0 < N && reg0 < N);
-    // Clamped indices for safe memory access during cooperative loading
+    // Inactive threads still load, from a clamped row.
     const int out_safe = min(out0, N - 1);
     const int reg_safe = min(reg0, N - 1);
 
-    // per-BH base pointers and strides
     const int64_t stride_BH = (int64_t)N * D_CONST;
-    const bf16* XoBH  = X_out   + (int64_t)bh * stride_BH;
-    const bf16* XrBH  = X_reg   + (int64_t)bh * stride_BH;
-    const bf16* XlBH  = X_loop  + (int64_t)bh * stride_BH;
-    const bf16* VrBH  = V_reg   + (int64_t)bh * stride_BH;
-    const bf16* VlBH  = V_loop  + (int64_t)bh * stride_BH;
-    const bf16* gYlBH = gY_loop + (int64_t)bh * stride_BH;
-    const bf16* gYrBH = gY_reg  + (int64_t)bh * stride_BH;
-    const float* moBH = m_out  + (int64_t)bh * N;
-    const float* loBH = l_out  + (int64_t)bh * N;
-    const float* mlBH = m_loop + (int64_t)bh * N;
-    const float* llBH = l_loop + (int64_t)bh * N;
-    const float* mrBH = m_reg  + (int64_t)bh * N;
-    const float* lrBH = l_reg  + (int64_t)bh * N;
-          float* gVBH = gradV_out + (int64_t)bh * stride_BH;
+    const bf16* X_outBH   = X_out   + (int64_t)bh * stride_BH;
+    const bf16* X_regBH   = X_reg   + (int64_t)bh * stride_BH;
+    const bf16* X_loopBH  = X_loop  + (int64_t)bh * stride_BH;
+    const bf16* V_regBH   = V_reg   + (int64_t)bh * stride_BH;
+    const bf16* V_loopBH  = V_loop  + (int64_t)bh * stride_BH;
+    const bf16* gY_loopBH = gY_loop + (int64_t)bh * stride_BH;
+    const bf16* gY_regBH  = gY_reg  + (int64_t)bh * stride_BH;
+    const float* m_outBH  = m_out  + (int64_t)bh * N;
+    const float* l_outBH  = l_out  + (int64_t)bh * N;
+    const float* m_loopBH = m_loop + (int64_t)bh * N;
+    const float* l_loopBH = l_loop + (int64_t)bh * N;
+    const float* m_regBH  = m_reg  + (int64_t)bh * N;
+    const float* l_regBH  = l_reg  + (int64_t)bh * N;
+          float* gV_outBH = gradV_out + (int64_t)bh * stride_BH;
 
-    // ---- registers for the two thread-resident modes -------------------
     float x_out_vec[D_CONST];
     float x_reg_vec[D_CONST], v_reg_vec[D_CONST];
     #pragma unroll
     for (int d=0; d<D_CONST; ++d){
-        x_out_vec[d]  = bf2f(XoBH[out_safe*D_CONST + d]);
-        x_reg_vec[d]  = bf2f(XrBH[reg_safe*D_CONST + d]);
-        v_reg_vec[d]  = bf2f(VrBH[reg_safe*D_CONST + d]);
+        x_out_vec[d]  = bf2f(X_outBH[out_safe*D_CONST + d]);
+        x_reg_vec[d]  = bf2f(X_regBH[reg_safe*D_CONST + d]);
+        v_reg_vec[d]  = bf2f(V_regBH[reg_safe*D_CONST + d]);
     }
-    // gY_reg row: warp-uniform when reg sits on thread y, so read it from
-    // global (broadcast, L1-hot) rather than spending a fourth D-long register
-    // array that spills. On thread x every lane wants a different row, so cache.
-    const bf16* gy_reg_glob = &gYrBH[reg_safe*D_CONST];
-    float gy_reg_vec[OUT_IS_Y ? D_CONST : 1];
+    // gY_reg row: on thread y it is warp-uniform, so read it straight from
+    // global (broadcast, L1-hot) instead of spending a fourth D-long register
+    // array that spills. On thread x each lane wants its own row, so cache it.
+    const bf16* gy_reg_row = &gY_regBH[reg_safe*D_CONST];
+    float gy_reg_cache[OUT_IS_Y ? D_CONST : 1];
     if constexpr (OUT_IS_Y) {
         #pragma unroll
-        for (int d=0; d<D_CONST; ++d) gy_reg_vec[d] = bf2f(gy_reg_glob[d]);
+        for (int d=0; d<D_CONST; ++d) gy_reg_cache[d] = bf2f(gy_reg_row[d]);
     }
     float grad_acc[D_CONST] = {0.0f};
 
-    // ---- shared memory tiles for the loop mode -------------------------
     extern __shared__ float shmem[];
     float* sh_X  = shmem;                       // T_J * D_CONST
     float* sh_V  = sh_X  + T_J * D_CONST;       // T_J * D_CONST
@@ -268,25 +259,23 @@ __global__ void V_scatter_grad(
     float* sh_m  = sh_gY + T_J * D_CONST;       // T_J scalars
     float* sh_l  = sh_m  + T_J;
 
-    /* iterate over loop-mode tiles -------------------------------------- */
     for (int lBase=0; lBase < N; lBase+=T_J){
-        // cooperative load by all (out,reg) threads inside TB
-        const int lt = threadIdx.y;  // reuse y-dimension for co-load rows
+        // Cooperative load: all threads together cover the D range.
+        const int lt = threadIdx.y;  // reuse y for co-load rows
         if (lt < T_J && (lBase+lt) < N){
             const int lGlob = lBase + lt;
             for (int d=threadIdx.x; d<D_CONST; d+=T_I){
-                sh_X [lt*D_CONST + d] = bf2f(XlBH[lGlob*D_CONST + d]);
-                sh_V [lt*D_CONST + d] = bf2f(VlBH[lGlob*D_CONST + d]);
-                sh_gY[lt*D_CONST + d] = bf2f(gYlBH[lGlob*D_CONST + d]);
+                sh_X [lt*D_CONST + d] = bf2f(X_loopBH[lGlob*D_CONST + d]);
+                sh_V [lt*D_CONST + d] = bf2f(V_loopBH[lGlob*D_CONST + d]);
+                sh_gY[lt*D_CONST + d] = bf2f(gY_loopBH[lGlob*D_CONST + d]);
             }
             if (threadIdx.x == 0){
-                sh_m[lt] = mlBH[lGlob];
-                sh_l[lt] = llBH[lGlob];
+                sh_m[lt] = m_loopBH[lGlob];
+                sh_l[lt] = l_loopBH[lGlob];
             }
         }
         __syncthreads();
 
-        // ---- loop inside the tile (only active threads compute) --------
         if (active) {
             for (int lOff=0; lOff<T_J && (lBase+lOff)<N; ++lOff){
                 const int lGlob = lBase + lOff;
@@ -296,15 +285,15 @@ __global__ void V_scatter_grad(
                     dot += x_out_vec[d] * sh_X[lOff*D_CONST + d] * x_reg_vec[d];
                 float logits = dot * scale;
 
-                // Combined attention weights in LOG-SPACE to avoid overflow:
+                // Weight products in log space to avoid overflow:
                 // A_a * A_b = exp(2*logits - m_a - m_b) / (l_a * l_b)
-                float log_A_out  = logits - moBH[out_safe];
+                float log_A_out  = logits - m_outBH[out_safe];
                 float log_A_loop = logits - sh_m[lOff];
-                float log_A_reg  = logits - mrBH[reg_safe];
+                float log_A_reg  = logits - m_regBH[reg_safe];
 
-                float l_out_val  = fmaxf(loBH[out_safe], DENOM_EPS);
+                float l_out_val  = fmaxf(l_outBH[out_safe], DENOM_EPS);
                 float l_loop_val = fmaxf(sh_l[lOff], DENOM_EPS);
-                float l_reg_val  = fmaxf(lrBH[reg_safe], DENOM_EPS);
+                float l_reg_val  = fmaxf(l_regBH[reg_safe], DENOM_EPS);
 
                 const bool out_valid  = mask_pair_allowed(mask, N, b, out0, lGlob, reg0);
                 const bool loop_valid = mask_pair_allowed(mask, N, b, lGlob, out0, reg0);
@@ -322,8 +311,8 @@ __global__ void V_scatter_grad(
                 #pragma unroll
                 for (int d=0; d<D_CONST; ++d){
                     float gy_reg;
-                    if constexpr (OUT_IS_Y) gy_reg = gy_reg_vec[d];
-                    else                    gy_reg = bf2f(gy_reg_glob[d]);
+                    if constexpr (OUT_IS_Y) gy_reg = gy_reg_cache[d];
+                    else                    gy_reg = bf2f(gy_reg_row[d]);
                     grad_acc[d] += w1 * gy_loop_vec[d] * v_reg_vec[d]
                                  + w2 * gy_reg * v_loop_vec[d];
                 }
@@ -332,11 +321,10 @@ __global__ void V_scatter_grad(
         __syncthreads();
     }
 
-    // ---- atomic add results (only active threads) --------------------
     if (active) {
         #pragma unroll
         for (int d=0; d<D_CONST; ++d)
-            atomicAdd(&gVBH[out0*D_CONST + d], grad_acc[d]);
+            atomicAdd(&gV_outBH[out0*D_CONST + d], grad_acc[d]);
     }
 }
 
@@ -456,16 +444,16 @@ void Bwd_gather_tc(
     const int bcol8 = ((lane >> 3) & 1) * 8;
 
     extern __shared__ char smem_raw[];
-    bf16* xr_sm  = reinterpret_cast<bf16*>(smem_raw);            // [BTC_BJ][DPAD]
-    bf16* vr_sm  = xr_sm + BTC_BJ * DPAD;
-    bf16* gyr_sm = vr_sm + BTC_BJ * DPAD;
-    bf16* xc_sm  = gyr_sm + BTC_BJ * DPAD;                       // [K_pad][DPAD]
-    bf16* vc_sm  = xc_sm + K_pad * DPAD;
-    bf16* gyc_sm = vc_sm + K_pad * DPAD;
-    float* anchX = reinterpret_cast<float*>(gyc_sm + K_pad * DPAD);  // [D] scale*Xa
-    float* anchV = anchX + D;                                    // [D]
-    float* anchG = anchV + D;                                    // [D]
-    float* mc_sm = anchG + D;                                    // [K_pad]
+    bf16* xr_sm   = reinterpret_cast<bf16*>(smem_raw);            // [BTC_BJ][DPAD]
+    bf16* vr_sm   = xr_sm + BTC_BJ * DPAD;
+    bf16* gyr_sm  = vr_sm + BTC_BJ * DPAD;
+    bf16* xc_sm   = gyr_sm + BTC_BJ * DPAD;                       // [K_pad][DPAD]
+    bf16* vc_sm   = xc_sm + K_pad * DPAD;
+    bf16* gyc_sm  = vc_sm + K_pad * DPAD;
+    float* anchX  = reinterpret_cast<float*>(gyc_sm + K_pad * DPAD);  // [D] scale*Xa
+    float* anchV  = anchX + D;                                    // [D]
+    float* anchG  = anchV + D;                                    // [D]
+    float* mc_sm  = anchG + D;                                    // [K_pad]
     float* ilc_sm = mc_sm + K_pad;
     float* sc_sm  = ilc_sm + K_pad;
     float* mr_sm  = sc_sm + K_pad;                               // [BTC_BJ]
@@ -936,18 +924,18 @@ __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
 
     // Per (B,H) base pointers
     const int64_t stride_BH = (int64_t)N * D_CONST;
-    const bf16* Qbh = Q   + bh * stride_BH;
-    const bf16* Rbh = R   + bh * stride_BH;
-    const bf16* Sbh = S   + bh * stride_BH;
-    const bf16* Vq1bh = Vq1 + bh * stride_BH;
-    const bf16* Vq2bh = Vq2 + bh * stride_BH;
-    const bf16* Vr1bh = Vr1 + bh * stride_BH;
-    const bf16* Vr2bh = Vr2 + bh * stride_BH;
-    const bf16* Vs1bh = Vs1 + bh * stride_BH;
-    const bf16* Vs2bh = Vs2 + bh * stride_BH;
-    const bf16* gYqbh = grad_Yq + bh * stride_BH;
-    const bf16* gYrbh = grad_Yr + bh * stride_BH;
-    const bf16* gYsbh = grad_Ys + bh * stride_BH;
+    const bf16* Qbh    = Q   + bh * stride_BH;
+    const bf16* Rbh    = R   + bh * stride_BH;
+    const bf16* Sbh    = S   + bh * stride_BH;
+    const bf16* Vq1bh  = Vq1 + bh * stride_BH;
+    const bf16* Vq2bh  = Vq2 + bh * stride_BH;
+    const bf16* Vr1bh  = Vr1 + bh * stride_BH;
+    const bf16* Vr2bh  = Vr2 + bh * stride_BH;
+    const bf16* Vs1bh  = Vs1 + bh * stride_BH;
+    const bf16* Vs2bh  = Vs2 + bh * stride_BH;
+    const bf16* gYqbh  = grad_Yq + bh * stride_BH;
+    const bf16* gYrbh  = grad_Yr + bh * stride_BH;
+    const bf16* gYsbh  = grad_Ys + bh * stride_BH;
     const bf16* gYq2bh = grad_Yq_ + bh * stride_BH;
     const bf16* gYr2bh = grad_Yr_ + bh * stride_BH;
     const bf16* gYs2bh = grad_Ys_ + bh * stride_BH;
@@ -957,8 +945,8 @@ __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
     const float* ljBH  = l_j + bh * N;
     const float* mkBH  = m_k + bh * N;
     const float* lkBH  = l_k + bh * N;
-    float* sum_qBH = sum_q + bh * N;
-    float* sum_sBH = sum_s + bh * N;
+    float* sum_qBH     = sum_q + bh * N;
+    float* sum_sBH     = sum_s + bh * N;
 
     constexpr int D_PAD = D_CONST + 1;  // bank-conflict-free stride
     extern __shared__ float shmem[];
@@ -1296,18 +1284,18 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
 
     // Per (B,H) base pointers
     const int64_t stride_BH = (int64_t)N * D_CONST;
-    const bf16* Qbh = Q   + bh * stride_BH;
-    const bf16* Rbh = R   + bh * stride_BH;
-    const bf16* Sbh = S   + bh * stride_BH;
-    const bf16* Vq1bh = Vq1 + bh * stride_BH;
-    const bf16* Vq2bh = Vq2 + bh * stride_BH;
-    const bf16* Vr1bh = Vr1 + bh * stride_BH;
-    const bf16* Vr2bh = Vr2 + bh * stride_BH;
-    const bf16* Vs1bh = Vs1 + bh * stride_BH;
-    const bf16* Vs2bh = Vs2 + bh * stride_BH;
-    const bf16* gYqbh = grad_Yq + bh * stride_BH;
-    const bf16* gYrbh = grad_Yr + bh * stride_BH;
-    const bf16* gYsbh = grad_Ys + bh * stride_BH;
+    const bf16* Qbh    = Q   + bh * stride_BH;
+    const bf16* Rbh    = R   + bh * stride_BH;
+    const bf16* Sbh    = S   + bh * stride_BH;
+    const bf16* Vq1bh  = Vq1 + bh * stride_BH;
+    const bf16* Vq2bh  = Vq2 + bh * stride_BH;
+    const bf16* Vr1bh  = Vr1 + bh * stride_BH;
+    const bf16* Vr2bh  = Vr2 + bh * stride_BH;
+    const bf16* Vs1bh  = Vs1 + bh * stride_BH;
+    const bf16* Vs2bh  = Vs2 + bh * stride_BH;
+    const bf16* gYqbh  = grad_Yq + bh * stride_BH;
+    const bf16* gYrbh  = grad_Yr + bh * stride_BH;
+    const bf16* gYsbh  = grad_Ys + bh * stride_BH;
     const bf16* gYq2bh = grad_Yq_ + bh * stride_BH;
     const bf16* gYr2bh = grad_Yr_ + bh * stride_BH;
     const bf16* gYs2bh = grad_Ys_ + bh * stride_BH;
@@ -1317,7 +1305,7 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
     const float* ljBH  = l_j + bh * N;
     const float* mkBH  = m_k + bh * N;
     const float* lkBH  = l_k + bh * N;
-    float* sum_rBH = sum_r + bh * N;
+    float* sum_rBH     = sum_r + bh * N;
 
     constexpr int D_PAD = D_CONST + 1;  // bank-conflict-free stride
     extern __shared__ float shmem[];
@@ -1846,8 +1834,9 @@ backward_impl(torch::Tensor grad_Y_q,
     dim3 block_dim(TI, TK);
     dim3 grid_dim((N + TI - 1) / TI, (N + TK - 1) / TK, B * H);
 
-    // Role table (out / reg / loop), one launch per V_1 gradient. Gather
-    // kernels use static shared memory sized by D_TMPL.
+    // Role table (out / reg / loop), one launch per V_1 gradient; the last arg
+    // puts out on thread y, which the grad_Vs permutation wants. Gather kernels
+    // use static shared memory sized by D_TMPL.
     auto launch = [&](const at::Tensor& X_out, const at::Tensor& X_reg,
                       const at::Tensor& X_loop, const at::Tensor& V_reg,
                       const at::Tensor& V_loop, const at::Tensor& gY_loop,
@@ -1871,9 +1860,9 @@ backward_impl(torch::Tensor grad_Y_q,
           mask_ptr, N, H, scale);
     };
 
-    launch(Q, S, R, Vs_1, Vr_1, grad_Y_r, grad_Y_s, m_j, l_j, m_k, l_k, grad_Vq_1, false);
-    launch(R, S, Q, Vs_1, Vq_1, grad_Y_q, grad_Y_s, m_i, l_i, m_k, l_k, grad_Vr_1, false);
-    launch(S, Q, R, Vq_1, Vr_1, grad_Y_r, grad_Y_q, m_j, l_j, m_i, l_i, grad_Vs_1, true);
+    launch(Q, S, R,  Vs_1, Vr_1,  grad_Y_r, grad_Y_s,  m_j, l_j,  m_k, l_k,  grad_Vq_1, false);
+    launch(R, S, Q,  Vs_1, Vq_1,  grad_Y_q, grad_Y_s,  m_i, l_i,  m_k, l_k,  grad_Vr_1, false);
+    launch(S, Q, R,  Vq_1, Vr_1,  grad_Y_r, grad_Y_q,  m_j, l_j,  m_i, l_i,  grad_Vs_1, true);
   });
 
   // ============================================================================
@@ -1887,7 +1876,7 @@ backward_impl(torch::Tensor grad_Y_q,
 
     const size_t shmem_scatter = 3 * T_J * D_TMPL * sizeof(float) + 2 * T_J * sizeof(float);
 
-    // Same role table as the gather grads; the out mode's stats are consumed
+    // Same role table as the gather grads, but the out mode's stats are consumed
     // as well, so all six m/l tensors are passed.
     auto launch = [&](const at::Tensor& X_out, const at::Tensor& X_reg,
                       const at::Tensor& X_loop, const at::Tensor& V_reg,
@@ -1914,12 +1903,12 @@ backward_impl(torch::Tensor grad_Y_q,
           mask_ptr, N, H, scale);
     };
 
-    launch(Q, S, R, Vs_2, Vr_2, grad_Y_r_, grad_Y_s_,
-           m_i, l_i, m_j, l_j, m_k, l_k, grad_Vq_2, false);
-    launch(R, S, Q, Vs_2, Vq_2, grad_Y_q_, grad_Y_s_,
-           m_j, l_j, m_i, l_i, m_k, l_k, grad_Vr_2, false);
-    launch(S, Q, R, Vq_2, Vr_2, grad_Y_r_, grad_Y_q_,
-           m_k, l_k, m_j, l_j, m_i, l_i, grad_Vs_2, true);
+    launch(Q, S, R,  Vs_2, Vr_2,  grad_Y_r_, grad_Y_s_,
+           m_i, l_i,  m_j, l_j,  m_k, l_k,  grad_Vq_2, false);
+    launch(R, S, Q,  Vs_2, Vq_2,  grad_Y_q_, grad_Y_s_,
+           m_j, l_j,  m_i, l_i,  m_k, l_k,  grad_Vr_2, false);
+    launch(S, Q, R,  Vq_2, Vr_2,  grad_Y_r_, grad_Y_q_,
+           m_k, l_k,  m_j, l_j,  m_i, l_i,  grad_Vs_2, true);
   });
   AT_CUDA_CHECK(cudaGetLastError());
 
