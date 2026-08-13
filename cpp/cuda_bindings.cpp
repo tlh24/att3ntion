@@ -9,15 +9,45 @@
  */
 
 #include <torch/extension.h>
+#include <cstdlib>
 #include <tuple>
 #include <cuda_runtime.h>
 #include "cuda_bindings.h"
+
+namespace att3_tc {
+
+State& state() {
+    static State s = []() {
+        auto enabled = [](const char* name) {
+            const char* e = std::getenv(name);
+            return !(e && e[0] == '0');
+        };
+        return State{enabled("ATT3_YQ_TC"), enabled("ATT3_BWD_TC")};
+    }();
+    return s;
+}
+
+}  // namespace att3_tc
 
 // =============================================================================
 // Python Bindings
 // =============================================================================
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("tc_launches", []() {
+        return std::make_pair(att3_tc::state().fwd_launches.load(),
+                              att3_tc::state().bwd_launches.load());
+    }, "Cumulative (Y_gather_tc, Bwd_gather_tc) launch counts");
+
+    m.def("tc_set_enabled", [](bool forward, bool backward) {
+        auto prev = std::make_pair(att3_tc::state().fwd_enabled,
+                                   att3_tc::state().bwd_enabled);
+        att3_tc::state().fwd_enabled = forward;
+        att3_tc::state().bwd_enabled = backward;
+        return prev;
+    }, "Set both TC gates, returning the previous (forward, backward)",
+       py::arg("forward"), py::arg("backward"));
+
     m.def(
         "forward",
         [](at::Tensor Q, at::Tensor R, at::Tensor S,

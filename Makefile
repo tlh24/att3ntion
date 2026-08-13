@@ -64,12 +64,12 @@ sanitizer-tier0: sanitizer-memcheck sanitizer-racecheck sanitizer-initcheck sani
 sanitizer-memcheck: maybe-build
 	$(GUARD)
 	$(SANITIZE) --tool memcheck $(PYTHON) -m pytest \
-		tests/test_backward_tc.py tests/test_cuda_mask.py -x
+		tests/test_tc_paths.py tests/test_cuda_mask.py -x
 
 sanitizer-racecheck sanitizer-initcheck sanitizer-synccheck: maybe-build
 	$(GUARD)
 	$(SANITIZE) --tool $(patsubst sanitizer-%,%,$@) $(PYTHON) -m pytest \
-		tests/test_backward_tc.py -k tc_variants_finite -q
+		tests/test_tc_paths.py -k tc_variants_finite -q
 	$(SANITIZE) --tool $(patsubst sanitizer-%,%,$@) $(PYTHON) \
 		tests/test_kernel_correctness.py --quick
 

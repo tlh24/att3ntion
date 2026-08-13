@@ -2236,10 +2236,6 @@ backward_impl(torch::Tensor grad_Y_q,
   // path below unchanged. Disable with ATT3_BWD_TC=0.
   if (D == 64 && I == J && J == K && (N % 16 == 0)
       && Y_q.defined() && Y_r.defined() && Y_s.defined()) {
-    static const bool tc_enabled = []() {
-        const char* e = std::getenv("ATT3_BWD_TC");
-        return !(e && e[0] == '0');
-    }();
     static const int max_smem_optin = []() {
         int dev = 0, major = 0, v = 0;
         cudaGetDevice(&dev);
@@ -2262,7 +2258,8 @@ backward_impl(torch::Tensor grad_Y_q,
         sizeof(float) * (3 * 64 + (size_t)3 * K_pad + 3 * BTC_BJ
                          + BTC_WARPS * 2 * 64 + 2 * 64)
         + smem_mask;
-    if (tc_enabled && N <= BTC_MAX_K && smem_tc <= (size_t)max_smem_optin) {
+    if (att3_tc::state().bwd_enabled && N <= BTC_MAX_K
+        && smem_tc <= (size_t)max_smem_optin) {
       // Single host round-trip for the gate.
       const bool scatter_active =
           (grad_Y_q_.ne(0).any() | grad_Y_r_.ne(0).any() | grad_Y_s_.ne(0).any())
@@ -2303,6 +2300,7 @@ backward_impl(torch::Tensor grad_Y_q,
                 mc.data_ptr<float>(), lc.data_ptr<float>(), sc.data_ptr<float>(),
                 gX.data_ptr<float>(), gV.data_ptr<float>(),
                 mask_ptr, H, N, K_pad, scale);
+            ++att3_tc::state().bwd_launches;
         };
         // Role table (anchor / rows / cols), one launch per gradient family:
         launch(Q, Vq_1, grad_Y_q,  R, Vr_1, grad_Y_r,  S, Vs_1, grad_Y_s,

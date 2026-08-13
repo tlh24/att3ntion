@@ -8,7 +8,23 @@
 #pragma once
 
 #include <torch/extension.h>
+#include <atomic>
 #include <tuple>
+
+// Both tensor-core gates fail open into the scalar path, so tests need to see
+// which one ran. Counters are per launch: an engaged pass adds 3, one per role.
+namespace att3_tc {
+
+struct State {
+    bool fwd_enabled;                       // seeded from ATT3_YQ_TC
+    bool bwd_enabled;                       // seeded from ATT3_BWD_TC
+    std::atomic<unsigned long long> fwd_launches{0};
+    std::atomic<unsigned long long> bwd_launches{0};
+};
+
+State& state();
+
+}  // namespace att3_tc
 
 // Forward pass returns: Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_, m_i, l_i, m_j, l_j, m_k, l_k
 // The softmax stats (m_i, l_i, m_j, l_j, m_k, l_k) are computed during forward and

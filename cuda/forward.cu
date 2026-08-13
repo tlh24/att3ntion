@@ -14,8 +14,6 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
-#include <cstdlib>
-
 #include "common.cuh"
 #include "../cpp/cuda_bindings.h"
 
@@ -1942,10 +1940,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     // All three gathers use it with permuted roles. Disable with ATT3_YQ_TC=0.
     bool yq_tc_done = false, yr_tc_done = false, ys_tc_done = false;
     if constexpr (D_TMPL == 64) {
-        static const bool tc_enabled = []() {
-            const char* e = std::getenv("ATT3_YQ_TC");
-            return !(e && e[0] == '0');
-        }();
         // sm_80+ only: below that the kernel body compiles to a no-op (bf16
         // mma/ldmatrix/cp.async), so launching it would silently return zeros.
         static const int max_smem_optin = []() {
@@ -1964,7 +1958,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
                              at::Tensor& m_out, at::Tensor& l_out,
                              int n_anchor, int n_rows, int rows_valid,
                              int n_res, int res_valid, cudaStream_t stream) -> bool {
-            if (!tc_enabled || n_res > TC_MAX_K) return false;
+            if (!att3_tc::state().fwd_enabled || n_res > TC_MAX_K) return false;
             const int res_pad = ceil_div(n_res, TC_BK) * TC_BK;
             constexpr int TC_DPAD = D_TMPL + 8;
             const size_t smem_tc =
@@ -2003,6 +1997,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
                 H, n_anchor, n_rows, n_res, res_pad, scale,
                 rows_valid, res_valid
             );
+            ++att3_tc::state().fwd_launches;
             return true;
         };
         yq_tc_done = launch_tc(Q, R, S, Vr_1, Vs_1, Y_q, m_i, l_i,

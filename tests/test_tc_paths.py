@@ -1,19 +1,18 @@
-"""Correctness tests for the tensor-core backward path (Bwd_gather_tc).
+"""Correctness tests for the tensor-core paths (Y_gather_tc, Bwd_gather_tc).
 
-The TC path engages only when the forward outputs Y_q/Y_r/Y_s are passed to
-backward AND the scatter cotangents are zero (scatter unused). Calling
-backward WITHOUT the Y tensors forces the scalar path, which lets one process
-compare both paths directly, and both against torch autograd.
+The backward TC path engages only when the forward outputs Y_q/Y_r/Y_s are
+passed to backward AND the scatter cotangents are zero (scatter unused).
+Calling backward WITHOUT the Y tensors forces the scalar path, which lets one
+process compare both paths directly, and both against torch autograd.
 
-The second half of the file covers the MASKED=true variant. Since
+The MASKED=true variant is covered from `_ref_gather_masked` onward. Since
 _torch_kernels has no masked reference, those tests build a gather-only fp32
-einsum reference (`_ref_gather_masked`) and differentiate it with autograd.
+einsum reference and differentiate it with autograd.
 
-Note: on GPUs with < ~172 KB opt-in shared memory (e.g. consumer Ada), large-N
-configs silently fall back to the scalar path; the autograd comparison still
-holds. Full TC coverage requires an A100/H100. `_tc_smem_bytes` computes the
-kernel's requirement so the fallback-sensitive tests can skip rather than
-silently pass.
+Both gates fail open into the scalar path — wrong D, resident dim past
+TC_MAX_K, or too little opt-in shared memory (< ~190 KB rules out consumer
+Ada) — so the dispatch matrix at the end of the file asserts which kernel ran
+via ck.tc_launches() rather than trusting the numbers alone.
 """
 import math
 import os
@@ -28,6 +27,7 @@ if PROJECT_ROOT not in sys.path:
 
 import att3ntion._cuda_kernels as ck
 import att3ntion._torch_kernels as tk
+from att3ntion import HypergraphAttention
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
@@ -131,9 +131,12 @@ def test_nonzero_scatter_grads_fall_back():
 
     out = ck.forward(*[bf[n] for n in names], 0.0)
     stats = out[6:12]
+    before = ck.tc_launches()
     got = ck.backward(*[x.to(torch.bfloat16) for x in g],
                       *[bf[n] for n in names], *stats, 0.0,
                       None, out[0], out[1], out[2])
+    torch.cuda.synchronize()
+    assert ck.tc_launches()[1] == before[1], "TC path engaged despite scatter grads"
 
     ref = {n: inp[n].detach().clone().requires_grad_(True) for n in names}
     ro = tk.forward(ref["Q"], ref["R"], ref["S"], ref["Vq_1"], ref["Vq_2"],
@@ -153,22 +156,44 @@ def test_nonzero_scatter_grads_fall_back():
 # Masked path (Bwd_gather_tc<64, true>)
 # ===========================================================================
 
-# Mirrors the kernel's smem layout (BTC_BJ=128, BTC_BK=32, BTC_WARPS=8, D=64,
-# DPAD=72) so tests that must not silently fall back can skip instead.
+# Mirror the kernels' smem layouts and dispatch gates. TC_* are forward.cu,
+# BTC_* backward.cu; DPAD is D=64 padded against bank conflicts.
+TC_BJ, TC_BK, TC_MAX_K, TC_WARPS = 128, 64, 256, 8
+BTC_BJ, BTC_BK, BTC_MAX_K, BTC_WARPS = 128, 32, 256, 8
+DPAD = 64 + 8
+
+
+def _smem_optin():
+    props = torch.cuda.get_device_properties(0)
+    return props.shared_memory_per_block_optin if props.major >= 8 else 0
+
+
+def _fwd_tc_smem(N):
+    res = -(-N // TC_BK) * TC_BK
+    return (2 * (2 * TC_BJ * DPAD + 2 * res * DPAD)
+            + 4 * (res + TC_BJ + TC_WARPS * 64 + TC_WARPS * 2 + 64 + 2 + 64))
+
+
 def _tc_smem_bytes(N, masked):
-    k_pad = -(-N // 32) * 32
-    total = 2 * (3 * 128 * 72 + 3 * k_pad * 72)
-    total += 4 * (3 * 64 + 3 * k_pad + 3 * 128 + 8 * 2 * 64 + 2 * 64)
+    k_pad = -(-N // BTC_BK) * BTC_BK
+    total = 2 * (3 * BTC_BJ * DPAD + 3 * k_pad * DPAD)
+    total += 4 * (3 * 64 + 3 * k_pad + 3 * BTC_BJ + BTC_WARPS * 2 * 64 + 2 * 64)
     if masked:
-        total += 4 * k_pad * (k_pad // 32) + k_pad
+        total += 4 * 2 * (k_pad + 1) * (k_pad // 32) + 4 * (k_pad + BTC_BJ)
     return total
 
 
 def _tc_fits(N, masked=True):
-    props = torch.cuda.get_device_properties(0)
-    if props.major < 8:
-        return False
-    return _tc_smem_bytes(N, masked) <= props.shared_memory_per_block_optin
+    return _tc_smem_bytes(N, masked) <= _smem_optin()
+
+
+def _expect_fwd_tc(N, D):
+    return D == 64 and N <= TC_MAX_K and _fwd_tc_smem(N) <= _smem_optin()
+
+
+def _expect_bwd_tc(N, D, masked):
+    return (D == 64 and N % 16 == 0 and N <= BTC_MAX_K
+            and _tc_smem_bytes(N, masked) <= _smem_optin())
 
 
 def _ref_gather_masked(Q, R, S, Vq1, Vr1, Vs1, mask):
@@ -358,6 +383,146 @@ def test_tc_variants_finite(N, kind):
     out_names = ["Y_q", "Y_r", "Y_s", "Y_q_", "Y_r_", "Y_s_"]
     for name, t in zip(out_names + GRAD_NAMES, list(out[:6]) + list(grads)):
         assert torch.isfinite(t).all(), f"{name}: non-finite (N={N} mask={kind})"
+
+
+# ===========================================================================
+# Dispatch matrix
+# ===========================================================================
+
+def _dispatch_run(B, H, N, D, mask, tc=True, valid=None, seed=0):
+    """One forward+backward, reporting TC launches. tc=False forces the scalar
+    path in-process so the same inputs can be run down both."""
+    torch.manual_seed(seed)
+    dev = "cuda"
+    names = ["Q", "R", "S", "Vq_1", "Vq_2", "Vr_1", "Vr_2", "Vs_1", "Vs_2"]
+    bf = {n: torch.randn(B, H, N, D, device=dev).to(torch.bfloat16) for n in names}
+    g = [torch.randn(B, H, N, D, device=dev).to(torch.bfloat16) for _ in range(3)]
+    zero = torch.zeros(B, H, N, D, device=dev, dtype=torch.bfloat16)
+    v = (N, N, N) if valid is None else (valid, valid, valid)
+    if valid is not None:                       # _autograd zero-pads the tail
+        for t in list(bf.values()) + g:
+            t[:, :, valid:, :] = 0
+
+    prev = ck.tc_set_enabled(tc, tc)
+    try:
+        before = ck.tc_launches()
+        out = ck.forward(*[bf[n] for n in names], 0.0, *v, mask)
+        grads = ck.backward(*g, zero, zero, zero, *[bf[n] for n in names],
+                            *out[6:12], 0.0, mask, out[0], out[1], out[2])
+        torch.cuda.synchronize()
+        after = ck.tc_launches()
+    finally:
+        ck.tc_set_enabled(*prev)
+    return bf, out, grads, (after[0] - before[0], after[1] - before[1])
+
+
+# D: only 64 is TC. N: 128/256 reach the unmasked forward variant, everything
+# else the masked one (n_rows % TC_BJ), and past TC_MAX_K both fall back.
+DISPATCH_CELLS = [(N, D, kind)
+                  for N in [16, 32, 96, 128, 160, 256]
+                  for D in [16, 32, 64]
+                  for kind in (None, "causal")]
+DISPATCH_CELLS += [(272, 64, None), (272, 64, "causal"), (512, 64, None)]
+
+
+@pytest.mark.parametrize("N,D,kind", DISPATCH_CELLS)
+def test_dispatch_selects_expected_path(N, D, kind):
+    """A silent fallback is a failure, not a green run. Both directions are
+    asserted, so a gate that drifts either way shows up here."""
+    B, H = 1, 1
+    mask = _make_mask(kind, B, N, "cuda") if kind else None
+    _, _, _, (fwd, bwd) = _dispatch_run(B, H, N, D, mask, seed=N + D)
+    assert fwd == (3 if _expect_fwd_tc(N, D) else 0), (
+        f"forward: {fwd} TC launches at N={N} D={D} mask={kind}")
+    assert bwd == (3 if _expect_bwd_tc(N, D, kind is not None) else 0), (
+        f"backward: {bwd} TC launches at N={N} D={D} mask={kind}")
+
+
+@pytest.mark.parametrize("reference", ["scalar", "torch"])
+@pytest.mark.parametrize("kind", [None] + MASK_KINDS)
+@pytest.mark.parametrize("N", [32, 96, 128, 256])
+def test_forward_tc_matches_reference(N, kind, reference):
+    """TC-vs-scalar isolates the tensor-core kernel; TC-vs-torch is the actual
+    oracle, and catches a wrong assumption both kernels happen to share."""
+    B, H, D = 1, 2, 64
+    if not _expect_fwd_tc(N, D):
+        pytest.skip(f"device opt-in smem too small for forward TC at N={N}")
+    if reference == "torch" and N > 128:
+        pytest.skip("fp32 cube reference too large past N=128")
+    mask = _make_mask(kind, B, N, "cuda") if kind else None
+    bf, out, _, (fwd, _) = _dispatch_run(B, H, N, D, mask, seed=N)
+    assert fwd == 3, f"forward TC did not engage at N={N} mask={kind}"
+
+    if reference == "scalar":
+        _, exp, _, (f2, _) = _dispatch_run(B, H, N, D, mask, tc=False, seed=N)
+        assert f2 == 0, "scalar run still took the TC path"
+    else:
+        f = {n: v.float() for n, v in bf.items()}
+        if mask is None:
+            exp = tk.forward(f["Q"], f["R"], f["S"], f["Vq_1"], f["Vq_2"],
+                             f["Vr_1"], f["Vr_2"], f["Vs_1"], f["Vs_2"], 0.0)
+        else:
+            exp = _ref_gather_masked(f["Q"], f["R"], f["S"],
+                                     f["Vq_1"], f["Vr_1"], f["Vs_1"], mask)
+
+    for idx, name in enumerate(["Y_q", "Y_r", "Y_s"]):
+        got, want = out[idx].float(), exp[idx].float()
+        assert torch.isfinite(got).all(), f"{name}: non-finite (N={N} {kind})"
+        err = (got - want).abs().max().item()
+        tol = 0.05 * max(want.abs().max().item(), 1e-3)
+        assert err <= tol, (
+            f"{name} vs {reference} (N={N} mask={kind}): max diff {err:.3e} "
+            f"> {tol:.3e}")
+
+
+@pytest.mark.parametrize("N,valid", [(32, 19), (128, 100), (256, 200)])
+def test_partial_valid_matches_scalar(N, valid):
+    """I/J/K_valid < N drives the masked TC variant with no mask tensor — the
+    shape _autograd emits for a padded sequence."""
+    B, H, D = 1, 2, 64
+    if not _expect_fwd_tc(N, D):
+        pytest.skip(f"device opt-in smem too small for forward TC at N={N}")
+    _, out, grads, (fwd, _) = _dispatch_run(B, H, N, D, None, valid=valid, seed=valid)
+    _, exp, ref, (f2, _) = _dispatch_run(B, H, N, D, None, valid=valid,
+                                         tc=False, seed=valid)
+    assert fwd == 3, f"forward TC did not engage at N={N} valid={valid}"
+    assert f2 == 0, "scalar run still took the TC path"
+    for idx, name in enumerate(["Y_q", "Y_r", "Y_s"]):
+        got, want = out[idx].float()[:, :, :valid], exp[idx].float()[:, :, :valid]
+        err = (got - want).abs().max().item()
+        assert err <= 0.05 * max(want.abs().max().item(), 1e-3), (
+            f"{name} (N={N} valid={valid}): TC vs scalar max diff {err:.3e}")
+    for idx, name in enumerate(GRAD_NAMES[:3]):
+        got, want = grads[idx].float()[:, :, :valid], ref[idx].float()[:, :, :valid]
+        err = (got - want).abs().max().item()
+        assert err <= 0.05 * max(want.abs().max().item(), 1e-3), (
+            f"{name} (N={N} valid={valid}): TC vs scalar max diff {err:.3e}")
+
+
+# _autograd pads to a multiple of 16 while TC_BJ is 128, so real (ragged)
+# sequence lengths reach the kernels at N values no fixed sweep generates.
+@pytest.mark.parametrize("N", [16, 19, 32, 48, 100, 129])
+@pytest.mark.parametrize("kind", [None, "causal"])
+def test_autograd_padded_n_engages_tc(N, kind):
+    torch.manual_seed(N)
+    B, d_model, H = 2, 128, 2          # d_head = 64, the one TC shape
+    mod = HypergraphAttention(d_model=d_model, n_heads=H, dropout_rate=0.0,
+                              scatter=False).to("cuda", torch.float32)
+    x = torch.randn(B, N, d_model, device="cuda")
+    mask = _make_mask(kind, B, N, "cuda") if kind else None
+
+    before = ck.tc_launches()
+    y = mod(x, mask=mask)
+    y.sum().backward()
+    torch.cuda.synchronize()
+    fwd, bwd = (a - b for a, b in zip(ck.tc_launches(), before))
+
+    padded = -(-N // 16) * 16
+    assert torch.isfinite(y).all()
+    assert fwd == (3 if _expect_fwd_tc(padded, 64) else 0), (
+        f"forward: {fwd} TC launches at N={N} (padded {padded}) mask={kind}")
+    assert bwd == (3 if _expect_bwd_tc(padded, 64, kind is not None) else 0), (
+        f"backward: {bwd} TC launches at N={N} (padded {padded}) mask={kind}")
 
 
 @pytest.mark.parametrize("N", [32, 64])
