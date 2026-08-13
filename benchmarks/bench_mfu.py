@@ -40,12 +40,8 @@ def build_flop_map(B, H, N, D):
         # Forward scatter  (4D + 5)
         "Y_scatter":            base * (4*D + 5),
         # Backward V gradients  (4D each)
-        "Vq_gather_grad":       base * 4 * D,
-        "Vr_gather_grad":       base * 4 * D,
-        "Vs_gather_grad":       base * 4 * D,
-        "Vq_scatter_grad":      base * 4 * D,
-        "Vr_scatter_grad":      base * 4 * D,
-        "Vs_scatter_grad":      base * 4 * D,
+        "V_gather_grad":        base * 4 * D,
+        "V_scatter_grad":       base * 4 * D,
         # QS_grad<true>:  correction sums for Q, S (and R) = jacobian term = B*H*N³*24D
         "QS_grad_kernel_TRUE":  base * 24 * D,
         # QS_grad<false>: grad_Q + grad_S = 2 * B*H*N³*24D

@@ -54,20 +54,26 @@ __device__ __forceinline__ bool mask_pair_allowed(
 // Gradient Kernels for V Tensors (Gather Path)
 // =============================================================================
 
-template<int D_CONST>
-__global__ void Vq_gather_grad(
-    const bf16* __restrict__ Q,        // [B,H,N,D]
-    const bf16* __restrict__ R,        // [B,H,N,D]
-    const bf16* __restrict__ S,        // [B,H,N,D]
-    const bf16* __restrict__ Vs,       // [B,H,N,D]   (Vs_1 slice)
-    const bf16* __restrict__ Vr,       // [B,H,N,D]   (Vr_1 slice)
-    const bf16* __restrict__ grad_Yr,  // [B,H,N,D] upstream grad for Y_r
-    const bf16* __restrict__ grad_Ys,  // [B,H,N,D] upstream grad for Y_s
-    const float* __restrict__ m_j,      // [B,H,N]
-    const float* __restrict__ l_j,      // [B,H,N]
-    const float* __restrict__ m_k,      // [B,H,N]
-    const float* __restrict__ l_k,      // [B,H,N]
-    float*       __restrict__ gradVq,   // [B,H,N,D]   (output)
+// The trilinear score is symmetric in Q/R/S, so grad_Vq_1 / grad_Vr_1 /
+// grad_Vs_1 are one kernel with permuted roles: `out` is the mode whose V
+// gradient this launch accumulates, `reg` is the register-resident partner
+// mode, `loop` is the mode streamed through shared memory. Each output picks
+// up one term from each of the other two Y gathers. OUT_IS_Y puts the out mode
+// on thread y, making the atomicAdd address warp-uniform.
+template<int D_CONST, bool OUT_IS_Y>
+__global__ void V_gather_grad(
+    const bf16* __restrict__ X_out,     // [B,H,N,D]
+    const bf16* __restrict__ X_reg,     // [B,H,N,D]
+    const bf16* __restrict__ X_loop,    // [B,H,N,D]
+    const bf16* __restrict__ V_reg,     // [B,H,N,D]   (V_1 slice)
+    const bf16* __restrict__ V_loop,    // [B,H,N,D]   (V_1 slice)
+    const bf16* __restrict__ gY_loop,   // [B,H,N,D] upstream grad for Y_loop
+    const bf16* __restrict__ gY_reg,    // [B,H,N,D] upstream grad for Y_reg
+    const float* __restrict__ m_loop,   // [B,H,N]
+    const float* __restrict__ l_loop,   // [B,H,N]
+    const float* __restrict__ m_reg,    // [B,H,N]
+    const float* __restrict__ l_reg,    // [B,H,N]
+    float*       __restrict__ gradV_out,// [B,H,N,D]   (output)
     const bool*  __restrict__ mask,
     int  N,
     int  H,
@@ -76,94 +82,96 @@ __global__ void Vq_gather_grad(
     /* ---- decode indices ------------------------------------------------ */
     int bh  = blockIdx.z;          // flattened (batch, head)
     const int b = bh / H;
-    int i0  = blockIdx.x * T_I + threadIdx.x;
-    int k0  = blockIdx.y * T_K + threadIdx.y;
+    const int tx = blockIdx.x * T_I + threadIdx.x;
+    const int ty = blockIdx.y * T_K + threadIdx.y;
+    const int out0 = OUT_IS_Y ? ty : tx;
+    const int reg0 = OUT_IS_Y ? tx : ty;
 
     // Track if this thread should compute (DON'T return early - need all threads for shared mem loading)
-    const bool active = (i0 < N && k0 < N);
+    const bool active = (out0 < N && reg0 < N);
 
     const int64_t stride_BH = (int64_t)N * D_CONST;
-    const bf16* QBH = Q       + bh * stride_BH;
-    const bf16* RBH = R       + bh * stride_BH;
-    const bf16* SBH = S       + bh * stride_BH;
-    const bf16* VsBH = Vs      + bh * stride_BH;
-    const bf16* VrBH = Vr      + bh * stride_BH;
-    const bf16* gYrBH = grad_Yr + bh * stride_BH;
-    const bf16* gYsBH = grad_Ys + bh * stride_BH;
-    const float* mJBH  = m_j     + (int64_t)bh * N;
-    const float* lJBH  = l_j     + (int64_t)bh * N;
-    const float* mKBH  = m_k     + (int64_t)bh * N;
-    const float* lKBH  = l_k     + (int64_t)bh * N;
-          float* gVqBH = gradVq  + bh * stride_BH;
+    const bf16* XoBH  = X_out   + bh * stride_BH;
+    const bf16* XrBH  = X_reg   + bh * stride_BH;
+    const bf16* XlBH  = X_loop  + bh * stride_BH;
+    const bf16* VrBH  = V_reg   + bh * stride_BH;
+    const bf16* VlBH  = V_loop  + bh * stride_BH;
+    const bf16* gYlBH = gY_loop + bh * stride_BH;
+    const bf16* gYrBH = gY_reg  + bh * stride_BH;
+    const float* mlBH = m_loop  + (int64_t)bh * N;
+    const float* llBH = l_loop  + (int64_t)bh * N;
+    const float* mrBH = m_reg   + (int64_t)bh * N;
+    const float* lrBH = l_reg   + (int64_t)bh * N;
+          float* gVBH = gradV_out + bh * stride_BH;
 
-    /* ---- per-thread vectors: fused qs = q*s (drops separate q,s scalars in inner loop)
-            vs_vec stays in regs (k-only, hot for Yr path)
-            gyk_vec = grad_Ys[k0,:] hoisted out of j-loop (was reloaded inside) */
-    float qs_vec[D_CONST];
-    float vs_vec[D_CONST];
-    float gyk_vec[D_CONST];
+    /* ---- per-thread vectors: fused prod = X_out*X_reg (drops separate scalars in inner loop)
+            v_reg_vec stays in regs (reg-only, hot for the Y_loop path)
+            gy_reg_vec = gY_reg[reg0,:] hoisted out of the loop-mode loop */
+    float prod_vec[D_CONST];
+    float v_reg_vec[D_CONST];
+    float gy_reg_vec[D_CONST];
     float grad_acc[D_CONST] = {0.0f};
 
     // Clamp indices for safe memory access (inactive threads load from valid location)
-    const int i0_safe = min(i0, N-1);
-    const int k0_safe = min(k0, N-1);
+    const int out_safe = min(out0, N-1);
+    const int reg_safe = min(reg0, N-1);
 
     #pragma unroll
     for (int d=0; d<D_CONST; ++d){
-        qs_vec[d]  = bf2f(QBH[i0_safe*D_CONST + d]) * bf2f(SBH[k0_safe*D_CONST + d]);
-        vs_vec[d]  = bf2f(VsBH[k0_safe*D_CONST + d]);
-        gyk_vec[d] = bf2f(gYsBH[k0_safe*D_CONST + d]);
+        prod_vec[d]   = bf2f(XoBH[out_safe*D_CONST + d]) * bf2f(XrBH[reg_safe*D_CONST + d]);
+        v_reg_vec[d]  = bf2f(VrBH[reg_safe*D_CONST + d]);
+        gy_reg_vec[d] = bf2f(gYrBH[reg_safe*D_CONST + d]);
     }
 
-    // Hoist k-only stats out of j-loop; pre-invert l_k once.
-    const float mk     = mKBH[k0_safe];
-    const float inv_lk = 1.0f / fmaxf(lKBH[k0_safe], DENOM_EPS);
+    // Hoist reg-only stats out of the loop; pre-invert l_reg once.
+    const float m_reg_val = mrBH[reg_safe];
+    const float inv_l_reg = 1.0f / fmaxf(lrBH[reg_safe], DENOM_EPS);
 
-    /* ---- loop over J in chunks ---------------------------------------- */
-    for (int jBase=0; jBase<N; jBase+=T_J){
-        __shared__ float sh_R [T_J][D_CONST];
-        __shared__ float sh_Vr[T_J][D_CONST];
-        __shared__ float sh_gYr[T_J][D_CONST];
-        __shared__ float sh_mj[T_J];
-        __shared__ float sh_lj_inv[T_J];      // pre-inverted, multiply not divide
+    __shared__ float sh_X [T_J][D_CONST];
+    __shared__ float sh_V [T_J][D_CONST];
+    __shared__ float sh_gY[T_J][D_CONST];
+    __shared__ float sh_m[T_J];
+    __shared__ float sh_l_inv[T_J];      // pre-inverted, multiply not divide
 
+    /* ---- loop over the loop mode in chunks ----------------------------- */
+    for (int lBase=0; lBase<N; lBase+=T_J){
         // Cooperative loading: ALL threads participate to cover all D dimensions
-        int lj = threadIdx.y;                       // 0 … T_K-1 (≤T_J)
-        if (lj < T_J && (jBase+lj) < N){
-            int jGlob = jBase + lj;
+        int lt = threadIdx.y;                       // 0 … T_K-1 (≤T_J)
+        if (lt < T_J && (lBase+lt) < N){
+            int lGlob = lBase + lt;
             #pragma unroll
             for (int d=threadIdx.x; d<D_CONST; d+=T_I){
-                sh_R [lj][d] = bf2f(RBH[jGlob*D_CONST + d]);
-                sh_Vr[lj][d] = bf2f(VrBH[jGlob*D_CONST + d]);
-                sh_gYr[lj][d] = bf2f(gYrBH[jGlob*D_CONST + d]);
+                sh_X [lt][d] = bf2f(XlBH[lGlob*D_CONST + d]);
+                sh_V [lt][d] = bf2f(VlBH[lGlob*D_CONST + d]);
+                sh_gY[lt][d] = bf2f(gYlBH[lGlob*D_CONST + d]);
             }
             if (threadIdx.x == 0){
-                sh_mj[lj]     = mJBH[jGlob];
-                sh_lj_inv[lj] = 1.0f / fmaxf(lJBH[jGlob], DENOM_EPS);
+                sh_m[lt]     = mlBH[lGlob];
+                sh_l_inv[lt] = 1.0f / fmaxf(llBH[lGlob], DENOM_EPS);
             }
         }
         __syncthreads();
 
-        /* ---- iterate inside loaded j-chunk (only active threads compute) */
+        /* ---- iterate inside loaded chunk (only active threads compute) -- */
         if (active) {
-            for (int jOff=0; jOff<T_J && (jBase+jOff)<N; ++jOff){
-                const int jGlob = jBase + jOff;
-                // logits = (q*s) · r — halved FMA vs q*r*s (save 64 FMA per j)
+            for (int lOff=0; lOff<T_J && (lBase+lOff)<N; ++lOff){
+                const int lGlob = lBase + lOff;
+                // logits = (X_out*X_reg) · X_loop — halved FMA vs the triple product
                 float logits=0.f;
                 #pragma unroll
                 for (int d=0; d<D_CONST; ++d)
-                    logits += qs_vec[d] * sh_R[jOff][d];
+                    logits += prod_vec[d] * sh_X[lOff][d];
                 logits *= scale;
 
-                const bool ar_valid = mask_pair_allowed(mask, N, b, jGlob, i0, k0);
-                const bool as_valid = mask_pair_allowed(mask, N, b, k0, i0, jGlob);
-                float wj = ar_valid ? (__expf(fminf(logits - sh_mj[jOff], EXP_CLIP)) * sh_lj_inv[jOff]) : 0.0f;
-                float wk = as_valid ? (__expf(fminf(logits - mk,           EXP_CLIP)) * inv_lk) : 0.0f;
+                const bool loop_valid = mask_pair_allowed(mask, N, b, lGlob, out0, reg0);
+                const bool reg_valid  = mask_pair_allowed(mask, N, b, reg0, out0, lGlob);
+                float w_loop = loop_valid ? (__expf(fminf(logits - sh_m[lOff], EXP_CLIP)) * sh_l_inv[lOff]) : 0.0f;
+                float w_reg  = reg_valid  ? (__expf(fminf(logits - m_reg_val,  EXP_CLIP)) * inv_l_reg) : 0.0f;
 
                 #pragma unroll
                 for (int d=0; d<D_CONST; ++d){
-                    grad_acc[d] += wj * sh_gYr[jOff][d] * vs_vec[d]      /* Yr path */
-                                +  wk * gyk_vec[d]     * sh_Vr[jOff][d]; /* Ys path */
+                    grad_acc[d] += w_loop * sh_gY[lOff][d] * v_reg_vec[d]  /* Y_loop path */
+                                +  w_reg  * gy_reg_vec[d]  * sh_V[lOff][d]; /* Y_reg path */
                 }
             }
         }
@@ -174,385 +182,150 @@ __global__ void Vq_gather_grad(
     if (active) {
         #pragma unroll
         for (int d=0; d<D_CONST; ++d)
-            atomicAdd(&gVqBH[i0*D_CONST + d], grad_acc[d]);
-    }
-}
-
-template<int D_CONST>
-__global__ void Vr_gather_grad(
-    const bf16* __restrict__ Q,        // [B,H,N,D]
-    const bf16* __restrict__ R,        // [B,H,N,D]
-    const bf16* __restrict__ S,        // [B,H,N,D]
-    const bf16* __restrict__ Vq,       // [B,H,N,D]
-    const bf16* __restrict__ Vs,       // [B,H,N,D]
-    const bf16* __restrict__ grad_Yq,  // [B,H,N,D] upstream grad for Y_q
-    const bf16* __restrict__ grad_Ys,  // [B,H,N,D] upstream grad for Y_s
-    const float* __restrict__ m_i,      // [B,H,N]
-    const float* __restrict__ l_i,      // [B,H,N]
-    const float* __restrict__ m_k,      // [B,H,N]
-    const float* __restrict__ l_k,      // [B,H,N]
-    float*       __restrict__ gradVr,   // [B,H,N,D]
-    const bool*  __restrict__ mask,
-    int  N,
-    int  H,
-    float scale )
-{
-    int bh  = blockIdx.z;
-    const int b = bh / H;
-    int j0  = blockIdx.x * T_I + threadIdx.x;
-    int k0  = blockIdx.y * T_K + threadIdx.y;
-    
-    // Track if this thread should compute (DON'T return early - need all threads for shared mem loading)
-    const bool active = (j0 < N && k0 < N);
-
-    const int64_t stride_BH = (int64_t)N * D_CONST;
-    const bf16* QBH = Q      + bh * stride_BH;
-    const bf16* RBH = R      + bh * stride_BH;
-    const bf16* SBH = S      + bh * stride_BH;
-    const bf16* VqBH = Vq     + bh * stride_BH;
-    const bf16* VsBH = Vs     + bh * stride_BH;
-    const bf16* gYqBH = grad_Yq + bh * stride_BH;
-    const bf16* gYsBH = grad_Ys + bh * stride_BH;
-    const float* mIBH  = m_i    + (int64_t)bh * N;
-    const float* lIBH  = l_i    + (int64_t)bh * N;
-    const float* mKBH  = m_k    + (int64_t)bh * N;
-    const float* lKBH  = l_k    + (int64_t)bh * N;
-          float* gVrBH = gradVr + bh * stride_BH;
-
-    // Clamp indices for safe memory access (inactive threads load from valid location)
-    const int j0_safe = min(j0, N-1);
-    const int k0_safe = min(k0, N-1);
-
-    /* ---- per-thread vectors: fused rs = r*s (drops separate r,s scalars in inner loop)
-            vs_vec stays in regs (k-only, hot for Yi path)
-            gy_k_vec = grad_Ys[k0,:] hoisted out of i-loop */
-    float rs_vec[D_CONST];
-    float vs_vec[D_CONST];
-    float gy_k_vec[D_CONST];
-    float grad_acc[D_CONST] = {0.0f};
-
-    #pragma unroll
-    for (int d=0; d<D_CONST; ++d){
-        rs_vec[d]   = bf2f(RBH[j0_safe*D_CONST + d]) * bf2f(SBH[k0_safe*D_CONST + d]);
-        vs_vec[d]   = bf2f(VsBH[k0_safe*D_CONST + d]);
-        gy_k_vec[d] = bf2f(gYsBH[k0_safe*D_CONST + d]);
-    }
-
-    // Hoist k-only stats out of i-loop; pre-invert l_k once.
-    const float m_k_val = mKBH[k0_safe];
-    const float inv_l_k = 1.0f / fmaxf(lKBH[k0_safe], DENOM_EPS);
-
-
-    for (int iBase=0; iBase<N; iBase+=T_J){
-        __shared__ float sh_Q [T_J][D_CONST];
-        __shared__ float sh_Vq[T_J][D_CONST];
-        __shared__ float sh_gYq[T_J][D_CONST];
-        __shared__ float sh_mi[T_J];
-        __shared__ float sh_li_inv[T_J];      // pre-inverted, multiply not divide
-
-        // Cooperative loading: ALL threads participate to cover all D dimensions
-        int li = threadIdx.y;
-        if (li < T_J && (iBase+li) < N){
-            int iGlob = iBase + li;
-            #pragma unroll
-            for (int d=threadIdx.x; d<D_CONST; d+=T_I){
-                sh_Q [li][d] = bf2f(QBH[iGlob*D_CONST + d]);
-                sh_Vq[li][d] = bf2f(VqBH[iGlob*D_CONST + d]);
-                sh_gYq[li][d] = bf2f(gYqBH[iGlob*D_CONST + d]);
-            }
-            if (threadIdx.x == 0){
-                sh_mi[li]     = mIBH[iGlob];
-                sh_li_inv[li] = 1.0f / fmaxf(lIBH[iGlob], DENOM_EPS);
-            }
-        }
-        __syncthreads();
-
-        // Only active threads compute
-        if (active) {
-            for (int iOff=0; iOff<T_J && (iBase+iOff)<N; ++iOff){
-                const int iGlob = iBase + iOff;
-                // logits = q · (r*s) — halved FMA vs q*r*s (save 64 FMA per i)
-                float logits=0.f;
-                #pragma unroll
-                for (int d=0; d<D_CONST; ++d)
-                    logits += sh_Q[iOff][d] * rs_vec[d];
-                logits *= scale;
-
-                const bool aq_valid = mask_pair_allowed(mask, N, b, iGlob, j0, k0);
-                const bool as_valid = mask_pair_allowed(mask, N, b, k0, iGlob, j0);
-                float wi = aq_valid ? (__expf(fminf(logits - sh_mi[iOff], EXP_CLIP)) * sh_li_inv[iOff]) : 0.0f;
-                float wk = as_valid ? (__expf(fminf(logits - m_k_val,     EXP_CLIP)) * inv_l_k) : 0.0f;
-
-                #pragma unroll
-                for (int d=0; d<D_CONST; ++d){
-                    grad_acc[d] += wi * sh_gYq[iOff][d] * vs_vec[d]
-                                  + wk * gy_k_vec[d]   * sh_Vq[iOff][d];
-                }
-            }
-        }
-        __syncthreads();
-    }
-
-    /* ---- atomic add to global grad (only active threads) --------------- */
-    if (active) {
-        #pragma unroll
-        for (int d=0; d<D_CONST; ++d)
-            atomicAdd(&gVrBH[j0*D_CONST + d], grad_acc[d]);
-    }
-}
-
-template<int D_CONST>
-__global__ void Vs_gather_grad(
-    const bf16* __restrict__ Q,        // [B,H,N,D]
-    const bf16* __restrict__ R,        // [B,H,N,D]
-    const bf16* __restrict__ S,        // [B,H,N,D]
-    const bf16* __restrict__ Vq,       // [B,H,N,D]
-    const bf16* __restrict__ Vr,       // [B,H,N,D]
-    const bf16* __restrict__ grad_Yq,  // [B,H,N,D] upstream grad for Y_q
-    const bf16* __restrict__ grad_Yr,  // [B,H,N,D] upstream grad for Y_r
-    const float* __restrict__ m_i,      // [B,H,N]
-    const float* __restrict__ l_i,      // [B,H,N]
-    const float* __restrict__ m_j,      // [B,H,N]
-    const float* __restrict__ l_j,      // [B,H,N]
-    float*       __restrict__ gradVs,   // [B,H,N,D]
-    const bool*  __restrict__ mask,
-    int  N,
-    int  H,
-    float scale )
-{
-    int bh  = blockIdx.z;
-    const int b = bh / H;
-    int i0  = blockIdx.x * T_I + threadIdx.x;
-    int k0  = blockIdx.y * T_K + threadIdx.y;
-    
-    // Track if this thread should compute (DON'T return early - need all threads for shared mem loading)
-    const bool active = (i0 < N && k0 < N);
-
-    const int64_t stride_BH = (int64_t)N * D_CONST;
-    const bf16* QBH = Q      + bh * stride_BH;
-    const bf16* RBH = R      + bh * stride_BH;
-    const bf16* SBH = S      + bh * stride_BH;
-    const bf16* VqBH = Vq     + bh * stride_BH;
-    const bf16* VrBH = Vr     + bh * stride_BH;
-    const bf16* gYqBH = grad_Yq + bh * stride_BH;
-    const bf16* gYrBH = grad_Yr + bh * stride_BH;
-    const float* mIBH  = m_i    + (int64_t)bh * N;
-    const float* lIBH  = l_i    + (int64_t)bh * N;
-    const float* mJBH  = m_j    + (int64_t)bh * N;
-    const float* lJBH  = l_j    + (int64_t)bh * N;
-          float* gVsBH = gradVs + bh * stride_BH;
-
-    // Clamp indices for safe memory access (inactive threads load from valid location)
-    const int i0_safe = min(i0, N-1);
-    const int k0_safe = min(k0, N-1);
-
-    /* ---- per-thread vectors: fused qs = q*s (drops separate q,s scalars in inner loop)
-            vq_vec stays in regs (i-only, hot for Yj path)
-            gy_i_vec = grad_Yq[i0,:] hoisted out of j-loop */
-    float qs_vec[D_CONST];
-    float vq_vec[D_CONST];
-    float gy_i_vec[D_CONST];
-    float grad_acc[D_CONST] = {0.0f};
-
-    #pragma unroll
-    for (int d=0; d<D_CONST; ++d){
-        qs_vec[d]   = bf2f(QBH[i0_safe*D_CONST + d]) * bf2f(SBH[k0_safe*D_CONST + d]);
-        vq_vec[d]   = bf2f(VqBH[i0_safe*D_CONST + d]);
-        gy_i_vec[d] = bf2f(gYqBH[i0_safe*D_CONST + d]);
-    }
-
-    // Hoist i-only stats out of j-loop; pre-invert l_i once.
-    const float m_i_val = mIBH[i0_safe];
-    const float inv_l_i = 1.0f / fmaxf(lIBH[i0_safe], DENOM_EPS);
-
-
-    for (int jBase=0; jBase<N; jBase+=T_J){
-        __shared__ float sh_R [T_J][D_CONST];
-        __shared__ float sh_Vr[T_J][D_CONST];
-        __shared__ float sh_gYr[T_J][D_CONST];
-        __shared__ float sh_mj[T_J];
-        __shared__ float sh_lj_inv[T_J];      // pre-inverted, multiply not divide
-
-        // Cooperative loading: ALL threads participate to cover all D dimensions
-        int lj = threadIdx.y;
-        if (lj < T_J && (jBase+lj) < N){
-            int jGlob = jBase + lj;
-            #pragma unroll
-            for (int d=threadIdx.x; d<D_CONST; d+=T_I){
-                sh_R [lj][d] = bf2f(RBH[jGlob*D_CONST + d]);
-                sh_Vr[lj][d] = bf2f(VrBH[jGlob*D_CONST + d]);
-                sh_gYr[lj][d] = bf2f(gYrBH[jGlob*D_CONST + d]);
-            }
-            if (threadIdx.x == 0){
-                sh_mj[lj]     = mJBH[jGlob];
-                sh_lj_inv[lj] = 1.0f / fmaxf(lJBH[jGlob], DENOM_EPS);
-            }
-        }
-        __syncthreads();
-
-        // Only active threads compute
-        if (active) {
-            for (int jOff=0; jOff<T_J && (jBase+jOff)<N; ++jOff){
-                const int jGlob = jBase + jOff;
-                // logits = (q*s) · r — halved FMA vs q*r*s (save 64 FMA per j)
-                float logits=0.f;
-                #pragma unroll
-                for (int d=0; d<D_CONST; ++d)
-                    logits += qs_vec[d] * sh_R[jOff][d];
-                logits *= scale;
-
-                const bool aq_valid = mask_pair_allowed(mask, N, b, i0, jGlob, k0);
-                const bool ar_valid = mask_pair_allowed(mask, N, b, jGlob, i0, k0);
-                float wi = aq_valid ? (__expf(fminf(logits - m_i_val,     EXP_CLIP)) * inv_l_i) : 0.0f;
-                float wj = ar_valid ? (__expf(fminf(logits - sh_mj[jOff], EXP_CLIP)) * sh_lj_inv[jOff]) : 0.0f;
-
-                #pragma unroll
-                for (int d=0; d<D_CONST; ++d){
-                    grad_acc[d] += wi * gy_i_vec[d]    * sh_Vr[jOff][d]
-                                  + wj * sh_gYr[jOff][d] * vq_vec[d];
-                }
-            }
-        }
-        __syncthreads();
-    }
-
-    /* ---- atomic add to global grad (only active threads) --------------- */
-    if (active) {
-        #pragma unroll
-        for (int d=0; d<D_CONST; ++d)
-            atomicAdd(&gVsBH[k0*D_CONST + d], grad_acc[d]);
+            atomicAdd(&gVBH[out0*D_CONST + d], grad_acc[d]);
     }
 }
 
 // ===================== scatter-grad Vq2, Vr2, Vs2 ======================
 
-
-template<int D_CONST>
-__global__ void Vq_scatter_grad(
-    const bf16* __restrict__ Q,      // [B,H,N,D]
-    const bf16* __restrict__ R,      // [B,H,N,D]
-    const bf16* __restrict__ S,      // [B,H,N,D]
-    const bf16* __restrict__ Vr2,    // [B,H,N,D]
-    const bf16* __restrict__ Vs2,    // [B,H,N,D]
-    const bf16* __restrict__ grad_Yr_, // [B,H,N,D]
-    const bf16* __restrict__ grad_Ys_, // [B,H,N,D]
-    const float* __restrict__ m_i,    // [B,H,N]
-    const float* __restrict__ l_i,    // [B,H,N]
-    const float* __restrict__ m_j,    // [B,H,N]
-    const float* __restrict__ l_j,    // [B,H,N]
-    const float* __restrict__ m_k,    // [B,H,N]
-    const float* __restrict__ l_k,    // [B,H,N]
-    float*       __restrict__ gradVq, // [B,H,N,D]
+// Same role permutation as V_gather_grad, but each scatter output is a product
+// of two attention weights, so the out mode's own stats are consumed too.
+template<int D_CONST, bool OUT_IS_Y>
+__global__ void V_scatter_grad(
+    const bf16* __restrict__ X_out,     // [B,H,N,D]
+    const bf16* __restrict__ X_reg,     // [B,H,N,D]
+    const bf16* __restrict__ X_loop,    // [B,H,N,D]
+    const bf16* __restrict__ V_reg,     // [B,H,N,D]   (V_2 slice)
+    const bf16* __restrict__ V_loop,    // [B,H,N,D]   (V_2 slice)
+    const bf16* __restrict__ gY_loop,   // [B,H,N,D]
+    const bf16* __restrict__ gY_reg,    // [B,H,N,D]
+    const float* __restrict__ m_out,    // [B,H,N]
+    const float* __restrict__ l_out,    // [B,H,N]
+    const float* __restrict__ m_loop,   // [B,H,N]
+    const float* __restrict__ l_loop,   // [B,H,N]
+    const float* __restrict__ m_reg,    // [B,H,N]
+    const float* __restrict__ l_reg,    // [B,H,N]
+    float*       __restrict__ gradV_out,// [B,H,N,D]
     const bool*  __restrict__ mask,
     int N, int H, float scale)
 {
-    /* threadblock organisation = (i,k) tile  --------------------------- */
-    const int i0 = blockIdx.x * T_I + threadIdx.x;   // 0..N-1 (column)
-    const int k0 = blockIdx.y * T_K + threadIdx.y;   // 0..N-1 (row)
-    const int bh = blockIdx.z;                       // flattened (B,H)
+    /* threadblock organisation = (out,reg) tile ------------------------- */
+    const int tx = blockIdx.x * T_I + threadIdx.x;     // 0..N-1 (column)
+    const int ty = blockIdx.y * T_K + threadIdx.y;     // 0..N-1 (row)
+    const int out0 = OUT_IS_Y ? ty : tx;
+    const int reg0 = OUT_IS_Y ? tx : ty;
+    const int bh = blockIdx.z;                         // flattened (B,H)
     const int b = bh / H;
-    
+
     // ALL threads must participate in cooperative loading - use active flag instead of early return
-    const bool active = (i0 < N && k0 < N);
+    const bool active = (out0 < N && reg0 < N);
     // Clamped indices for safe memory access during cooperative loading
-    const int i0_safe = min(i0, N - 1);
-    const int k0_safe = min(k0, N - 1);
+    const int out_safe = min(out0, N - 1);
+    const int reg_safe = min(reg0, N - 1);
 
     // per-BH base pointers and strides
     const int64_t stride_BH = (int64_t)N * D_CONST;
-    const bf16* QBH = Q    + (int64_t)bh * stride_BH;
-    const bf16* RBH = R    + (int64_t)bh * stride_BH;
-    const bf16* SBH = S    + (int64_t)bh * stride_BH;
-    const bf16* Vr2BH = Vr2  + (int64_t)bh * stride_BH;
-    const bf16* Vs2BH = Vs2  + (int64_t)bh * stride_BH;
-    const bf16* gYrBH = grad_Yr_ + (int64_t)bh * stride_BH;
-    const bf16* gYsBH = grad_Ys_ + (int64_t)bh * stride_BH;
-    const float* m_iBH = m_i  + (int64_t)bh * N;
-    const float* l_iBH = l_i  + (int64_t)bh * N;
-    const float* m_jBH = m_j  + (int64_t)bh * N;
-    const float* l_jBH = l_j  + (int64_t)bh * N;
-    const float* m_kBH = m_k  + (int64_t)bh * N;
-    const float* l_kBH = l_k  + (int64_t)bh * N;
-          float* gVqBH = gradVq + (int64_t)bh * stride_BH;
+    const bf16* XoBH  = X_out   + (int64_t)bh * stride_BH;
+    const bf16* XrBH  = X_reg   + (int64_t)bh * stride_BH;
+    const bf16* XlBH  = X_loop  + (int64_t)bh * stride_BH;
+    const bf16* VrBH  = V_reg   + (int64_t)bh * stride_BH;
+    const bf16* VlBH  = V_loop  + (int64_t)bh * stride_BH;
+    const bf16* gYlBH = gY_loop + (int64_t)bh * stride_BH;
+    const bf16* gYrBH = gY_reg  + (int64_t)bh * stride_BH;
+    const float* moBH = m_out  + (int64_t)bh * N;
+    const float* loBH = l_out  + (int64_t)bh * N;
+    const float* mlBH = m_loop + (int64_t)bh * N;
+    const float* llBH = l_loop + (int64_t)bh * N;
+    const float* mrBH = m_reg  + (int64_t)bh * N;
+    const float* lrBH = l_reg  + (int64_t)bh * N;
+          float* gVBH = gradV_out + (int64_t)bh * stride_BH;
 
-    // ---- registers for bf2f(Q[i0]), bf2f(S[k0]), bf2f(Vs2[k0]) --------------------------
-    float q_vec[D_CONST];
-    float s_vec[D_CONST], vs2_vec[D_CONST];
+    // ---- registers for the two thread-resident modes -------------------
+    float x_out_vec[D_CONST];
+    float x_reg_vec[D_CONST], v_reg_vec[D_CONST];
     #pragma unroll
     for (int d=0; d<D_CONST; ++d){
-        q_vec[d]  = bf2f(QBH[i0_safe*D_CONST + d]);
-        s_vec[d]  = bf2f(SBH[k0_safe*D_CONST + d]);
-        vs2_vec[d]= bf2f(Vs2BH[k0_safe*D_CONST + d]);
+        x_out_vec[d]  = bf2f(XoBH[out_safe*D_CONST + d]);
+        x_reg_vec[d]  = bf2f(XrBH[reg_safe*D_CONST + d]);
+        v_reg_vec[d]  = bf2f(VrBH[reg_safe*D_CONST + d]);
+    }
+    // gY_reg row: warp-uniform when reg sits on thread y, so read it from
+    // global (broadcast, L1-hot) rather than spending a fourth D-long register
+    // array that spills. On thread x every lane wants a different row, so cache.
+    const bf16* gy_reg_glob = &gYrBH[reg_safe*D_CONST];
+    float gy_reg_vec[OUT_IS_Y ? D_CONST : 1];
+    if constexpr (OUT_IS_Y) {
+        #pragma unroll
+        for (int d=0; d<D_CONST; ++d) gy_reg_vec[d] = bf2f(gy_reg_glob[d]);
     }
     float grad_acc[D_CONST] = {0.0f};
 
-    // ---- shared memory tiles for (j) ----------------------------------
+    // ---- shared memory tiles for the loop mode -------------------------
     extern __shared__ float shmem[];
-    float* sh_R   = shmem;                        // T_J * D_CONST
-    float* sh_Vr2 = sh_R   + T_J * D_CONST;       // T_J * D_CONST
-    float* sh_gYr = sh_Vr2 + T_J * D_CONST;       // T_J * D_CONST   (dYr[j,:])
-    float* sh_mj  = (float*)(sh_gYr + T_J * D_CONST);  // T_J scalars
-    float* sh_lj  = sh_mj  + T_J;
+    float* sh_X  = shmem;                       // T_J * D_CONST
+    float* sh_V  = sh_X  + T_J * D_CONST;       // T_J * D_CONST
+    float* sh_gY = sh_V  + T_J * D_CONST;       // T_J * D_CONST
+    float* sh_m  = sh_gY + T_J * D_CONST;       // T_J scalars
+    float* sh_l  = sh_m  + T_J;
 
-    /* iterate over J tiles --------------------------------------------- */
-    for (int jBase=0; jBase < N; jBase+=T_J){
-        // cooperative load by all (i,k) threads inside TB
-        const int ld_idx = threadIdx.y;  // reuse y-dimension for co-load rows
-        if (ld_idx < T_J && (jBase+ld_idx) < N){
-            const int jGlob = jBase + ld_idx;
+    /* iterate over loop-mode tiles -------------------------------------- */
+    for (int lBase=0; lBase < N; lBase+=T_J){
+        // cooperative load by all (out,reg) threads inside TB
+        const int lt = threadIdx.y;  // reuse y-dimension for co-load rows
+        if (lt < T_J && (lBase+lt) < N){
+            const int lGlob = lBase + lt;
             for (int d=threadIdx.x; d<D_CONST; d+=T_I){
-                sh_R  [ld_idx*D_CONST + d] = bf2f(RBH[jGlob*D_CONST + d]);
-                sh_Vr2[ld_idx*D_CONST + d] = bf2f(Vr2BH[jGlob*D_CONST + d]);
-                sh_gYr[ld_idx*D_CONST + d] = bf2f(gYrBH[jGlob*D_CONST + d]);
+                sh_X [lt*D_CONST + d] = bf2f(XlBH[lGlob*D_CONST + d]);
+                sh_V [lt*D_CONST + d] = bf2f(VlBH[lGlob*D_CONST + d]);
+                sh_gY[lt*D_CONST + d] = bf2f(gYlBH[lGlob*D_CONST + d]);
             }
-            if (threadIdx.x==0){
-                sh_mj[ld_idx] = m_jBH[jGlob];
-                sh_lj[ld_idx] = l_jBH[jGlob];
+            if (threadIdx.x == 0){
+                sh_m[lt] = mlBH[lGlob];
+                sh_l[lt] = llBH[lGlob];
             }
         }
         __syncthreads();
 
-        // ---- loop inside J-tile (only active threads compute) --------
+        // ---- loop inside the tile (only active threads compute) --------
         if (active) {
-            for (int jOff=0; jOff<T_J && (jBase+jOff)<N; ++jOff){
-                const int jGlob = jBase + jOff;
-                // dot(bf2f(Q[i]),bf2f(R[j]),bf2f(S[k]))
+            for (int lOff=0; lOff<T_J && (lBase+lOff)<N; ++lOff){
+                const int lGlob = lBase + lOff;
                 float dot = 0.f;
                 #pragma unroll
                 for (int d=0; d<D_CONST; ++d)
-                    dot += q_vec[d] * sh_R[jOff*D_CONST + d] * s_vec[d];
+                    dot += x_out_vec[d] * sh_X[lOff*D_CONST + d] * x_reg_vec[d];
                 float logits = dot * scale;
 
-                // Compute combined attention weights in LOG-SPACE to avoid overflow
-                // Aq = exp(logits - m_i) / l_i,  As = exp(logits - m_k) / l_k
-                // Aq * As = exp(2*logits - m_i - m_k) / (l_i * l_k)
-                float log_Aq = logits - m_iBH[i0_safe];
-                float log_Ar = logits - sh_mj[jOff];
-                float log_As = logits - m_kBH[k0_safe];
+                // Combined attention weights in LOG-SPACE to avoid overflow:
+                // A_a * A_b = exp(2*logits - m_a - m_b) / (l_a * l_b)
+                float log_A_out  = logits - moBH[out_safe];
+                float log_A_loop = logits - sh_m[lOff];
+                float log_A_reg  = logits - mrBH[reg_safe];
 
-                float l_i_val = fmaxf(l_iBH[i0_safe], DENOM_EPS);
-                float l_j_val = fmaxf(sh_lj[jOff], DENOM_EPS);
-                float l_k_val = fmaxf(l_kBH[k0_safe], DENOM_EPS);
+                float l_out_val  = fmaxf(loBH[out_safe], DENOM_EPS);
+                float l_loop_val = fmaxf(sh_l[lOff], DENOM_EPS);
+                float l_reg_val  = fmaxf(lrBH[reg_safe], DENOM_EPS);
 
-                const bool aq_valid = mask_pair_allowed(mask, N, b, i0, jGlob, k0);
-                const bool ar_valid = mask_pair_allowed(mask, N, b, jGlob, i0, k0);
-                const bool as_valid = mask_pair_allowed(mask, N, b, k0, i0, jGlob);
-                float w1 = (aq_valid && as_valid)
-                    ? (__expf(fminf(log_Aq + log_As, EXP_CLIP)) / (l_i_val * l_k_val))
+                const bool out_valid  = mask_pair_allowed(mask, N, b, out0, lGlob, reg0);
+                const bool loop_valid = mask_pair_allowed(mask, N, b, lGlob, out0, reg0);
+                const bool reg_valid  = mask_pair_allowed(mask, N, b, reg0, out0, lGlob);
+                float w1 = (out_valid && reg_valid)
+                    ? (__expf(fminf(log_A_out + log_A_reg, EXP_CLIP)) / (l_out_val * l_reg_val))
                     : 0.0f;
-                float w2 = (aq_valid && ar_valid)
-                    ? (__expf(fminf(log_Aq + log_Ar, EXP_CLIP)) / (l_i_val * l_j_val))
+                float w2 = (out_valid && loop_valid)
+                    ? (__expf(fminf(log_A_out + log_A_loop, EXP_CLIP)) / (l_out_val * l_loop_val))
                     : 0.0f;
 
-                // load vectors
-                const float* dYr_vec = &sh_gYr[jOff*D_CONST];
-                const float* Vr2_vec = &sh_Vr2[jOff*D_CONST];
-                const bf16* dYs_vec = &gYsBH[k0*D_CONST]; // contiguous in global, convert on use
+                const float* gy_loop_vec = &sh_gY[lOff*D_CONST];
+                const float* v_loop_vec  = &sh_V[lOff*D_CONST];
 
                 #pragma unroll
                 for (int d=0; d<D_CONST; ++d){
-                    grad_acc[d] += w1 * dYr_vec[d] * vs2_vec[d] +
-                                   w2 * bf2f(dYs_vec[d]) * Vr2_vec[d];
+                    float gy_reg;
+                    if constexpr (OUT_IS_Y) gy_reg = gy_reg_vec[d];
+                    else                    gy_reg = bf2f(gy_reg_glob[d]);
+                    grad_acc[d] += w1 * gy_loop_vec[d] * v_reg_vec[d]
+                                 + w2 * gy_reg * v_loop_vec[d];
                 }
             }
         }
@@ -563,274 +336,7 @@ __global__ void Vq_scatter_grad(
     if (active) {
         #pragma unroll
         for (int d=0; d<D_CONST; ++d)
-            atomicAdd(&gVqBH[i0*D_CONST + d], grad_acc[d]);
-    }
-}
-
-template<int D_CONST>
-__global__ void Vr_scatter_grad(
-    const bf16* __restrict__ Q,      // [B,H,N,D]
-    const bf16* __restrict__ R,      // [B,H,N,D]
-    const bf16* __restrict__ S,      // [B,H,N,D]
-    const bf16* __restrict__ Vq2,    // [B,H,N,D]
-    const bf16* __restrict__ Vs2,    // [B,H,N,D]
-    const bf16* __restrict__ grad_Yq_, // [B,H,N,D]
-    const bf16* __restrict__ grad_Ys_, // [B,H,N,D]
-    const float* __restrict__ m_i,    // [B,H,N]
-    const float* __restrict__ l_i,    // [B,H,N]
-    const float* __restrict__ m_j,    // [B,H,N]
-    const float* __restrict__ l_j,    // [B,H,N]
-    const float* __restrict__ m_k,    // [B,H,N]
-    const float* __restrict__ l_k,    // [B,H,N]
-    float*       __restrict__ gradVr, // [B,H,N,D]
-    const bool*  __restrict__ mask,
-    int N, int H, float scale)
-{
-    const int j0 = blockIdx.x * T_I + threadIdx.x;
-    const int k0 = blockIdx.y * T_K + threadIdx.y;
-    const int bh = blockIdx.z;
-    const int b = bh / H;
-    
-    // ALL threads must participate in cooperative loading - use active flag instead of early return
-    const bool active = (j0 < N && k0 < N);
-    // Clamped indices for safe memory access during cooperative loading
-    const int j0_safe = min(j0, N - 1);
-    const int k0_safe = min(k0, N - 1);
-
-    const int64_t stride_BH = (int64_t)N * D_CONST;
-    const bf16* QBH = Q     + (int64_t)bh * stride_BH;
-    const bf16* RBH = R     + (int64_t)bh * stride_BH;
-    const bf16* SBH = S     + (int64_t)bh * stride_BH;
-    const bf16* Vq2BH = Vq2   + (int64_t)bh * stride_BH;
-    const bf16* Vs2BH = Vs2   + (int64_t)bh * stride_BH;
-    const bf16* gYqBH = grad_Yq_ + (int64_t)bh * stride_BH;
-    const bf16* gYsBH = grad_Ys_ + (int64_t)bh * stride_BH;
-    const float* m_iBH = m_i   + (int64_t)bh * N;
-    const float* l_iBH = l_i   + (int64_t)bh * N;
-    const float* m_jBH = m_j   + (int64_t)bh * N;
-    const float* l_jBH = l_j   + (int64_t)bh * N;
-    const float* m_kBH = m_k   + (int64_t)bh * N;
-    const float* l_kBH = l_k   + (int64_t)bh * N;
-          float* gVrBH = gradVr+ (int64_t)bh * stride_BH;
-
-    float r_vec[D_CONST];
-    float s_vec[D_CONST];
-    float vs2_vec[D_CONST];
-    float gy_k_vec[D_CONST];
-    #pragma unroll
-    for (int d=0; d<D_CONST; ++d){
-        r_vec[d]    = bf2f(RBH[j0_safe*D_CONST + d]);
-        s_vec[d]    = bf2f(SBH[k0_safe*D_CONST + d]);
-        vs2_vec[d]  = bf2f(Vs2BH[k0_safe*D_CONST + d]);
-        gy_k_vec[d] = bf2f(gYsBH[k0_safe*D_CONST + d]);
-    }
-
-    float grad_acc[D_CONST] = {0.0f};
-
-    extern __shared__ float shmem[];
-    float* sh_Q   = shmem;                         // T_J * D_CONST
-    float* sh_Vq2 = sh_Q   + T_J * D_CONST;        // T_J * D_CONST
-    float* sh_gYq = sh_Vq2 + T_J * D_CONST;        // T_J * D_CONST
-    float* sh_mi  = (float*)(sh_gYq + T_J * D_CONST); // T_J
-    float* sh_li  = sh_mi + T_J;                   // T_J
-
-    for (int iBase=0; iBase < N; iBase+=T_J){
-        const int li = threadIdx.y;
-        if (li < T_J && (iBase + li) < N){
-            const int iGlob = iBase + li;
-            for (int d=threadIdx.x; d<D_CONST; d+=T_I){
-                sh_Q  [li*D_CONST + d] = bf2f(QBH[iGlob*D_CONST + d]);
-                sh_Vq2[li*D_CONST + d] = bf2f(Vq2BH[iGlob*D_CONST + d]);
-                sh_gYq[li*D_CONST + d] = bf2f(gYqBH[iGlob*D_CONST + d]);
-            }
-            if (threadIdx.x == 0){
-                sh_mi[li] = m_iBH[iGlob];
-                sh_li[li] = l_iBH[iGlob];
-            }
-        }
-        __syncthreads();
-
-        // Only active threads compute
-        if (active) {
-            for (int iOff=0; iOff<T_J && (iBase+iOff)<N; ++iOff){
-                const int iGlob = iBase + iOff;
-                float dot = 0.f;
-                #pragma unroll
-                for (int d=0; d<D_CONST; ++d)
-                    dot += sh_Q[iOff*D_CONST + d] * r_vec[d] * s_vec[d];
-                float logits = dot * scale;
-
-                // Compute combined attention weights in LOG-SPACE to avoid overflow
-                float log_Aq = logits - sh_mi[iOff];
-                float log_Ar = logits - m_jBH[j0_safe];
-                float log_As = logits - m_kBH[k0_safe];
-
-                float l_i_val = fmaxf(sh_li[iOff], DENOM_EPS);
-                float l_j_val = fmaxf(l_jBH[j0_safe], DENOM_EPS);
-                float l_k_val = fmaxf(l_kBH[k0_safe], DENOM_EPS);
-
-                const bool aq_valid = mask_pair_allowed(mask, N, b, iGlob, j0, k0);
-                const bool ar_valid = mask_pair_allowed(mask, N, b, j0, iGlob, k0);
-                const bool as_valid = mask_pair_allowed(mask, N, b, k0, iGlob, j0);
-                float w1 = (ar_valid && as_valid)
-                    ? (__expf(fminf(log_Ar + log_As, EXP_CLIP)) / (l_j_val * l_k_val))
-                    : 0.0f;
-                float w2 = (aq_valid && ar_valid)
-                    ? (__expf(fminf(log_Aq + log_Ar, EXP_CLIP)) / (l_i_val * l_j_val))
-                    : 0.0f;
-
-                const float* dy_q_vec = &sh_gYq[iOff*D_CONST];
-                const float* vq2_vec  = &sh_Vq2[iOff*D_CONST];
-
-                #pragma unroll
-                for (int d=0; d<D_CONST; ++d){
-                    grad_acc[d] += w1 * dy_q_vec[d] * vs2_vec[d]
-                                  + w2 * gy_k_vec[d] * vq2_vec[d];
-                }
-            }
-        }
-        __syncthreads();
-    }
-
-    // Only active threads write results
-    if (active) {
-        #pragma unroll
-        for (int d=0; d<D_CONST; ++d)
-            atomicAdd(&gVrBH[j0*D_CONST + d], grad_acc[d]);
-    }
-}
-
-template<int D_CONST>
-__global__ void Vs_scatter_grad(
-    const bf16* __restrict__ Q,      // [B,H,N,D]
-    const bf16* __restrict__ R,      // [B,H,N,D]
-    const bf16* __restrict__ S,      // [B,H,N,D]
-    const bf16* __restrict__ Vq2,    // [B,H,N,D]
-    const bf16* __restrict__ Vr2,    // [B,H,N,D]
-    const bf16* __restrict__ grad_Yq_, // [B,H,N,D]
-    const bf16* __restrict__ grad_Yr_, // [B,H,N,D]
-    const float* __restrict__ m_i,    // [B,H,N]
-    const float* __restrict__ l_i,    // [B,H,N]
-    const float* __restrict__ m_j,    // [B,H,N]
-    const float* __restrict__ l_j,    // [B,H,N]
-    const float* __restrict__ m_k,    // [B,H,N]
-    const float* __restrict__ l_k,    // [B,H,N]
-    float*       __restrict__ gradVs, // [B,H,N,D]
-    const bool*  __restrict__ mask,
-    int N, int H, float scale)
-{
-    const int i0 = blockIdx.x * T_I + threadIdx.x;
-    const int k0 = blockIdx.y * T_K + threadIdx.y;
-    const int bh = blockIdx.z;
-    const int b = bh / H;
-    
-    // ALL threads must participate in cooperative loading - use active flag instead of early return
-    const bool active = (i0 < N && k0 < N);
-    // Clamped indices for safe memory access during cooperative loading
-    const int i0_safe = min(i0, N - 1);
-    const int k0_safe = min(k0, N - 1);
-
-    const int64_t stride_BH = (int64_t)N * D_CONST;
-    const bf16* QBH = Q     + (int64_t)bh * stride_BH;
-    const bf16* RBH = R     + (int64_t)bh * stride_BH;
-    const bf16* SBH = S     + (int64_t)bh * stride_BH;
-    const bf16* Vq2BH = Vq2   + (int64_t)bh * stride_BH;
-    const bf16* Vr2BH = Vr2   + (int64_t)bh * stride_BH;
-    const bf16* gYqBH = grad_Yq_ + (int64_t)bh * stride_BH;
-    const bf16* gYrBH = grad_Yr_ + (int64_t)bh * stride_BH;
-    const float* m_iBH = m_i   + (int64_t)bh * N;
-    const float* l_iBH = l_i   + (int64_t)bh * N;
-    const float* m_jBH = m_j   + (int64_t)bh * N;
-    const float* l_jBH = l_j   + (int64_t)bh * N;
-    const float* m_kBH = m_k   + (int64_t)bh * N;
-    const float* l_kBH = l_k   + (int64_t)bh * N;
-          float* gVsBH = gradVs+ (int64_t)bh * stride_BH;
-
-    float q_vec[D_CONST];
-    float s_vec[D_CONST];
-    float vq2_vec[D_CONST];
-    float gy_i_vec[D_CONST];
-    #pragma unroll
-    for (int d=0; d<D_CONST; ++d){
-        q_vec[d]    = bf2f(QBH[i0_safe*D_CONST + d]);
-        s_vec[d]    = bf2f(SBH[k0_safe*D_CONST + d]);
-        vq2_vec[d]  = bf2f(Vq2BH[i0_safe*D_CONST + d]);
-        gy_i_vec[d] = bf2f(gYqBH[i0_safe*D_CONST + d]);
-    }
-
-    float grad_acc[D_CONST] = {0.0f};
-
-    extern __shared__ float shmem[];
-    float* sh_R   = shmem;                         // T_J * D_CONST
-    float* sh_Vr2 = sh_R   + T_J * D_CONST;        // T_J * D_CONST
-    float* sh_gYr = sh_Vr2 + T_J * D_CONST;        // T_J * D_CONST
-    float* sh_mj  = (float*)(sh_gYr + T_J * D_CONST);
-    float* sh_lj  = sh_mj + T_J;
-
-    for (int jBase=0; jBase < N; jBase+=T_J){
-        int lj = threadIdx.y;
-        if (lj < T_J && (jBase + lj) < N){
-            int jGlob = jBase + lj;
-            #pragma unroll
-            for (int d=threadIdx.x; d<D_CONST; d+=T_I){
-                sh_R  [lj*D_CONST + d] = bf2f(RBH[jGlob*D_CONST + d]);
-                sh_Vr2[lj*D_CONST + d] = bf2f(Vr2BH[jGlob*D_CONST + d]);
-                sh_gYr[lj*D_CONST + d] = bf2f(gYrBH[jGlob*D_CONST + d]);
-            }
-            if (threadIdx.x == 0){
-                sh_mj[lj] = m_jBH[jGlob];
-                sh_lj[lj] = l_jBH[jGlob];
-            }
-        }
-        __syncthreads();
-
-        // Only active threads compute
-        if (active) {
-            for (int jOff=0; jOff<T_J && (jBase+jOff)<N; ++jOff){
-                const int jGlob = jBase + jOff;
-                float dot = 0.f;
-                #pragma unroll
-                for (int d=0; d<D_CONST; ++d)
-                    dot += q_vec[d] * sh_R[jOff*D_CONST + d] * s_vec[d];
-                float logits = dot * scale;
-
-                // Compute combined attention weights in LOG-SPACE to avoid overflow
-                float log_Aq = logits - m_iBH[i0_safe];
-                float log_Ar = logits - sh_mj[jOff];
-                float log_As = logits - m_kBH[k0_safe];
-
-                float l_i_val = fmaxf(l_iBH[i0_safe], DENOM_EPS);
-                float l_j_val = fmaxf(sh_lj[jOff], DENOM_EPS);
-                float l_k_val = fmaxf(l_kBH[k0_safe], DENOM_EPS);
-
-                const bool aq_valid = mask_pair_allowed(mask, N, b, i0, jGlob, k0);
-                const bool ar_valid = mask_pair_allowed(mask, N, b, jGlob, i0, k0);
-                const bool as_valid = mask_pair_allowed(mask, N, b, k0, i0, jGlob);
-                float w1 = (ar_valid && as_valid)
-                    ? (__expf(fminf(log_Ar + log_As, EXP_CLIP)) / (l_j_val * l_k_val))
-                    : 0.0f;
-                float w2 = (aq_valid && as_valid)
-                    ? (__expf(fminf(log_Aq + log_As, EXP_CLIP)) / (l_i_val * l_k_val))
-                    : 0.0f;
-
-                const float* vr2_vec = &sh_Vr2[jOff*D_CONST];
-                const float* dy_r_vec = &sh_gYr[jOff*D_CONST];
-
-                #pragma unroll
-                for (int d=0; d<D_CONST; ++d){
-                    grad_acc[d] += w1 * gy_i_vec[d] * vr2_vec[d]
-                                  + w2 * dy_r_vec[d] * vq2_vec[d];
-                }
-            }
-        }
-        __syncthreads();
-    }
-
-    // Only active threads write results
-    if (active) {
-        #pragma unroll
-        for (int d=0; d<D_CONST; ++d)
-            atomicAdd(&gVsBH[k0*D_CONST + d], grad_acc[d]);
+            atomicAdd(&gVBH[out0*D_CONST + d], grad_acc[d]);
     }
 }
 
@@ -2340,60 +1846,34 @@ backward_impl(torch::Tensor grad_Y_q,
     dim3 block_dim(TI, TK);
     dim3 grid_dim((N + TI - 1) / TI, (N + TK - 1) / TK, B * H);
 
-    // --- grad_Vq_1 ---
-    {
-      // Gather kernels use static shared memory sized by D_TMPL
-      Vq_gather_grad<D_TMPL><<<grid_dim, block_dim, 0, at::cuda::getCurrentCUDAStream()>>>(
-          reinterpret_cast<const bf16*>(Q.data_ptr<at::BFloat16>()),
-          reinterpret_cast<const bf16*>(R.data_ptr<at::BFloat16>()),
-          reinterpret_cast<const bf16*>(S.data_ptr<at::BFloat16>()),
-          reinterpret_cast<const bf16*>(Vs_1.data_ptr<at::BFloat16>()),
-          reinterpret_cast<const bf16*>(Vr_1.data_ptr<at::BFloat16>()),
-          reinterpret_cast<const bf16*>(grad_Y_r.data_ptr<at::BFloat16>()),
-          reinterpret_cast<const bf16*>(grad_Y_s.data_ptr<at::BFloat16>()),
-          m_j.data_ptr<float>(),
-          l_j.data_ptr<float>(),
-          m_k.data_ptr<float>(),
-          l_k.data_ptr<float>(),
-          grad_Vq_1.data_ptr<float>(),
+    // Role table (out / reg / loop), one launch per V_1 gradient. Gather
+    // kernels use static shared memory sized by D_TMPL.
+    auto launch = [&](const at::Tensor& X_out, const at::Tensor& X_reg,
+                      const at::Tensor& X_loop, const at::Tensor& V_reg,
+                      const at::Tensor& V_loop, const at::Tensor& gY_loop,
+                      const at::Tensor& gY_reg, const at::Tensor& m_loop,
+                      const at::Tensor& l_loop, const at::Tensor& m_reg,
+                      const at::Tensor& l_reg, at::Tensor& gradV_out,
+                      bool out_is_y) {
+      auto* kernel = out_is_y ? V_gather_grad<D_TMPL, true>
+                              : V_gather_grad<D_TMPL, false>;
+      kernel<<<grid_dim, block_dim, 0, at::cuda::getCurrentCUDAStream()>>>(
+          reinterpret_cast<const bf16*>(X_out.data_ptr<at::BFloat16>()),
+          reinterpret_cast<const bf16*>(X_reg.data_ptr<at::BFloat16>()),
+          reinterpret_cast<const bf16*>(X_loop.data_ptr<at::BFloat16>()),
+          reinterpret_cast<const bf16*>(V_reg.data_ptr<at::BFloat16>()),
+          reinterpret_cast<const bf16*>(V_loop.data_ptr<at::BFloat16>()),
+          reinterpret_cast<const bf16*>(gY_loop.data_ptr<at::BFloat16>()),
+          reinterpret_cast<const bf16*>(gY_reg.data_ptr<at::BFloat16>()),
+          m_loop.data_ptr<float>(), l_loop.data_ptr<float>(),
+          m_reg.data_ptr<float>(), l_reg.data_ptr<float>(),
+          gradV_out.data_ptr<float>(),
           mask_ptr, N, H, scale);
-    }
+    };
 
-    // --- grad_Vr_1 ---
-    {
-      Vr_gather_grad<D_TMPL><<<grid_dim, block_dim, 0, at::cuda::getCurrentCUDAStream()>>>(
-          reinterpret_cast<const bf16*>(Q.data_ptr<at::BFloat16>()),
-          reinterpret_cast<const bf16*>(R.data_ptr<at::BFloat16>()),
-          reinterpret_cast<const bf16*>(S.data_ptr<at::BFloat16>()),
-          reinterpret_cast<const bf16*>(Vq_1.data_ptr<at::BFloat16>()),
-          reinterpret_cast<const bf16*>(Vs_1.data_ptr<at::BFloat16>()),
-          reinterpret_cast<const bf16*>(grad_Y_q.data_ptr<at::BFloat16>()),
-          reinterpret_cast<const bf16*>(grad_Y_s.data_ptr<at::BFloat16>()),
-          m_i.data_ptr<float>(),
-          l_i.data_ptr<float>(),
-          m_k.data_ptr<float>(),
-          l_k.data_ptr<float>(),
-          grad_Vr_1.data_ptr<float>(),
-          mask_ptr, N, H, scale);
-    }
-
-    // --- grad_Vs_1 ---
-    {
-      Vs_gather_grad<D_TMPL><<<grid_dim, block_dim, 0, at::cuda::getCurrentCUDAStream()>>>(
-          reinterpret_cast<const bf16*>(Q.data_ptr<at::BFloat16>()),
-          reinterpret_cast<const bf16*>(R.data_ptr<at::BFloat16>()),
-          reinterpret_cast<const bf16*>(S.data_ptr<at::BFloat16>()),
-          reinterpret_cast<const bf16*>(Vq_1.data_ptr<at::BFloat16>()),
-          reinterpret_cast<const bf16*>(Vr_1.data_ptr<at::BFloat16>()),
-          reinterpret_cast<const bf16*>(grad_Y_q.data_ptr<at::BFloat16>()),
-          reinterpret_cast<const bf16*>(grad_Y_r.data_ptr<at::BFloat16>()),
-          m_i.data_ptr<float>(),
-          l_i.data_ptr<float>(),
-          m_j.data_ptr<float>(),
-          l_j.data_ptr<float>(),
-          grad_Vs_1.data_ptr<float>(),
-          mask_ptr, N, H, scale);
-    }
+    launch(Q, S, R, Vs_1, Vr_1, grad_Y_r, grad_Y_s, m_j, l_j, m_k, l_k, grad_Vq_1, false);
+    launch(R, S, Q, Vs_1, Vq_1, grad_Y_q, grad_Y_s, m_i, l_i, m_k, l_k, grad_Vr_1, false);
+    launch(S, Q, R, Vq_1, Vr_1, grad_Y_r, grad_Y_q, m_j, l_j, m_i, l_i, grad_Vs_1, true);
   });
 
   // ============================================================================
@@ -2407,59 +1887,39 @@ backward_impl(torch::Tensor grad_Y_q,
 
     const size_t shmem_scatter = 3 * T_J * D_TMPL * sizeof(float) + 2 * T_J * sizeof(float);
 
-    // --- grad_Vq_2 ---
-    Vq_scatter_grad<D_TMPL><<<grid_dim, block_dim, shmem_scatter, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const bf16*>(Q.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(R.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(S.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(Vr_2.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(Vs_2.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(grad_Y_r_.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(grad_Y_s_.data_ptr<at::BFloat16>()),
-        m_i.data_ptr<float>(),
-        l_i.data_ptr<float>(),
-        m_j.data_ptr<float>(),
-        l_j.data_ptr<float>(),
-        m_k.data_ptr<float>(),
-        l_k.data_ptr<float>(),
-        grad_Vq_2.data_ptr<float>(),
-        mask_ptr, N, H, scale);
+    // Same role table as the gather grads; the out mode's stats are consumed
+    // as well, so all six m/l tensors are passed.
+    auto launch = [&](const at::Tensor& X_out, const at::Tensor& X_reg,
+                      const at::Tensor& X_loop, const at::Tensor& V_reg,
+                      const at::Tensor& V_loop, const at::Tensor& gY_loop,
+                      const at::Tensor& gY_reg, const at::Tensor& m_out,
+                      const at::Tensor& l_out, const at::Tensor& m_loop,
+                      const at::Tensor& l_loop, const at::Tensor& m_reg,
+                      const at::Tensor& l_reg, at::Tensor& gradV_out,
+                      bool out_is_y) {
+      auto* kernel = out_is_y ? V_scatter_grad<D_TMPL, true>
+                              : V_scatter_grad<D_TMPL, false>;
+      kernel<<<grid_dim, block_dim, shmem_scatter, at::cuda::getCurrentCUDAStream()>>>(
+          reinterpret_cast<const bf16*>(X_out.data_ptr<at::BFloat16>()),
+          reinterpret_cast<const bf16*>(X_reg.data_ptr<at::BFloat16>()),
+          reinterpret_cast<const bf16*>(X_loop.data_ptr<at::BFloat16>()),
+          reinterpret_cast<const bf16*>(V_reg.data_ptr<at::BFloat16>()),
+          reinterpret_cast<const bf16*>(V_loop.data_ptr<at::BFloat16>()),
+          reinterpret_cast<const bf16*>(gY_loop.data_ptr<at::BFloat16>()),
+          reinterpret_cast<const bf16*>(gY_reg.data_ptr<at::BFloat16>()),
+          m_out.data_ptr<float>(), l_out.data_ptr<float>(),
+          m_loop.data_ptr<float>(), l_loop.data_ptr<float>(),
+          m_reg.data_ptr<float>(), l_reg.data_ptr<float>(),
+          gradV_out.data_ptr<float>(),
+          mask_ptr, N, H, scale);
+    };
 
-    // --- grad_Vr_2 ---
-    Vr_scatter_grad<D_TMPL><<<grid_dim, block_dim, shmem_scatter, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const bf16*>(Q.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(R.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(S.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(Vq_2.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(Vs_2.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(grad_Y_q_.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(grad_Y_s_.data_ptr<at::BFloat16>()),
-        m_i.data_ptr<float>(),
-        l_i.data_ptr<float>(),
-        m_j.data_ptr<float>(),
-        l_j.data_ptr<float>(),
-        m_k.data_ptr<float>(),
-        l_k.data_ptr<float>(),
-        grad_Vr_2.data_ptr<float>(),
-        mask_ptr, N, H, scale);
-
-    // --- grad_Vs_2 ---
-    Vs_scatter_grad<D_TMPL><<<grid_dim, block_dim, shmem_scatter, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const bf16*>(Q.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(R.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(S.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(Vq_2.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(Vr_2.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(grad_Y_q_.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const bf16*>(grad_Y_r_.data_ptr<at::BFloat16>()),
-        m_i.data_ptr<float>(),
-        l_i.data_ptr<float>(),
-        m_j.data_ptr<float>(),
-        l_j.data_ptr<float>(),
-        m_k.data_ptr<float>(),
-        l_k.data_ptr<float>(),
-        grad_Vs_2.data_ptr<float>(),
-        mask_ptr, N, H, scale);
+    launch(Q, S, R, Vs_2, Vr_2, grad_Y_r_, grad_Y_s_,
+           m_i, l_i, m_j, l_j, m_k, l_k, grad_Vq_2, false);
+    launch(R, S, Q, Vs_2, Vq_2, grad_Y_q_, grad_Y_s_,
+           m_j, l_j, m_i, l_i, m_k, l_k, grad_Vr_2, false);
+    launch(S, Q, R, Vq_2, Vr_2, grad_Y_r_, grad_Y_q_,
+           m_k, l_k, m_j, l_j, m_i, l_i, grad_Vs_2, true);
   });
   AT_CUDA_CHECK(cudaGetLastError());
 

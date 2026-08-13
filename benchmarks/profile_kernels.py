@@ -17,10 +17,8 @@ ALL_KERNELS = [
     "Y_scatter",
     # Backward tensor-core fast path (gather-only; needs zero scatter grads)
     "Bwd_gather_tc",
-    # Backward scalar path: V gradients (gather)
-    "Vq_gather_grad", "Vr_gather_grad", "Vs_gather_grad",
-    # Backward scalar path: V gradients (scatter)
-    "Vq_scatter_grad", "Vr_scatter_grad", "Vs_scatter_grad",
+    # Backward scalar path: V gradients (gather / scatter)
+    "V_gather_grad", "V_scatter_grad",
     # Backward scalar path: Jacobian corrections + Q/S and R gradients
     "QS_grad_kernel", "R_grad_kernel",
 ]
@@ -227,8 +225,7 @@ Examples:
 Available kernels:
   Forward:  Y_gather, Y_gather_tc,
             Y_scatter
-  Backward: Vq_gather_grad, Vr_gather_grad, Vs_gather_grad,
-            Vq_scatter_grad, Vr_scatter_grad, Vs_scatter_grad,
+  Backward: V_gather_grad, V_scatter_grad,
             jacobian_corrections, QS_grad_fused, R_grad
 """)
 
