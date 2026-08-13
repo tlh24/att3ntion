@@ -38,9 +38,7 @@ def build_flop_map(B, H, N, D):
         "Yr_gather":            base * (4*D + 3),
         "Ys_gather":            base * (4*D + 3),
         # Forward scatter  (4D + 5)
-        "Yq_scatter":           base * (4*D + 5),
-        "Yr_scatter":           base * (4*D + 5),
-        "Ys_scatter":           base * (4*D + 5),
+        "Y_scatter":            base * (4*D + 5),
         # Backward V gradients  (4D each)
         "Vq_gather_grad":       base * 4 * D,
         "Vr_gather_grad":       base * 4 * D,

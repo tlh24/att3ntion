@@ -778,14 +778,19 @@ void reduce_scatter_partials(
 // =============================================================================
 
 /**
- * @brief Computes Y_q_ = sum_{j,k} Ar[i,j,k] * As[i,j,k] * Vr_2[j,:] * Vs_2[k,:]
+ * @brief Y[anchor,:] = sum_{a,c} A[..] * V_loop1[a,:] * V_loop2[c,:]
  *
  * Uses parallel outer-product approach for computing 3-way attention scores.
- * Each block processes a tile of I outputs, iterating over all J and K tiles.
- * This eliminates atomic operations by ensuring each output is owned by exactly
- * one block.
+ * Each block processes a tile of anchor outputs, iterating over all loop1 and
+ * loop2 tiles. This eliminates atomic operations by ensuring each output is
+ * owned by exactly one block.
  *
- * Grid:  (ceil(I/TILE_I), H, B)
+ * The trilinear score is symmetric in Q/R/S, so Y_q_/Y_r_/Y_s_ are the same
+ * kernel with permuted roles: anchor is the output mode, loop1 is the split
+ * (outer) mode, loop2 the inner one; the two loop modes supply the softmax
+ * stats and the V2 operands, the anchor's own m/l are never consumed.
+ *
+ * Grid:  (ceil(n_anchor/TILE_I) * num_chunks, H, B)
  * Block: 256 threads (1D)
  *
  * Requirements:
@@ -796,32 +801,32 @@ void reduce_scatter_partials(
 template<int D_CONST>
 __global__
 __launch_bounds__(256, 2)
-void Yq_scatter(
-    const bf16* __restrict__ Q,
-    const bf16* __restrict__ R,
-    const bf16* __restrict__ S,
-    const bf16* __restrict__ Vr_2,
-    const bf16* __restrict__ Vs_2,
-    const float* __restrict__ m_j_in,
-    const float* __restrict__ l_j_in,
-    const float* __restrict__ m_k_in,
-    const float* __restrict__ l_k_in,
-    float* __restrict__ Y_q_,
+void Y_scatter(
+    const bf16* __restrict__ anchor,
+    const bf16* __restrict__ loop1,
+    const bf16* __restrict__ loop2,
+    const bf16* __restrict__ V_loop1,
+    const bf16* __restrict__ V_loop2,
+    const float* __restrict__ m1_in,
+    const float* __restrict__ l1_in,
+    const float* __restrict__ m2_in,
+    const float* __restrict__ l2_in,
+    float* __restrict__ Y_part,
     const bool* __restrict__ mask,
-    int B, int H, int I, int J, int K, float scale,
-    int num_j_chunks
+    int B, int H, int n_anchor, int n_loop1, int n_loop2, float scale,
+    int num_chunks
 ) {
-    // --- Grid/Block Mapping (split-J) ---
+    // --- Grid/Block Mapping (split over loop1) ---
     const int b = blockIdx.z;
     const int h = blockIdx.y;
-    const int j_chunk = blockIdx.x % num_j_chunks;
-    const int i_start = (blockIdx.x / num_j_chunks) * TILE_I;
+    const int chunk = blockIdx.x % num_chunks;
+    const int a_start = (blockIdx.x / num_chunks) * TILE_I;
 
-    // Compute J-range for this chunk
-    const int total_j_tiles = (J + TILE_J - 1) / TILE_J;
-    const int j_tpc = (total_j_tiles + num_j_chunks - 1) / num_j_chunks;
-    const int j_loop_start = j_chunk * j_tpc * TILE_J;
-    const int j_loop_end = min(j_loop_start + j_tpc * TILE_J, J);
+    // Compute loop1-range for this chunk
+    const int total_1_tiles = (n_loop1 + TILE_J - 1) / TILE_J;
+    const int tpc_1 = (total_1_tiles + num_chunks - 1) / num_chunks;
+    const int loop1_start = chunk * tpc_1 * TILE_J;
+    const int loop1_end = min(loop1_start + tpc_1 * TILE_J, n_loop1);
 
     const int tid = threadIdx.x;
     const int tpb = blockDim.x;
@@ -830,90 +835,89 @@ void Yq_scatter(
     constexpr int ATTN_I_STRIDE = TILE_J * ATTN_K_STRIDE;
 
     // --- Memory Offsets ---
-    const int64_t q_bh_offset = (int64_t)(b * H + h) * I * D_CONST;
-    const int64_t r_bh_offset = (int64_t)(b * H + h) * J * D_CONST;
-    const int64_t s_bh_offset = (int64_t)(b * H + h) * K * D_CONST;
-    const int64_t mj_bh_offset = (int64_t)(b * H + h) * J;
-    const int64_t mk_bh_offset = (int64_t)(b * H + h) * K;
+    const int64_t a_bh_offset = (int64_t)(b * H + h) * n_anchor * D_CONST;
+    const int64_t l1_bh_offset = (int64_t)(b * H + h) * n_loop1 * D_CONST;
+    const int64_t l2_bh_offset = (int64_t)(b * H + h) * n_loop2 * D_CONST;
+    const int64_t m1_bh_offset = (int64_t)(b * H + h) * n_loop1;
+    const int64_t m2_bh_offset = (int64_t)(b * H + h) * n_loop2;
 
     // --- Shared Memory Layout ---
     extern __shared__ char smem_raw[];
-    bf16* q_tile = reinterpret_cast<bf16*>(smem_raw);
-    bf16* r_tile = q_tile + TILE_I * DP;
-    bf16* s_tile = r_tile + TILE_J * DP;
-    bf16* vr_tile = s_tile + TILE_K * DP;
-    bf16* vs_tile = vr_tile + TILE_J * DP;
-    float* attn_tile = reinterpret_cast<float*>(vs_tile + TILE_K * DP);
-    float* mj_tile = attn_tile + TILE_I * ATTN_I_STRIDE;
-    float* lj_tile = mj_tile + TILE_J;
-    float* mk_tile = lj_tile + TILE_J;
-    float* lk_tile = mk_tile + TILE_K;
+    bf16* a_tile = reinterpret_cast<bf16*>(smem_raw);
+    bf16* l1_tile = a_tile + TILE_I * DP;
+    bf16* l2_tile = l1_tile + TILE_J * DP;
+    bf16* v1_tile = l2_tile + TILE_K * DP;
+    bf16* v2_tile = v1_tile + TILE_J * DP;
+    float* attn_tile = reinterpret_cast<float*>(v2_tile + TILE_K * DP);
+    float* m1_tile = attn_tile + TILE_I * ATTN_I_STRIDE;
+    float* ln1_tile = m1_tile + TILE_J;
+    float* m2_tile = ln1_tile + TILE_J;
+    float* ln2_tile = m2_tile + TILE_K;
 
     // --- Thread Indexing for Cooperative Loads ---
-    constexpr int i_load_D = D_CONST;  // compile-time for efficient div/mod
-    const int i_load = tid / i_load_D;
-    const int d_load = tid % i_load_D;
+    const int i_load = tid / D_CONST;
+    const int d_load = tid % D_CONST;
     constexpr int load_pairs = D_CONST / 2;
     constexpr int load_iters = (TILE_I * load_pairs + 256 - 1) / 256;
     constexpr int load_step = 256 / D_CONST;
 
     // --- Per-Thread Output Accumulators (registers) ---
-    float2 yq_acc[8];
+    float2 y_acc[8];
     #pragma unroll
     for (int n = 0; n < 8; n++) {
-        yq_acc[n] = make_float2(0.0f, 0.0f);
+        y_acc[n] = make_float2(0.0f, 0.0f);
     }
 
-    // --- Load Q Tile (fixed for entire block) ---
+    // --- Load Anchor Tile (fixed for entire block) ---
     for (int n = 0; n < TILE_I; n += load_step) {
-        int i_global = i_start + n + i_load;
-        if (n + i_load < TILE_I && i_global < I) {
-            q_tile[(n + i_load) * DP + d_load] = Q[q_bh_offset + i_global * D_CONST + d_load];
+        int a_global = a_start + n + i_load;
+        if (n + i_load < TILE_I && a_global < n_anchor) {
+            a_tile[(n + i_load) * DP + d_load] = anchor[a_bh_offset + a_global * D_CONST + d_load];
         }
     }
     __syncthreads();
 
-    // --- Main Loop: Iterate Over J Tiles (split range) ---
-    for (int jt = j_loop_start; jt < j_loop_end; jt += TILE_J) {
+    // --- Main Loop: Iterate Over loop1 Tiles (split range) ---
+    for (int jt = loop1_start; jt < loop1_end; jt += TILE_J) {
         for (int n = 0; n < TILE_J; n += load_step) {
             int j_global = jt + n + i_load;
-            if (n + i_load < TILE_J && j_global < J) {
-                r_tile[(n + i_load) * DP + d_load] = R[r_bh_offset + j_global * D_CONST + d_load];
+            if (n + i_load < TILE_J && j_global < n_loop1) {
+                l1_tile[(n + i_load) * DP + d_load] = loop1[l1_bh_offset + j_global * D_CONST + d_load];
             }
         }
         for (int n = 0; n < TILE_J; n += load_step) {
             int j_global = jt + n + i_load;
-            if (n + i_load < TILE_J && j_global < J) {
-                vr_tile[(n + i_load) * DP + d_load] = Vr_2[r_bh_offset + j_global * D_CONST + d_load];
+            if (n + i_load < TILE_J && j_global < n_loop1) {
+                v1_tile[(n + i_load) * DP + d_load] = V_loop1[l1_bh_offset + j_global * D_CONST + d_load];
             }
         }
-        if (tid < TILE_J && jt + tid < J) {
-            const float l = l_j_in[mj_bh_offset + jt + tid];
+        if (tid < TILE_J && jt + tid < n_loop1) {
+            const float l = l1_in[m1_bh_offset + jt + tid];
             if (l <= DENOM_EPS) {
-                mj_tile[tid] = 0.0f;
-                lj_tile[tid] = 0.0f;
+                m1_tile[tid] = 0.0f;
+                ln1_tile[tid] = 0.0f;
             } else {
-                mj_tile[tid] = m_j_in[mj_bh_offset + jt + tid];
-                lj_tile[tid] = 1.0f / l;
+                m1_tile[tid] = m1_in[m1_bh_offset + jt + tid];
+                ln1_tile[tid] = 1.0f / l;
             }
         }
 
-        // --- Inner Loop: Iterate Over K Tiles ---
-        for (int kt = 0; kt < K; kt += TILE_K) {
+        // --- Inner Loop: Iterate Over loop2 Tiles ---
+        for (int kt = 0; kt < n_loop2; kt += TILE_K) {
             for (int n = 0; n < TILE_K; n += load_step) {
                 int k_global = kt + n + i_load;
-                if (n + i_load < TILE_K && k_global < K) {
-                    s_tile[(n + i_load) * DP + d_load] = S[s_bh_offset + k_global * D_CONST + d_load];
+                if (n + i_load < TILE_K && k_global < n_loop2) {
+                    l2_tile[(n + i_load) * DP + d_load] = loop2[l2_bh_offset + k_global * D_CONST + d_load];
                 }
             }
-            if (tid < TILE_K && kt + tid < K) {
-                const float l = l_k_in[mk_bh_offset + kt + tid];
+            if (tid < TILE_K && kt + tid < n_loop2) {
+                const float l = l2_in[m2_bh_offset + kt + tid];
                 if (l <= DENOM_EPS) {
-                    mk_tile[tid] = 0.0f;
-                    lk_tile[tid] = 0.0f;
+                    m2_tile[tid] = 0.0f;
+                    ln2_tile[tid] = 0.0f;
                 } else {
-                    mk_tile[tid] = m_k_in[mk_bh_offset + kt + tid];
-                    lk_tile[tid] = 1.0f / l;
+                    m2_tile[tid] = m2_in[m2_bh_offset + kt + tid];
+                    ln2_tile[tid] = 1.0f / l;
                 }
             }
             __syncthreads();
@@ -943,9 +947,9 @@ void Yq_scatter(
                 const int d_idx = da * d_per_slice + db;
                 #pragma unroll
                 for (int u = 0; u < 4; u++) {
-                    qa[u] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(q_tile + (ia * 4 + u) * DP + d_idx));
-                    ra[u] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(r_tile + (ja * 4 + u) * DP + d_idx));
-                    sa[u] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(s_tile + (ka * 4 + u) * DP + d_idx));
+                    qa[u] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(a_tile + (ia * 4 + u) * DP + d_idx));
+                    ra[u] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(l1_tile + (ja * 4 + u) * DP + d_idx));
+                    sa[u] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(l2_tile + (ka * 4 + u) * DP + d_idx));
                 }
                 #pragma unroll
                 for (int i0 = 0; i0 < 4; i0++) {
@@ -1001,30 +1005,31 @@ void Yq_scatter(
 
             // --- Apply Softmax Scaling ---
             if (da == 0) {
-                // Fuse exp(logit-mjt)*ljt * exp(logit-mkt)*lkt into a single
-                // exp(2*logit - mjt - mkt) * ljt * lkt: halves MUFU expf traffic.
+                // Fuse exp(logit-m1t)*l1t * exp(logit-m2t)*l2t into a single
+                // exp(2*logit - m1t - m2t) * l1t * l2t: halves MUFU expf traffic.
                 const float two_scale = 2.0f * scale;
                 #pragma unroll
                 for (int i0 = 0; i0 < 4; i0++) {
                     #pragma unroll
                     for (int i1 = 0; i1 < 4; i1++) {
-                        const float mjt = mj_tile[ja * 4 + i1];
-                        const float ljt = lj_tile[ja * 4 + i1];
+                        const float m1t = m1_tile[ja * 4 + i1];
+                        const float l1t = ln1_tile[ja * 4 + i1];
                         #pragma unroll
                         for (int i2 = 0; i2 < 4; i2++) {
-                            const int i_global = i_start + ia * 4 + i0;
+                            const int a_global = a_start + ia * 4 + i0;
                             const int j_global = jt + ja * 4 + i1;
                             const int k_global = kt + ka * 4 + i2;
-                            const bool cell_valid = (i_global < I)
-                                && (j_global < J)
-                                && (k_global < K)
-                                && mask_pair_allowed(mask, I, b, i_global, j_global, k_global);
-                            const float mkt = mk_tile[ka * 4 + i2];
-                            const float lkt = lk_tile[ka * 4 + i2];
+                            // Mask stride is I == n_anchor (scatter requires I == J == K).
+                            const bool cell_valid = (a_global < n_anchor)
+                                && (j_global < n_loop1)
+                                && (k_global < n_loop2)
+                                && mask_pair_allowed(mask, n_anchor, b, a_global, j_global, k_global);
+                            const float m2t = m2_tile[ka * 4 + i2];
+                            const float l2t = ln2_tile[ka * 4 + i2];
                             attn_tile[(ia * 4 + i0) * ATTN_I_STRIDE +
                                       (ja * 4 + i1) * ATTN_K_STRIDE +
                                       (ka * 4 + i2)] = cell_valid
-                                        ? __expf(acc[i0][i1][i2] * two_scale - mjt - mkt) * ljt * lkt
+                                        ? __expf(acc[i0][i1][i2] * two_scale - m1t - m2t) * l1t * l2t
                                         : 0.0f;
                         }
                     }
@@ -1034,8 +1039,8 @@ void Yq_scatter(
 
             for (int n = 0; n < TILE_K; n += load_step) {
                 int k_global = kt + n + i_load;
-                if (n + i_load < TILE_K && k_global < K) {
-                    vs_tile[(n + i_load) * DP + d_load] = Vs_2[s_bh_offset + k_global * D_CONST + d_load];
+                if (n + i_load < TILE_K && k_global < n_loop2) {
+                    v2_tile[(n + i_load) * DP + d_load] = V_loop2[l2_bh_offset + k_global * D_CONST + d_load];
                 }
             }
             __syncthreads();
@@ -1043,19 +1048,19 @@ void Yq_scatter(
             // --- Accumulate Output (factored outer product: f = u^T (A v)) ---
             // dy depends only on (tid % load_pairs); since tpb=256 is a multiple
             // of load_pairs=32, dy is identical across both n=0 and n=1 iters —
-            // so vrts/vsts can be loaded once and reused.
+            // so v1ts/v2ts can be loaded once and reused.
             const int dy_h = (tid % load_pairs) * 2;
-            float2 vrts[TILE_J];
-            float2 vsts[TILE_K];
+            float2 v1ts[TILE_J];
+            float2 v2ts[TILE_K];
             #pragma unroll
             for (int jy = 0; jy < TILE_J; jy++) {
-                vrts[jy] = __bfloat1622float2(
-                    *reinterpret_cast<const __nv_bfloat162*>(vr_tile + jy * DP + dy_h));
+                v1ts[jy] = __bfloat1622float2(
+                    *reinterpret_cast<const __nv_bfloat162*>(v1_tile + jy * DP + dy_h));
             }
             #pragma unroll
             for (int ky = 0; ky < TILE_K; ky++) {
-                vsts[ky] = __bfloat1622float2(
-                    *reinterpret_cast<const __nv_bfloat162*>(vs_tile + ky * DP + dy_h));
+                v2ts[ky] = __bfloat1622float2(
+                    *reinterpret_cast<const __nv_bfloat162*>(v2_tile + ky * DP + dy_h));
             }
             for (int n = 0; n < load_iters; n++) {
                 int tid_n = tid + n * tpb;
@@ -1075,16 +1080,16 @@ void Yq_scatter(
                         for (int ky = 0; ky < TILE_K; ky++) {
                             const float p_a = attn_tile[iy * ATTN_I_STRIDE + (jy + 0) * ATTN_K_STRIDE + ky];
                             const float p_b = attn_tile[iy * ATTN_I_STRIDE + (jy + 1) * ATTN_K_STRIDE + ky];
-                            tx_a += p_a * vsts[ky].x;  tx_b += p_b * vsts[ky].x;
-                            ty_a += p_a * vsts[ky].y;  ty_b += p_b * vsts[ky].y;
+                            tx_a += p_a * v2ts[ky].x;  tx_b += p_b * v2ts[ky].x;
+                            ty_a += p_a * v2ts[ky].y;  ty_b += p_b * v2ts[ky].y;
                         }
-                        fx += vrts[jy + 0].x * tx_a;
-                        fx += vrts[jy + 1].x * tx_b;
-                        fy += vrts[jy + 0].y * ty_a;
-                        fy += vrts[jy + 1].y * ty_b;
+                        fx += v1ts[jy + 0].x * tx_a;
+                        fx += v1ts[jy + 1].x * tx_b;
+                        fy += v1ts[jy + 0].y * ty_a;
+                        fy += v1ts[jy + 1].y * ty_b;
                     }
-                    yq_acc[n].x += fx;
-                    yq_acc[n].y += fy;
+                    y_acc[n].x += fx;
+                    y_acc[n].y += fy;
                 }
             }
             __syncthreads();
@@ -1092,682 +1097,18 @@ void Yq_scatter(
     }
 
     // --- Write Output to Global Memory (chunked layout) ---
-    const int64_t bh_I = q_bh_offset / D_CONST;  // = (b*H + h) * I
+    const int64_t bh_A = a_bh_offset / D_CONST;  // = (b*H + h) * n_anchor
     for (int n = 0; n < load_iters; n++) {
         int tid_n = tid + n * tpb;
         if (tid_n < TILE_I * load_pairs) {
             int iy = tid_n / load_pairs;
             int dy = (tid_n % load_pairs) * 2;
-            int i_global = i_start + iy;
-            if (i_global < I) {
-                int64_t out_off = (bh_I + i_global) * (int64_t)num_j_chunks * D_CONST
-                                + (int64_t)j_chunk * D_CONST + dy;
-                Y_q_[out_off] = yq_acc[n].x;
-                Y_q_[out_off + 1] = yq_acc[n].y;
-            }
-        }
-    }
-}
-
-
-
-/**
- * @brief Computes Y_r_ = sum_{i,k} Ar[i,j,k] * As[i,j,k] * Vq_2[i,:] * Vs_2[k,:]
- *
- * Uses parallel outer-product approach for computing 3-way attention scores.
- * Each block processes a tile of J outputs, iterating over all I and K tiles.
- * This eliminates atomic operations by ensuring each output is owned by exactly
- * one block.
- *
- * Grid:  (ceil(J/TILE_J), H, B)
- * Block: 256 threads (1D)
- *
- * Requirements:
- * - D must be a multiple of 4
- * - I, J, K must be equal and multiples of TILE_I (16)
- * - I, J, K must be >= TILE_I
- */
-template<int D_CONST>
-__global__
-__launch_bounds__(256, 2)
-void Yr_scatter(
-    const bf16* __restrict__ Q,
-    const bf16* __restrict__ R,
-    const bf16* __restrict__ S,
-    const bf16* __restrict__ Vq_2,
-    const bf16* __restrict__ Vs_2,
-    const float* __restrict__ m_i_in,
-    const float* __restrict__ l_i_in,
-    const float* __restrict__ m_k_in,
-    const float* __restrict__ l_k_in,
-    float* __restrict__ Y_r_,
-    const bool* __restrict__ mask,
-    int B, int H, int I, int J, int K, float scale,
-    int num_i_chunks
-) {
-    // --- Grid/Block Mapping (split-I) ---
-    const int b = blockIdx.z;
-    const int h = blockIdx.y;
-    const int i_chunk = blockIdx.x % num_i_chunks;
-    const int j_start = (blockIdx.x / num_i_chunks) * TILE_J;
-
-    // Compute I-range for this chunk
-    const int total_i_tiles = (I + TILE_I - 1) / TILE_I;
-    const int i_tpc = (total_i_tiles + num_i_chunks - 1) / num_i_chunks;
-    const int i_loop_start = i_chunk * i_tpc * TILE_I;
-    const int i_loop_end = min(i_loop_start + i_tpc * TILE_I, I);
-
-    const int tid = threadIdx.x;
-    const int tpb = blockDim.x;
-    constexpr int DP = D_CONST + SCAT_SMEM_PAD;
-    constexpr int ATTN_K_STRIDE = TILE_K + SCAT_ATTN_PAD;
-    constexpr int ATTN_I_STRIDE = TILE_J * ATTN_K_STRIDE;
-
-    // --- Memory Offsets ---
-    const int64_t r_bh_offset = (int64_t)(b * H + h) * J * D_CONST;
-    const int64_t q_bh_offset = (int64_t)(b * H + h) * I * D_CONST;
-    const int64_t s_bh_offset = (int64_t)(b * H + h) * K * D_CONST;
-    const int64_t mi_bh_offset = (int64_t)(b * H + h) * I;
-    const int64_t mk_bh_offset = (int64_t)(b * H + h) * K;
-
-    // --- Shared Memory Layout ---
-    extern __shared__ char smem_raw[];
-    bf16* r_tile = reinterpret_cast<bf16*>(smem_raw);
-    bf16* q_tile = r_tile + TILE_J * DP;
-    bf16* s_tile = q_tile + TILE_I * DP;
-    bf16* vq_tile = s_tile + TILE_K * DP;
-    bf16* vs_tile = vq_tile + TILE_I * DP;
-    float* attn_tile = reinterpret_cast<float*>(vs_tile + TILE_K * DP);
-    float* mi_tile = attn_tile + TILE_I * ATTN_I_STRIDE;
-    float* li_tile = mi_tile + TILE_I;
-    float* mk_tile = li_tile + TILE_I;
-    float* lk_tile = mk_tile + TILE_K;
-
-    // --- Thread Indexing for Cooperative Loads ---
-    const int j_load = tid / D_CONST;
-    const int d_load = tid % D_CONST;
-    constexpr int load_pairs = D_CONST / 2;
-    constexpr int load_iters = (TILE_J * load_pairs + 256 - 1) / 256;
-    constexpr int load_step = 256 / D_CONST;
-
-    // --- Per-Thread Output Accumulators (registers) ---
-    float2 yr_acc[8];
-    #pragma unroll
-    for (int n = 0; n < 8; n++) {
-        yr_acc[n] = make_float2(0.0f, 0.0f);
-    }
-
-    // --- Load R Tile (fixed for entire block) ---
-    for (int n = 0; n < TILE_J; n += load_step) {
-        int j_global = j_start + n + j_load;
-        if (n + j_load < TILE_J && j_global < J) {
-            r_tile[(n + j_load) * DP + d_load] = R[r_bh_offset + j_global * D_CONST + d_load];
-        }
-    }
-    __syncthreads();
-
-    // --- Main Loop: Iterate Over I Tiles (split range) ---
-    for (int it = i_loop_start; it < i_loop_end; it += TILE_I) {
-        for (int n = 0; n < TILE_I; n += load_step) {
-            int i_global = it + n + j_load;
-            if (n + j_load < TILE_I && i_global < I) {
-                q_tile[(n + j_load) * DP + d_load] = Q[q_bh_offset + i_global * D_CONST + d_load];
-            }
-        }
-        for (int n = 0; n < TILE_I; n += load_step) {
-            int i_global = it + n + j_load;
-            if (n + j_load < TILE_I && i_global < I) {
-                vq_tile[(n + j_load) * DP + d_load] = Vq_2[q_bh_offset + i_global * D_CONST + d_load];
-            }
-        }
-        if (tid < TILE_I && it + tid < I) {
-            const float l = l_i_in[mi_bh_offset + it + tid];
-            if (l <= DENOM_EPS) {
-                mi_tile[tid] = 0.0f;
-                li_tile[tid] = 0.0f;
-            } else {
-                mi_tile[tid] = m_i_in[mi_bh_offset + it + tid];
-                li_tile[tid] = 1.0f / l;
-            }
-        }
-
-        // --- Inner Loop: Iterate Over K Tiles ---
-        for (int kt = 0; kt < K; kt += TILE_K) {
-            for (int n = 0; n < TILE_K; n += load_step) {
-                int k_global = kt + n + j_load;
-                if (n + j_load < TILE_K && k_global < K) {
-                    s_tile[(n + j_load) * DP + d_load] = S[s_bh_offset + k_global * D_CONST + d_load];
-                }
-            }
-            if (tid < TILE_K && kt + tid < K) {
-                const float l = l_k_in[mk_bh_offset + kt + tid];
-                if (l <= DENOM_EPS) {
-                    mk_tile[tid] = 0.0f;
-                    lk_tile[tid] = 0.0f;
-                } else {
-                    mk_tile[tid] = m_k_in[mk_bh_offset + kt + tid];
-                    lk_tile[tid] = 1.0f / l;
-                }
-            }
-            __syncthreads();
-
-            // --- Parallel Outer-Product Attention Computation ---
-            float acc[4][4][4];
-            #pragma unroll
-            for (int i0 = 0; i0 < 4; i0++) {
-                #pragma unroll
-                for (int i1 = 0; i1 < 4; i1++) {
-                    #pragma unroll
-                    for (int i2 = 0; i2 < 4; i2++) {
-                        acc[i0][i1][i2] = 0.0f;
-                    }
-                }
-            }
-
-            const int da = tid / (TILE_I * TILE_J * TILE_K / 64);
-            const int ia = (tid / (TILE_J * TILE_K / 16)) % (TILE_I / 4);
-            const int ja = (tid / (TILE_K / 4)) % (TILE_J / 4);
-            const int ka = tid % (TILE_K / 4);
-
-            float2 qa[4], ra[4], sa[4];
-            constexpr int d_per_slice = D_CONST / 4;
-
-            for (int db = 0; db < d_per_slice; db += 2) {
-                const int d_idx = da * d_per_slice + db;
-                #pragma unroll
-                for (int u = 0; u < 4; u++) {
-                    qa[u] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(q_tile + (ia * 4 + u) * DP + d_idx));
-                    ra[u] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(r_tile + (ja * 4 + u) * DP + d_idx));
-                    sa[u] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(s_tile + (ka * 4 + u) * DP + d_idx));
-                }
-                #pragma unroll
-                for (int i0 = 0; i0 < 4; i0++) {
-                    #pragma unroll
-                    for (int i1 = 0; i1 < 4; i1++) {
-                        // Hoist q*r outside the i2 loop: each (i0,i1) is reused
-                        // across all 4 values of i2, so the two q*r FMULs need
-                        // happen only once per (i0,i1,db) instead of per i2.
-                        const float qrx = qa[i0].x * ra[i1].x;
-                        const float qry = qa[i0].y * ra[i1].y;
-                        #pragma unroll
-                        for (int i2 = 0; i2 < 4; i2++) {
-                            acc[i0][i1][i2] += qrx * sa[i2].x + qry * sa[i2].y;
-                        }
-                    }
-                }
-            }
-
-            // --- Reduction Across Dimension Slices ---
-            for (int u = 1; u < 4; u++) {
-                if (da == u) {
-                    #pragma unroll
-                    for (int i0 = 0; i0 < 4; i0++) {
-                        #pragma unroll
-                        for (int i1 = 0; i1 < 4; i1++) {
-                            #pragma unroll
-                            for (int i2 = 0; i2 < 4; i2++) {
-                                attn_tile[(ia * 4 + i0) * ATTN_I_STRIDE +
-                                          (ja * 4 + i1) * ATTN_K_STRIDE +
-                                          (ka * 4 + i2)] = acc[i0][i1][i2];
-                            }
-                        }
-                    }
-                }
-                __syncthreads();
-
-                if (da == 0) {
-                    #pragma unroll
-                    for (int i0 = 0; i0 < 4; i0++) {
-                        #pragma unroll
-                        for (int i1 = 0; i1 < 4; i1++) {
-                            #pragma unroll
-                            for (int i2 = 0; i2 < 4; i2++) {
-                                acc[i0][i1][i2] += attn_tile[(ia * 4 + i0) * ATTN_I_STRIDE +
-                                                             (ja * 4 + i1) * ATTN_K_STRIDE +
-                                                             (ka * 4 + i2)];
-                            }
-                        }
-                    }
-                }
-                __syncthreads();
-            }
-
-            // --- Apply Softmax Scaling ---
-            if (da == 0) {
-                // Fuse exp(logit-mit)*lit * exp(logit-mkt)*lkt into a single
-                // exp(2*logit - mit - mkt) * lit * lkt: halves MUFU expf traffic.
-                const float two_scale = 2.0f * scale;
-                #pragma unroll
-                for (int i0 = 0; i0 < 4; i0++) {
-                    const float mit = mi_tile[ia * 4 + i0];
-                    const float lit = li_tile[ia * 4 + i0];
-                    #pragma unroll
-                    for (int i1 = 0; i1 < 4; i1++) {
-                        #pragma unroll
-                        for (int i2 = 0; i2 < 4; i2++) {
-                            const int i_global = it + ia * 4 + i0;
-                            const int j_global = j_start + ja * 4 + i1;
-                            const int k_global = kt + ka * 4 + i2;
-                            const bool cell_valid = (i_global < I)
-                                && (j_global < J)
-                                && (k_global < K)
-                                && mask_pair_allowed(mask, I, b, j_global, i_global, k_global);
-                            const float mkt = mk_tile[ka * 4 + i2];
-                            const float lkt = lk_tile[ka * 4 + i2];
-                            attn_tile[(ia * 4 + i0) * ATTN_I_STRIDE +
-                                      (ja * 4 + i1) * ATTN_K_STRIDE +
-                                      (ka * 4 + i2)] = cell_valid
-                                        ? __expf(acc[i0][i1][i2] * two_scale - mit - mkt) * lit * lkt
-                                        : 0.0f;
-                        }
-                    }
-                }
-            }
-            __syncthreads();
-
-            for (int n = 0; n < TILE_K; n += load_step) {
-                int k_global = kt + n + j_load;
-                if (n + j_load < TILE_K && k_global < K) {
-                    vs_tile[(n + j_load) * DP + d_load] = Vs_2[s_bh_offset + k_global * D_CONST + d_load];
-                }
-            }
-            __syncthreads();
-
-            // --- Accumulate Output (factored outer product: f = u^T (A v)) ---
-            // dy depends only on (tid % load_pairs); since tpb=256 is a multiple
-            // of load_pairs=32, dy is identical across both n=0 and n=1 iters —
-            // so vqts/vsts can be loaded once and reused.
-            const int dy_h = (tid % load_pairs) * 2;
-            float2 vqts[TILE_I];
-            float2 vsts[TILE_K];
-            #pragma unroll
-            for (int iy = 0; iy < TILE_I; iy++) {
-                vqts[iy] = __bfloat1622float2(
-                    *reinterpret_cast<const __nv_bfloat162*>(vq_tile + iy * DP + dy_h));
-            }
-            #pragma unroll
-            for (int ky = 0; ky < TILE_K; ky++) {
-                vsts[ky] = __bfloat1622float2(
-                    *reinterpret_cast<const __nv_bfloat162*>(vs_tile + ky * DP + dy_h));
-            }
-            for (int n = 0; n < load_iters; n++) {
-                int tid_n = tid + n * tpb;
-                if (tid_n < TILE_J * load_pairs) {
-                    int jy = tid_n / load_pairs;
-
-                    // Pair-process 2 iy values per outer iter: 4 parallel inner
-                    // FMA chains (vs 2 with single iy), keeping the FFMA pipe
-                    // saturated through dependency latency. No extra reduction
-                    // adds — each `fx +=` is one FMA, two of them per outer iter.
-                    float fx = 0.0f, fy = 0.0f;
-                    #pragma unroll
-                    for (int iy = 0; iy < TILE_I; iy += 2) {
-                        float tx_a = 0.0f, ty_a = 0.0f;
-                        float tx_b = 0.0f, ty_b = 0.0f;
-                        #pragma unroll
-                        for (int ky = 0; ky < TILE_K; ky++) {
-                            const float p_a = attn_tile[(iy + 0) * ATTN_I_STRIDE + jy * ATTN_K_STRIDE + ky];
-                            const float p_b = attn_tile[(iy + 1) * ATTN_I_STRIDE + jy * ATTN_K_STRIDE + ky];
-                            tx_a += p_a * vsts[ky].x;  tx_b += p_b * vsts[ky].x;
-                            ty_a += p_a * vsts[ky].y;  ty_b += p_b * vsts[ky].y;
-                        }
-                        fx += vqts[iy + 0].x * tx_a;
-                        fx += vqts[iy + 1].x * tx_b;
-                        fy += vqts[iy + 0].y * ty_a;
-                        fy += vqts[iy + 1].y * ty_b;
-                    }
-                    yr_acc[n].x += fx;
-                    yr_acc[n].y += fy;
-                }
-            }
-            __syncthreads();
-        }
-    }
-
-    // --- Write Output to Global Memory (chunked layout) ---
-    const int64_t bh_J = r_bh_offset / D_CONST;  // = (b*H + h) * J
-    for (int n = 0; n < load_iters; n++) {
-        int tid_n = tid + n * tpb;
-        if (tid_n < TILE_J * load_pairs) {
-            int jy = tid_n / load_pairs;
-            int dy = (tid_n % load_pairs) * 2;
-            int j_global = j_start + jy;
-            if (j_global < J) {
-                int64_t out_off = (bh_J + j_global) * (int64_t)num_i_chunks * D_CONST
-                                + (int64_t)i_chunk * D_CONST + dy;
-                Y_r_[out_off] = yr_acc[n].x;
-                Y_r_[out_off + 1] = yr_acc[n].y;
-            }
-        }
-    }
-}
-
-
-
-/**
- * @brief Computes Y_s_ = sum_{i,j} Ar[i,j,k] * As[i,j,k] * Vq_2[i,:] * Vr_2[j,:]
- *
- * Uses parallel outer-product approach for computing 3-way attention scores.
- * Each block processes a tile of K outputs, iterating over all I and J tiles.
- * This eliminates atomic operations by ensuring each output is owned by exactly
- * one block.
- *
- * Grid:  (ceil(K/TILE_K), H, B)
- * Block: 256 threads (1D)
- *
- * Requirements:
- * - D must be a multiple of 4
- * - I, J, K must be equal and multiples of TILE_I (16)
- * - I, J, K must be >= TILE_I
- */
-template<int D_CONST>
-__global__
-__launch_bounds__(256, 2)
-void Ys_scatter(
-    const bf16* __restrict__ Q,
-    const bf16* __restrict__ R,
-    const bf16* __restrict__ S,
-    const bf16* __restrict__ Vq_2,
-    const bf16* __restrict__ Vr_2,
-    const float* __restrict__ m_i_in,
-    const float* __restrict__ l_i_in,
-    const float* __restrict__ m_j_in,
-    const float* __restrict__ l_j_in,
-    float* __restrict__ Y_s_,
-    const bool* __restrict__ mask,
-    int B, int H, int I, int J, int K, float scale,
-    int num_i_chunks
-) {
-    // --- Grid/Block Mapping (split-I) ---
-    const int b = blockIdx.z;
-    const int h = blockIdx.y;
-    const int i_chunk = blockIdx.x % num_i_chunks;
-    const int k_start = (blockIdx.x / num_i_chunks) * TILE_K;
-
-    // Compute I-range for this chunk
-    const int total_i_tiles = (I + TILE_I - 1) / TILE_I;
-    const int i_tpc = (total_i_tiles + num_i_chunks - 1) / num_i_chunks;
-    const int i_loop_start = i_chunk * i_tpc * TILE_I;
-    const int i_loop_end = min(i_loop_start + i_tpc * TILE_I, I);
-
-    const int tid = threadIdx.x;
-    const int tpb = blockDim.x;
-    constexpr int DP = D_CONST + SCAT_SMEM_PAD;
-    constexpr int ATTN_K_STRIDE = TILE_K + SCAT_ATTN_PAD;
-    constexpr int ATTN_I_STRIDE = TILE_J * ATTN_K_STRIDE;
-
-    // --- Memory Offsets ---
-    const int64_t s_bh_offset = (int64_t)(b * H + h) * K * D_CONST;
-    const int64_t q_bh_offset = (int64_t)(b * H + h) * I * D_CONST;
-    const int64_t r_bh_offset = (int64_t)(b * H + h) * J * D_CONST;
-    const int64_t mi_bh_offset = (int64_t)(b * H + h) * I;
-    const int64_t mj_bh_offset = (int64_t)(b * H + h) * J;
-
-    // --- Shared Memory Layout ---
-    extern __shared__ char smem_raw[];
-    bf16* s_tile = reinterpret_cast<bf16*>(smem_raw);
-    bf16* q_tile = s_tile + TILE_K * DP;
-    bf16* r_tile = q_tile + TILE_I * DP;
-    bf16* vq_tile = r_tile + TILE_J * DP;
-    bf16* vr_tile = vq_tile + TILE_I * DP;
-    float* attn_tile = reinterpret_cast<float*>(vr_tile + TILE_J * DP);
-    float* mi_tile = attn_tile + TILE_I * ATTN_I_STRIDE;
-    float* li_tile = mi_tile + TILE_I;
-    float* mj_tile = li_tile + TILE_I;
-    float* lj_tile = mj_tile + TILE_J;
-
-    // --- Thread Indexing for Cooperative Loads ---
-    const int k_load = tid / D_CONST;
-    const int d_load = tid % D_CONST;
-    constexpr int load_pairs = D_CONST / 2;
-    constexpr int load_iters = (TILE_K * load_pairs + 256 - 1) / 256;
-    constexpr int load_step = 256 / D_CONST;
-
-    // --- Per-Thread Output Accumulators (registers) ---
-    float2 ys_acc[8];
-    #pragma unroll
-    for (int n = 0; n < 8; n++) {
-        ys_acc[n] = make_float2(0.0f, 0.0f);
-    }
-
-    // --- Load S Tile (fixed for entire block) ---
-    for (int n = 0; n < TILE_K; n += load_step) {
-        int k_global = k_start + n + k_load;
-        if (n + k_load < TILE_K && k_global < K) {
-            s_tile[(n + k_load) * DP + d_load] = S[s_bh_offset + k_global * D_CONST + d_load];
-        }
-    }
-    __syncthreads();
-
-    // --- Main Loop: Iterate Over I Tiles (split range) ---
-    for (int it = i_loop_start; it < i_loop_end; it += TILE_I) {
-        for (int n = 0; n < TILE_I; n += load_step) {
-            int i_global = it + n + k_load;
-            if (n + k_load < TILE_I && i_global < I) {
-                q_tile[(n + k_load) * DP + d_load] = Q[q_bh_offset + i_global * D_CONST + d_load];
-            }
-        }
-        for (int n = 0; n < TILE_I; n += load_step) {
-            int i_global = it + n + k_load;
-            if (n + k_load < TILE_I && i_global < I) {
-                vq_tile[(n + k_load) * DP + d_load] = Vq_2[q_bh_offset + i_global * D_CONST + d_load];
-            }
-        }
-        if (tid < TILE_I && it + tid < I) {
-            const float l = l_i_in[mi_bh_offset + it + tid];
-            if (l <= DENOM_EPS) {
-                mi_tile[tid] = 0.0f;
-                li_tile[tid] = 0.0f;
-            } else {
-                mi_tile[tid] = m_i_in[mi_bh_offset + it + tid];
-                li_tile[tid] = 1.0f / l;
-            }
-        }
-
-        // --- Inner Loop: Iterate Over J Tiles ---
-        for (int jt = 0; jt < J; jt += TILE_J) {
-            for (int n = 0; n < TILE_J; n += load_step) {
-                int j_global = jt + n + k_load;
-                if (n + k_load < TILE_J && j_global < J) {
-                    r_tile[(n + k_load) * DP + d_load] = R[r_bh_offset + j_global * D_CONST + d_load];
-                }
-            }
-            for (int n = 0; n < TILE_J; n += load_step) {
-                int j_global = jt + n + k_load;
-                if (n + k_load < TILE_J && j_global < J) {
-                    vr_tile[(n + k_load) * DP + d_load] = Vr_2[r_bh_offset + j_global * D_CONST + d_load];
-                }
-            }
-            if (tid < TILE_J && jt + tid < J) {
-                const float l = l_j_in[mj_bh_offset + jt + tid];
-                if (l <= DENOM_EPS) {
-                    mj_tile[tid] = 0.0f;
-                    lj_tile[tid] = 0.0f;
-                } else {
-                    mj_tile[tid] = m_j_in[mj_bh_offset + jt + tid];
-                    lj_tile[tid] = 1.0f / l;
-                }
-            }
-            __syncthreads();
-
-            // --- Parallel Outer-Product Attention Computation ---
-            float acc[4][4][4];
-            #pragma unroll
-            for (int i0 = 0; i0 < 4; i0++) {
-                #pragma unroll
-                for (int i1 = 0; i1 < 4; i1++) {
-                    #pragma unroll
-                    for (int i2 = 0; i2 < 4; i2++) {
-                        acc[i0][i1][i2] = 0.0f;
-                    }
-                }
-            }
-
-            const int da = tid / (TILE_I * TILE_J * TILE_K / 64);
-            const int ia = (tid / (TILE_J * TILE_K / 16)) % (TILE_I / 4);
-            const int ja = (tid / (TILE_K / 4)) % (TILE_J / 4);
-            const int ka = tid % (TILE_K / 4);
-
-            float2 qa[4], ra[4], sa[4];
-            constexpr int d_per_slice = D_CONST / 4;
-
-            for (int db = 0; db < d_per_slice; db += 2) {
-                const int d_idx = da * d_per_slice + db;
-                #pragma unroll
-                for (int u = 0; u < 4; u++) {
-                    qa[u] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(q_tile + (ia * 4 + u) * DP + d_idx));
-                    ra[u] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(r_tile + (ja * 4 + u) * DP + d_idx));
-                    sa[u] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(s_tile + (ka * 4 + u) * DP + d_idx));
-                }
-                #pragma unroll
-                for (int i0 = 0; i0 < 4; i0++) {
-                    #pragma unroll
-                    for (int i1 = 0; i1 < 4; i1++) {
-                        // Hoist q*r outside the i2 loop: each (i0,i1) is reused
-                        // across all 4 values of i2, so the two q*r FMULs need
-                        // happen only once per (i0,i1,db) instead of per i2.
-                        const float qrx = qa[i0].x * ra[i1].x;
-                        const float qry = qa[i0].y * ra[i1].y;
-                        #pragma unroll
-                        for (int i2 = 0; i2 < 4; i2++) {
-                            acc[i0][i1][i2] += qrx * sa[i2].x + qry * sa[i2].y;
-                        }
-                    }
-                }
-            }
-
-            // --- Reduction Across Dimension Slices ---
-            for (int u = 1; u < 4; u++) {
-                if (da == u) {
-                    #pragma unroll
-                    for (int i0 = 0; i0 < 4; i0++) {
-                        #pragma unroll
-                        for (int i1 = 0; i1 < 4; i1++) {
-                            #pragma unroll
-                            for (int i2 = 0; i2 < 4; i2++) {
-                                attn_tile[(ia * 4 + i0) * ATTN_I_STRIDE +
-                                          (ja * 4 + i1) * ATTN_K_STRIDE +
-                                          (ka * 4 + i2)] = acc[i0][i1][i2];
-                            }
-                        }
-                    }
-                }
-                __syncthreads();
-
-                if (da == 0) {
-                    #pragma unroll
-                    for (int i0 = 0; i0 < 4; i0++) {
-                        #pragma unroll
-                        for (int i1 = 0; i1 < 4; i1++) {
-                            #pragma unroll
-                            for (int i2 = 0; i2 < 4; i2++) {
-                                acc[i0][i1][i2] += attn_tile[(ia * 4 + i0) * ATTN_I_STRIDE +
-                                                             (ja * 4 + i1) * ATTN_K_STRIDE +
-                                                             (ka * 4 + i2)];
-                            }
-                        }
-                    }
-                }
-                __syncthreads();
-            }
-
-            // --- Apply Softmax Scaling ---
-            if (da == 0) {
-                // Fuse exp(logit-mit)*lit * exp(logit-mjt)*ljt into a single
-                // exp(2*logit - mit - mjt) * lit * ljt: halves MUFU expf traffic.
-                const float two_scale = 2.0f * scale;
-                #pragma unroll
-                for (int i0 = 0; i0 < 4; i0++) {
-                    const float mit = mi_tile[ia * 4 + i0];
-                    const float lit = li_tile[ia * 4 + i0];
-                    #pragma unroll
-                    for (int i1 = 0; i1 < 4; i1++) {
-                        const float mjt = mj_tile[ja * 4 + i1];
-                        const float ljt = lj_tile[ja * 4 + i1];
-                        #pragma unroll
-                        for (int i2 = 0; i2 < 4; i2++) {
-                            const int i_global = it + ia * 4 + i0;
-                            const int j_global = jt + ja * 4 + i1;
-                            const int k_global = k_start + ka * 4 + i2;
-                            const bool cell_valid = (i_global < I)
-                                && (j_global < J)
-                                && (k_global < K)
-                                && mask_pair_allowed(mask, I, b, k_global, i_global, j_global);
-                            attn_tile[(ia * 4 + i0) * ATTN_I_STRIDE +
-                                      (ja * 4 + i1) * ATTN_K_STRIDE +
-                                      (ka * 4 + i2)] = cell_valid
-                                        ? __expf(acc[i0][i1][i2] * two_scale - mit - mjt) * lit * ljt
-                                        : 0.0f;
-                        }
-                    }
-                }
-            }
-            __syncthreads();
-
-            // --- Accumulate Output (factored outer product: f = u^T (A v)) ---
-            // dy depends only on (tid % load_pairs); since tpb=256 is a multiple
-            // of load_pairs=32, dy is identical across both n=0 and n=1 iters —
-            // so vqts/vrts can be loaded once and reused.
-            const int dy_h = (tid % load_pairs) * 2;
-            float2 vqts[TILE_I];
-            float2 vrts[TILE_J];
-            #pragma unroll
-            for (int iy = 0; iy < TILE_I; iy++) {
-                vqts[iy] = __bfloat1622float2(
-                    *reinterpret_cast<const __nv_bfloat162*>(vq_tile + iy * DP + dy_h));
-            }
-            #pragma unroll
-            for (int jy = 0; jy < TILE_J; jy++) {
-                vrts[jy] = __bfloat1622float2(
-                    *reinterpret_cast<const __nv_bfloat162*>(vr_tile + jy * DP + dy_h));
-            }
-            for (int n = 0; n < load_iters; n++) {
-                int tid_n = tid + n * tpb;
-                if (tid_n < TILE_K * load_pairs) {
-                    int ky = tid_n / load_pairs;
-
-                    // Pair-process 2 iy values per outer iter: 4 parallel inner
-                    // FMA chains (vs 2 with single iy), keeping the FFMA pipe
-                    // saturated through dependency latency. No extra reduction
-                    // adds — each `fx +=` is one FMA, two of them per outer iter.
-                    float fx = 0.0f, fy = 0.0f;
-                    #pragma unroll
-                    for (int iy = 0; iy < TILE_I; iy += 2) {
-                        float tx_a = 0.0f, ty_a = 0.0f;
-                        float tx_b = 0.0f, ty_b = 0.0f;
-                        #pragma unroll
-                        for (int jy = 0; jy < TILE_J; jy++) {
-                            const float p_a = attn_tile[(iy + 0) * ATTN_I_STRIDE + jy * ATTN_K_STRIDE + ky];
-                            const float p_b = attn_tile[(iy + 1) * ATTN_I_STRIDE + jy * ATTN_K_STRIDE + ky];
-                            tx_a += p_a * vrts[jy].x;  tx_b += p_b * vrts[jy].x;
-                            ty_a += p_a * vrts[jy].y;  ty_b += p_b * vrts[jy].y;
-                        }
-                        fx += vqts[iy + 0].x * tx_a;
-                        fx += vqts[iy + 1].x * tx_b;
-                        fy += vqts[iy + 0].y * ty_a;
-                        fy += vqts[iy + 1].y * ty_b;
-                    }
-                    ys_acc[n].x += fx;
-                    ys_acc[n].y += fy;
-                }
-            }
-            __syncthreads();
-        }
-    }
-
-    // --- Write Output to Global Memory (chunked layout) ---
-    const int64_t bh_K = s_bh_offset / D_CONST;  // = (b*H + h) * K
-    for (int n = 0; n < load_iters; n++) {
-        int tid_n = tid + n * tpb;
-        if (tid_n < TILE_K * load_pairs) {
-            int ky = tid_n / load_pairs;
-            int dy = (tid_n % load_pairs) * 2;
-            int k_global = k_start + ky;
-            if (k_global < K) {
-                int64_t out_off = (bh_K + k_global) * (int64_t)num_i_chunks * D_CONST
-                                + (int64_t)i_chunk * D_CONST + dy;
-                Y_s_[out_off] = ys_acc[n].x;
-                Y_s_[out_off + 1] = ys_acc[n].y;
+            int a_global = a_start + iy;
+            if (a_global < n_anchor) {
+                int64_t out_off = (bh_A + a_global) * (int64_t)num_chunks * D_CONST
+                                + (int64_t)chunk * D_CONST + dy;
+                Y_part[out_off] = y_acc[n].x;
+                Y_part[out_off + 1] = y_acc[n].y;
             }
         }
     }
@@ -1918,21 +1259,21 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     Yr_scat_part = torch::empty({B * H * J * scat_i_chunks_r * D_TMPL}, opts_fp32);
     Ys_scat_part = torch::empty({B * H * K * scat_i_chunks_s * D_TMPL}, opts_fp32);
 
-    // Scatter shared memory size (same for all 3 scatter kernels)
+    // Scatter shared memory size (same for all 3 role permutations)
     constexpr int SCAT_DP = D_TMPL + SCAT_SMEM_PAD;
     constexpr int SCAT_ATTN_K_STRIDE = TILE_K + SCAT_ATTN_PAD;
     const size_t scatter_smem_size =
         sizeof(bf16) * (
-            TILE_I * SCAT_DP +             // q/r/s_tile (output dim)
-            TILE_J * SCAT_DP +             // r/q/q_tile
-            TILE_K * SCAT_DP +             // s/s/r_tile
-            TILE_J * SCAT_DP +             // vr/vq/vq_tile  (reused for second value dim)
-            TILE_K * SCAT_DP               // vs/vs/vr_tile
+            TILE_I * SCAT_DP +             // a_tile (anchor / output dim)
+            TILE_J * SCAT_DP +             // l1_tile
+            TILE_K * SCAT_DP +             // l2_tile
+            TILE_J * SCAT_DP +             // v1_tile
+            TILE_K * SCAT_DP               // v2_tile
         ) +
         sizeof(float) * (
             TILE_I * TILE_J * SCAT_ATTN_K_STRIDE + // attn_tile
-            TILE_I + TILE_I +              // m1_tile, l1_tile (first stats dim)
-            TILE_K + TILE_K                // m2_tile, l2_tile (second stats dim)
+            TILE_J + TILE_J +              // m1_tile, ln1_tile (loop1 stats)
+            TILE_K + TILE_K                // m2_tile, ln2_tile (loop2 stats)
         );
 
     // Tensor-core fast path for D=64 and resident dim <= 256 (cuda_docs/gather_readme.md):
@@ -2097,79 +1438,42 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     TORCH_CHECK(I == J && J == K, "Scatter requires I == J == K");
     TORCH_CHECK(I % TILE_I == 0, "Scatter requires I to be a multiple of TILE_I (16)");
 
-    const dim3 scatter_block(256);
-
-    // SCATTER: Y_q_ on stream 0 (output=I, split over J)
-    {
-        const int num_i_tiles = (I + TILE_I - 1) / TILE_I;
-        dim3 grid(num_i_tiles * scat_j_chunks_q, H, B);
-        Yq_scatter<D_TMPL><<<grid, scatter_block, scatter_smem_size, streams[0]>>>(
-            reinterpret_cast<const bf16*>(Q.data_ptr<at::BFloat16>()),
-            reinterpret_cast<const bf16*>(R.data_ptr<at::BFloat16>()),
-            reinterpret_cast<const bf16*>(S.data_ptr<at::BFloat16>()),
-            reinterpret_cast<const bf16*>(Vr_2.data_ptr<at::BFloat16>()),
-            reinterpret_cast<const bf16*>(Vs_2.data_ptr<at::BFloat16>()),
-            m_j.data_ptr<float>(), l_j.data_ptr<float>(),
-            m_k.data_ptr<float>(), l_k.data_ptr<float>(),
-            Yq_scat_part.data_ptr<float>(),
+    // Role permutation: anchor (output) / loop1 (split dim, V2+stats) /
+    // loop2 (inner dim, V2+stats). The anchor's own m/l are never consumed.
+    auto launch_scatter = [&](const at::Tensor& anchor, const at::Tensor& loop1,
+                              const at::Tensor& loop2, const at::Tensor& V1,
+                              const at::Tensor& V2, at::Tensor& m1, at::Tensor& l1,
+                              at::Tensor& m2, at::Tensor& l2,
+                              at::Tensor& Y_part, at::Tensor& Yout,
+                              int n_anchor, int n_loop1, int n_loop2,
+                              int num_chunks, cudaStream_t stream) {
+        dim3 grid(ceil_div(n_anchor, TILE_I) * num_chunks, H, B);
+        Y_scatter<D_TMPL><<<grid, dim3(256), scatter_smem_size, stream>>>(
+            reinterpret_cast<const bf16*>(anchor.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const bf16*>(loop1.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const bf16*>(loop2.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const bf16*>(V1.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const bf16*>(V2.data_ptr<at::BFloat16>()),
+            m1.data_ptr<float>(), l1.data_ptr<float>(),
+            m2.data_ptr<float>(), l2.data_ptr<float>(),
+            Y_part.data_ptr<float>(),
             mask_ptr,
-            B, H, I, J, K, scale,
-            scat_j_chunks_q
+            B, H, n_anchor, n_loop1, n_loop2, scale,
+            num_chunks
         );
-        reduce_scatter_partials<D_TMPL><<<dim3(I, H, B), D_TMPL, 0, streams[0]>>>(
-            Yq_scat_part.data_ptr<float>(),
-            reinterpret_cast<bf16*>(Y_q_.data_ptr<at::BFloat16>()),
-            I, scat_j_chunks_q
+        reduce_scatter_partials<D_TMPL><<<dim3(n_anchor, H, B), D_TMPL, 0, stream>>>(
+            Y_part.data_ptr<float>(),
+            reinterpret_cast<bf16*>(Yout.data_ptr<at::BFloat16>()),
+            n_anchor, num_chunks
         );
-    }
+    };
 
-    // SCATTER: Y_r_ on stream 1 (output=J, split over I)
-    {
-        const int num_j_tiles = (J + TILE_J - 1) / TILE_J;
-        dim3 grid(num_j_tiles * scat_i_chunks_r, H, B);
-        Yr_scatter<D_TMPL><<<grid, scatter_block, scatter_smem_size, streams[1]>>>(
-            reinterpret_cast<const bf16*>(Q.data_ptr<at::BFloat16>()),
-            reinterpret_cast<const bf16*>(R.data_ptr<at::BFloat16>()),
-            reinterpret_cast<const bf16*>(S.data_ptr<at::BFloat16>()),
-            reinterpret_cast<const bf16*>(Vq_2.data_ptr<at::BFloat16>()),
-            reinterpret_cast<const bf16*>(Vs_2.data_ptr<at::BFloat16>()),
-            m_i.data_ptr<float>(), l_i.data_ptr<float>(),
-            m_k.data_ptr<float>(), l_k.data_ptr<float>(),
-            Yr_scat_part.data_ptr<float>(),
-            mask_ptr,
-            B, H, I, J, K, scale,
-            scat_i_chunks_r
-        );
-        reduce_scatter_partials<D_TMPL><<<dim3(J, H, B), D_TMPL, 0, streams[1]>>>(
-            Yr_scat_part.data_ptr<float>(),
-            reinterpret_cast<bf16*>(Y_r_.data_ptr<at::BFloat16>()),
-            J, scat_i_chunks_r
-        );
-    }
-
-    // SCATTER: Y_s_ on stream 2 (output=K, split over I)
-    {
-        const int num_k_tiles = (K + TILE_K - 1) / TILE_K;
-        dim3 grid(num_k_tiles * scat_i_chunks_s, H, B);
-        Ys_scatter<D_TMPL><<<grid, scatter_block, scatter_smem_size, streams[2]>>>(
-            reinterpret_cast<const bf16*>(Q.data_ptr<at::BFloat16>()),
-            reinterpret_cast<const bf16*>(R.data_ptr<at::BFloat16>()),
-            reinterpret_cast<const bf16*>(S.data_ptr<at::BFloat16>()),
-            reinterpret_cast<const bf16*>(Vq_2.data_ptr<at::BFloat16>()),
-            reinterpret_cast<const bf16*>(Vr_2.data_ptr<at::BFloat16>()),
-            m_i.data_ptr<float>(), l_i.data_ptr<float>(),
-            m_j.data_ptr<float>(), l_j.data_ptr<float>(),
-            Ys_scat_part.data_ptr<float>(),
-            mask_ptr,
-            B, H, I, J, K, scale,
-            scat_i_chunks_s
-        );
-        reduce_scatter_partials<D_TMPL><<<dim3(K, H, B), D_TMPL, 0, streams[2]>>>(
-            Ys_scat_part.data_ptr<float>(),
-            reinterpret_cast<bf16*>(Y_s_.data_ptr<at::BFloat16>()),
-            K, scat_i_chunks_s
-        );
-    }
+    launch_scatter(Q, R, S, Vr_2, Vs_2, m_j, l_j, m_k, l_k,
+                   Yq_scat_part, Y_q_, I, J, K, scat_j_chunks_q, streams[0]);
+    launch_scatter(R, Q, S, Vq_2, Vs_2, m_i, l_i, m_k, l_k,
+                   Yr_scat_part, Y_r_, J, I, K, scat_i_chunks_r, streams[1]);
+    launch_scatter(S, Q, R, Vq_2, Vr_2, m_i, l_i, m_j, l_j,
+                   Ys_scat_part, Y_s_, K, I, J, scat_i_chunks_s, streams[2]);
 
     } // end if (scatter_used)
 
