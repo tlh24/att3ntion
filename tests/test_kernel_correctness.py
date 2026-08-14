@@ -285,9 +285,13 @@ def case(request):
             for n in INPUT_NAMES
         ]
 
-    return config, cuda_fwd, ref_fwd, cuda_grads, ref_grads
+    yield config, cuda_fwd, ref_fwd, cuda_grads, ref_grads
 
-    del inputs, bf16, grad_Y, cuda_fwd, ref_fwd, cuda_grads, ref_grads
+    # The reference's FP32 copies and the BF16 draws are the large holdings and
+    # are not part of the yielded tuple, so dropping the names here does free
+    # them. Shapes vary widely between configs, so hand the blocks back rather
+    # than leaving the caching allocator fragmented for the next one.
+    del inputs, bf16, grad_Y, ref_inputs, cuda_fwd, ref_fwd, cuda_grads, ref_grads
     torch.cuda.empty_cache()
 
 
