@@ -3,6 +3,7 @@
 #   make build              			  Build/install the extension
 #   make test               		      Run quick correctness tests
 #   make test-full        				  Run detailed correctness tests
+#   make test-stress                       Run large-input-scale configs
 #   make test-mask                       Run mask-specific tests (naive + CUDA)
 #   make -k sanitizer-tier0               Run all four CUDA sanitizers (H100 only)
 #   make bench              			  Benchmark (test + run)
@@ -43,6 +44,12 @@ test-quiet: maybe-build
 
 test-full: maybe-build
 	$(PYTHON) -m pytest tests/test_kernel_correctness.py -m "quick or standard"
+
+# -rxX prints the xfail/xpass reasons: the D=64 configs here sit on the tensor-
+# core score-precision limit (cuda_docs/gather_readme.md section 5), and a silent
+# X in the progress line is how that stopped being visible in the first place.
+test-stress: maybe-build
+	$(PYTHON) -m pytest tests/test_kernel_correctness.py -m stress -rxX
 
 test-mask: maybe-build
 	$(PYTHON) -m pytest tests/test_naive_mask.py tests/test_cuda_mask.py -q
