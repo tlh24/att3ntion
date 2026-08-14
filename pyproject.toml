@@ -21,6 +21,15 @@ dependencies = [
 [tool.setuptools]
 packages = ["att3ntion"]
 
+[tool.pytest.ini_options]
+markers = [
+    "quick: smoke-test shapes",
+    "standard: default correctness sweep",
+    "large: large-N shapes",
+    "stress: larger input scales",
+    "edge: minimal B/H shapes",
+]
+
 
 [project.optional-dependencies]
 cu130 = ["torch>=2.5"]

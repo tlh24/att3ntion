@@ -36,14 +36,13 @@ test: maybe-build
 	@echo "═══════════════════════════════════════════════════════════════"
 	@echo "CORRECTNESS: Quick tests"
 	@echo "═══════════════════════════════════════════════════════════════"
-	$(PYTHON) tests/test_kernel_correctness.py --quick --continue-on-failure -v
+	$(PYTHON) -m pytest tests/test_kernel_correctness.py -m quick
 
 test-quiet: maybe-build
-	@$(PYTHON) tests/test_kernel_correctness.py --quick --continue-on-failure 2>&1 | \
-		(grep -E "(FAIL|Error|Exception|Traceback)" && exit 1 || echo "  ✓ All correctness tests passed")
+	@$(PYTHON) -m pytest tests/test_kernel_correctness.py -m quick -q
 
 test-full: maybe-build
-	$(PYTHON) tests/test_kernel_correctness.py --continue-on-failure -v
+	$(PYTHON) -m pytest tests/test_kernel_correctness.py -m "quick or standard"
 
 test-mask: maybe-build
 	$(PYTHON) -m pytest tests/test_naive_mask.py tests/test_cuda_mask.py -q
@@ -70,8 +69,8 @@ sanitizer-racecheck sanitizer-initcheck sanitizer-synccheck: maybe-build
 	$(GUARD)
 	$(SANITIZE) --tool $(patsubst sanitizer-%,%,$@) $(PYTHON) -m pytest \
 		tests/test_tc_paths.py -k tc_variants_finite -q
-	$(SANITIZE) --tool $(patsubst sanitizer-%,%,$@) $(PYTHON) \
-		tests/test_kernel_correctness.py --quick
+	$(SANITIZE) --tool $(patsubst sanitizer-%,%,$@) $(PYTHON) -m pytest \
+		tests/test_kernel_correctness.py -m quick -q
 
 # --- Benchmarks: Regression Tracking ---
 
