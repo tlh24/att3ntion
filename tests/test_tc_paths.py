@@ -10,11 +10,9 @@ _torch_kernels has no masked reference, those tests build a gather-only fp32
 einsum reference and differentiate it with autograd.
 
 Both gates fail open into the scalar path — wrong D, or too little opt-in shared
-memory. The forward streams its col side, so its smem cost is flat in N and it
-engages at any N; the backward keeps that side resident and falls back past
-~352 unmasked / ~256 masked on a 227 KB H100. So the dispatch matrix at the end
-of the file asserts which kernel ran via ck.tc_launches() rather than trusting
-the numbers alone.
+memory. Both kernels stream their col side, so both smem costs are flat in N and
+both engage at any N. So the dispatch matrix at the end of the file asserts
+which kernel ran via ck.tc_launches() rather than trusting the numbers alone.
 """
 import math
 import os
@@ -175,17 +173,18 @@ FWD_TC_SMEM = (2 * (2 * TC_BJ * DPAD + 4 * TC_BK * DPAD)
                + 4 * (2 * TC_BK + TC_BJ + TC_WARPS * 64 + TC_WARPS * 2 + 64 + 2 + 64))
 
 
-def _tc_smem_bytes(N, masked):
-    k_pad = -(-N // BTC_BK) * BTC_BK
-    total = 2 * (3 * BTC_BJ * DPAD + 3 * k_pad * DPAD)
-    total += 4 * (3 * 64 + 3 * k_pad + 3 * BTC_BJ + BTC_WARPS * 2 * 64 + 2 * 64)
+# Also independent of N: two staged BTC_BK col tiles + one tile's mask windows.
+def _tc_smem_bytes(masked):
+    total = 2 * (3 * BTC_BJ * DPAD + 6 * BTC_BK * DPAD)
+    total += 4 * (3 * 64 + 6 * BTC_BK + 3 * BTC_BJ + BTC_WARPS * 2 * 64 + 2 * 64)
     if masked:
-        total += 4 * 2 * (k_pad + 1) * (k_pad // 32) + 4 * (k_pad + BTC_BJ)
+        total += 4 * 2 * (BTC_BJ + BTC_BK * (BTC_BJ // 32))
+        total += 4 * (2 * BTC_BK + BTC_BJ)
     return total
 
 
-def _tc_fits(N, masked=True):
-    return _tc_smem_bytes(N, masked) <= _smem_optin()
+def _tc_fits(masked=True):
+    return _tc_smem_bytes(masked) <= _smem_optin()
 
 
 def _expect_fwd_tc(N, D):
@@ -194,7 +193,7 @@ def _expect_fwd_tc(N, D):
 
 def _expect_bwd_tc(N, D, masked):
     return (D == 64 and N % 16 == 0
-            and _tc_smem_bytes(N, masked) <= _smem_optin())
+            and _tc_smem_bytes(masked) <= _smem_optin())
 
 
 def _ref_gather_masked(Q, R, S, Vq1, Vr1, Vs1, mask):
@@ -327,7 +326,7 @@ def test_masked_tc_matches_scalar_path_large_n(kind, N):
     check TC against the scalar path (itself validated against the reference at
     smaller N). Tolerances are looser than an exact match because TC rounds the
     softmax weights to bf16 for its output GEMMs."""
-    if not _tc_fits(N, masked=True):
+    if not _tc_fits(masked=True):
         pytest.skip(f"device opt-in smem too small for masked TC at N={N}")
     B, H, D = 1, 1, 64
     torch.manual_seed(4242 + N)
@@ -348,7 +347,7 @@ def test_masked_tc_path_actually_engages(N):
     """Guard against the masked gate silently falling back: the TC and scalar
     paths differ numerically (bf16 GEMM operands vs fp32 scalar), so bitwise
     equality means the gate did not fire."""
-    if not _tc_fits(N, masked=True):
+    if not _tc_fits(masked=True):
         pytest.skip(f"device opt-in smem too small for masked TC at N={N}")
     B, H, D = 1, 2, 64
     mask = _make_mask("causal", B, N, "cuda")
@@ -419,8 +418,7 @@ def _dispatch_run(B, H, N, D, mask, tc=True, valid=None, seed=0):
 
 
 # D: only 64 is TC. N: 128/256 reach the unmasked forward variant, everything
-# else the masked one (n_rows % TC_BJ). 384/512 pin the split where the forward
-# stays on TC and the backward alone falls back.
+# else the masked one (n_rows % TC_BJ). 384/512 pin that both kernels stream.
 DISPATCH_CELLS = [(N, D, kind)
                   for N in [16, 32, 96, 128, 160, 256]
                   for D in [16, 32, 64]

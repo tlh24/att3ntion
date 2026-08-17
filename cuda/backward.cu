@@ -337,7 +337,8 @@ __global__ void V_scatter_grad(
 // pass, run three times with permuted roles exactly like Y_gather_tc:
 //
 //   anchor a (one CTA per (b,h,a)) / rows r (16-row warp tiles) / cols c
-//   (shared-memory resident). Score-shaped GEMMs per (r,c) tile, D contracted:
+//   (double-buffered BTC_BK-column stage, as in Y_gather_tc, so smem is flat
+//   in N). Score-shaped GEMMs per (r,c) tile, D contracted:
 //
 //     x   = scale * sum_d Xa[d]  * Xr[r,d]  * Xc[c,d]      (logits)
 //     d_a =         sum_d gYa[d] * Vr[r,d]  * Vc[c,d]
@@ -385,15 +386,12 @@ __global__ void V_scatter_grad(
 // guarantee x <= m, and it also subsumes the pad test: pad rows and cols carry
 // a zero inv-l and read zero mask bits.
 //
-// The remaining two factors are genuinely 2-D non-separable, so the whole
-// [N][N] mask goes resident, bit-packed, twice: row-major (mask[r][c] is bit c
-// of row r) and bit-transposed (mask[c][r] is bit c of row r of mskT). One
-// row-major copy can serve both orientations, but reading mask[c][r] from it is
-// column-major — four loads and variable shifts per fragment against two
-// aligned loads from the transpose. Each tile is (K_pad+1)*(K_pad/32) words,
-// the spare row being the all-zero row that pad rows point at; 17.4 KB total at
-// N=256. mskT is built in the prologue by 32x32 __ballot_sync bit transposes
-// off the row-major tile, entirely in shared memory.
+// The remaining two factors are genuinely 2-D non-separable, but a (r,c) tile
+// touches only the [BTC_BJ][BTC_BK] mask rectangle, staged per tile as two
+// bit-packed 512-byte windows: msk_sm packs mask[r][c] along c (one word per
+// row), mskT_sm packs mask[c][r] along r. Both pack along the mask's own fast
+// axis, so both load straight from global — no resident [N][N] copies, no
+// transpose. Pad rows and cols pack to zero bits, gating their cells off.
 //
 // The collapsed correction sums are unaffected by masking: sum = rowsum(dY o Y)
 // holds for any weight matrix the forward actually used, and the forward
@@ -402,6 +400,21 @@ __global__ void V_scatter_grad(
 constexpr int BTC_BJ = 128;       // rows per block iteration (8 warps x 16)
 constexpr int BTC_BK = 32;        // cols per inner iteration
 constexpr int BTC_WARPS = 8;
+constexpr int BTC_MRW = BTC_BJ / 32;   // words per col of a transposed window
+
+// 32 mask bools -> one word, bit t = row[t]. Bases are 32-aligned and
+// N % 16 == 0, so the uchar4 reads are aligned; a short lim leaves zeros.
+__device__ __forceinline__ uint32_t pack_mask32(const bool* row, int lim) {
+    uint32_t bits = 0u;
+    int t = 0;
+    for (; t + 4 <= lim; t += 4) {
+        const uchar4 v = *reinterpret_cast<const uchar4*>(row + t);
+        bits |= ((v.x ? 1u : 0u) << t)       | ((v.y ? 1u : 0u) << (t + 1))
+              | ((v.z ? 1u : 0u) << (t + 2)) | ((v.w ? 1u : 0u) << (t + 3));
+    }
+    for (; t < lim; t++) if (row[t]) bits |= 1u << t;
+    return bits;
+}
 
 template<int D_CONST, bool MASKED>
 __global__ __launch_bounds__(BTC_WARPS * 32, 1)
@@ -412,7 +425,7 @@ void Bwd_gather_tc(
     const bf16* __restrict__ Xr_bf,  // row side
     const bf16* __restrict__ Vr_bf,
     const bf16* __restrict__ gYr_bf,
-    const bf16* __restrict__ Xc_bf,  // col side (smem resident)
+    const bf16* __restrict__ Xc_bf,  // col side (streamed per k tile)
     const bf16* __restrict__ Vc_bf,
     const bf16* __restrict__ gYc_bf,
     const float* __restrict__ m_a, const float* __restrict__ l_a, const float* __restrict__ sum_a,
@@ -446,127 +459,106 @@ void Bwd_gather_tc(
     bf16* xr_sm   = reinterpret_cast<bf16*>(smem_raw);            // [BTC_BJ][DPAD]
     bf16* vr_sm   = xr_sm + BTC_BJ * DPAD;
     bf16* gyr_sm  = vr_sm + BTC_BJ * DPAD;
-    bf16* xc_sm   = gyr_sm + BTC_BJ * DPAD;                       // [K_pad][DPAD]
-    bf16* vc_sm   = xc_sm + K_pad * DPAD;
-    bf16* gyc_sm  = vc_sm + K_pad * DPAD;
-    float* anchX  = reinterpret_cast<float*>(gyc_sm + K_pad * DPAD);  // [D] scale*Xa
+    bf16* xc_sm   = gyr_sm + BTC_BJ * DPAD;                       // [2][BTC_BK][DPAD]
+    bf16* vc_sm   = xc_sm + 2 * BTC_BK * DPAD;
+    bf16* gyc_sm  = vc_sm + 2 * BTC_BK * DPAD;
+    float* anchX  = reinterpret_cast<float*>(gyc_sm + 2 * BTC_BK * DPAD);  // [D] scale*Xa
     float* anchV  = anchX + D;                                    // [D]
     float* anchG  = anchV + D;                                    // [D]
-    float* mc_sm  = anchG + D;                                    // [K_pad]
-    float* ilc_sm = mc_sm + K_pad;
-    float* sc_sm  = ilc_sm + K_pad;
-    float* mr_sm  = sc_sm + K_pad;                               // [BTC_BJ]
+    float* mc_sm  = anchG + D;                                    // [2][BTC_BK]
+    float* ilc_sm = mc_sm + 2 * BTC_BK;
+    float* sc_sm  = ilc_sm + 2 * BTC_BK;
+    float* mr_sm  = sc_sm + 2 * BTC_BK;                          // [BTC_BJ]
     float* ilr_sm = mr_sm + BTC_BJ;
     float* sr_sm  = ilr_sm + BTC_BJ;
     float* wOut   = sr_sm + BTC_BJ;                              // [BTC_WARPS][2*D]
     float* redOut = wOut + BTC_WARPS * 2 * D;                    // [2*D]
-    // MASKED only (host omits these bytes when MASKED=false). Both tiles carry
-    // one extra all-zero row at index K_pad, which pad rows read so that their
-    // cells gate themselves off with no per-cell pad test (see below).
-    const int NW = K_pad >> 5;    // bit-packing words per mask row
-    uint32_t* msk_sm  = reinterpret_cast<uint32_t*>(redOut + 2 * D);  // [K_pad+1][NW]
-    uint32_t* mskT_sm = msk_sm + (K_pad + 1) * NW;                    // [K_pad+1][NW]
-    float* ilac_sm = reinterpret_cast<float*>(mskT_sm + (K_pad + 1) * NW);  // [K_pad]
-    float* par_sm  = ilac_sm + K_pad;                                 // [BTC_BJ]
+    // MASKED only (host omits these bytes): the tile in flight's mask windows.
+    uint32_t* msk_sm  = reinterpret_cast<uint32_t*>(redOut + 2 * D);  // [2][BTC_BJ]
+    uint32_t* mskT_sm = msk_sm + 2 * BTC_BJ;                          // [2][BTC_BK][BTC_MRW]
+    float* ilac_sm = reinterpret_cast<float*>(mskT_sm + 2 * BTC_BK * BTC_MRW);  // [2][BTC_BK]
+    float* par_sm  = ilac_sm + 2 * BTC_BK;                            // [BTC_BJ]
 
     const int64_t bh = (int64_t)b * H + h;
     const int64_t nd_off = bh * N * D;
     const int64_t a_off  = nd_off + (int64_t)a * D;
     const int64_t st_off = bh * N;
 
-    // ---- one-time loads: resident col side (async), anchor, col stats ----
+    // ---- one-time loads: anchor only (the col side stages per k tile) ----
     constexpr int DV = D / 8;
-    for (int idx = tid; idx < K_pad * DV; idx += blockDim.x) {
-        const int k = idx / DV, dv = (idx % DV) * 8;
-        if (k < N) {
-            const int64_t off = nd_off + (int64_t)k * D + dv;
-            cp_async16(xc_sm + k * DPAD + dv, Xc_bf + off);
-            cp_async16(vc_sm + k * DPAD + dv, Vc_bf + off);
-            cp_async16(gyc_sm + k * DPAD + dv, gYc_bf + off);
-        } else {
-            const uint4 z = make_uint4(0, 0, 0, 0);
-            *reinterpret_cast<uint4*>(xc_sm + k * DPAD + dv) = z;
-            *reinterpret_cast<uint4*>(vc_sm + k * DPAD + dv) = z;
-            *reinterpret_cast<uint4*>(gyc_sm + k * DPAD + dv) = z;
-        }
-    }
     for (int d = tid; d < D; d += blockDim.x) {
         anchX[d] = scale * bf2f(Xa_bf[a_off + d]);
         anchV[d] = bf2f(Va_bf[a_off + d]);
         anchG[d] = bf2f(gYa_bf[a_off + d]);
-    }
-    for (int k = tid; k < K_pad; k += blockDim.x) {
-        if (k < N) {
-            mc_sm[k]  = m_c[st_off + k];
-            ilc_sm[k] = 1.0f / fmaxf(l_c[st_off + k], DENOM_EPS);
-            sc_sm[k]  = sum_c[st_off + k];
-        } else {
-            mc_sm[k] = 0.0f; ilc_sm[k] = 0.0f; sc_sm[k] = 0.0f;
-        }
     }
     if (tid < 2 * D) redOut[tid] = 0.0f;
 
     const float ma  = m_a[st_off + a];
     const float ila = 1.0f / fmaxf(l_a[st_off + a], DENOM_EPS);
     const float sa  = sum_a[st_off + a];
-
-    // ---- resident bit-packed mask: one word = 32 consecutive cols of a row ----
-    if constexpr (MASKED) {
-        const bool* mb = mask + (int64_t)b * N * N;
-        for (int idx = tid; idx < (K_pad + 1) * NW; idx += blockDim.x) {
-            const int r = idx / NW, w = idx - r * NW;
-            uint32_t bits = 0u;
-            const int cbase = w * 32;
-            if (r < N && cbase < N) {
-                // N % 16 == 0 and cbase % 32 == 0, so the row slice is
-                // 4-byte aligned and lim is a multiple of 4.
-                const int lim = min(32, N - cbase);
-                const bool* row = mb + (int64_t)r * N + cbase;
-                int t = 0;
-                for (; t + 4 <= lim; t += 4) {
-                    const uchar4 v = *reinterpret_cast<const uchar4*>(row + t);
-                    bits |= ((v.x ? 1u : 0u) << t)       | ((v.y ? 1u : 0u) << (t + 1))
-                          | ((v.z ? 1u : 0u) << (t + 2)) | ((v.w ? 1u : 0u) << (t + 3));
-                }
-                for (; t < lim; t++) if (row[t]) bits |= 1u << t;
-            }
-            msk_sm[idx] = bits;
-        }
-        // The two separable column factors fold into per-column floats, so they
-        // cost nothing per cell: mask[c][a] zeroes P_c's inv-l outright, and
-        // mask[a][c] rides along with the anchor's inv-l in ilac_sm. Both loops
-        // walk the same c per thread as the ilc_sm staging above, so the
-        // read-modify-write of ilc_sm needs no barrier.
-        for (int c = tid; c < K_pad; c += blockDim.x) {
-            const bool ac = (c < N) && mb[(int64_t)a * N + c];   // mask[a][c]
-            const bool ca = (c < N) && mb[(int64_t)c * N + a];   // mask[c][a]
-            ilac_sm[c] = ac ? ila : 0.0f;
-            if (!ca) ilc_sm[c] = 0.0f;
-        }
-        __syncthreads();
-        // Bit-transpose msk_sm into mskT_sm so that mskT[r][c] == mask[c][r]:
-        // P_c's factor then reads the same shape as P_r's (one word per row per
-        // 32-col tile, immediate shifts) instead of four column-major loads.
-        // One __ballot_sync per output row of each 32x32 bit block.
-        const int NB = NW;
-        for (int blk = warp; blk < NB * NB; blk += BTC_WARPS) {
-            const int bI = blk / NB, bJ = blk - bI * NB;
-            const uint32_t w = msk_sm[(bI * 32 + lane) * NW + bJ];
-            #pragma unroll
-            for (int t = 0; t < 32; t++) {
-                const uint32_t col = __ballot_sync(0xFFFFFFFFu, (w >> t) & 1u);
-                if (lane == t) mskT_sm[(bJ * 32 + t) * NW + bI] = col;
-            }
-        }
-        for (int w = tid; w < NW; w += blockDim.x) mskT_sm[K_pad * NW + w] = 0u;
-    }
-
-    asm volatile("cp.async.wait_all;\n" ::);
-    __syncthreads();
+    const bool* mb  = MASKED ? mask + (int64_t)b * N * N : nullptr;
 
     // ---- row blocks of BTC_BJ rows, one 16-row tile per warp ----
     for (int j0 = 0; j0 < N; j0 += BTC_BJ) {
-        __syncthreads();  // previous iteration's smem reads done
+        __syncthreads();  // previous iteration's smem reads (and anchor) done
+
+        // Stage col tile k0 into buffer `buf`: matrices, forward stats and
+        // (masked) mask windows. Zero-filled pads carry a zero inv-l and zero
+        // mask bits, gating the tail tile off with no per-cell test.
+        auto stage_cols = [&](int k0, int buf) {
+            bf16* xs = xc_sm + buf * BTC_BK * DPAD;
+            bf16* vs = vc_sm + buf * BTC_BK * DPAD;
+            bf16* gs = gyc_sm + buf * BTC_BK * DPAD;
+            for (int idx = tid; idx < BTC_BK * DV; idx += blockDim.x) {
+                const int kl = idx / DV, dv = (idx % DV) * 8;
+                const int k = k0 + kl;
+                if (k < N) {
+                    const int64_t off = nd_off + (int64_t)k * D + dv;
+                    cp_async16(xs + kl * DPAD + dv, Xc_bf + off);
+                    cp_async16(vs + kl * DPAD + dv, Vc_bf + off);
+                    cp_async16(gs + kl * DPAD + dv, gYc_bf + off);
+                } else {
+                    const uint4 z = make_uint4(0, 0, 0, 0);
+                    *reinterpret_cast<uint4*>(xs + kl * DPAD + dv) = z;
+                    *reinterpret_cast<uint4*>(vs + kl * DPAD + dv) = z;
+                    *reinterpret_cast<uint4*>(gs + kl * DPAD + dv) = z;
+                }
+            }
+            for (int kl = tid; kl < BTC_BK; kl += blockDim.x) {
+                const int k = k0 + kl;
+                float mc = 0.0f, ilc = 0.0f, sc = 0.0f;
+                if (k < N) {
+                    mc  = m_c[st_off + k];
+                    ilc = 1.0f / fmaxf(l_c[st_off + k], DENOM_EPS);
+                    sc  = sum_c[st_off + k];
+                }
+                if constexpr (MASKED) {
+                    // Separable column factors, free per cell: mask[c][a]
+                    // zeroes P_c's inv-l, mask[a][c] rides in ilac_sm.
+                    if (k >= N || !mb[(int64_t)k * N + a]) ilc = 0.0f;
+                    ilac_sm[buf * BTC_BK + kl] =
+                        (k < N && mb[(int64_t)a * N + k]) ? ila : 0.0f;
+                }
+                mc_sm[buf * BTC_BK + kl]  = mc;
+                ilc_sm[buf * BTC_BK + kl] = ilc;
+                sc_sm[buf * BTC_BK + kl]  = sc;
+            }
+            if constexpr (MASKED) {
+                for (int jl = tid; jl < BTC_BJ; jl += blockDim.x) {
+                    const int j = j0 + jl;
+                    msk_sm[buf * BTC_BJ + jl] = (j < N)
+                        ? pack_mask32(mb + (int64_t)j * N + k0, min(BTC_BK, N - k0))
+                        : 0u;
+                }
+                for (int idx = tid; idx < BTC_BK * BTC_MRW; idx += blockDim.x) {
+                    const int kl = idx / BTC_MRW, w = idx - kl * BTC_MRW;
+                    const int k = k0 + kl, jb = j0 + w * 32;
+                    mskT_sm[buf * BTC_BK * BTC_MRW + idx] = (k < N && jb < N)
+                        ? pack_mask32(mb + (int64_t)k * N + jb, min(32, N - jb))
+                        : 0u;
+                }
+            }
+        };
 
         for (int idx = tid; idx < BTC_BJ * DV; idx += blockDim.x) {
             const int jl = idx / DV, dv = (idx % DV) * 8;
@@ -592,10 +584,8 @@ void Bwd_gather_tc(
                     // Both row-side factors are staged rather than kept in
                     // registers: at 255 registers the kernel spills, so a live
                     // register costs more than a rematerializable smem read.
-                    if (!((msk_sm[j * NW + (a >> 5)] >> (a & 31)) & 1u))
-                        il = 0.0f;                                   // mask[r][a]
-                    par_sm[jl] = ((msk_sm[a * NW + (j >> 5)] >> (j & 31)) & 1u)
-                               ? 1.0f : 0.0f;                        // mask[a][r]
+                    if (!mb[(int64_t)j * N + a]) il = 0.0f;          // mask[r][a]
+                    par_sm[jl] = mb[(int64_t)a * N + j] ? 1.0f : 0.0f;  // mask[a][r]
                 }
                 ilr_sm[jl] = il;
             } else {
@@ -603,6 +593,8 @@ void Bwd_gather_tc(
                 if constexpr (MASKED) par_sm[jl] = 0.0f;
             }
         }
+        stage_cols(0, 0);
+        asm volatile("cp.async.wait_all;\n" ::);
         __syncthreads();
 
         const int jw = warp * 16;
@@ -618,11 +610,12 @@ void Bwd_gather_tc(
         const bool rpad1 = (j0 + jw + g + 8) >= N;
 
         // The two row-side mask factors were folded into ilr_sm / par_sm during
-        // staging above. Pad rows point at the tiles' spare zero row, so their
-        // 2-D factors read 0 and no per-cell pad test is needed; their inv-l and
-        // par are already 0 from that same loop.
-        const int rw0 = MASKED ? (rpad0 ? K_pad : (j0 + jw + g))     : 0;
-        const int rw1 = MASKED ? (rpad1 ? K_pad : (j0 + jw + g + 8)) : 0;
+        // staging above. Pad rows pack to zero bits in both windows, so no
+        // per-cell pad test is needed. Rows jw+g and jw+g+8 always share one
+        // word of the transposed window (a 16-row tile never straddles a 32-row
+        // boundary), so one load covers both at shifts 0 and 8.
+        const int rwd = (jw + g) >> 5;
+        const int rb  = (jw + g) & 31;
 
         // Raw row fragments are col-invariant: load once, rescale into the
         // four A operands (A1/A3 share the Vr fragment). The rescale is done
@@ -661,7 +654,18 @@ void Bwd_gather_tc(
             for (int e = 0; e < 4; e++) { Ug[nt][e] = 0.0f; U1[nt][e] = 0.0f; U2[nt][e] = 0.0f; }
         }
 
+        int cur = 0;
         for (int k0 = 0; k0 < K_pad; k0 += BTC_BK) {
+            // Prefetch k0+1; the closing barrier publishes it and frees `cur`.
+            const int nxt = cur ^ 1;
+            if (k0 + BTC_BK < K_pad) stage_cols(k0 + BTC_BK, nxt);
+            const bf16* xc_cur  = xc_sm + cur * BTC_BK * DPAD;
+            const bf16* vc_cur  = vc_sm + cur * BTC_BK * DPAD;
+            const bf16* gyc_cur = gyc_sm + cur * BTC_BK * DPAD;
+            const float* mc_cur  = mc_sm + cur * BTC_BK;
+            const float* ilc_cur = ilc_sm + cur * BTC_BK;
+            const float* sc_cur  = sc_sm + cur * BTC_BK;
+
             // Score-shaped GEMMs: 4 accumulator sets over BTC_BK cols.
             float ax[4][4], ada[4][4], adr[4][4], adc[4][4];
             #pragma unroll
@@ -673,9 +677,9 @@ void Bwd_gather_tc(
             }
             #pragma unroll
             for (int p = 0; p < BTC_BK / 16; p++) {
-                const bf16* bx = xc_sm + (k0 + p * 16 + brow) * DPAD + bcol8;
-                const bf16* bv = vc_sm + (k0 + p * 16 + brow) * DPAD + bcol8;
-                const bf16* bg = gyc_sm + (k0 + p * 16 + brow) * DPAD + bcol8;
+                const bf16* bx = xc_cur + (p * 16 + brow) * DPAD + bcol8;
+                const bf16* bv = vc_cur + (p * 16 + brow) * DPAD + bcol8;
+                const bf16* bg = gyc_cur + (p * 16 + brow) * DPAD + bcol8;
                 #pragma unroll
                 for (int ks = 0; ks < 4; ks++) {
                     uint32_t bfr[4];
@@ -698,28 +702,26 @@ void Bwd_gather_tc(
             uint32_t gAf[BTC_BK / 16][4], Prf[BTC_BK / 16][4], Pcf[BTC_BK / 16][4];
             #pragma unroll
             for (int nt = 0; nt < 4; nt++) {
-                const int c = k0 + nt * 8 + 2 * tig;
-                const float mc0 = mc_sm[c],     ilc0 = ilc_sm[c],     sc0 = sc_sm[c];
-                const float mc1 = mc_sm[c + 1], ilc1 = ilc_sm[c + 1], sc1 = sc_sm[c + 1];
-                // Only the two genuinely 2-D factors are left per cell, and the
-                // transposed tile makes them the same shape: bits 0/1 of rc*
-                // are mask[r][c] and mask[r][c+1], bits 0/1 of cr* are
-                // mask[c][r] and mask[c+1][r] (c is even, so each pair shares a
-                // word). Four column-major loads became two aligned ones.
-                // (Hoisting these out of the nt loop is possible — c >> 5 is
-                // tile-invariant since BTC_BK == 32 — but measured 2% slower on
-                // H100: the kernel is register-bound, and keeping the words live
-                // across the tile costs more spill than the saved loads.)
+                const int cl = nt * 8 + 2 * tig;    // col within the staged tile
+                const int c  = k0 + cl;
+                const float mc0 = mc_cur[cl],     ilc0 = ilc_cur[cl],     sc0 = sc_cur[cl];
+                const float mc1 = mc_cur[cl + 1], ilc1 = ilc_cur[cl + 1], sc1 = sc_cur[cl + 1];
+                // Only the two 2-D factors are left per cell, one aligned load
+                // per pair in either window: bits 0/1 of rc* are mask[r][c] and
+                // mask[r][c+1] (c even, so the pair shares a word), bits 0/8 of
+                // cr* are mask[c][r] and mask[c][r+8]. So rc* indexes by row and
+                // cr* by col — the windows' packing axes, swapped.
                 uint32_t rc0 = ~0u, rc1 = ~0u, cr0 = ~0u, cr1 = ~0u;
                 float ilac0 = 0.0f, ilac1 = 0.0f;
                 if constexpr (MASKED) {
-                    const int cw = c >> 5, cb = c & 31;
-                    rc0 = msk_sm[rw0 * NW + cw] >> cb;
-                    rc1 = msk_sm[rw1 * NW + cw] >> cb;
-                    cr0 = mskT_sm[rw0 * NW + cw] >> cb;
-                    cr1 = mskT_sm[rw1 * NW + cw] >> cb;
-                    ilac0 = ilac_sm[c];
-                    ilac1 = ilac_sm[c + 1];
+                    const uint32_t* mw  = msk_sm + cur * BTC_BJ;
+                    const uint32_t* mtw = mskT_sm + cur * BTC_BK * BTC_MRW;
+                    rc0 = mw[jw + g]     >> cl;
+                    rc1 = mw[jw + g + 8] >> cl;
+                    cr0 = mtw[cl * BTC_MRW + rwd]       >> rb;
+                    cr1 = mtw[(cl + 1) * BTC_MRW + rwd] >> rb;
+                    ilac0 = ilac_sm[cur * BTC_BK + cl];
+                    ilac1 = ilac_sm[cur * BTC_BK + cl + 1];
                 }
                 float gA[4], Pr[4], Pc[4];
                 #pragma unroll
@@ -751,7 +753,8 @@ void Bwd_gather_tc(
                         // both sides: that cost `random` 21% over `causal`.
                         // Selecting on inv-l keeps every cell's cost identical.
                         const float ilrg = (((hi ? rc1 : rc0) >> c1) & 1u) ? ilr : 0.0f;
-                        const float ilcg = (((hi ? cr1 : cr0) >> c1) & 1u) ? ilc : 0.0f;
+                        const float ilcg = (((c1 ? cr1 : cr0) >> (hi ? 8 : 0)) & 1u)
+                                         ? ilc : 0.0f;
                         Pa    = __expf(fminf(x - ma,  0.0f)) * ilac * par;
                         Pr[e] = __expf(fminf(x - mrr, 0.0f)) * ilrg;
                         Pc[e] = __expf(fminf(x - mcc, 0.0f)) * ilcg;
@@ -778,9 +781,9 @@ void Bwd_gather_tc(
             // Output GEMMs: contract cols (B fragments via ldmatrix.trans).
             #pragma unroll
             for (int s2 = 0; s2 < BTC_BK / 16; s2++) {
-                const bf16* px = xc_sm + (k0 + s2 * 16 + lrow) * DPAD + lcol8;
-                const bf16* pv = vc_sm + (k0 + s2 * 16 + lrow) * DPAD + lcol8;
-                const bf16* pg = gyc_sm + (k0 + s2 * 16 + lrow) * DPAD + lcol8;
+                const bf16* px = xc_cur + (s2 * 16 + lrow) * DPAD + lcol8;
+                const bf16* pv = vc_cur + (s2 * 16 + lrow) * DPAD + lcol8;
+                const bf16* pg = gyc_cur + (s2 * 16 + lrow) * DPAD + lcol8;
                 #pragma unroll
                 for (int np = 0; np < 4; np++) {
                     uint32_t bfr[4];
@@ -795,6 +798,10 @@ void Bwd_gather_tc(
                     mma_bf16_m16n8k16(U2[2 * np + 1], Pcf[s2], bfr + 2);
                 }
             }
+
+            asm volatile("cp.async.wait_all;\n" ::);
+            __syncthreads();
+            cur = nxt;
         }
 
         // ---- epilogue: Hadamard row-collapse of this warp's 16 rows ----
@@ -1739,16 +1746,15 @@ backward_impl(torch::Tensor grad_Y_q,
     }();
     const int K_pad = ceil_div(N, BTC_BK) * BTC_BK;
     constexpr int TC_DPAD = 64 + 8;
-    // Masked runs add two resident bit-packed [K_pad+1][K_pad/32] mask tiles
-    // (row-major and bit-transposed, one spare zero row each for pad rows) plus
-    // the per-col anchor inv-l floats — 17.4 KB at N=256.
+    // Flat in N: the col side streams through two BTC_BK tiles, and masked runs
+    // add only the tile in flight's two mask windows plus its inv-l floats.
     const size_t smem_mask = use_mask
-        ? sizeof(uint32_t) * 2 * (size_t)(K_pad + 1) * (K_pad / 32)
-          + sizeof(float) * ((size_t)K_pad + BTC_BJ)
+        ? sizeof(uint32_t) * 2 * (size_t)(BTC_BJ + BTC_BK * BTC_MRW)
+          + sizeof(float) * (2 * (size_t)BTC_BK + BTC_BJ)
         : 0;
     const size_t smem_tc =
-        sizeof(bf16) * ((size_t)3 * BTC_BJ * TC_DPAD + (size_t)3 * K_pad * TC_DPAD) +
-        sizeof(float) * (3 * 64 + (size_t)3 * K_pad + 3 * BTC_BJ
+        sizeof(bf16) * ((size_t)3 * BTC_BJ * TC_DPAD + (size_t)6 * BTC_BK * TC_DPAD) +
+        sizeof(float) * (3 * 64 + 6 * (size_t)BTC_BK + 3 * BTC_BJ
                          + BTC_WARPS * 2 * 64 + 2 * 64)
         + smem_mask;
     if (att3_tc::state().bwd_enabled && smem_tc <= (size_t)max_smem_optin) {
