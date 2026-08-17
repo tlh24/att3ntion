@@ -26,6 +26,7 @@ def hypergraph_forward(
     Vq_1: torch.Tensor, Vq_2: torch.Tensor,
     Vr_1: torch.Tensor, Vr_2: torch.Tensor,
     Vs_1: torch.Tensor, Vs_2: torch.Tensor,
+    mask: torch.Tensor,
     dropout_rate: float,
     I_valid: int = -1,
     J_valid: int = -1,
@@ -39,13 +40,13 @@ def hypergraph_forward(
     _require_cuda()
     return _cuda_kernels.forward(
         Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate,
-        I_valid, J_valid, K_valid,
+        I_valid, J_valid, K_valid, mask,
     )
 
 
 @hypergraph_forward.register_fake
 def _hypergraph_forward_fake(
-    Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate,
+    Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, mask, dropout_rate,
     I_valid=-1, J_valid=-1, K_valid=-1,
 ):
     B, H, I, D = Q.shape
@@ -79,6 +80,8 @@ def hypergraph_backward(
     m_i: torch.Tensor, l_i: torch.Tensor,
     m_j: torch.Tensor, l_j: torch.Tensor,
     m_k: torch.Tensor, l_k: torch.Tensor,
+    mask: torch.Tensor,
+    Y_q: torch.Tensor, Y_r: torch.Tensor, Y_s: torch.Tensor,
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor,
     torch.Tensor, torch.Tensor, torch.Tensor,
@@ -88,7 +91,7 @@ def hypergraph_backward(
     return _cuda_kernels.backward(
         grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_,
         Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
-        m_i, l_i, m_j, l_j, m_k, l_k,
+        m_i, l_i, m_j, l_j, m_k, l_k, 0.0, mask, Y_q, Y_r, Y_s,
     )
 
 
@@ -96,7 +99,7 @@ def hypergraph_backward(
 def _hypergraph_backward_fake(
     grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_,
     Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
-    m_i, l_i, m_j, l_j, m_k, l_k,
+    m_i, l_i, m_j, l_j, m_k, l_k, mask, Y_q, Y_r, Y_s,
 ):
     return (
         torch.empty_like(Q), torch.empty_like(R), torch.empty_like(S),
@@ -107,9 +110,10 @@ def _hypergraph_backward_fake(
 
 
 def _setup_context(ctx, inputs, output):
-    Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, _dropout, _Iv, _Jv, _Kv = inputs
-    _, _, _, _, _, _, m_i, l_i, m_j, l_j, m_k, l_k = output
-    ctx.save_for_backward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, m_i, l_i, m_j, l_j, m_k, l_k)
+    Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, mask, _dropout, _Iv, _Jv, _Kv = inputs
+    Y_q, Y_r, Y_s, _, _, _, m_i, l_i, m_j, l_j, m_k, l_k = output
+    ctx.save_for_backward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
+                          m_i, l_i, m_j, l_j, m_k, l_k, mask, Y_q, Y_r, Y_s)
 
 
 def _backward(
@@ -117,7 +121,8 @@ def _backward(
     grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_,
     grad_m_i, grad_l_i, grad_m_j, grad_l_j, grad_m_k, grad_l_k,
 ):
-    Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, m_i, l_i, m_j, l_j, m_k, l_k = ctx.saved_tensors
+    Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, \
+        m_i, l_i, m_j, l_j, m_k, l_k, mask, Y_q, Y_r, Y_s = ctx.saved_tensors
     if grad_Y_q is None:
         grad_Y_q = torch.zeros_like(Q)
     if grad_Y_r is None:
@@ -134,8 +139,9 @@ def _backward(
         *hypergraph_backward(
             grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_,
             Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
-            m_i, l_i, m_j, l_j, m_k, l_k,
+            m_i, l_i, m_j, l_j, m_k, l_k, mask, Y_q, Y_r, Y_s,
         ),
+        None,  # mask
         None,  # dropout_rate
         None,  # I_valid
         None,  # J_valid

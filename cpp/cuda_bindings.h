@@ -8,7 +8,23 @@
 #pragma once
 
 #include <torch/extension.h>
+#include <atomic>
 #include <tuple>
+
+// Both tensor-core gates fail open into the scalar path, so tests need to see
+// which one ran. Counters are per launch: an engaged pass adds 3, one per role.
+namespace att3_tc {
+
+struct State {
+    bool fwd_enabled;                       // seeded from ATT3_YQ_TC
+    bool bwd_enabled;                       // seeded from ATT3_BWD_TC
+    std::atomic<unsigned long long> fwd_launches{0};
+    std::atomic<unsigned long long> bwd_launches{0};
+};
+
+State& state();
+
+}  // namespace att3_tc
 
 // Forward pass returns: Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_, m_i, l_i, m_j, l_j, m_k, l_k
 // The softmax stats (m_i, l_i, m_j, l_j, m_k, l_k) are computed during forward and
@@ -26,6 +42,7 @@ forward_cuda(
     at::Tensor Vq_1, at::Tensor Vq_2,
     at::Tensor Vr_1, at::Tensor Vr_2,
     at::Tensor Vs_1, at::Tensor Vs_2,
+    at::Tensor mask,
     double dropout_rate = 0.0,
     int64_t I_valid = -1,
     int64_t J_valid = -1,
@@ -36,6 +53,11 @@ forward_cuda(
 // numerical consistency and avoid redundant O(N²) computation.
 // Upstream grads include gather (grad_Y_q/r/s) and scatter (grad_Y_q_/r_/s_)
 // branches separately.
+//
+// Y_q/Y_r/Y_s are the forward's gather outputs; when provided (and the scatter
+// cotangents are all zero) the tensor-core fast path computes its Jacobian
+// correction sums as rowsum(dY o Y) instead of a full cube pass. Passing
+// undefined tensors keeps the scalar path.
 std::tuple<at::Tensor, at::Tensor, at::Tensor,
            at::Tensor, at::Tensor, at::Tensor,
            at::Tensor, at::Tensor, at::Tensor>
@@ -53,4 +75,8 @@ backward_cuda(
     at::Tensor m_i, at::Tensor l_i,
     at::Tensor m_j, at::Tensor l_j,
     at::Tensor m_k, at::Tensor l_k,
-    double dropout_rate = 0.0);
+    at::Tensor mask,
+    double dropout_rate = 0.0,
+    at::Tensor Y_q = at::Tensor(),
+    at::Tensor Y_r = at::Tensor(),
+    at::Tensor Y_s = at::Tensor());

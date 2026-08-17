@@ -153,121 +153,133 @@ def benchmark_fn(fn, warmup=5, iters=20):
     return median, min(times), max(times)
 
 
+def _naive_gather_forward(Q, R, S, Vq, Vr, Vs):
+    """Naive PyTorch hypergraph attention (gather branch only): materializes
+    the full O(N³) score tensor, three joint softmaxes, three contractions.
+    This is what running the same math in plain PyTorch would cost."""
+    B, H, N, _ = Q.shape
+    scale = 1.0 / (Q.shape[-1] ** 0.5)
+    x = torch.einsum('bhid,bhjd,bhkd->bhijk', Q, R, S) * scale
+    Aq = torch.softmax(x.reshape(B, H, N, -1), -1).reshape(B, H, N, N, N)
+    xr = x.transpose(2, 3)  # [b,h,j,i,k]
+    Ar = torch.softmax(xr.reshape(B, H, N, -1), -1).reshape(B, H, N, N, N)
+    xs = x.permute(0, 1, 4, 2, 3)  # [b,h,k,i,j]
+    As = torch.softmax(xs.reshape(B, H, N, -1), -1).reshape(B, H, N, N, N)
+    Y_q = torch.einsum('bhijk,bhjd,bhkd->bhid', Aq, Vr, Vs)
+    Y_r = torch.einsum('bhjik,bhid,bhkd->bhjd', Ar, Vq, Vs)
+    Y_s = torch.einsum('bhkij,bhid,bhjd->bhkd', As, Vq, Vr)
+    return Y_q, Y_r, Y_s
+
+
 def demo_benchmark():
-    """Compare CUDA kernel timing vs PyTorch reference implementation."""
+    """Compare CUDA kernel timing vs naive PyTorch (gather-only: scatter
+    branch unused, matching current models — the CUDA path skips scatter
+    work and runs the tensor-core backward when eligible)."""
     print("\n" + "=" * 60)
-    print("⏱️  Timing Benchmark: CUDA Kernels vs PyTorch Reference")
+    print("⏱️  Timing Benchmark: CUDA Kernels vs Naive PyTorch (no scatter)")
     print("=" * 60)
-    
+
     if not torch.cuda.is_available():
         print("⚠ CUDA not available. Skipping timing benchmark.")
         return
-    
-    # Import both implementations
+
     try:
         import att3ntion._cuda_kernels as cuda_ext
     except ImportError:
         print("⚠ CUDA extension not found. Run: python setup.py develop")
         return
-    
-    try:
-        import att3ntion._torch_kernels as ref_ext
-    except ImportError:
-        print("⚠ Reference extension not found. Run: python setup.py develop")
-        return
-    
+
     print(f"\nGPU: {torch.cuda.get_device_name(0)}")
-    print("\nComparing forward and backward pass timings.")
-    print("Lower is better. Ratio < 1.0 means CUDA is faster.\n")
-    
-    # Test configurations: (N, D) pairs
+    print("\n'Torch' = naive PyTorch materializing the O(N³) score tensor.")
+    print("'Time ×' = torch_ms / cuda_ms (higher = CUDA faster).")
+    print("Backward includes the torch forward re-run autograd requires.\n")
+
+    # Test configurations: (N, D) pairs. D=64 rows use the tensor-core
+    # forward gathers and backward; D=32 rows use the scalar kernels.
     configs = [
         ("N32_D32",  32,  32),
         ("N64_D32",  64,  32),
         ("N64_D64",  64,  64),
         ("N128_D32", 128, 32),
         ("N128_D64", 128, 64),
+        ("N256_D64", 256, 64),
     ]
-    
+
     B, H = 1, 2  # batch, heads
     warmup, iters = 5, 20
-    
-    print(f"{'Config':<12} │ {'Forward':^29} │ {'Backward':^29}")
-    print(f"{'':12} │ {'CUDA':>8}  {'Torch':>8}  {'Ratio':>8} │ {'CUDA':>8}  {'Torch':>8}  {'Ratio':>8}")
-    print("─" * 76)
-    
+
+    print(f"{'Config':<10} │ {'Forward':^26} │ {'Backward':^26} │ {'Step (f+b)':^26}")
+    print(f"{'':10} │ {'CUDA':>7} {'Torch':>8} {'Time ×':>7} │ {'CUDA':>7} {'Torch':>8} {'Time ×':>7} │ {'CUDA':>7} {'Torch':>8} {'Time ×':>7}")
+    print("─" * 100)
+
     for name, N, D in configs:
         torch.cuda.empty_cache()
         torch.manual_seed(42)
-        
-        # Create inputs
-        Q    = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
-        R    = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
-        S    = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
-        Vq_1 = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
-        Vq_2 = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
-        Vr_1 = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
-        Vr_2 = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
-        Vs_1 = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
-        Vs_2 = torch.randn(B, H, N, D, device='cuda', dtype=torch.float32)
-        cuda_inputs = tuple(t.to(torch.bfloat16) for t in (Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2))
-        grad_Y_q = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
-        grad_Y_r = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
-        grad_Y_s = torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
-        grad_Y_q_ = torch.zeros_like(grad_Y_q)
-        grad_Y_r_ = torch.zeros_like(grad_Y_r)
-        grad_Y_s_ = torch.zeros_like(grad_Y_s)
-        
-        # Forward benchmarks
+
+        Q, R, S, Vq_1, Vr_1, Vs_1 = (
+            torch.randn(B, H, N, D, device='cuda') for _ in range(6))
+        # Scatter unused: zero V2 operands (forward skips the scatter
+        # kernels) and zero scatter cotangents (backward takes the TC path).
+        zero_bf = torch.zeros(B, H, N, D, device='cuda', dtype=torch.bfloat16)
+        cuda_inputs = tuple(t.to(torch.bfloat16) for t in (Q, R, S)) + (
+            Vq_1.to(torch.bfloat16), zero_bf,
+            Vr_1.to(torch.bfloat16), zero_bf,
+            Vs_1.to(torch.bfloat16), zero_bf)
+        grad_Y_q, grad_Y_r, grad_Y_s = (
+            torch.randn(B, H, N, D, device='cuda', dtype=torch.bfloat16)
+            for _ in range(3))
+
         def run_cuda_fwd():
             return cuda_ext.forward(*cuda_inputs, 0.0)
-        
+
         def run_ref_fwd():
-            return ref_ext.forward(*cuda_inputs, 0.0)
-        
+            with torch.no_grad():
+                return _naive_gather_forward(Q, R, S, Vq_1, Vr_1, Vs_1)
+
         cuda_fwd_ms, _, _ = benchmark_fn(run_cuda_fwd, warmup, iters)
         ref_fwd_ms, _, _ = benchmark_fn(run_ref_fwd, warmup, iters)
-        fwd_ratio = cuda_fwd_ms / ref_fwd_ms if ref_fwd_ms > 0 else float('inf')
-        
-        # Get forward outputs for backward pass
+
+        # Forward outputs: stats for backward + Y for the TC path's
+        # collapsed correction sums.
         fwd_out = cuda_ext.forward(*cuda_inputs, 0.0)
+        Y_q, Y_r, Y_s = fwd_out[0], fwd_out[1], fwd_out[2]
         m_i, l_i, m_j, l_j, m_k, l_k = fwd_out[6:12]
-        
-        # Backward benchmarks
+
         def run_cuda_bwd():
             return cuda_ext.backward(
-                grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_, *cuda_inputs,
-                m_i, l_i, m_j, l_j, m_k, l_k, 0.0
+                grad_Y_q, grad_Y_r, grad_Y_s, zero_bf, zero_bf, zero_bf,
+                *cuda_inputs, m_i, l_i, m_j, l_j, m_k, l_k, 0.0,
+                None, Y_q, Y_r, Y_s
             )
-        
+
+        gq, gr, gs = grad_Y_q.float(), grad_Y_r.float(), grad_Y_s.float()
+
         def run_ref_bwd():
-            # Reference uses autograd
-            inputs = [Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2]
-            ref_inputs = [t.detach().clone().requires_grad_(True) for t in inputs]
-            ref_out = ref_ext.forward(*ref_inputs, 0.0)
-            total = sum(o.sum() for o in ref_out)
-            total.backward()
-        
+            ref_inputs = [t.detach().clone().requires_grad_(True)
+                          for t in (Q, R, S, Vq_1, Vr_1, Vs_1)]
+            yq, yr, ys = _naive_gather_forward(*ref_inputs)
+            ((yq * gq).sum() + (yr * gr).sum() + (ys * gs).sum()).backward()
+
         cuda_bwd_ms, _, _ = benchmark_fn(run_cuda_bwd, warmup, iters)
         ref_bwd_ms, _, _ = benchmark_fn(run_ref_bwd, warmup, iters)
-        bwd_ratio = cuda_bwd_ms / ref_bwd_ms if ref_bwd_ms > 0 else float('inf')
-        
-        # Format ratio with indicator
-        def fmt_ratio(r):
-            if r < 0.9:
-                return f"{r:.2f} ✓"
-            elif r > 1.1:
-                return f"{r:.2f} ✗"
-            else:
-                return f"{r:.2f}  "
-        
-        print(f"{name:<12} │ {cuda_fwd_ms:>7.2f}ms {ref_fwd_ms:>7.2f}ms {fmt_ratio(fwd_ratio):>8} │ {cuda_bwd_ms:>7.2f}ms {ref_bwd_ms:>7.2f}ms {fmt_ratio(bwd_ratio):>8}")
-        
-        del Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_
+
+        def fmt_x(r):
+            return f"{r:.1f}×" if r >= 1 else f"{r:.2f}×"
+
+        fwd_x = ref_fwd_ms / cuda_fwd_ms
+        bwd_x = ref_bwd_ms / cuda_bwd_ms
+        step_cuda = cuda_fwd_ms + cuda_bwd_ms
+        step_ref = ref_fwd_ms + ref_bwd_ms
+        print(f"{name:<10} │ {cuda_fwd_ms:>6.2f} {ref_fwd_ms:>7.2f} {fmt_x(fwd_x):>7} │ "
+              f"{cuda_bwd_ms:>6.2f} {ref_bwd_ms:>7.2f} {fmt_x(bwd_x):>7} │ "
+              f"{step_cuda:>6.2f} {step_ref:>7.2f} {fmt_x(step_ref / step_cuda):>7}")
+
+        del Q, R, S, Vq_1, Vr_1, Vs_1, grad_Y_q, grad_Y_r, grad_Y_s, fwd_out
         torch.cuda.empty_cache()
-    
-    print("─" * 76)
-    print("\n✓ = CUDA faster, ✗ = Torch faster")
+
+    print("─" * 100)
+    print("\nTimes in ms. Naive PyTorch also allocates the O(N³) score tensor")
+    print("(see --memory); att3ntion never materializes it.")
     print("\n" + "-" * 60)
 
 

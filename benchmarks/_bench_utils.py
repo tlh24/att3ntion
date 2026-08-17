@@ -15,6 +15,43 @@ def create_inputs(B: int, H: int, N: int, D: int,
     )
 
 
+MASK_KINDS = ("none", "causal", "all_true", "random", "dead_rows", "prefix_lm_pad")
+
+
+def make_mask(kind: str, B: int, N: int, device='cuda') -> Optional[torch.Tensor]:
+    """Attention mask of the given kind, or None for 'none'.
+
+    Mirrors `_make_mask` in tests/test_backward_tc.py so benchmark and
+    correctness runs exercise the same shapes.
+    """
+    if kind == "none":
+        return None
+    eye = torch.arange(N, device=device)
+    tri = torch.tril(torch.ones(B, N, N, device=device, dtype=torch.bool))
+    if kind == "causal":
+        return tri
+    if kind == "all_true":
+        return torch.ones(B, N, N, device=device, dtype=torch.bool)
+    if kind == "random":
+        m = torch.randint(0, 2, (B, N, N), device=device, dtype=torch.bool)
+        m[:, eye, eye] = True          # keep every anchor's denominator alive
+        return m
+    if kind == "dead_rows":
+        m = tri.clone()
+        m[:, 5, :] = False
+        m[:, N - 1, :] = False
+        return m
+    if kind == "prefix_lm_pad":
+        P = N // 2
+        m = torch.zeros(B, N, N, device=device, dtype=torch.bool)
+        m[:, :, :P] = True
+        m |= tri
+        m[:, :, N - 4:] = False
+        m[:, N - 4:, :] = False
+        return m
+    raise ValueError(f"unknown mask kind: {kind}")
+
+
 # --- Timing ---
 
 def benchmark_fn(fn, warmup=5, iters=20):
@@ -39,16 +76,25 @@ def benchmark_fn(fn, warmup=5, iters=20):
 
 # --- GPU Specs ---
 
+# bf16_tflops is dense tensor-core peak (no sparsity), the denominator for MFU
+# on the TC paths. Exact device names are matched before the substring fallback,
+# so the H100 variants must precede the generic entry.
 KNOWN_GPUS = {
-    "NVIDIA GeForce RTX 4080 Laptop GPU": {"fp32_tflops": 33.9,  "mem_bw_gbs": 432.0},
-    "NVIDIA GeForce RTX 4080":            {"fp32_tflops": 48.7,  "mem_bw_gbs": 716.8},
-    "NVIDIA GeForce RTX 4080 SUPER":      {"fp32_tflops": 52.0,  "mem_bw_gbs": 736.3},
-    "NVIDIA GeForce RTX 4090":            {"fp32_tflops": 82.6,  "mem_bw_gbs": 1008.0},
-    "NVIDIA GeForce RTX 3090":            {"fp32_tflops": 35.6,  "mem_bw_gbs": 936.2},
-    "NVIDIA GeForce RTX 3080":            {"fp32_tflops": 29.8,  "mem_bw_gbs": 760.3},
-    "NVIDIA A100-SXM4-40GB":              {"fp32_tflops": 19.5,  "mem_bw_gbs": 1555.0},
-    "NVIDIA A100-SXM4-80GB":              {"fp32_tflops": 19.5,  "mem_bw_gbs": 2039.0},
-    "NVIDIA H100":                        {"fp32_tflops": 51.2,  "mem_bw_gbs": 3350.0},
+    "NVIDIA GeForce RTX 4080 Laptop GPU": {"fp32_tflops": 33.9,  "bf16_tflops": 135.6, "mem_bw_gbs": 432.0},
+    "NVIDIA GeForce RTX 4080":            {"fp32_tflops": 48.7,  "bf16_tflops": 194.9, "mem_bw_gbs": 716.8},
+    "NVIDIA GeForce RTX 4080 SUPER":      {"fp32_tflops": 52.0,  "bf16_tflops": 208.0, "mem_bw_gbs": 736.3},
+    "NVIDIA GeForce RTX 4090":            {"fp32_tflops": 82.6,  "bf16_tflops": 330.3, "mem_bw_gbs": 1008.0},
+    "NVIDIA GeForce RTX 3090":            {"fp32_tflops": 35.6,  "bf16_tflops": 142.4, "mem_bw_gbs": 936.2},
+    "NVIDIA GeForce RTX 3080":            {"fp32_tflops": 29.8,  "bf16_tflops": 119.2, "mem_bw_gbs": 760.3},
+    "NVIDIA GeForce RTX 5090":            {"fp32_tflops": 104.8, "bf16_tflops": 419.2, "mem_bw_gbs": 1792.0},
+    "NVIDIA GeForce RTX 5080":            {"fp32_tflops": 56.3,  "bf16_tflops": 225.2, "mem_bw_gbs": 960.0},
+    "NVIDIA A100-SXM4-40GB":              {"fp32_tflops": 19.5,  "bf16_tflops": 312.0, "mem_bw_gbs": 1555.0},
+    "NVIDIA A100-SXM4-80GB":              {"fp32_tflops": 19.5,  "bf16_tflops": 312.0, "mem_bw_gbs": 2039.0},
+    "NVIDIA H100 80GB HBM3":              {"fp32_tflops": 66.9,  "bf16_tflops": 989.4, "mem_bw_gbs": 3350.0},
+    "NVIDIA H100 PCIe":                   {"fp32_tflops": 51.2,  "bf16_tflops": 756.5, "mem_bw_gbs": 2039.0},
+    "NVIDIA H100 NVL":                    {"fp32_tflops": 66.9,  "bf16_tflops": 989.4, "mem_bw_gbs": 3900.0},
+    "NVIDIA H100":                        {"fp32_tflops": 66.9,  "bf16_tflops": 989.4, "mem_bw_gbs": 3350.0},
+    "NVIDIA H200":                        {"fp32_tflops": 66.9,  "bf16_tflops": 989.4, "mem_bw_gbs": 4800.0},
 }
 
 
@@ -72,13 +118,18 @@ def get_gpu_specs() -> Dict:
         cuda_cores = props.multi_processor_count * 128
         fp32_tflops = cuda_cores * 2 * clock_ghz / 1000
         mem_bw_gbs = props.total_memory / 1e9 * 10
-        specs = {"fp32_tflops": round(fp32_tflops, 1), "mem_bw_gbs": round(mem_bw_gbs, 1)}
+        # No reliable way to estimate tensor-core peak: the fp32-to-bf16 ratio is
+        # ~4x on consumer parts but ~15x on datacenter ones. Leave it unset so
+        # callers refuse to report MFU rather than quote a fabricated number.
+        specs = {"fp32_tflops": round(fp32_tflops, 1), "bf16_tflops": None,
+                 "mem_bw_gbs": round(mem_bw_gbs, 1)}
 
     return {
         "name": name,
         "sm_count": props.multi_processor_count,
         "total_memory_gb": round(props.total_memory / 1e9, 2),
         "fp32_tflops": specs["fp32_tflops"],
+        "bf16_tflops": specs.get("bf16_tflops"),
         "mem_bw_gbs": specs["mem_bw_gbs"],
     }
 

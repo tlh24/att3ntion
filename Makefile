@@ -1,10 +1,11 @@
 
-# att3ntion Makefile
-#
 # Usage:
 #   make build              			  Build/install the extension
 #   make test               		      Run quick correctness tests
 #   make test-full        				  Run detailed correctness tests
+#   make test-stress                       Run large-input-scale configs
+#   make test-mask                       Run mask-specific tests (naive + CUDA)
+#   make -k sanitizer-tier0               Run all four CUDA sanitizers (H100 only)
 #   make bench              			  Benchmark (test + run)
 #   make bench BUILD=1                    Rebuild before benchmarking
 #   make bench-save NOTE="desc"           Save benchmark with note
@@ -36,14 +37,47 @@ test: maybe-build
 	@echo "═══════════════════════════════════════════════════════════════"
 	@echo "CORRECTNESS: Quick tests"
 	@echo "═══════════════════════════════════════════════════════════════"
-	$(PYTHON) tests/test_kernel_correctness.py --quick --continue-on-failure -v
+	$(PYTHON) -m pytest tests/test_kernel_correctness.py -m quick
 
 test-quiet: maybe-build
-	@$(PYTHON) tests/test_kernel_correctness.py --quick --continue-on-failure 2>&1 | \
-		(grep -E "(FAIL|Error|Exception|Traceback)" && exit 1 || echo "  ✓ All correctness tests passed")
+	@$(PYTHON) -m pytest tests/test_kernel_correctness.py -m quick -q
 
 test-full: maybe-build
-	$(PYTHON) tests/test_kernel_correctness.py --continue-on-failure -v
+	$(PYTHON) -m pytest tests/test_kernel_correctness.py -m "quick or standard"
+
+# -rxX prints the xfail/xpass reasons: the D=64 configs here sit on the tensor-
+# core score-precision limit (cuda_docs/gather_readme.md section 5), and a silent
+# X in the progress line is how that stopped being visible in the first place.
+test-stress: maybe-build
+	$(PYTHON) -m pytest tests/test_kernel_correctness.py -m stress -rxX
+
+test-mask: maybe-build
+	$(PYTHON) -m pytest tests/test_naive_mask.py tests/test_cuda_mask.py -q
+
+# --- CUDA Memory Safety ---
+# H100-gated: elsewhere the tensor-core kernels fall back to the scalar path
+# (opt-in shared memory is too small) and the run would pass without touching
+# them. The correctness harness reaches no tensor-core kernel at all, so the
+# TC variants are sanitized through pytest separately.
+
+GUARD = @$(PYTHON) -c "import torch,sys; \
+	n = torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no CUDA device'; \
+	sys.exit(0 if 'H100' in n else 'sanitizer targets require an H100, got '+n)"
+SANITIZE = compute-sanitizer --target-processes all --error-exitcode 99
+
+sanitizer-tier0: sanitizer-memcheck sanitizer-racecheck sanitizer-initcheck sanitizer-synccheck
+
+sanitizer-memcheck: maybe-build
+	$(GUARD)
+	$(SANITIZE) --tool memcheck $(PYTHON) -m pytest \
+		tests/test_tc_paths.py tests/test_cuda_mask.py -x
+
+sanitizer-racecheck sanitizer-initcheck sanitizer-synccheck: maybe-build
+	$(GUARD)
+	$(SANITIZE) --tool $(patsubst sanitizer-%,%,$@) $(PYTHON) -m pytest \
+		tests/test_tc_paths.py -k tc_variants_finite -q
+	$(SANITIZE) --tool $(patsubst sanitizer-%,%,$@) $(PYTHON) -m pytest \
+		tests/test_kernel_correctness.py -m quick -q
 
 # --- Benchmarks: Regression Tracking ---
 
@@ -142,7 +176,8 @@ clean:
 	find . -name "*.so" -delete
 	@echo "Cleaned build artifacts."
 
-.PHONY: build maybe-build test test-quiet test-full \
+.PHONY: build maybe-build test test-quiet test-full test-mask \
+		sanitizer-tier0 sanitizer-memcheck sanitizer-racecheck sanitizer-initcheck sanitizer-synccheck \
         bench bench-save bench-quick bench-large bench-forward bench-backward bench-complexity \
         bench-scaling bench-scaling-quick bench-compare bench-compare-quick \
         profile-timeline profile-kernel history history-h100 \
