@@ -76,7 +76,7 @@ class TestConfig:
         return f"{self.name}: B={self.B} H={self.H} N={self.N} D={self.D}{scale_str}"
 
 
-# N=16 pads the forward tensor-core resident dim to 64; N=128 is the smallest
+# N=16 pads the forward tensor-core col tile to 64; N=128 is the smallest
 # shape reaching the unmasked Y_gather_tc variant.
 QUICK_CONFIGS = [
     TestConfig("small_N16_D64",     B=1, H=2, N=16,  D=64),

@@ -402,7 +402,6 @@ __global__ void V_scatter_grad(
 constexpr int BTC_BJ = 128;       // rows per block iteration (8 warps x 16)
 constexpr int BTC_BK = 32;        // cols per inner iteration
 constexpr int BTC_WARPS = 8;
-constexpr int BTC_MAX_K = 256;    // resident col-side must fit in smem
 
 template<int D_CONST, bool MASKED>
 __global__ __launch_bounds__(BTC_WARPS * 32, 1)
@@ -1752,8 +1751,7 @@ backward_impl(torch::Tensor grad_Y_q,
         sizeof(float) * (3 * 64 + (size_t)3 * K_pad + 3 * BTC_BJ
                          + BTC_WARPS * 2 * 64 + 2 * 64)
         + smem_mask;
-    if (att3_tc::state().bwd_enabled && N <= BTC_MAX_K
-        && smem_tc <= (size_t)max_smem_optin) {
+    if (att3_tc::state().bwd_enabled && smem_tc <= (size_t)max_smem_optin) {
       // Single host round-trip for the gate.
       const bool scatter_active =
           (grad_Y_q_.ne(0).any() | grad_Y_r_.ne(0).any() | grad_Y_s_.ne(0).any())

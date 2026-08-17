@@ -5,10 +5,11 @@ MFU (Model FLOP Utilization) per-kernel and total.
 Wall-clock timing for total pass MFU; torch.profiler for per-kernel MFU.
 
 Peak is dense bf16 tensor-core TFLOPS: the kernels take bf16 in and out, and at
-D=64 with the resident dim within TC_MAX_K the gather forward and backward run
-on tensor cores. The scalar fallbacks (D != 64, longer sequences) issue the same
-bf16 operands through the CUDA cores, so they are measured against the same
-peak and simply score lower -- which is the comparison worth reporting.
+D=64 the gather forward runs on tensor cores at any N, the backward only while
+its resident col side still fits shared memory. The scalar fallbacks (D != 64,
+and the backward past that ceiling) issue the same bf16 operands through the
+CUDA cores, so they are measured against the same peak and simply score lower --
+which is the comparison worth reporting.
 """
 
 import os, sys

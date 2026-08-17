@@ -45,7 +45,7 @@ __device__ __forceinline__ bool mask_pair_allowed(
 }
 
 // =============================================================================
-// Tensor-core gather (Y_q/Y_r/Y_s, D=64, resident dim <= TC_MAX_K)
+// Tensor-core gather (Y_q/Y_r/Y_s, D=64, any n_cols)
 // =============================================================================
 // FlashAttention-style reformulation (cuda_docs/gather_readme.md). The trilinear
 // score is symmetric in Q/R/S, so Y_q/Y_r/Y_s are this one kernel with the three
@@ -67,18 +67,17 @@ __device__ __forceinline__ bool mask_pair_allowed(
 // kernel writes Y (bf16) and the anchor-side m / l stats directly, with semantics
 // identical to reduce_gather_partials (backward consumes them unchanged).
 //
-// cols and V_cols stay resident in shared memory for the whole CTA (n_cols <=
-// TC_MAX_K specialization; V_cols stays row-major, GEMM-2 B fragments use
-// ldmatrix.trans). rows are processed in blocks of TC_BJ, one m16 row-tile per
-// warp. GEMM 1
-// accumulator fragments feed GEMM 2 A fragments directly in registers (the
-// C-frag/A-frag layouts coincide), so P never round-trips through shared
-// memory.
+// cols and V_cols stream through a double-buffered TC_BK-column stage (tile k+1
+// issued with cp.async under the mma pipe), so smem is O(TC_BJ + TC_BK) and any
+// n_cols fits; the col side is re-read once per row block. V_cols stays
+// row-major, GEMM-2 B fragments use ldmatrix.trans. rows are processed in blocks
+// of TC_BJ, one m16 row-tile per warp. GEMM 1 accumulator fragments feed GEMM 2
+// A fragments directly in registers (the C-frag/A-frag layouts coincide), so P
+// never round-trips through shared memory.
 
 constexpr int TC_BJ = 128;        // rows per block iteration (8 warps x 16)
 constexpr int TC_BK = 64;         // cols per inner iteration
 constexpr int TC_WARPS = 8;
-constexpr int TC_MAX_K = 256;     // cols/V_cols must fit in shared memory
 // A GEMM-1 accumulator this negative marks a masked cell (valid |scores| are
 // bounded far below this; NEG_INF itself is -1e30).
 constexpr float TC_MASKED_THRESH = -5e29f;
@@ -128,10 +127,10 @@ void Y_gather_tc(
     extern __shared__ char smem_raw[];
     bf16* rowp_sm    = reinterpret_cast<bf16*>(smem_raw);            // [TC_BJ][DPAD]
     bf16* v_rows_sm  = rowp_sm + TC_BJ * DPAD;                       // [TC_BJ][DPAD]
-    bf16* cols_sm    = v_rows_sm + TC_BJ * DPAD;                     // [n_cols_pad][DPAD]
-    bf16* v_cols_sm  = cols_sm + n_cols_pad * DPAD;                  // [n_cols_pad][DPAD]
-    float* col_mul   = reinterpret_cast<float*>(v_cols_sm + n_cols_pad * DPAD);  // [n_cols_pad]
-    float* row_mul   = col_mul + n_cols_pad;                         // [TC_BJ]
+    bf16* cols_sm    = v_rows_sm + TC_BJ * DPAD;                     // [2][TC_BK][DPAD]
+    bf16* v_cols_sm  = cols_sm + 2 * TC_BK * DPAD;                   // [2][TC_BK][DPAD]
+    float* col_mul   = reinterpret_cast<float*>(v_cols_sm + 2 * TC_BK * DPAD);  // [2][TC_BK]
+    float* row_mul   = col_mul + 2 * TC_BK;                          // [TC_BJ]
     float* wN        = row_mul + TC_BJ;                              // [TC_WARPS][D]
     float* wML       = wN + TC_WARPS * D;                            // [TC_WARPS][2]
     float* redN      = wML + TC_WARPS * 2;                           // [D]
@@ -141,29 +140,38 @@ void Y_gather_tc(
     const int64_t bh = (int64_t)b * H + h;
     const bool* mrow = (mask != nullptr) ? (mask + ((int64_t)b * n_anchor + i) * n_anchor) : nullptr;
 
-    // ---- one-time loads: resident S and V2 (async), scale*q, k-validity ----
+    // ---- one-time load: scale*anchor (cols/V_cols stage per k tile) ----
     constexpr int DV = D / 8;       // 16-byte vectors per row
     const int64_t cols_off = bh * n_cols * D;
-    for (int idx = tid; idx < n_cols_pad * DV; idx += blockDim.x) {
-        const int k = idx / DV, dv = (idx % DV) * 8;
-        if (k < n_cols) {
-            cp_async16(cols_sm + k * DPAD + dv, X_cols + cols_off + (int64_t)k * D + dv);
-            cp_async16(v_cols_sm + k * DPAD + dv, V_cols + cols_off + (int64_t)k * D + dv);
-        } else {
-            const uint4 z = make_uint4(0, 0, 0, 0);
-            *reinterpret_cast<uint4*>(cols_sm + k * DPAD + dv) = z;
-            *reinterpret_cast<uint4*>(v_cols_sm + k * DPAD + dv) = z;
-        }
-    }
     const int64_t anchor_off = (bh * n_anchor + i) * D;
     for (int d = tid; d < D; d += blockDim.x) {
         anchor_sm[d] = scale * bf2f(X_anchor[anchor_off + d]);
     }
-    if constexpr (MASKED) {
-        for (int k = tid; k < n_cols_pad; k += blockDim.x) {
-            col_mul[k] = (k < cols_valid && (mrow == nullptr || mrow[k])) ? 1.0f : 0.0f;
+    // Stage col tile k0 into buffer `buf`. Zero-filled pads keep the tail tile
+    // free of per-cell bounds tests.
+    auto stage_cols = [&](int k0, int buf) {
+        bf16* cs = cols_sm + buf * TC_BK * DPAD;
+        bf16* vs = v_cols_sm + buf * TC_BK * DPAD;
+        for (int idx = tid; idx < TC_BK * DV; idx += blockDim.x) {
+            const int kl = idx / DV, dv = (idx % DV) * 8;
+            const int k = k0 + kl;
+            if (k < n_cols) {
+                cp_async16(cs + kl * DPAD + dv, X_cols + cols_off + (int64_t)k * D + dv);
+                cp_async16(vs + kl * DPAD + dv, V_cols + cols_off + (int64_t)k * D + dv);
+            } else {
+                const uint4 z = make_uint4(0, 0, 0, 0);
+                *reinterpret_cast<uint4*>(cs + kl * DPAD + dv) = z;
+                *reinterpret_cast<uint4*>(vs + kl * DPAD + dv) = z;
+            }
         }
-    }
+        if constexpr (MASKED) {
+            for (int kl = tid; kl < TC_BK; kl += blockDim.x) {
+                const int k = k0 + kl;
+                col_mul[buf * TC_BK + kl] =
+                    (k < cols_valid && (mrow == nullptr || mrow[k])) ? 1.0f : 0.0f;
+            }
+        }
+    };
     if (tid == 0) { redML[0] = NEG_INF; redML[1] = 0.0f; }
     for (int d = tid; d < D; d += blockDim.x) redN[d] = 0.0f;
 
@@ -196,6 +204,7 @@ void Y_gather_tc(
                 row_mul[jl] = (j < rows_valid && (mrow == nullptr || mrow[j])) ? 1.0f : 0.0f;
             }
         }
+        stage_cols(0, 0);
         asm volatile("cp.async.wait_all;\n" ::);
         __syncthreads();
 
@@ -218,7 +227,15 @@ void Y_gather_tc(
             U[nt][0] = U[nt][1] = U[nt][2] = U[nt][3] = 0.0f;
         }
 
+        int cur = 0;
         for (int k0 = 0; k0 < n_cols_pad; k0 += TC_BK) {
+            // Prefetch k0+1 into the idle buffer; the closing barrier publishes it
+            // and frees `cur` for reuse.
+            const int nxt = cur ^ 1;
+            if (k0 + TC_BK < n_cols_pad) stage_cols(k0 + TC_BK, nxt);
+            const bf16* cols_cur   = cols_sm + cur * TC_BK * DPAD;
+            const bf16* v_cols_cur = v_cols_sm + cur * TC_BK * DPAD;
+
             // GEMM 1: x[16 j][TC_BK k] as 8 n-tiles of accumulator fragments
             float acc[8][4];
             #pragma unroll
@@ -227,7 +244,7 @@ void Y_gather_tc(
             }
             #pragma unroll
             for (int p = 0; p < 4; p++) {
-                const bf16* bp = cols_sm + (k0 + p * 16 + brow) * DPAD + bcol8;
+                const bf16* bp = cols_cur + (p * 16 + brow) * DPAD + bcol8;
                 #pragma unroll
                 for (int ks = 0; ks < 4; ks++) {
                     uint32_t bfr[4];
@@ -242,7 +259,7 @@ void Y_gather_tc(
             #pragma unroll
             for (int nt = 0; nt < 8; nt++) {
                 if constexpr (MASKED) {
-                    const int kc = k0 + nt * 8 + 2 * tig;
+                    const int kc = cur * TC_BK + nt * 8 + 2 * tig;
                     const float k0f = col_mul[kc], k1f = col_mul[kc + 1];
                     acc[nt][0] = (rm0 * k0f > 0.5f) ? acc[nt][0] : NEG_INF;
                     acc[nt][1] = (rm0 * k1f > 0.5f) ? acc[nt][1] : NEG_INF;
@@ -299,7 +316,7 @@ void Y_gather_tc(
             // GEMM 2: U += P @ V2 (V2 row-major, B fragments via ldmatrix.trans).
             #pragma unroll
             for (int s2 = 0; s2 < 4; s2++) {
-                const bf16* bp = v_cols_sm + (k0 + s2 * 16 + lrow) * DPAD + lcol8;
+                const bf16* bp = v_cols_cur + (s2 * 16 + lrow) * DPAD + lcol8;
                 #pragma unroll
                 for (int np = 0; np < 4; np++) {
                     uint32_t bfr[4];
@@ -308,6 +325,10 @@ void Y_gather_tc(
                     mma_bf16_m16n8k16(U[2 * np + 1], pfr[s2], bfr + 2);
                 }
             }
+
+            asm volatile("cp.async.wait_all;\n" ::);
+            __syncthreads();
+            cur = nxt;
         }
 
         // ---- epilogue: V1-weighted row collapse of this warp's 16 rows ----
@@ -1269,7 +1290,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
             TILE_K + TILE_K                // mk_tile, lk_tile
         );
 
-    // Tensor-core fast path for D=64 and resident dim <= 256 (cuda_docs/gather_readme.md):
+    // Tensor-core fast path for D=64, any n_cols (cuda_docs/gather_readme.md):
     // the fused FlashAttention-style kernel writes Y/m/l directly, no reducer.
     // All three gathers use it with permuted roles. Disable with ATT3_YQ_TC=0.
     bool yq_tc_done = false, yr_tc_done = false, ys_tc_done = false;
@@ -1293,12 +1314,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
                              at::Tensor& m_out, at::Tensor& l_out,
                              int n_anchor, int n_rows, int rows_valid,
                              int n_cols, int cols_valid, cudaStream_t stream) -> bool {
-            if (!att3_tc::state().fwd_enabled || n_cols > TC_MAX_K) return false;
+            if (!att3_tc::state().fwd_enabled) return false;
             const int cols_pad = ceil_div(n_cols, TC_BK) * TC_BK;
             constexpr int TC_DPAD = D_TMPL + 8;
+            // Independent of n_cols: 2 row tiles + 2 double-buffered col tiles.
             const size_t smem_tc =
-                sizeof(bf16) * ((size_t)2 * TC_BJ * TC_DPAD + (size_t)2 * cols_pad * TC_DPAD) +
-                sizeof(float) * ((size_t)cols_pad + TC_BJ + TC_WARPS * D_TMPL
+                sizeof(bf16) * ((size_t)2 * TC_BJ * TC_DPAD + (size_t)4 * TC_BK * TC_DPAD) +
+                sizeof(float) * ((size_t)2 * TC_BK + TC_BJ + TC_WARPS * D_TMPL
                                  + TC_WARPS * 2 + D_TMPL + 2 + D_TMPL);
             if (smem_tc > (size_t)max_smem_optin) return false;
             static size_t smem_attr_set = 0;

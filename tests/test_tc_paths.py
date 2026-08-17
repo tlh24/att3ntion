@@ -9,10 +9,12 @@ The MASKED=true variant is covered from `_ref_gather_masked` onward. Since
 _torch_kernels has no masked reference, those tests build a gather-only fp32
 einsum reference and differentiate it with autograd.
 
-Both gates fail open into the scalar path — wrong D, resident dim past
-TC_MAX_K, or too little opt-in shared memory (< ~190 KB rules out consumer
-Ada) — so the dispatch matrix at the end of the file asserts which kernel ran
-via ck.tc_launches() rather than trusting the numbers alone.
+Both gates fail open into the scalar path — wrong D, or too little opt-in shared
+memory. The forward streams its col side, so its smem cost is flat in N and it
+engages at any N; the backward keeps that side resident and falls back past
+~352 unmasked / ~256 masked on a 227 KB H100. So the dispatch matrix at the end
+of the file asserts which kernel ran via ck.tc_launches() rather than trusting
+the numbers alone.
 """
 import math
 import os
@@ -158,8 +160,8 @@ def test_nonzero_scatter_grads_fall_back():
 
 # Mirror the kernels' smem layouts and dispatch gates. TC_* are forward.cu,
 # BTC_* backward.cu; DPAD is D=64 padded against bank conflicts.
-TC_BJ, TC_BK, TC_MAX_K, TC_WARPS = 128, 64, 256, 8
-BTC_BJ, BTC_BK, BTC_MAX_K, BTC_WARPS = 128, 32, 256, 8
+TC_BJ, TC_BK, TC_WARPS = 128, 64, 8
+BTC_BJ, BTC_BK, BTC_WARPS = 128, 32, 8
 DPAD = 64 + 8
 
 
@@ -168,10 +170,9 @@ def _smem_optin():
     return props.shared_memory_per_block_optin if props.major >= 8 else 0
 
 
-def _fwd_tc_smem(N):
-    res = -(-N // TC_BK) * TC_BK
-    return (2 * (2 * TC_BJ * DPAD + 2 * res * DPAD)
-            + 4 * (res + TC_BJ + TC_WARPS * 64 + TC_WARPS * 2 + 64 + 2 + 64))
+# Independent of N: the forward streams its col side through two TC_BK tiles.
+FWD_TC_SMEM = (2 * (2 * TC_BJ * DPAD + 4 * TC_BK * DPAD)
+               + 4 * (2 * TC_BK + TC_BJ + TC_WARPS * 64 + TC_WARPS * 2 + 64 + 2 + 64))
 
 
 def _tc_smem_bytes(N, masked):
@@ -188,11 +189,11 @@ def _tc_fits(N, masked=True):
 
 
 def _expect_fwd_tc(N, D):
-    return D == 64 and N <= TC_MAX_K and _fwd_tc_smem(N) <= _smem_optin()
+    return D == 64 and FWD_TC_SMEM <= _smem_optin()
 
 
 def _expect_bwd_tc(N, D, masked):
-    return (D == 64 and N % 16 == 0 and N <= BTC_MAX_K
+    return (D == 64 and N % 16 == 0
             and _tc_smem_bytes(N, masked) <= _smem_optin())
 
 
@@ -418,12 +419,14 @@ def _dispatch_run(B, H, N, D, mask, tc=True, valid=None, seed=0):
 
 
 # D: only 64 is TC. N: 128/256 reach the unmasked forward variant, everything
-# else the masked one (n_rows % TC_BJ), and past TC_MAX_K both fall back.
+# else the masked one (n_rows % TC_BJ). 384/512 pin the split where the forward
+# stays on TC and the backward alone falls back.
 DISPATCH_CELLS = [(N, D, kind)
                   for N in [16, 32, 96, 128, 160, 256]
                   for D in [16, 32, 64]
                   for kind in (None, "causal")]
-DISPATCH_CELLS += [(272, 64, None), (272, 64, "causal"), (512, 64, None)]
+DISPATCH_CELLS += [(272, 64, None), (272, 64, "causal"),
+                   (384, 64, None), (512, 64, None), (512, 64, "causal")]
 
 
 @pytest.mark.parametrize("N,D,kind", DISPATCH_CELLS)
@@ -441,7 +444,7 @@ def test_dispatch_selects_expected_path(N, D, kind):
 
 @pytest.mark.parametrize("reference", ["scalar", "torch"])
 @pytest.mark.parametrize("kind", [None] + MASK_KINDS)
-@pytest.mark.parametrize("N", [32, 96, 128, 256])
+@pytest.mark.parametrize("N", [32, 96, 128, 256, 384, 512])
 def test_forward_tc_matches_reference(N, kind, reference):
     """TC-vs-scalar isolates the tensor-core kernel; TC-vs-torch is the actual
     oracle, and catches a wrong assumption both kernels happen to share."""
