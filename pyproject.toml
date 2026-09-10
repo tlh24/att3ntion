@@ -28,6 +28,7 @@ markers = [
     "large: large-N shapes",
     "stress: larger input scales",
     "edge: minimal B/H shapes",
+    "sanitizer: compute-sanitizer smoke subset",
 ]
 
 

@@ -10,6 +10,7 @@
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -1546,6 +1547,80 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     // Return outputs + softmax stats (for reuse in backward pass)
     return std::make_tuple(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_,
                            m_i, l_i, m_j, l_j, m_k, l_k);
+}
+
+
+// =============================================================================
+// Single query-gather API (one softmax per query; see cuda_bindings.h)
+// =============================================================================
+
+void single_gather_check(const std::vector<at::Tensor>& xs, const at::Tensor& mask) {
+    const at::Tensor& Q = xs[0];
+    TORCH_CHECK(Q.defined() && Q.is_cuda(), "single_gather: inputs must be CUDA tensors");
+    TORCH_CHECK(Q.dim() == 4, "single_gather: inputs must be [B,H,N,D]");
+    const auto B = Q.size(0), H = Q.size(1), N = Q.size(2), D = Q.size(3);
+    TORCH_CHECK(B > 0 && H > 0 && N > 0, "single_gather: empty batch/head/sequence");
+    TORCH_CHECK(D == 64 || D == 128, "single_gather: D must be 64 or 128, got ", D);
+    TORCH_CHECK(N % 16 == 0, "single_gather: N must be a multiple of 16, got ", N);
+    for (const auto& x : xs) {
+        TORCH_CHECK(x.defined() && x.is_cuda() && x.device() == Q.device(),
+                    "single_gather: all inputs must be on one CUDA device");
+        TORCH_CHECK(x.scalar_type() == at::kBFloat16, "single_gather: inputs must be bf16");
+        TORCH_CHECK(x.is_contiguous(), "single_gather: inputs must be contiguous");
+        TORCH_CHECK(x.sizes() == Q.sizes(), "single_gather: all inputs must share one shape");
+    }
+    if (mask.defined()) {
+        TORCH_CHECK(mask.is_cuda() && mask.device() == Q.device(), "single_gather: mask must be on the input device");
+        TORCH_CHECK(mask.scalar_type() == at::kBool, "single_gather: mask must be bool");
+        TORCH_CHECK(mask.is_contiguous(), "single_gather: mask must be contiguous");
+        TORCH_CHECK(mask.dim() == 3 && mask.size(0) == B && mask.size(1) == N && mask.size(2) == N,
+                    "single_gather: mask must be [B,N,N]");
+    }
+}
+
+// Opt-in shared memory of the tensors' device; 0 below sm_80, where the
+// tensor-core kernels compile to no-ops.
+static int sg_smem_optin(const at::Tensor& t) {
+    int major = 0, v = 0;
+    const int dev = t.device().index();
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+    if (major < 8) return 0;
+    cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    return v;
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> single_gather_forward_cuda(
+    at::Tensor Q, at::Tensor R, at::Tensor S, at::Tensor Vr, at::Tensor Vs,
+    at::Tensor mask)
+{
+    single_gather_check({Q, R, S, Vr, Vs}, mask);
+    const int B = Q.size(0), H = Q.size(1), N = Q.size(2), D = Q.size(3);
+    const float scale = 1.0f / sqrtf((float)D);
+    const bool* mask_ptr = mask.defined() ? mask.data_ptr<bool>() : nullptr;
+
+    c10::cuda::CUDAGuard guard(Q.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto Y = torch::empty_like(Q);
+    auto m = torch::empty({B, H, N}, Q.options().dtype(at::kFloat));
+    auto l = torch::empty({B, H, N}, Q.options().dtype(at::kFloat));
+
+    const int optin = sg_smem_optin(Q);
+    const bool ok = (D == 64)
+        ? launch_Y_gather_tc<64, TC_WARPS, TC_BK>(Q, R, S, Vr, Vs, Y, m, l, mask_ptr,
+              B, H, N, N, N, N, N, scale, optin, stream)
+        : launch_Y_gather_tc<128, 4, 32>(Q, R, S, Vr, Vs, Y, m, l, mask_ptr,
+              B, H, N, N, N, N, N, scale, optin, stream);
+    TORCH_CHECK(ok, "single_gather_forward: tensor-core path unavailable on this device "
+                    "(needs sm_80+ and ", tc_smem_bytes(D, D == 64 ? TC_WARPS : 4, D == 64 ? TC_BK : 32),
+                    " B opt-in shared memory, have ", optin, ")");
+    AT_CUDA_CHECK(cudaGetLastError());
+    auto& st = att3_tc::state();
+    ++st.sg_fwd_launches;
+    st.sg_last_fwd = "D=" + std::to_string(D) + " warps=" + std::to_string(D == 64 ? TC_WARPS : 4)
+                   + " bk=" + std::to_string(D == 64 ? TC_BK : 32)
+                   + " masked=" + std::to_string(mask_ptr != nullptr || N % ((D == 64 ? TC_WARPS : 4) * 16) != 0
+                                                 || N % (D == 64 ? TC_BK : 32) != 0);
+    return std::make_tuple(Y, m, l);
 }
 
 

@@ -9,7 +9,9 @@
 
 #include <torch/extension.h>
 #include <atomic>
+#include <string>
 #include <tuple>
+#include <vector>
 
 // Both tensor-core gates fail open into the scalar path, so tests need to see
 // which one ran. Counters are per launch: an engaged pass adds 3, one per role.
@@ -20,11 +22,35 @@ struct State {
     bool bwd_enabled;                       // seeded from ATT3_BWD_TC
     std::atomic<unsigned long long> fwd_launches{0};
     std::atomic<unsigned long long> bwd_launches{0};
+    // single_gather_* entry points: launch counts per specialization and the
+    // tile shape each last selected ("D=64 warps=8 bk=32 masked=0").
+    std::atomic<unsigned long long> sg_fwd_launches{0};
+    std::atomic<unsigned long long> sg_bwd_anchor_launches{0};
+    std::atomic<unsigned long long> sg_bwd_rows_launches{0};
+    std::string sg_last_fwd, sg_last_bwd;
 };
 
 State& state();
 
 }  // namespace att3_tc
+
+// Single query-gather: one softmax over (j, k) per query i, Y = sum P V_r V_s.
+// All five inputs are contiguous CUDA bf16 [B,H,N,D] with D in {64,128} and
+// N % 16 == 0; mask is undefined or contiguous CUDA bool [B,N,N] (true =
+// visible). Both run only the tensor-core kernels and raise if the device
+// cannot (no scalar fallback).
+void single_gather_check(const std::vector<at::Tensor>& xs, const at::Tensor& mask);
+
+// Returns (Y bf16 [B,H,N,D], m fp32 [B,H,N], l fp32 [B,H,N]); LSE = m + log(l).
+std::tuple<at::Tensor, at::Tensor, at::Tensor> single_gather_forward_cuda(
+    at::Tensor Q, at::Tensor R, at::Tensor S, at::Tensor Vr, at::Tensor Vs,
+    at::Tensor mask);
+
+// Returns (dQ, dR, dS, dVr, dVs), bf16.
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+single_gather_backward_cuda(
+    at::Tensor dY, at::Tensor Q, at::Tensor R, at::Tensor S, at::Tensor Vr,
+    at::Tensor Vs, at::Tensor Y, at::Tensor m, at::Tensor l, at::Tensor mask);
 
 // Forward pass returns: Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_, m_i, l_i, m_j, l_j, m_k, l_k
 // The softmax stats (m_i, l_i, m_j, l_j, m_k, l_k) are computed during forward and

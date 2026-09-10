@@ -39,6 +39,39 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                               att3_tc::state().bwd_launches.load());
     }, "Cumulative (Y_gather_tc, Bwd_gather_tc) launch counts");
 
+    m.def("sg_dispatch", []() {
+        auto& s = att3_tc::state();
+        py::dict d;
+        d["fwd_launches"] = s.sg_fwd_launches.load();
+        d["bwd_anchor_launches"] = s.sg_bwd_anchor_launches.load();
+        d["bwd_rows_launches"] = s.sg_bwd_rows_launches.load();
+        d["last_fwd"] = s.sg_last_fwd;
+        d["last_bwd"] = s.sg_last_bwd;
+        return d;
+    }, "single_gather_* launch counts per specialization and last selected tile shapes");
+
+    m.def("single_gather_forward",
+        [](at::Tensor Q, at::Tensor R, at::Tensor S, at::Tensor Vr, at::Tensor Vs,
+           c10::optional<at::Tensor> mask) {
+            return single_gather_forward_cuda(Q, R, S, Vr, Vs,
+                                              mask.has_value() ? *mask : at::Tensor());
+        },
+        "Single query-gather forward (returns Y, m, l; LSE = m + log l)",
+        py::arg("Q"), py::arg("R"), py::arg("S"), py::arg("Vr"), py::arg("Vs"),
+        py::arg("mask") = py::none());
+
+    m.def("single_gather_backward",
+        [](at::Tensor dY, at::Tensor Q, at::Tensor R, at::Tensor S, at::Tensor Vr,
+           at::Tensor Vs, at::Tensor Y, at::Tensor m, at::Tensor l,
+           c10::optional<at::Tensor> mask) {
+            return single_gather_backward_cuda(dY, Q, R, S, Vr, Vs, Y, m, l,
+                                               mask.has_value() ? *mask : at::Tensor());
+        },
+        "Single query-gather backward (returns dQ, dR, dS, dVr, dVs)",
+        py::arg("dY"), py::arg("Q"), py::arg("R"), py::arg("S"), py::arg("Vr"),
+        py::arg("Vs"), py::arg("Y"), py::arg("m"), py::arg("l"),
+        py::arg("mask") = py::none());
+
     m.def("tc_set_enabled", [](bool forward, bool backward) {
         auto prev = std::make_pair(att3_tc::state().fwd_enabled,
                                    att3_tc::state().bwd_enabled);
