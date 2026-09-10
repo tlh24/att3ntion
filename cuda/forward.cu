@@ -45,7 +45,7 @@ __device__ __forceinline__ bool mask_pair_allowed(
 }
 
 // =============================================================================
-// Tensor-core gather (Y_q/Y_r/Y_s, D=64, any n_cols)
+// Tensor-core gather (Y_q/Y_r/Y_s, D=64/128, any n_cols)
 // =============================================================================
 // FlashAttention-style reformulation (cuda_docs/gather_readme.md). The trilinear
 // score is symmetric in Q/R/S, so Y_q/Y_r/Y_s are this one kernel with the three
@@ -67,20 +67,29 @@ __device__ __forceinline__ bool mask_pair_allowed(
 // kernel writes Y (bf16) and the anchor-side m / l stats directly, with semantics
 // identical to reduce_gather_partials (backward consumes them unchanged).
 //
-// cols and V_cols stream through a double-buffered TC_BK-column stage (tile k+1
-// issued with cp.async under the mma pipe), so smem is O(TC_BJ + TC_BK) and any
+// cols and V_cols stream through a double-buffered BK-column stage (tile k+1
+// issued with cp.async under the mma pipe), so smem is O(BJ + BK) and any
 // n_cols fits; the col side is re-read once per row block. V_cols stays
 // row-major, GEMM-2 B fragments use ldmatrix.trans. rows are processed in blocks
-// of TC_BJ, one m16 row-tile per warp. GEMM 1 accumulator fragments feed GEMM 2
+// of BJ, one m16 row-tile per warp. GEMM 1 accumulator fragments feed GEMM 2
 // A fragments directly in registers (the C-frag/A-frag layouts coincide), so P
 // never round-trips through shared memory.
 
-constexpr int TC_BJ = 128;        // rows per block iteration (8 warps x 16)
-constexpr int TC_BK = 64;         // cols per inner iteration
+// Tile shape: WARPS x 16 rows per block iteration, BK cols per inner iteration.
+// D=64 runs 8x64 (76 KB). D=128 doubles every per-thread accumulator and runs
+// 4x32 (74 KB): 3 CTAs/SM on an H100 where 8x64 (142 KB) gets 1, measured
+// faster there, and it also fits the 99 KB of sm_86/89.
 constexpr int TC_WARPS = 8;
+constexpr int TC_BK = 64;
 // A GEMM-1 accumulator this negative marks a masked cell (valid |scores| are
 // bounded far below this; NEG_INF itself is -1e30).
 constexpr float TC_MASKED_THRESH = -5e29f;
+
+constexpr size_t tc_smem_bytes(int D, int warps, int bk) {
+    const int bj = warps * 16, dpad = D + 8;
+    return sizeof(bf16) * ((size_t)2 * bj * dpad + (size_t)4 * bk * dpad) +
+           sizeof(float) * ((size_t)2 * bk + bj + warps * D + warps * 2 + D + 2 + D);
+}
 
 // mma_bf16_m16n8k16 / pack_bf162 / ldmatrix_x4 / ldmatrix_x4_trans /
 // cp_async16 live in common.cuh (shared with the tensor-core backward).
@@ -88,8 +97,8 @@ constexpr float TC_MASKED_THRESH = -5e29f;
 // MASKED=false is the fast path for the common case (no attention mask, no
 // row/col padding): score masking, col_mul/row_mul reads, and the masked-exp
 // selects drop out of the hot loop entirely.
-template<int D_CONST, bool MASKED>
-__global__ __launch_bounds__(TC_WARPS * 32)
+template<int D_CONST, bool MASKED, int WARPS, int BK>
+__global__ __launch_bounds__(WARPS * 32)
 void Y_gather_tc(
     const bf16* __restrict__ X_anchor,
     const bf16* __restrict__ X_rows,
@@ -104,9 +113,13 @@ void Y_gather_tc(
     int rows_valid, int cols_valid)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    static_assert(D_CONST == 64, "Y_gather_tc supports D=64 only");
+    static_assert(D_CONST == 64 || D_CONST == 128, "Y_gather_tc supports D=64/128");
     constexpr int D = D_CONST;
     constexpr int DPAD = D + 8;     // bf16 row stride: 144 B, conflict-free for frags
+    constexpr int BJ = WARPS * 16;  // rows per block iteration, one m16 tile per warp
+    constexpr int KS = D / 16;      // GEMM-1 k-steps (D contracted)
+    constexpr int NT = D / 8;       // GEMM-2 n-tiles (D output)
+    constexpr int CT = BK / 8;      // GEMM-1 n-tiles (cols)
 
     const int i = blockIdx.x;
     const int h = blockIdx.y;
@@ -125,15 +138,15 @@ void Y_gather_tc(
     const int bcol8 = ((lane >> 3) & 1) * 8;
 
     extern __shared__ char smem_raw[];
-    bf16* rowp_sm    = reinterpret_cast<bf16*>(smem_raw);            // [TC_BJ][DPAD]
-    bf16* v_rows_sm  = rowp_sm + TC_BJ * DPAD;                       // [TC_BJ][DPAD]
-    bf16* cols_sm    = v_rows_sm + TC_BJ * DPAD;                     // [2][TC_BK][DPAD]
-    bf16* v_cols_sm  = cols_sm + 2 * TC_BK * DPAD;                   // [2][TC_BK][DPAD]
-    float* col_mul   = reinterpret_cast<float*>(v_cols_sm + 2 * TC_BK * DPAD);  // [2][TC_BK]
-    float* row_mul   = col_mul + 2 * TC_BK;                          // [TC_BJ]
-    float* wN        = row_mul + TC_BJ;                              // [TC_WARPS][D]
-    float* wML       = wN + TC_WARPS * D;                            // [TC_WARPS][2]
-    float* redN      = wML + TC_WARPS * 2;                           // [D]
+    bf16* rowp_sm    = reinterpret_cast<bf16*>(smem_raw);            // [BJ][DPAD]
+    bf16* v_rows_sm  = rowp_sm + BJ * DPAD;                          // [BJ][DPAD]
+    bf16* cols_sm    = v_rows_sm + BJ * DPAD;                        // [2][BK][DPAD]
+    bf16* v_cols_sm  = cols_sm + 2 * BK * DPAD;                      // [2][BK][DPAD]
+    float* col_mul   = reinterpret_cast<float*>(v_cols_sm + 2 * BK * DPAD);  // [2][BK]
+    float* row_mul   = col_mul + 2 * BK;                             // [BJ]
+    float* wN        = row_mul + BJ;                                 // [WARPS][D]
+    float* wML       = wN + WARPS * D;                               // [WARPS][2]
+    float* redN      = wML + WARPS * 2;                              // [D]
     float* redML     = redN + D;                                     // {M_run, L_run}
     float* anchor_sm = redML + 2;                                    // [D] fp32 scale*anchor
 
@@ -150,9 +163,9 @@ void Y_gather_tc(
     // Stage col tile k0 into buffer `buf`. Zero-filled pads keep the tail tile
     // free of per-cell bounds tests.
     auto stage_cols = [&](int k0, int buf) {
-        bf16* cs = cols_sm + buf * TC_BK * DPAD;
-        bf16* vs = v_cols_sm + buf * TC_BK * DPAD;
-        for (int idx = tid; idx < TC_BK * DV; idx += blockDim.x) {
+        bf16* cs = cols_sm + buf * BK * DPAD;
+        bf16* vs = v_cols_sm + buf * BK * DPAD;
+        for (int idx = tid; idx < BK * DV; idx += blockDim.x) {
             const int kl = idx / DV, dv = (idx % DV) * 8;
             const int k = k0 + kl;
             if (k < n_cols) {
@@ -165,9 +178,9 @@ void Y_gather_tc(
             }
         }
         if constexpr (MASKED) {
-            for (int kl = tid; kl < TC_BK; kl += blockDim.x) {
+            for (int kl = tid; kl < BK; kl += blockDim.x) {
                 const int k = k0 + kl;
-                col_mul[buf * TC_BK + kl] =
+                col_mul[buf * BK + kl] =
                     (k < cols_valid && (mrow == nullptr || mrow[k])) ? 1.0f : 0.0f;
             }
         }
@@ -175,11 +188,11 @@ void Y_gather_tc(
     if (tid == 0) { redML[0] = NEG_INF; redML[1] = 0.0f; }
     for (int d = tid; d < D; d += blockDim.x) redN[d] = 0.0f;
 
-    // ---- j blocks of TC_BJ rows, one 16-row tile per warp ----
-    for (int j0 = 0; j0 < n_rows; j0 += TC_BJ) {
+    // ---- j blocks of BJ rows, one 16-row tile per warp ----
+    for (int j0 = 0; j0 < n_rows; j0 += BJ) {
         __syncthreads();  // previous iteration's smem reads (and initial loads) done
 
-        for (int idx = tid; idx < TC_BJ * DV; idx += blockDim.x) {
+        for (int idx = tid; idx < BJ * DV; idx += blockDim.x) {
             const int jl = idx / DV, dv = (idx % DV) * 8;
             const int j = j0 + jl;
             uint4 row_pack = make_uint4(0, 0, 0, 0), v_row_pack = row_pack;
@@ -199,7 +212,7 @@ void Y_gather_tc(
             *reinterpret_cast<uint4*>(v_rows_sm + jl * DPAD + dv) = v_row_pack;
         }
         if constexpr (MASKED) {
-            for (int jl = tid; jl < TC_BJ; jl += blockDim.x) {
+            for (int jl = tid; jl < BJ; jl += blockDim.x) {
                 int j = j0 + jl;
                 row_mul[jl] = (j < rows_valid && (mrow == nullptr || mrow[j])) ? 1.0f : 0.0f;
             }
@@ -212,41 +225,41 @@ void Y_gather_tc(
         const float rm0 = MASKED ? row_mul[rw + g] : 1.0f;
         const float rm1 = MASKED ? row_mul[rw + g + 8] : 1.0f;
 
-        // GEMM-1 A fragments (Qp rows) are k-invariant: hoist all 4 k-steps.
-        uint32_t a_rowp[4][4];
+        // GEMM-1 A fragments (Qp rows) are k-invariant: hoist all KS k-steps.
+        uint32_t a_rowp[KS][4];
         #pragma unroll
-        for (int ks = 0; ks < 4; ks++) {
+        for (int ks = 0; ks < KS; ks++) {
             ldmatrix_x4(a_rowp[ks], rowp_sm + (rw + lrow) * DPAD + ks * 16 + lcol8);
         }
 
         float m0 = NEG_INF, m1 = NEG_INF;   // rows g / g+8 (replicated in quad)
         float l0 = 0.0f, l1 = 0.0f;         // per-lane partials, quad-reduced later
-        float U[8][4];                      // GEMM-2 accumulators over D
+        float U[NT][4];                     // GEMM-2 accumulators over D
         #pragma unroll
-        for (int nt = 0; nt < 8; nt++) {
+        for (int nt = 0; nt < NT; nt++) {
             U[nt][0] = U[nt][1] = U[nt][2] = U[nt][3] = 0.0f;
         }
 
         int cur = 0;
-        for (int k0 = 0; k0 < n_cols_pad; k0 += TC_BK) {
+        for (int k0 = 0; k0 < n_cols_pad; k0 += BK) {
             // Prefetch k0+1 into the idle buffer; the closing barrier publishes it
             // and frees `cur` for reuse.
             const int nxt = cur ^ 1;
-            if (k0 + TC_BK < n_cols_pad) stage_cols(k0 + TC_BK, nxt);
-            const bf16* cols_cur   = cols_sm + cur * TC_BK * DPAD;
-            const bf16* v_cols_cur = v_cols_sm + cur * TC_BK * DPAD;
+            if (k0 + BK < n_cols_pad) stage_cols(k0 + BK, nxt);
+            const bf16* cols_cur   = cols_sm + cur * BK * DPAD;
+            const bf16* v_cols_cur = v_cols_sm + cur * BK * DPAD;
 
-            // GEMM 1: x[16 j][TC_BK k] as 8 n-tiles of accumulator fragments
-            float acc[8][4];
+            // GEMM 1: x[16 j][BK k] as CT n-tiles of accumulator fragments
+            float acc[CT][4];
             #pragma unroll
-            for (int nt = 0; nt < 8; nt++) {
+            for (int nt = 0; nt < CT; nt++) {
                 acc[nt][0] = acc[nt][1] = acc[nt][2] = acc[nt][3] = 0.0f;
             }
             #pragma unroll
-            for (int p = 0; p < 4; p++) {
+            for (int p = 0; p < BK / 16; p++) {
                 const bf16* bp = cols_cur + (p * 16 + brow) * DPAD + bcol8;
                 #pragma unroll
-                for (int ks = 0; ks < 4; ks++) {
+                for (int ks = 0; ks < KS; ks++) {
                     uint32_t bfr[4];
                     ldmatrix_x4(bfr, bp + ks * 16);
                     mma_bf16_m16n8k16(acc[2 * p],     a_rowp[ks], bfr);
@@ -257,9 +270,9 @@ void Y_gather_tc(
             // Mask invalid cells to NEG_INF, take the running row max.
             float mt0 = NEG_INF, mt1 = NEG_INF;
             #pragma unroll
-            for (int nt = 0; nt < 8; nt++) {
+            for (int nt = 0; nt < CT; nt++) {
                 if constexpr (MASKED) {
-                    const int kc = cur * TC_BK + nt * 8 + 2 * tig;
+                    const int kc = cur * BK + nt * 8 + 2 * tig;
                     const float k0f = col_mul[kc], k1f = col_mul[kc + 1];
                     acc[nt][0] = (rm0 * k0f > 0.5f) ? acc[nt][0] : NEG_INF;
                     acc[nt][1] = (rm0 * k1f > 0.5f) ? acc[nt][1] : NEG_INF;
@@ -280,7 +293,7 @@ void Y_gather_tc(
             const float a0 = __expf(m0 - mn0), a1 = __expf(m1 - mn1);
             l0 *= a0; l1 *= a1;
             #pragma unroll
-            for (int nt = 0; nt < 8; nt++) {
+            for (int nt = 0; nt < NT; nt++) {
                 U[nt][0] *= a0; U[nt][1] *= a0;
                 U[nt][2] *= a1; U[nt][3] *= a1;
             }
@@ -288,9 +301,9 @@ void Y_gather_tc(
 
             // exp + repack: two adjacent GEMM-1 C tiles form one GEMM-2 A
             // fragment (identical thread layouts) — no shuffles, no smem.
-            uint32_t pfr[4][4];
+            uint32_t pfr[BK / 16][4];
             #pragma unroll
-            for (int s2 = 0; s2 < 4; s2++) {
+            for (int s2 = 0; s2 < BK / 16; s2++) {
                 #pragma unroll
                 for (int half = 0; half < 2; half++) {
                     const int nt = 2 * s2 + half;
@@ -315,10 +328,10 @@ void Y_gather_tc(
 
             // GEMM 2: U += P @ V2 (V2 row-major, B fragments via ldmatrix.trans).
             #pragma unroll
-            for (int s2 = 0; s2 < 4; s2++) {
+            for (int s2 = 0; s2 < BK / 16; s2++) {
                 const bf16* bp = v_cols_cur + (s2 * 16 + lrow) * DPAD + lcol8;
                 #pragma unroll
-                for (int np = 0; np < 4; np++) {
+                for (int np = 0; np < NT / 2; np++) {
                     uint32_t bfr[4];
                     ldmatrix_x4_trans(bfr, bp + np * 16);
                     mma_bf16_m16n8k16(U[2 * np],     pfr[s2], bfr);
@@ -350,11 +363,11 @@ void Y_gather_tc(
             Lw += __shfl_xor_sync(0xFFFFFFFF, Lw, off);
         }
 
-        float nacc[16];
+        float nacc[2 * NT];
         const bf16* v1r0 = v_rows_sm + (rw + g) * DPAD + 2 * tig;
         const bf16* v1r1 = v_rows_sm + (rw + g + 8) * DPAD + 2 * tig;
         #pragma unroll
-        for (int nt = 0; nt < 8; nt++) {
+        for (int nt = 0; nt < NT; nt++) {
             const float2 v10 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(v1r0 + nt * 8));
             const float2 v11 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(v1r1 + nt * 8));
             nacc[2 * nt + 0] = w0 * v10.x * U[nt][0] + w1 * v11.x * U[nt][2];
@@ -363,14 +376,14 @@ void Y_gather_tc(
         #pragma unroll
         for (int off = 4; off <= 16; off <<= 1) {
             #pragma unroll
-            for (int e = 0; e < 16; e++) {
+            for (int e = 0; e < 2 * NT; e++) {
                 nacc[e] += __shfl_xor_sync(0xFFFFFFFF, nacc[e], off);
             }
         }
 
         if (lane < 4) {
             #pragma unroll
-            for (int nt = 0; nt < 8; nt++) {
+            for (int nt = 0; nt < NT; nt++) {
                 wN[warp * D + nt * 8 + 2 * lane]     = nacc[2 * nt + 0];
                 wN[warp * D + nt * 8 + 2 * lane + 1] = nacc[2 * nt + 1];
             }
@@ -381,23 +394,23 @@ void Y_gather_tc(
         }
         __syncthreads();
 
-        // ---- fold the 8 warp results into the CTA running (M, L, N) ----
+        // ---- fold the warp results into the CTA running (M, L, N) ----
         const float Mold = redML[0], Lold = redML[1];
         float Mnew = Mold;
         #pragma unroll
-        for (int wd = 0; wd < TC_WARPS; wd++) Mnew = fmaxf(Mnew, wML[wd * 2]);
+        for (int wd = 0; wd < WARPS; wd++) Mnew = fmaxf(Mnew, wML[wd * 2]);
         const float aR = __expf(Mold - Mnew);
         float nNew = 0.0f;
         if (tid < D) {
             nNew = redN[tid] * aR;
             #pragma unroll
-            for (int wd = 0; wd < TC_WARPS; wd++) {
+            for (int wd = 0; wd < WARPS; wd++) {
                 nNew += __expf(wML[wd * 2] - Mnew) * wN[wd * D + tid];
             }
         }
         float lNew = Lold * aR;
         #pragma unroll
-        for (int wd = 0; wd < TC_WARPS; wd++) {
+        for (int wd = 0; wd < WARPS; wd++) {
             lNew += __expf(wML[wd * 2] - Mnew) * wML[wd * 2 + 1];
         }
         __syncthreads();
@@ -420,6 +433,52 @@ void Y_gather_tc(
 #endif  // __CUDA_ARCH__ >= 800
 }
 
+
+// The D guard lives here (not at the call site) because FWD_DISPATCH_D binds
+// D_TMPL as a constexpr local, so an `if constexpr` there would still
+// instantiate the D=16/32 kernels.
+template<int D, int WARPS, int BK>
+static bool launch_Y_gather_tc(
+    const at::Tensor& anchor, const at::Tensor& rows, const at::Tensor& cols,
+    const at::Tensor& V_rows, const at::Tensor& V_cols, at::Tensor& Yout,
+    at::Tensor& m_out, at::Tensor& l_out, const bool* mask_ptr, int B, int H,
+    int n_anchor, int n_rows, int rows_valid, int n_cols, int cols_valid,
+    float scale, int max_smem_optin, cudaStream_t stream)
+{
+    if constexpr (D < 64) {
+        return false;
+    } else {
+    constexpr size_t smem_tc = tc_smem_bytes(D, WARPS, BK);
+    if (smem_tc > (size_t)max_smem_optin) return false;
+    static bool attr_set = false;
+    if (!attr_set) {
+        AT_CUDA_CHECK(cudaFuncSetAttribute(Y_gather_tc<D, false, WARPS, BK>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_tc));
+        AT_CUDA_CHECK(cudaFuncSetAttribute(Y_gather_tc<D, true, WARPS, BK>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_tc));
+        attr_set = true;
+    }
+    const int cols_pad = ceil_div(n_cols, BK) * BK;
+    // Fast path also requires whole row-blocks: a partial block's zero-filled
+    // Qp rows must be masked out of the softmax.
+    const bool tc_masked = (mask_ptr != nullptr)
+        || (rows_valid < n_rows) || (cols_valid < n_cols)
+        || (cols_pad != n_cols) || (n_rows % (WARPS * 16) != 0);
+    auto* tc_kernel = tc_masked ? Y_gather_tc<D, true, WARPS, BK>
+                                : Y_gather_tc<D, false, WARPS, BK>;
+    tc_kernel<<<dim3(n_anchor, H, B), dim3(WARPS * 32), smem_tc, stream>>>(
+        reinterpret_cast<const bf16*>(anchor.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const bf16*>(rows.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const bf16*>(cols.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const bf16*>(V_rows.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const bf16*>(V_cols.data_ptr<at::BFloat16>()),
+        reinterpret_cast<bf16*>(Yout.data_ptr<at::BFloat16>()),
+        m_out.data_ptr<float>(), l_out.data_ptr<float>(), mask_ptr,
+        H, n_anchor, n_rows, n_cols, cols_pad, scale, rows_valid, cols_valid);
+    ++att3_tc::state().fwd_launches;
+    return true;
+    }
+}
 
 // =============================================================================
 // Split gather (Y_q/Y_r/Y_s fallback path, any D)
@@ -1137,7 +1196,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     at::Tensor Vs_1, at::Tensor Vs_2,
     at::Tensor mask,
     double dropout_rate,
-    int64_t I_valid, int64_t J_valid, int64_t K_valid) {
+    int64_t I_valid, int64_t J_valid, int64_t K_valid,
+    int64_t gather_mode) {
+    // gather_mode 0 runs all three gathers; 1 runs only the Q-anchored one.
+    // The skipped outputs stay zero and their softmax stats are set so the
+    // backward's row/col weights exp(x - m) / l vanish exactly (m = +1e30,
+    // l = 1), which lets the fused backward run unchanged on one gather.
+    TORCH_CHECK(gather_mode == 0 || gather_mode == 1, "gather_mode must be 0 or 1");
+    const bool q_only = gather_mode == 1;
     Q = Q.contiguous();  
     R = R.contiguous();  
     S = S.contiguous();
@@ -1214,14 +1280,15 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
 
     TORCH_CHECK(Q.scalar_type() == at::kBFloat16, "forward expects bfloat16 inputs.");
     TORCH_CHECK(D % 4 == 0, "D must be multiple of 4.");
-    TORCH_CHECK(D == 16 || D == 32 || D == 64, "forward: unsupported D=", D, ". Supported: 16, 32, 64");
+    TORCH_CHECK(D == 16 || D == 32 || D == 64 || D == 128, "forward: unsupported D=", D, ". Supported: 16, 32, 64, 128");
 
-    // D-dispatch to D_TMPL in {16, 32, 64}.
+    // D-dispatch to D_TMPL in {16, 32, 64, 128}.
     #define FWD_DISPATCH_D(D_VAL, ...) \
       [&] { \
         if ((D_VAL) == 16)      { constexpr int D_TMPL = 16; __VA_ARGS__; } \
         else if ((D_VAL) == 32) { constexpr int D_TMPL = 32; __VA_ARGS__; } \
         else if ((D_VAL) == 64) { constexpr int D_TMPL = 64; __VA_ARGS__; } \
+        else if ((D_VAL) == 128) { constexpr int D_TMPL = 128; __VA_ARGS__; } \
       }()
 
     FWD_DISPATCH_D(D, {
@@ -1290,11 +1357,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
             TILE_K + TILE_K                // mk_tile, lk_tile
         );
 
-    // Tensor-core fast path for D=64, any n_cols (cuda_docs/gather_readme.md):
+    // Tensor-core fast path for D=64/128, any n_cols (cuda_docs/gather_readme.md):
     // the fused FlashAttention-style kernel writes Y/m/l directly, no reducer.
     // All three gathers use it with permuted roles. Disable with ATT3_YQ_TC=0.
     bool yq_tc_done = false, yr_tc_done = false, ys_tc_done = false;
-    if constexpr (D_TMPL == 64) {
+    if (D_TMPL >= 64) {
         // sm_80+ only: below that the kernel body compiles to a no-op (bf16
         // mma/ldmatrix/cp.async), so launching it would silently return zeros.
         static const int max_smem_optin = []() {
@@ -1315,54 +1382,24 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
                              int n_anchor, int n_rows, int rows_valid,
                              int n_cols, int cols_valid, cudaStream_t stream) -> bool {
             if (!att3_tc::state().fwd_enabled) return false;
-            const int cols_pad = ceil_div(n_cols, TC_BK) * TC_BK;
-            constexpr int TC_DPAD = D_TMPL + 8;
-            // Independent of n_cols: 2 row tiles + 2 double-buffered col tiles.
-            const size_t smem_tc =
-                sizeof(bf16) * ((size_t)2 * TC_BJ * TC_DPAD + (size_t)4 * TC_BK * TC_DPAD) +
-                sizeof(float) * ((size_t)2 * TC_BK + TC_BJ + TC_WARPS * D_TMPL
-                                 + TC_WARPS * 2 + D_TMPL + 2 + D_TMPL);
-            if (smem_tc > (size_t)max_smem_optin) return false;
-            static size_t smem_attr_set = 0;
-            if (smem_tc > smem_attr_set) {
-                AT_CUDA_CHECK(cudaFuncSetAttribute(
-                    Y_gather_tc<64, false>,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_tc));
-                AT_CUDA_CHECK(cudaFuncSetAttribute(
-                    Y_gather_tc<64, true>,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_tc));
-                smem_attr_set = smem_tc;
-            }
-            // Fast path also requires whole row-blocks: a partial block's
-            // zero-filled Qp rows must be masked out of the softmax.
-            const bool tc_masked = (mask_ptr != nullptr)
-                || (rows_valid < n_rows) || (cols_valid < n_cols)
-                || (cols_pad != n_cols) || (n_rows % TC_BJ != 0);
-            auto* tc_kernel = tc_masked ? Y_gather_tc<64, true>
-                                        : Y_gather_tc<64, false>;
-            dim3 grid_tc(n_anchor, H, B);
-            tc_kernel<<<grid_tc, dim3(TC_WARPS * 32), smem_tc, stream>>>(
-                reinterpret_cast<const bf16*>(anchor.data_ptr<at::BFloat16>()),
-                reinterpret_cast<const bf16*>(rows.data_ptr<at::BFloat16>()),
-                reinterpret_cast<const bf16*>(cols.data_ptr<at::BFloat16>()),
-                reinterpret_cast<const bf16*>(V_rows.data_ptr<at::BFloat16>()),
-                reinterpret_cast<const bf16*>(V_cols.data_ptr<at::BFloat16>()),
-                reinterpret_cast<bf16*>(Yout.data_ptr<at::BFloat16>()),
-                m_out.data_ptr<float>(),
-                l_out.data_ptr<float>(),
-                mask_ptr,
-                H, n_anchor, n_rows, n_cols, cols_pad, scale,
-                rows_valid, cols_valid
-            );
-            ++att3_tc::state().fwd_launches;
-            return true;
+            return launch_Y_gather_tc<D_TMPL, (D_TMPL == 128 ? 4 : TC_WARPS), (D_TMPL == 128 ? 32 : TC_BK)>(
+                anchor, rows, cols, V_rows, V_cols, Yout, m_out, l_out, mask_ptr,
+                B, H, n_anchor, n_rows, rows_valid, n_cols, cols_valid, scale,
+                max_smem_optin, stream);
         };
         yq_tc_done = launch_tc(Q, R, S, Vr_1, Vs_1, Y_q, m_i, l_i,
                                I, J, (int)J_valid, K, (int)K_valid, streams[0]);
-        yr_tc_done = launch_tc(R, Q, S, Vq_1, Vs_1, Y_r, m_j, l_j,
-                               J, I, (int)I_valid, K, (int)K_valid, streams[1]);
-        ys_tc_done = launch_tc(S, Q, R, Vq_1, Vr_1, Y_s, m_k, l_k,
-                               K, I, (int)I_valid, J, (int)J_valid, streams[2]);
+        if (!q_only) {
+            yr_tc_done = launch_tc(R, Q, S, Vq_1, Vs_1, Y_r, m_j, l_j,
+                                   J, I, (int)I_valid, K, (int)K_valid, streams[1]);
+            ys_tc_done = launch_tc(S, Q, R, Vq_1, Vr_1, Y_s, m_k, l_k,
+                                   K, I, (int)I_valid, J, (int)J_valid, streams[2]);
+        }
+    }
+    if (q_only) {
+        yr_tc_done = ys_tc_done = true;
+        m_j.fill_(1e30f); l_j.fill_(1.0f);
+        m_k.fill_(1e30f); l_k.fill_(1.0f);
     }
 
     // Legacy split gather + exact reducer, for streams the TC path didn't take.

@@ -58,11 +58,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            int64_t I_valid,
            int64_t J_valid,
            int64_t K_valid,
-           c10::optional<at::Tensor> mask_opt) {
+           c10::optional<at::Tensor> mask_opt,
+           int64_t gather_mode) {
             at::Tensor mask = mask_opt.has_value() ? *mask_opt : at::Tensor();
             return forward_cuda(
                 Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
-                mask, dropout_rate, I_valid, J_valid, K_valid
+                mask, dropout_rate, I_valid, J_valid, K_valid, gather_mode
             );
         },
         "Hypergraph Attention forward (returns Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_, m_i, l_i, m_j, l_j, m_k, l_k)",
@@ -79,7 +80,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("I_valid") = -1,
         py::arg("J_valid") = -1,
         py::arg("K_valid") = -1,
-        py::arg("mask") = py::none()
+        py::arg("mask") = py::none(),
+        py::arg("gather_mode") = 0
     );
 
     m.def(

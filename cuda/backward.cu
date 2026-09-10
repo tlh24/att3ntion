@@ -345,10 +345,9 @@ __global__ void V_scatter_grad(
 //     d_r =         sum_d Va[d]  * gYr[r,d] * Vc[c,d]
 //     d_c =         sum_d Va[d]  * Vr[r,d]  * gYc[c,d]
 //
-//   The anchor vector is folded into the A operand as a diagonal rescale of
-//   raw row fragments in registers (packed bf16 __hmul2), so the four A
-//   operands need no extra shared-memory buffers. Softmax weights come
-//   straight from the forward stats (no online pass):
+//   The anchor vector is folded into the A operands as a diagonal rescale of
+//   the raw rows, staged once per row block into four shared-memory tiles.
+//   Softmax weights come straight from the forward stats (no online pass):
 //
 //     P_a = exp(x - m_a)/l_a    P_r = exp(x - m_r[r])/l_r[r]    P_c likewise
 //     grad_A = (d_a - sum_a)*P_a + (d_r - sum_r[r])*P_r + (d_c - sum_c[c])*P_c
@@ -397,10 +396,23 @@ __global__ void V_scatter_grad(
 // holds for any weight matrix the forward actually used, and the forward
 // zeroes masked cells, so a fully masked row gets Y = 0 and sum = 0.
 
-constexpr int BTC_BJ = 128;       // rows per block iteration (8 warps x 16)
-constexpr int BTC_BK = 32;        // cols per inner iteration
+// Tile shape: WARPS x 16 rows per block iteration, BK cols per inner iteration.
+// The host picks the largest shape whose smem fits the device (8 warps on an
+// H100; 4 at D=64 and 2 at D=128 inside the 99 KB of sm_86/89).
 constexpr int BTC_WARPS = 8;
-constexpr int BTC_MRW = BTC_BJ / 32;   // words per col of a transposed window
+constexpr int BTC_BK = 32;
+constexpr int BTC_BJ = BTC_WARPS * 16;
+
+constexpr size_t btc_smem_bytes(int D, int warps, int bk, bool masked) {
+    const int bj = warps * 16, dpad = D + 8;
+    size_t b = sizeof(bf16) * ((size_t)4 * bj * dpad + (size_t)6 * bk * dpad)
+             + sizeof(float) * ((size_t)3 * D + 6 * bk + 3 * bj + warps * 2 * D + 2 * D);
+    if (masked) {
+        b += sizeof(uint32_t) * 2 * (size_t)(bj + bk * (bj / 32))
+           + sizeof(float) * (2 * (size_t)bk + bj);
+    }
+    return b;
+}
 
 // 32 mask bools -> one word, bit t = row[t]. Bases are 32-aligned and
 // N % 16 == 0, so the uchar4 reads are aligned; a short lim leaves zeros.
@@ -416,8 +428,8 @@ __device__ __forceinline__ uint32_t pack_mask32(const bool* row, int lim) {
     return bits;
 }
 
-template<int D_CONST, bool MASKED>
-__global__ __launch_bounds__(BTC_WARPS * 32, 1)
+template<int D_CONST, bool MASKED, int WARPS, int BK>
+__global__ __launch_bounds__(WARPS * 32, 1)
 void Bwd_gather_tc(
     const bf16* __restrict__ Xa_bf,  // anchor side [B,H,N,D]
     const bf16* __restrict__ Va_bf,
@@ -437,9 +449,17 @@ void Bwd_gather_tc(
     int H, int N, int K_pad, float scale)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    static_assert(D_CONST == 64, "Bwd_gather_tc supports D=64 only");
+    static_assert(D_CONST == 64 || D_CONST == 128, "Bwd_gather_tc supports D=64/128");
     constexpr int D = D_CONST;
     constexpr int DPAD = D + 8;
+    constexpr int BJ = WARPS * 16;
+    constexpr int MRW = BJ / 32;    // words per col of a transposed mask window
+    constexpr int KS = D / 16;      // score GEMM k-steps (D contracted)
+    // The three output accumulators cover DH cols per pass over the col side;
+    // D=128 makes two passes, recomputing the scores, rather than doubling the
+    // accumulator registers.
+    constexpr int DH = 64;
+    constexpr int NPASS = D / DH;
 
     const int a = blockIdx.x;
     const int h = blockIdx.y;
@@ -456,28 +476,32 @@ void Bwd_gather_tc(
     const int bcol8 = ((lane >> 3) & 1) * 8;
 
     extern __shared__ char smem_raw[];
-    bf16* xr_sm   = reinterpret_cast<bf16*>(smem_raw);            // [BTC_BJ][DPAD]
-    bf16* vr_sm   = xr_sm + BTC_BJ * DPAD;
-    bf16* gyr_sm  = vr_sm + BTC_BJ * DPAD;
-    bf16* xc_sm   = gyr_sm + BTC_BJ * DPAD;                       // [2][BTC_BK][DPAD]
-    bf16* vc_sm   = xc_sm + 2 * BTC_BK * DPAD;
-    bf16* gyc_sm  = vc_sm + 2 * BTC_BK * DPAD;
-    float* anchX  = reinterpret_cast<float*>(gyc_sm + 2 * BTC_BK * DPAD);  // [D] scale*Xa
+    // The four A operands, anchor already folded in: scale*Xa o Xr, gYa o Vr,
+    // Va o gYr, Va o Vr. Staged per row block; the epilogue re-reads the raw
+    // rows from global instead of keeping a second copy here.
+    bf16* a0_sm   = reinterpret_cast<bf16*>(smem_raw);            // [BJ][DPAD]
+    bf16* a1_sm   = a0_sm + BJ * DPAD;
+    bf16* a2_sm   = a1_sm + BJ * DPAD;
+    bf16* a3_sm   = a2_sm + BJ * DPAD;
+    bf16* xc_sm   = a3_sm + BJ * DPAD;                            // [2][BK][DPAD]
+    bf16* vc_sm   = xc_sm + 2 * BK * DPAD;
+    bf16* gyc_sm  = vc_sm + 2 * BK * DPAD;
+    float* anchX  = reinterpret_cast<float*>(gyc_sm + 2 * BK * DPAD);  // [D] scale*Xa
     float* anchV  = anchX + D;                                    // [D]
     float* anchG  = anchV + D;                                    // [D]
-    float* mc_sm  = anchG + D;                                    // [2][BTC_BK]
-    float* ilc_sm = mc_sm + 2 * BTC_BK;
-    float* sc_sm  = ilc_sm + 2 * BTC_BK;
-    float* mr_sm  = sc_sm + 2 * BTC_BK;                          // [BTC_BJ]
-    float* ilr_sm = mr_sm + BTC_BJ;
-    float* sr_sm  = ilr_sm + BTC_BJ;
-    float* wOut   = sr_sm + BTC_BJ;                              // [BTC_WARPS][2*D]
-    float* redOut = wOut + BTC_WARPS * 2 * D;                    // [2*D]
+    float* mc_sm  = anchG + D;                                    // [2][BK]
+    float* ilc_sm = mc_sm + 2 * BK;
+    float* sc_sm  = ilc_sm + 2 * BK;
+    float* mr_sm  = sc_sm + 2 * BK;                              // [BJ]
+    float* ilr_sm = mr_sm + BJ;
+    float* sr_sm  = ilr_sm + BJ;
+    float* wOut   = sr_sm + BJ;                                  // [WARPS][2*D]
+    float* redOut = wOut + WARPS * 2 * D;                        // [2*D]
     // MASKED only (host omits these bytes): the tile in flight's mask windows.
-    uint32_t* msk_sm  = reinterpret_cast<uint32_t*>(redOut + 2 * D);  // [2][BTC_BJ]
-    uint32_t* mskT_sm = msk_sm + 2 * BTC_BJ;                          // [2][BTC_BK][BTC_MRW]
-    float* ilac_sm = reinterpret_cast<float*>(mskT_sm + 2 * BTC_BK * BTC_MRW);  // [2][BTC_BK]
-    float* par_sm  = ilac_sm + 2 * BTC_BK;                            // [BTC_BJ]
+    uint32_t* msk_sm  = reinterpret_cast<uint32_t*>(redOut + 2 * D);  // [2][BJ]
+    uint32_t* mskT_sm = msk_sm + 2 * BJ;                              // [2][BK][MRW]
+    float* ilac_sm = reinterpret_cast<float*>(mskT_sm + 2 * BK * MRW);  // [2][BK]
+    float* par_sm  = ilac_sm + 2 * BK;                                // [BJ]
 
     const int64_t bh = (int64_t)b * H + h;
     const int64_t nd_off = bh * N * D;
@@ -491,25 +515,25 @@ void Bwd_gather_tc(
         anchV[d] = bf2f(Va_bf[a_off + d]);
         anchG[d] = bf2f(gYa_bf[a_off + d]);
     }
-    if (tid < 2 * D) redOut[tid] = 0.0f;
+    for (int d = tid; d < 2 * D; d += blockDim.x) redOut[d] = 0.0f;
 
     const float ma  = m_a[st_off + a];
     const float ila = 1.0f / fmaxf(l_a[st_off + a], DENOM_EPS);
     const float sa  = sum_a[st_off + a];
     const bool* mb  = MASKED ? mask + (int64_t)b * N * N : nullptr;
 
-    // ---- row blocks of BTC_BJ rows, one 16-row tile per warp ----
-    for (int j0 = 0; j0 < N; j0 += BTC_BJ) {
+    // ---- row blocks of BJ rows, one 16-row tile per warp ----
+    for (int j0 = 0; j0 < N; j0 += BJ) {
         __syncthreads();  // previous iteration's smem reads (and anchor) done
 
         // Stage col tile k0 into buffer `buf`: matrices, forward stats and
         // (masked) mask windows. Zero-filled pads carry a zero inv-l and zero
         // mask bits, gating the tail tile off with no per-cell test.
         auto stage_cols = [&](int k0, int buf) {
-            bf16* xs = xc_sm + buf * BTC_BK * DPAD;
-            bf16* vs = vc_sm + buf * BTC_BK * DPAD;
-            bf16* gs = gyc_sm + buf * BTC_BK * DPAD;
-            for (int idx = tid; idx < BTC_BK * DV; idx += blockDim.x) {
+            bf16* xs = xc_sm + buf * BK * DPAD;
+            bf16* vs = vc_sm + buf * BK * DPAD;
+            bf16* gs = gyc_sm + buf * BK * DPAD;
+            for (int idx = tid; idx < BK * DV; idx += blockDim.x) {
                 const int kl = idx / DV, dv = (idx % DV) * 8;
                 const int k = k0 + kl;
                 if (k < N) {
@@ -524,7 +548,7 @@ void Bwd_gather_tc(
                     *reinterpret_cast<uint4*>(gs + kl * DPAD + dv) = z;
                 }
             }
-            for (int kl = tid; kl < BTC_BK; kl += blockDim.x) {
+            for (int kl = tid; kl < BK; kl += blockDim.x) {
                 const int k = k0 + kl;
                 float mc = 0.0f, ilc = 0.0f, sc = 0.0f;
                 if (k < N) {
@@ -536,31 +560,34 @@ void Bwd_gather_tc(
                     // Separable column factors, free per cell: mask[c][a]
                     // zeroes P_c's inv-l, mask[a][c] rides in ilac_sm.
                     if (k >= N || !mb[(int64_t)k * N + a]) ilc = 0.0f;
-                    ilac_sm[buf * BTC_BK + kl] =
+                    ilac_sm[buf * BK + kl] =
                         (k < N && mb[(int64_t)a * N + k]) ? ila : 0.0f;
                 }
-                mc_sm[buf * BTC_BK + kl]  = mc;
-                ilc_sm[buf * BTC_BK + kl] = ilc;
-                sc_sm[buf * BTC_BK + kl]  = sc;
+                mc_sm[buf * BK + kl]  = mc;
+                ilc_sm[buf * BK + kl] = ilc;
+                sc_sm[buf * BK + kl]  = sc;
             }
             if constexpr (MASKED) {
-                for (int jl = tid; jl < BTC_BJ; jl += blockDim.x) {
+                for (int jl = tid; jl < BJ; jl += blockDim.x) {
                     const int j = j0 + jl;
-                    msk_sm[buf * BTC_BJ + jl] = (j < N)
-                        ? pack_mask32(mb + (int64_t)j * N + k0, min(BTC_BK, N - k0))
+                    msk_sm[buf * BJ + jl] = (j < N)
+                        ? pack_mask32(mb + (int64_t)j * N + k0, min(BK, N - k0))
                         : 0u;
                 }
-                for (int idx = tid; idx < BTC_BK * BTC_MRW; idx += blockDim.x) {
-                    const int kl = idx / BTC_MRW, w = idx - kl * BTC_MRW;
+                for (int idx = tid; idx < BK * MRW; idx += blockDim.x) {
+                    const int kl = idx / MRW, w = idx - kl * MRW;
                     const int k = k0 + kl, jb = j0 + w * 32;
-                    mskT_sm[buf * BTC_BK * BTC_MRW + idx] = (k < N && jb < N)
+                    mskT_sm[buf * BK * MRW + idx] = (k < N && jb < N)
                         ? pack_mask32(mb + (int64_t)k * N + jb, min(32, N - jb))
                         : 0u;
                 }
             }
         };
 
-        for (int idx = tid; idx < BTC_BJ * DV; idx += blockDim.x) {
+        // A operands: the anchor rescale is done in fp32 with a single bf16
+        // rounding, matching Y_gather_tc's Qp precision. Pad rows stage as
+        // zeros.
+        for (int idx = tid; idx < BJ * DV; idx += blockDim.x) {
             const int jl = idx / DV, dv = (idx % DV) * 8;
             const int j = j0 + jl;
             uint4 xq = make_uint4(0, 0, 0, 0), vq = xq, gq = xq;
@@ -570,11 +597,31 @@ void Bwd_gather_tc(
                 vq = *reinterpret_cast<const uint4*>(Vr_bf + off);
                 gq = *reinterpret_cast<const uint4*>(gYr_bf + off);
             }
-            *reinterpret_cast<uint4*>(xr_sm + jl * DPAD + dv) = xq;
-            *reinterpret_cast<uint4*>(vr_sm + jl * DPAD + dv) = vq;
-            *reinterpret_cast<uint4*>(gyr_sm + jl * DPAD + dv) = gq;
+            const __nv_bfloat162* xp = reinterpret_cast<const __nv_bfloat162*>(&xq);
+            const __nv_bfloat162* vp = reinterpret_cast<const __nv_bfloat162*>(&vq);
+            const __nv_bfloat162* gp = reinterpret_cast<const __nv_bfloat162*>(&gq);
+            uint4 a0, a1, a2, a3;
+            __nv_bfloat162* p0 = reinterpret_cast<__nv_bfloat162*>(&a0);
+            __nv_bfloat162* p1 = reinterpret_cast<__nv_bfloat162*>(&a1);
+            __nv_bfloat162* p2 = reinterpret_cast<__nv_bfloat162*>(&a2);
+            __nv_bfloat162* p3 = reinterpret_cast<__nv_bfloat162*>(&a3);
+            #pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int d = dv + 2 * e;
+                const float2 x = __bfloat1622float2(xp[e]);
+                const float2 v = __bfloat1622float2(vp[e]);
+                const float2 gy = __bfloat1622float2(gp[e]);
+                p0[e] = __floats2bfloat162_rn(x.x * anchX[d], x.y * anchX[d + 1]);
+                p1[e] = __floats2bfloat162_rn(v.x * anchG[d], v.y * anchG[d + 1]);
+                p2[e] = __floats2bfloat162_rn(gy.x * anchV[d], gy.y * anchV[d + 1]);
+                p3[e] = __floats2bfloat162_rn(v.x * anchV[d], v.y * anchV[d + 1]);
+            }
+            *reinterpret_cast<uint4*>(a0_sm + jl * DPAD + dv) = a0;
+            *reinterpret_cast<uint4*>(a1_sm + jl * DPAD + dv) = a1;
+            *reinterpret_cast<uint4*>(a2_sm + jl * DPAD + dv) = a2;
+            *reinterpret_cast<uint4*>(a3_sm + jl * DPAD + dv) = a3;
         }
-        for (int jl = tid; jl < BTC_BJ; jl += blockDim.x) {
+        for (int jl = tid; jl < BJ; jl += blockDim.x) {
             const int j = j0 + jl;
             if (j < N) {
                 mr_sm[jl]  = m_r[st_off + j];
@@ -582,8 +629,8 @@ void Bwd_gather_tc(
                 sr_sm[jl]  = sum_r[st_off + j];
                 if constexpr (MASKED) {
                     // Both row-side factors are staged rather than kept in
-                    // registers: at 255 registers the kernel spills, so a live
-                    // register costs more than a rematerializable smem read.
+                    // registers: a live register costs more than a
+                    // rematerializable smem read.
                     if (!mb[(int64_t)j * N + a]) il = 0.0f;          // mask[r][a]
                     par_sm[jl] = mb[(int64_t)a * N + j] ? 1.0f : 0.0f;  // mask[a][r]
                 }
@@ -593,8 +640,6 @@ void Bwd_gather_tc(
                 if constexpr (MASKED) par_sm[jl] = 0.0f;
             }
         }
-        stage_cols(0, 0);
-        asm volatile("cp.async.wait_all;\n" ::);
         __syncthreads();
 
         const int jw = warp * 16;
@@ -617,248 +662,224 @@ void Bwd_gather_tc(
         const int rwd = (jw + g) >> 5;
         const int rb  = (jw + g) & 31;
 
-        // Raw row fragments are col-invariant: load once, rescale into the
-        // four A operands (A1/A3 share the Vr fragment). The rescale is done
-        // in fp32 with a single bf16 rounding, matching Y_gather_tc's Qp
-        // precision. A-fragment register e covers columns
-        // ks*16 + (e<2 ? 0 : 8) + {2*tig, 2*tig+1}, identical for both rows.
-        uint32_t A0[4][4], A1[4][4], A2[4][4], A3[4][4];
-        #pragma unroll
-        for (int ks = 0; ks < 4; ks++) {
-            const int c0 = ks * 16 + 2 * tig;
-            const float aX[4] = {anchX[c0], anchX[c0 + 1], anchX[c0 + 8], anchX[c0 + 9]};
-            const float aV[4] = {anchV[c0], anchV[c0 + 1], anchV[c0 + 8], anchV[c0 + 9]};
-            const float aG[4] = {anchG[c0], anchG[c0 + 1], anchG[c0 + 8], anchG[c0 + 9]};
-            uint32_t rX[4], rV[4], rG[4];
-            const int roff = (jw + lrow) * DPAD + ks * 16 + lcol8;
-            ldmatrix_x4(rX, xr_sm + roff);
-            ldmatrix_x4(rV, vr_sm + roff);
-            ldmatrix_x4(rG, gyr_sm + roff);
-            #pragma unroll
-            for (int e = 0; e < 4; e++) {
-                const int hf = (e >> 1) * 2;
-                const float2 fX = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rX[e]));
-                const float2 fV = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rV[e]));
-                const float2 fG = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rG[e]));
-                A0[ks][e] = pack_bf162(fX.x * aX[hf], fX.y * aX[hf + 1]);
-                A1[ks][e] = pack_bf162(fV.x * aG[hf], fV.y * aG[hf + 1]);
-                A2[ks][e] = pack_bf162(fG.x * aV[hf], fG.y * aV[hf + 1]);
-                A3[ks][e] = pack_bf162(fV.x * aV[hf], fV.y * aV[hf + 1]);
-            }
-        }
-
-        float Ug[8][4], U1[8][4], U2[8][4];
-        #pragma unroll
-        for (int nt = 0; nt < 8; nt++) {
-            #pragma unroll
-            for (int e = 0; e < 4; e++) { Ug[nt][e] = 0.0f; U1[nt][e] = 0.0f; U2[nt][e] = 0.0f; }
-        }
-
-        int cur = 0;
-        for (int k0 = 0; k0 < K_pad; k0 += BTC_BK) {
-            // Prefetch k0+1; the closing barrier publishes it and frees `cur`.
-            const int nxt = cur ^ 1;
-            if (k0 + BTC_BK < K_pad) stage_cols(k0 + BTC_BK, nxt);
-            const bf16* xc_cur  = xc_sm + cur * BTC_BK * DPAD;
-            const bf16* vc_cur  = vc_sm + cur * BTC_BK * DPAD;
-            const bf16* gyc_cur = gyc_sm + cur * BTC_BK * DPAD;
-            const float* mc_cur  = mc_sm + cur * BTC_BK;
-            const float* ilc_cur = ilc_sm + cur * BTC_BK;
-            const float* sc_cur  = sc_sm + cur * BTC_BK;
-
-            // Score-shaped GEMMs: 4 accumulator sets over BTC_BK cols.
-            float ax[4][4], ada[4][4], adr[4][4], adc[4][4];
-            #pragma unroll
-            for (int nt = 0; nt < 4; nt++) {
-                #pragma unroll
-                for (int e = 0; e < 4; e++) {
-                    ax[nt][e] = 0.0f; ada[nt][e] = 0.0f; adr[nt][e] = 0.0f; adc[nt][e] = 0.0f;
-                }
-            }
-            #pragma unroll
-            for (int p = 0; p < BTC_BK / 16; p++) {
-                const bf16* bx = xc_cur + (p * 16 + brow) * DPAD + bcol8;
-                const bf16* bv = vc_cur + (p * 16 + brow) * DPAD + bcol8;
-                const bf16* bg = gyc_cur + (p * 16 + brow) * DPAD + bcol8;
-                #pragma unroll
-                for (int ks = 0; ks < 4; ks++) {
-                    uint32_t bfr[4];
-                    ldmatrix_x4(bfr, bx + ks * 16);
-                    mma_bf16_m16n8k16(ax[2 * p],     A0[ks], bfr);
-                    mma_bf16_m16n8k16(ax[2 * p + 1], A0[ks], bfr + 2);
-                    ldmatrix_x4(bfr, bv + ks * 16);   // shared by d_a and d_r
-                    mma_bf16_m16n8k16(ada[2 * p],     A1[ks], bfr);
-                    mma_bf16_m16n8k16(ada[2 * p + 1], A1[ks], bfr + 2);
-                    mma_bf16_m16n8k16(adr[2 * p],     A2[ks], bfr);
-                    mma_bf16_m16n8k16(adr[2 * p + 1], A2[ks], bfr + 2);
-                    ldmatrix_x4(bfr, bg + ks * 16);
-                    mma_bf16_m16n8k16(adc[2 * p],     A3[ks], bfr);
-                    mma_bf16_m16n8k16(adc[2 * p + 1], A3[ks], bfr + 2);
-                }
-            }
-
-            // Elementwise: weights from forward stats, Jacobian-corrected
-            // grad_A; repack C-fragments as output-GEMM A-fragments.
-            uint32_t gAf[BTC_BK / 16][4], Prf[BTC_BK / 16][4], Pcf[BTC_BK / 16][4];
-            #pragma unroll
-            for (int nt = 0; nt < 4; nt++) {
-                const int cl = nt * 8 + 2 * tig;    // col within the staged tile
-                const int c  = k0 + cl;
-                const float mc0 = mc_cur[cl],     ilc0 = ilc_cur[cl],     sc0 = sc_cur[cl];
-                const float mc1 = mc_cur[cl + 1], ilc1 = ilc_cur[cl + 1], sc1 = sc_cur[cl + 1];
-                // Only the two 2-D factors are left per cell, one aligned load
-                // per pair in either window: bits 0/1 of rc* are mask[r][c] and
-                // mask[r][c+1] (c even, so the pair shares a word), bits 0/8 of
-                // cr* are mask[c][r] and mask[c][r+8]. So rc* indexes by row and
-                // cr* by col — the windows' packing axes, swapped.
-                uint32_t rc0 = ~0u, rc1 = ~0u, cr0 = ~0u, cr1 = ~0u;
-                float ilac0 = 0.0f, ilac1 = 0.0f;
-                if constexpr (MASKED) {
-                    const uint32_t* mw  = msk_sm + cur * BTC_BJ;
-                    const uint32_t* mtw = mskT_sm + cur * BTC_BK * BTC_MRW;
-                    rc0 = mw[jw + g]     >> cl;
-                    rc1 = mw[jw + g + 8] >> cl;
-                    cr0 = mtw[cl * BTC_MRW + rwd]       >> rb;
-                    cr1 = mtw[(cl + 1) * BTC_MRW + rwd] >> rb;
-                    ilac0 = ilac_sm[cur * BTC_BK + cl];
-                    ilac1 = ilac_sm[cur * BTC_BK + cl + 1];
-                }
-                float gA[4], Pr[4], Pc[4];
-                #pragma unroll
-                for (int e = 0; e < 4; e++) {
-                    const bool hi = (e >= 2), c1 = (e & 1);
-                    const float mrr = hi ? mr1 : mr0;
-                    const float ilr = hi ? ilr1 : ilr0;
-                    const float srr = hi ? sr1 : sr0;
-                    const float mcc = c1 ? mc1 : mc0;
-                    const float ilc = c1 ? ilc1 : ilc0;
-                    const float scc = c1 ? sc1 : sc0;
-                    float Pa;
-                    if constexpr (MASKED) {
-                        // Clamping the exponent at 0 is what lets every gate be
-                        // a plain multiply or select: live cells always have
-                        // x <= m so the clamp never touches them, while dead
-                        // ones can no longer reach inf and turn 0*inf into NaN.
-                        // That kills the pad test too (pad rows/cols carry a
-                        // zero inv-l and zero mask bits), so no `pad` term
-                        // appears below. Remaining per cell: mask[r][c] and
-                        // mask[c][r]; the anchor's own factors already rode in
-                        // via ilac (col) and par (row).
-                        const float x = ax[nt][e];
-                        const float ilac = c1 ? ilac1 : ilac0;
-                        const float par  = hi ? par1 : par0;
-                        // Gate the *scale*, never the exp. Guarding the whole
-                        // expression lets nvcc branch around the MUFU, and a
-                        // scattered mask then diverges inside the warp and runs
-                        // both sides: that cost `random` 21% over `causal`.
-                        // Selecting on inv-l keeps every cell's cost identical.
-                        const float ilrg = (((hi ? rc1 : rc0) >> c1) & 1u) ? ilr : 0.0f;
-                        const float ilcg = (((c1 ? cr1 : cr0) >> (hi ? 8 : 0)) & 1u)
-                                         ? ilc : 0.0f;
-                        Pa    = __expf(fminf(x - ma,  0.0f)) * ilac * par;
-                        Pr[e] = __expf(fminf(x - mrr, 0.0f)) * ilrg;
-                        Pc[e] = __expf(fminf(x - mcc, 0.0f)) * ilcg;
-                    } else {
-                        const bool pad = (hi ? rpad1 : rpad0) | (c + c1 >= N);
-                        const float x = pad ? NEG_INF : ax[nt][e];
-                        Pa    = __expf(x - ma)  * ila;
-                        Pr[e] = __expf(x - mrr) * ilr;
-                        Pc[e] = __expf(x - mcc) * ilc;
-                    }
-                    gA[e] = (ada[nt][e] - sa) * Pa
-                          + (adr[nt][e] - srr) * Pr[e]
-                          + (adc[nt][e] - scc) * Pc[e];
-                }
-                const int s2 = nt >> 1, hf = nt & 1;
-                gAf[s2][2 * hf + 0] = pack_bf162(gA[0], gA[1]);
-                gAf[s2][2 * hf + 1] = pack_bf162(gA[2], gA[3]);
-                Prf[s2][2 * hf + 0] = pack_bf162(Pr[0], Pr[1]);
-                Prf[s2][2 * hf + 1] = pack_bf162(Pr[2], Pr[3]);
-                Pcf[s2][2 * hf + 0] = pack_bf162(Pc[0], Pc[1]);
-                Pcf[s2][2 * hf + 1] = pack_bf162(Pc[2], Pc[3]);
-            }
-
-            // Output GEMMs: contract cols (B fragments via ldmatrix.trans).
-            #pragma unroll
-            for (int s2 = 0; s2 < BTC_BK / 16; s2++) {
-                const bf16* px = xc_cur + (s2 * 16 + lrow) * DPAD + lcol8;
-                const bf16* pv = vc_cur + (s2 * 16 + lrow) * DPAD + lcol8;
-                const bf16* pg = gyc_cur + (s2 * 16 + lrow) * DPAD + lcol8;
-                #pragma unroll
-                for (int np = 0; np < 4; np++) {
-                    uint32_t bfr[4];
-                    ldmatrix_x4_trans(bfr, px + np * 16);
-                    mma_bf16_m16n8k16(Ug[2 * np],     gAf[s2], bfr);
-                    mma_bf16_m16n8k16(Ug[2 * np + 1], gAf[s2], bfr + 2);
-                    ldmatrix_x4_trans(bfr, pv + np * 16);
-                    mma_bf16_m16n8k16(U1[2 * np],     Prf[s2], bfr);
-                    mma_bf16_m16n8k16(U1[2 * np + 1], Prf[s2], bfr + 2);
-                    ldmatrix_x4_trans(bfr, pg + np * 16);
-                    mma_bf16_m16n8k16(U2[2 * np],     Pcf[s2], bfr);
-                    mma_bf16_m16n8k16(U2[2 * np + 1], Pcf[s2], bfr + 2);
-                }
-            }
-
+        for (int pass = 0; pass < NPASS; pass++) {
+            const int d0 = pass * DH;   // this pass's output col slice
+            stage_cols(0, 0);
             asm volatile("cp.async.wait_all;\n" ::);
             __syncthreads();
-            cur = nxt;
-        }
 
-        // ---- epilogue: Hadamard row-collapse of this warp's 16 rows ----
-        float ng[16], nv[16];
-        const bf16* xr0 = xr_sm + (jw + g) * DPAD + 2 * tig;
-        const bf16* xr1 = xr_sm + (jw + g + 8) * DPAD + 2 * tig;
-        const bf16* vr0 = vr_sm + (jw + g) * DPAD + 2 * tig;
-        const bf16* vr1 = vr_sm + (jw + g + 8) * DPAD + 2 * tig;
-        const bf16* gy0 = gyr_sm + (jw + g) * DPAD + 2 * tig;
-        const bf16* gy1 = gyr_sm + (jw + g + 8) * DPAD + 2 * tig;
-        #pragma unroll
-        for (int nt = 0; nt < 8; nt++) {
-            const float2 x0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(xr0 + nt * 8));
-            const float2 x1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(xr1 + nt * 8));
-            const float2 v0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(vr0 + nt * 8));
-            const float2 v1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(vr1 + nt * 8));
-            const float2 g0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(gy0 + nt * 8));
-            const float2 g1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(gy1 + nt * 8));
-            ng[2 * nt + 0] = x0.x * Ug[nt][0] + x1.x * Ug[nt][2];
-            ng[2 * nt + 1] = x0.y * Ug[nt][1] + x1.y * Ug[nt][3];
-            nv[2 * nt + 0] = g0.x * U1[nt][0] + g1.x * U1[nt][2]
-                           + v0.x * U2[nt][0] + v1.x * U2[nt][2];
-            nv[2 * nt + 1] = g0.y * U1[nt][1] + g1.y * U1[nt][3]
-                           + v0.y * U2[nt][1] + v1.y * U2[nt][3];
-        }
-        #pragma unroll
-        for (int off = 4; off <= 16; off <<= 1) {
+            float Ug[DH / 8][4], U1[DH / 8][4], U2[DH / 8][4];
             #pragma unroll
-            for (int e = 0; e < 16; e++) {
-                ng[e] += __shfl_xor_sync(0xFFFFFFFF, ng[e], off);
-                nv[e] += __shfl_xor_sync(0xFFFFFFFF, nv[e], off);
+            for (int nt = 0; nt < DH / 8; nt++) {
+                #pragma unroll
+                for (int e = 0; e < 4; e++) { Ug[nt][e] = 0.0f; U1[nt][e] = 0.0f; U2[nt][e] = 0.0f; }
             }
-        }
-        if (lane < 4) {
+
+            int cur = 0;
+            for (int k0 = 0; k0 < K_pad; k0 += BK) {
+                // Prefetch k0+1; the closing barrier publishes it and frees `cur`.
+                const int nxt = cur ^ 1;
+                if (k0 + BK < K_pad) stage_cols(k0 + BK, nxt);
+                const bf16* xc_cur  = xc_sm + cur * BK * DPAD;
+                const bf16* vc_cur  = vc_sm + cur * BK * DPAD;
+                const bf16* gyc_cur = gyc_sm + cur * BK * DPAD;
+                const float* mc_cur  = mc_sm + cur * BK;
+                const float* ilc_cur = ilc_sm + cur * BK;
+                const float* sc_cur  = sc_sm + cur * BK;
+
+                // 16 cols at a time: score GEMMs, elementwise, output GEMMs.
+                #pragma unroll
+                for (int s2 = 0; s2 < BK / 16; s2++) {
+                    float ax[2][4], ada[2][4], adr[2][4], adc[2][4];
+                    #pragma unroll
+                    for (int nt = 0; nt < 2; nt++) {
+                        #pragma unroll
+                        for (int e = 0; e < 4; e++) {
+                            ax[nt][e] = 0.0f; ada[nt][e] = 0.0f; adr[nt][e] = 0.0f; adc[nt][e] = 0.0f;
+                        }
+                    }
+                    const bf16* bx = xc_cur + (s2 * 16 + brow) * DPAD + bcol8;
+                    const bf16* bv = vc_cur + (s2 * 16 + brow) * DPAD + bcol8;
+                    const bf16* bg = gyc_cur + (s2 * 16 + brow) * DPAD + bcol8;
+                    #pragma unroll
+                    for (int ks = 0; ks < KS; ks++) {
+                        uint32_t A0[4], A1[4], A2[4], A3[4], bfr[4];
+                        const int roff = (jw + lrow) * DPAD + ks * 16 + lcol8;
+                        ldmatrix_x4(A0, a0_sm + roff);
+                        ldmatrix_x4(A1, a1_sm + roff);
+                        ldmatrix_x4(A2, a2_sm + roff);
+                        ldmatrix_x4(A3, a3_sm + roff);
+                        ldmatrix_x4(bfr, bx + ks * 16);
+                        mma_bf16_m16n8k16(ax[0], A0, bfr);
+                        mma_bf16_m16n8k16(ax[1], A0, bfr + 2);
+                        ldmatrix_x4(bfr, bv + ks * 16);   // shared by d_a and d_r
+                        mma_bf16_m16n8k16(ada[0], A1, bfr);
+                        mma_bf16_m16n8k16(ada[1], A1, bfr + 2);
+                        mma_bf16_m16n8k16(adr[0], A2, bfr);
+                        mma_bf16_m16n8k16(adr[1], A2, bfr + 2);
+                        ldmatrix_x4(bfr, bg + ks * 16);
+                        mma_bf16_m16n8k16(adc[0], A3, bfr);
+                        mma_bf16_m16n8k16(adc[1], A3, bfr + 2);
+                    }
+
+                    // Elementwise: weights from forward stats, Jacobian-corrected
+                    // grad_A; repack C-fragments as output-GEMM A-fragments.
+                    uint32_t gAf[4], Prf[4], Pcf[4];
+                    #pragma unroll
+                    for (int hf = 0; hf < 2; hf++) {
+                        const int cl = s2 * 16 + hf * 8 + 2 * tig;   // col within the staged tile
+                        const int c  = k0 + cl;
+                        const float mc0 = mc_cur[cl],     ilc0 = ilc_cur[cl],     sc0 = sc_cur[cl];
+                        const float mc1 = mc_cur[cl + 1], ilc1 = ilc_cur[cl + 1], sc1 = sc_cur[cl + 1];
+                        // Only the two 2-D factors are left per cell, one aligned load
+                        // per pair in either window: bits 0/1 of rc* are mask[r][c] and
+                        // mask[r][c+1] (c even, so the pair shares a word), bits 0/8 of
+                        // cr* are mask[c][r] and mask[c][r+8]. So rc* indexes by row and
+                        // cr* by col — the windows' packing axes, swapped.
+                        uint32_t rc0 = ~0u, rc1 = ~0u, cr0 = ~0u, cr1 = ~0u;
+                        float ilac0 = 0.0f, ilac1 = 0.0f;
+                        if constexpr (MASKED) {
+                            const uint32_t* mw  = msk_sm + cur * BJ;
+                            const uint32_t* mtw = mskT_sm + cur * BK * MRW;
+                            rc0 = mw[jw + g]     >> cl;
+                            rc1 = mw[jw + g + 8] >> cl;
+                            cr0 = mtw[cl * MRW + rwd]       >> rb;
+                            cr1 = mtw[(cl + 1) * MRW + rwd] >> rb;
+                            ilac0 = ilac_sm[cur * BK + cl];
+                            ilac1 = ilac_sm[cur * BK + cl + 1];
+                        }
+                        float gA[4], Pr[4], Pc[4];
+                        #pragma unroll
+                        for (int e = 0; e < 4; e++) {
+                            const bool hi = (e >= 2), c1 = (e & 1);
+                            const float mrr = hi ? mr1 : mr0;
+                            const float ilr = hi ? ilr1 : ilr0;
+                            const float srr = hi ? sr1 : sr0;
+                            const float mcc = c1 ? mc1 : mc0;
+                            const float ilc = c1 ? ilc1 : ilc0;
+                            const float scc = c1 ? sc1 : sc0;
+                            float Pa;
+                            if constexpr (MASKED) {
+                                // Clamping the exponent at 0 is what lets every gate be
+                                // a plain multiply or select: live cells always have
+                                // x <= m so the clamp never touches them, while dead
+                                // ones can no longer reach inf and turn 0*inf into NaN.
+                                // That kills the pad test too (pad rows/cols carry a
+                                // zero inv-l and zero mask bits), so no `pad` term
+                                // appears below. Remaining per cell: mask[r][c] and
+                                // mask[c][r]; the anchor's own factors already rode in
+                                // via ilac (col) and par (row).
+                                const float x = ax[hf][e];
+                                const float ilac = c1 ? ilac1 : ilac0;
+                                const float par  = hi ? par1 : par0;
+                                // Gate the *scale*, never the exp. Guarding the whole
+                                // expression lets nvcc branch around the MUFU, and a
+                                // scattered mask then diverges inside the warp and runs
+                                // both sides: that cost `random` 21% over `causal`.
+                                // Selecting on inv-l keeps every cell's cost identical.
+                                const float ilrg = (((hi ? rc1 : rc0) >> c1) & 1u) ? ilr : 0.0f;
+                                const float ilcg = (((c1 ? cr1 : cr0) >> (hi ? 8 : 0)) & 1u)
+                                                 ? ilc : 0.0f;
+                                Pa    = __expf(fminf(x - ma,  0.0f)) * ilac * par;
+                                Pr[e] = __expf(fminf(x - mrr, 0.0f)) * ilrg;
+                                Pc[e] = __expf(fminf(x - mcc, 0.0f)) * ilcg;
+                            } else {
+                                const bool pad = (hi ? rpad1 : rpad0) | (c + c1 >= N);
+                                const float x = pad ? NEG_INF : ax[hf][e];
+                                Pa    = __expf(x - ma)  * ila;
+                                Pr[e] = __expf(x - mrr) * ilr;
+                                Pc[e] = __expf(x - mcc) * ilc;
+                            }
+                            gA[e] = (ada[hf][e] - sa) * Pa
+                                  + (adr[hf][e] - srr) * Pr[e]
+                                  + (adc[hf][e] - scc) * Pc[e];
+                        }
+                        gAf[2 * hf + 0] = pack_bf162(gA[0], gA[1]);
+                        gAf[2 * hf + 1] = pack_bf162(gA[2], gA[3]);
+                        Prf[2 * hf + 0] = pack_bf162(Pr[0], Pr[1]);
+                        Prf[2 * hf + 1] = pack_bf162(Pr[2], Pr[3]);
+                        Pcf[2 * hf + 0] = pack_bf162(Pc[0], Pc[1]);
+                        Pcf[2 * hf + 1] = pack_bf162(Pc[2], Pc[3]);
+                    }
+
+                    // Output GEMMs: contract cols (B fragments via ldmatrix.trans).
+                    const bf16* px = xc_cur + (s2 * 16 + lrow) * DPAD + lcol8 + d0;
+                    const bf16* pv = vc_cur + (s2 * 16 + lrow) * DPAD + lcol8 + d0;
+                    const bf16* pg = gyc_cur + (s2 * 16 + lrow) * DPAD + lcol8 + d0;
+                    #pragma unroll
+                    for (int np = 0; np < DH / 16; np++) {
+                        uint32_t bfr[4];
+                        ldmatrix_x4_trans(bfr, px + np * 16);
+                        mma_bf16_m16n8k16(Ug[2 * np],     gAf, bfr);
+                        mma_bf16_m16n8k16(Ug[2 * np + 1], gAf, bfr + 2);
+                        ldmatrix_x4_trans(bfr, pv + np * 16);
+                        mma_bf16_m16n8k16(U1[2 * np],     Prf, bfr);
+                        mma_bf16_m16n8k16(U1[2 * np + 1], Prf, bfr + 2);
+                        ldmatrix_x4_trans(bfr, pg + np * 16);
+                        mma_bf16_m16n8k16(U2[2 * np],     Pcf, bfr);
+                        mma_bf16_m16n8k16(U2[2 * np + 1], Pcf, bfr + 2);
+                    }
+                }
+
+                asm volatile("cp.async.wait_all;\n" ::);
+                __syncthreads();
+                cur = nxt;
+            }
+
+            // ---- epilogue: Hadamard row-collapse of this warp's 16 rows ----
+            // Raw rows come from global (L2-hot); pad rows contribute zeros.
+            float ng[DH / 4], nv[DH / 4];
+            const int64_t r0 = nd_off + (int64_t)min(j0 + jw + g, N - 1) * D + d0 + 2 * tig;
+            const int64_t r1 = nd_off + (int64_t)min(j0 + jw + g + 8, N - 1) * D + d0 + 2 * tig;
+            auto ld2 = [](const bf16* p, bool pad) {
+                return pad ? make_float2(0.0f, 0.0f)
+                           : __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(p));
+            };
             #pragma unroll
-            for (int nt = 0; nt < 8; nt++) {
-                wOut[warp * 2 * D + nt * 8 + 2 * lane]         = ng[2 * nt + 0];
-                wOut[warp * 2 * D + nt * 8 + 2 * lane + 1]     = ng[2 * nt + 1];
-                wOut[warp * 2 * D + D + nt * 8 + 2 * lane]     = nv[2 * nt + 0];
-                wOut[warp * 2 * D + D + nt * 8 + 2 * lane + 1] = nv[2 * nt + 1];
+            for (int nt = 0; nt < DH / 8; nt++) {
+                const float2 x0 = ld2(Xr_bf + r0 + nt * 8, rpad0),  x1 = ld2(Xr_bf + r1 + nt * 8, rpad1);
+                const float2 v0 = ld2(Vr_bf + r0 + nt * 8, rpad0),  v1 = ld2(Vr_bf + r1 + nt * 8, rpad1);
+                const float2 g0 = ld2(gYr_bf + r0 + nt * 8, rpad0), g1 = ld2(gYr_bf + r1 + nt * 8, rpad1);
+                ng[2 * nt + 0] = x0.x * Ug[nt][0] + x1.x * Ug[nt][2];
+                ng[2 * nt + 1] = x0.y * Ug[nt][1] + x1.y * Ug[nt][3];
+                nv[2 * nt + 0] = g0.x * U1[nt][0] + g1.x * U1[nt][2]
+                               + v0.x * U2[nt][0] + v1.x * U2[nt][2];
+                nv[2 * nt + 1] = g0.y * U1[nt][1] + g1.y * U1[nt][3]
+                               + v0.y * U2[nt][1] + v1.y * U2[nt][3];
+            }
+            #pragma unroll
+            for (int off = 4; off <= 16; off <<= 1) {
+                #pragma unroll
+                for (int e = 0; e < DH / 4; e++) {
+                    ng[e] += __shfl_xor_sync(0xFFFFFFFF, ng[e], off);
+                    nv[e] += __shfl_xor_sync(0xFFFFFFFF, nv[e], off);
+                }
+            }
+            if (lane < 4) {
+                float* wo = wOut + warp * 2 * D + d0;
+                #pragma unroll
+                for (int nt = 0; nt < DH / 8; nt++) {
+                    wo[nt * 8 + 2 * lane]         = ng[2 * nt + 0];
+                    wo[nt * 8 + 2 * lane + 1]     = ng[2 * nt + 1];
+                    wo[D + nt * 8 + 2 * lane]     = nv[2 * nt + 0];
+                    wo[D + nt * 8 + 2 * lane + 1] = nv[2 * nt + 1];
+                }
             }
         }
         __syncthreads();
-        if (tid < 2 * D) {
+        for (int t = tid; t < 2 * D; t += blockDim.x) {
             float acc = 0.0f;
             #pragma unroll
-            for (int w = 0; w < BTC_WARPS; w++) acc += wOut[w * 2 * D + tid];
-            redOut[tid] += acc;
+            for (int w = 0; w < WARPS; w++) acc += wOut[w * 2 * D + t];
+            redOut[t] += acc;
         }
     }
     __syncthreads();
 
     // ---- direct stores: this CTA exclusively owns row a of both outputs ----
-    if (tid < D) {
-        gradXa[a_off + tid] = scale * redOut[tid];
-    } else if (tid < 2 * D) {
-        gradVa[a_off + tid - D] = redOut[tid];
+    for (int t = tid; t < D; t += blockDim.x) {
+        gradXa[a_off + t] = scale * redOut[t];
+        gradVa[a_off + t] = redOut[D + t];
     }
 #endif  // __CUDA_ARCH__ >= 800
 }
@@ -1623,15 +1644,42 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
 
 
 
+// Largest tile shape whose smem fits the device, or nullptr. Halving the warp
+// count is what brings D=64 (4 warps) and D=128 (2 warps) under 99 KB.
+template<int D, int WARPS, int BK>
+static decltype(&Bwd_gather_tc<64, false, 8, 32>) pick_bwd_tc(
+    bool use_mask, int max_smem_optin, size_t& smem, int& threads)
+{
+    smem = btc_smem_bytes(D, WARPS, BK, use_mask);
+    if (smem > (size_t)max_smem_optin) {
+        constexpr int MIN_WARPS = (D == 128) ? 2 : 4;
+        if constexpr (WARPS > MIN_WARPS) {
+            return pick_bwd_tc<D, MIN_WARPS, BK>(use_mask, max_smem_optin, smem, threads);
+        }
+        return nullptr;
+    }
+    threads = WARPS * 32;
+    auto* k = use_mask ? Bwd_gather_tc<D, true, WARPS, BK>
+                       : Bwd_gather_tc<D, false, WARPS, BK>;
+    static bool attr_set[2] = {false, false};
+    if (!attr_set[use_mask]) {
+        AT_CUDA_CHECK(cudaFuncSetAttribute(
+            k, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+        attr_set[use_mask] = true;
+    }
+    return k;
+}
+
 // =============================================================================
-// D-dispatch: routes to D_CONST=32 or D_CONST=64 template instantiation
+// D-dispatch: routes to the D_CONST template instantiation
 // =============================================================================
 #define DISPATCH_D(D_VAL, ...) \
   [&] { \
     if ((D_VAL) == 16)      { constexpr int D_TMPL = 16; __VA_ARGS__; } \
     else if ((D_VAL) == 32) { constexpr int D_TMPL = 32; __VA_ARGS__; } \
     else if ((D_VAL) == 64) { constexpr int D_TMPL = 64; __VA_ARGS__; } \
-    else { TORCH_CHECK(false, "backward: unsupported D=", (D_VAL), ". Supported: 16, 32, 64"); } \
+    else if ((D_VAL) == 128) { constexpr int D_TMPL = 128; __VA_ARGS__; } \
+    else { TORCH_CHECK(false, "backward: unsupported D=", (D_VAL), ". Supported: 16, 32, 64, 128"); } \
   }()
 
 // =============================================================================
@@ -1734,7 +1782,7 @@ backward_impl(torch::Tensor grad_Y_q,
   // Requires the forward outputs Y_q/Y_r/Y_s (for the collapsed correction
   // sums) and all-zero scatter cotangents. Anything else takes the scalar
   // path below unchanged. Disable with ATT3_BWD_TC=0.
-  if (D == 64 && I == J && J == K && (N % 16 == 0)
+  if ((D == 64 || D == 128) && I == J && J == K && (N % 16 == 0)
       && Y_q.defined() && Y_r.defined() && Y_s.defined()) {
     static const int max_smem_optin = []() {
         int dev = 0, major = 0, v = 0;
@@ -1744,20 +1792,13 @@ backward_impl(torch::Tensor grad_Y_q,
         cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
         return v;
     }();
+    size_t smem_tc = 0;
+    int threads_tc = 0;
+    auto* tc_kernel = (D == 64)
+        ? pick_bwd_tc<64, BTC_WARPS, BTC_BK>(use_mask, max_smem_optin, smem_tc, threads_tc)
+        : pick_bwd_tc<128, BTC_WARPS, BTC_BK>(use_mask, max_smem_optin, smem_tc, threads_tc);
     const int K_pad = ceil_div(N, BTC_BK) * BTC_BK;
-    constexpr int TC_DPAD = 64 + 8;
-    // Flat in N: the col side streams through two BTC_BK tiles, and masked runs
-    // add only the tile in flight's two mask windows plus its inv-l floats.
-    const size_t smem_mask = use_mask
-        ? sizeof(uint32_t) * 2 * (size_t)(BTC_BJ + BTC_BK * BTC_MRW)
-          + sizeof(float) * (2 * (size_t)BTC_BK + BTC_BJ)
-        : 0;
-    const size_t smem_tc =
-        sizeof(bf16) * ((size_t)3 * BTC_BJ * TC_DPAD + (size_t)6 * BTC_BK * TC_DPAD) +
-        sizeof(float) * (3 * 64 + 6 * (size_t)BTC_BK + 3 * BTC_BJ
-                         + BTC_WARPS * 2 * 64 + 2 * 64)
-        + smem_mask;
-    if (att3_tc::state().bwd_enabled && smem_tc <= (size_t)max_smem_optin) {
+    if (att3_tc::state().bwd_enabled && tc_kernel != nullptr) {
       // Single host round-trip for the gate.
       const bool scatter_active =
           (grad_Y_q_.ne(0).any() | grad_Y_r_.ne(0).any() | grad_Y_s_.ne(0).any())
@@ -1769,18 +1810,8 @@ backward_impl(torch::Tensor grad_Y_q,
         sum_r = (grad_Y_r.to(at::kFloat) * Y_r.to(at::kFloat)).sum(-1).contiguous();
         sum_s = (grad_Y_s.to(at::kFloat) * Y_s.to(at::kFloat)).sum(-1).contiguous();
 
-        auto* tc_kernel = use_mask ? Bwd_gather_tc<64, true>
-                                   : Bwd_gather_tc<64, false>;
-        static size_t smem_attr_set[2] = {0, 0};
-        const int variant = use_mask ? 1 : 0;
-        if (smem_tc > smem_attr_set[variant]) {
-            AT_CUDA_CHECK(cudaFuncSetAttribute(
-                tc_kernel,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_tc));
-            smem_attr_set[variant] = smem_tc;
-        }
         auto stream = at::cuda::getCurrentCUDAStream();
-        const dim3 grid_tc(N, H, B), block_tc(BTC_WARPS * 32);
+        const dim3 grid_tc(N, H, B), block_tc(threads_tc);
         auto bp = [](const torch::Tensor& t) {
             return reinterpret_cast<const bf16*>(t.data_ptr<at::BFloat16>());
         };
@@ -1980,8 +2011,8 @@ backward_impl(torch::Tensor grad_Y_q,
 
     // Phase 2: grad_Q + grad_S (fused)
     {
-      constexpr int tileI = TILE_I;
-      constexpr int tileK = TILE_K;
+      constexpr int tileI = D_TMPL == 128 ? 8 : TILE_I;   // 16x16 tiles need 124 KB at D=128
+      constexpr int tileK = D_TMPL == 128 ? 8 : TILE_K;
       constexpr int tileJ = 16;
 
       dim3 block_dim(tileI, tileK);
@@ -2036,8 +2067,8 @@ backward_impl(torch::Tensor grad_Y_q,
 
     // Phase 3: grad_R
     {
-      constexpr int tileJ = TILE_J;
-      constexpr int tileK = TILE_K;
+      constexpr int tileJ = D_TMPL == 128 ? 8 : TILE_J;
+      constexpr int tileK = D_TMPL == 128 ? 8 : TILE_K;
       constexpr int tileI = 16;
 
       dim3 block_dim(tileJ, tileK);

@@ -84,6 +84,8 @@ QUICK_CONFIGS = [
     TestConfig("small_N32_D32",     B=1, H=2, N=32, D=32),
     TestConfig("small_N64_D32",     B=1, H=2, N=64, D=32),
     TestConfig("small_N32_D64",     B=1, H=2, N=32, D=64),
+    TestConfig("small_N32_D128",    B=1, H=2, N=32, D=128),
+    TestConfig("small_N128_D128",   B=1, H=2, N=128, D=128),
 ]
 
 STANDARD_CONFIGS = [
@@ -158,6 +160,8 @@ LARGE_CONFIGS = [
     TestConfig("large_N224_D64",    B=1, H=2, N=224, D=64),
     TestConfig("large_N256_D32",    B=2, H=2, N=256, D=32),
     TestConfig("large_N256_D64",    B=1, H=2, N=256, D=64),
+    TestConfig("large_N96_D128",    B=1, H=2, N=96,  D=128),
+    TestConfig("large_N256_D128",   B=1, H=2, N=256, D=128),
     TestConfig("large_N288_D32",    B=1, H=2, N=288, D=32),
     TestConfig("large_N320_D32",    B=1, H=1, N=320, D=32),
     TestConfig("large_N384_D32",    B=1, H=1, N=384, D=32),
@@ -183,6 +187,7 @@ STRESS_CONFIGS = [
     TestConfig("stress_N64_s2",     B=1, H=2, N=64, D=32, input_scale=2.0),
     TestConfig("stress_D64_s2",     B=1, H=2, N=32, D=64, input_scale=2.0),
     TestConfig("stress_N64_D64_s2", B=1, H=2, N=64, D=64, input_scale=2.0),
+    TestConfig("stress_N64_D128_s2", B=1, H=2, N=64, D=128, input_scale=2.0),
 ]
 
 EDGE_CONFIGS = [
@@ -200,14 +205,14 @@ CONFIG_GROUPS = {
     'edge': EDGE_CONFIGS,
 }
 
-# The D=64 tensor-core kernels round Q_i (*) R_j to bf16 for the MMA, leaving
+# The D=64/128 tensor-core kernels round Q_i (*) R_j to bf16 for the MMA, leaving
 # scores ~2^-9 relative where the scalar D=16/32 path is exact. The softmax
 # exponentiates that, so the output error runs ~exp(2.1e-3 * |score|) - 1: 1% at
 # input_scale=1, but 6% by input_scale=2. cuda_docs/gather_readme.md section 5
 # has the envelope; test_tc_paths.py checks the TC path against the scalar
 # path's own error instead, which is the criterion that isolates the kernel.
 TC_SCORE_PRECISION = pytest.mark.xfail(
-    reason="D=64 TC path: bf16 score rounding amplified by exp at input_scale>1",
+    reason="D>=64 TC path: bf16 score rounding amplified by exp at input_scale>1",
     strict=False)
 
 
@@ -222,7 +227,7 @@ def _config_params():
     return [
         pytest.param(c, id=c.name,
                      marks=[getattr(pytest.mark, g) for g in groups]
-                     + ([TC_SCORE_PRECISION] if c.D == 64 and c.input_scale > 1.0
+                     + ([TC_SCORE_PRECISION] if c.D >= 64 and c.input_scale > 1.0
                         else []))
         for c, groups in seen.values()
     ]

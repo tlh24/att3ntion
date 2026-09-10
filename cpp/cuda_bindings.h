@@ -46,7 +46,8 @@ forward_cuda(
     double dropout_rate = 0.0,
     int64_t I_valid = -1,
     int64_t J_valid = -1,
-    int64_t K_valid = -1);
+    int64_t K_valid = -1,
+    int64_t gather_mode = 0);
 
 // Backward pass using pre-computed softmax stats from forward pass.
 // This is the only backward API - stats must come from forward pass to ensure

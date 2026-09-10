@@ -31,6 +31,7 @@ def hypergraph_forward(
     I_valid: int = -1,
     J_valid: int = -1,
     K_valid: int = -1,
+    gather_mode: int = 0,
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor,
     torch.Tensor, torch.Tensor, torch.Tensor,
@@ -40,14 +41,14 @@ def hypergraph_forward(
     _require_cuda()
     return _cuda_kernels.forward(
         Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, dropout_rate,
-        I_valid, J_valid, K_valid, mask,
+        I_valid, J_valid, K_valid, mask, gather_mode,
     )
 
 
 @hypergraph_forward.register_fake
 def _hypergraph_forward_fake(
     Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, mask, dropout_rate,
-    I_valid=-1, J_valid=-1, K_valid=-1,
+    I_valid=-1, J_valid=-1, K_valid=-1, gather_mode=0,
 ):
     B, H, I, D = Q.shape
     _, _, J, _ = R.shape
@@ -110,7 +111,7 @@ def _hypergraph_backward_fake(
 
 
 def _setup_context(ctx, inputs, output):
-    Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, mask, _dropout, _Iv, _Jv, _Kv = inputs
+    Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, mask, _dropout, _Iv, _Jv, _Kv, _gm = inputs
     Y_q, Y_r, Y_s, _, _, _, m_i, l_i, m_j, l_j, m_k, l_k = output
     ctx.save_for_backward(Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
                           m_i, l_i, m_j, l_j, m_k, l_k, mask, Y_q, Y_r, Y_s)
@@ -146,6 +147,7 @@ def _backward(
         None,  # I_valid
         None,  # J_valid
         None,  # K_valid
+        None,  # gather_mode
     )
 
 

@@ -72,6 +72,7 @@ class _HypergraphAttentionAutograd(Function):
         mask,
         dropout_rate=0.0,
         scatter=False,
+        gather_mode=0,
     ):
         """
         Calls the C++ forward pass and saves necessary tensors for backward.
@@ -113,7 +114,7 @@ class _HypergraphAttentionAutograd(Function):
 
         outputs_tuple = torch.ops.att3ntion.hypergraph_forward(
             Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2, mask_tensor, dropout_rate,
-            orig_seq_len, orig_seq_len, orig_seq_len,
+            orig_seq_len, orig_seq_len, orig_seq_len, gather_mode,
         )
 
         if isinstance(outputs_tuple, tuple) and len(outputs_tuple) == 12:
@@ -246,6 +247,7 @@ class _HypergraphAttentionAutograd(Function):
             None,
             None,
             None,
+            None,
         )
 
 class QuickGELU(nn.Module):
@@ -256,23 +258,29 @@ class HypergraphAttention(nn.Module):
     """
     3-way hypergraph attention layer backed by hand-written CUDA kernels.
     """
-    def __init__(self, d_model, n_heads, dropout_rate=0, scatter=False):
+    def __init__(self, d_model, n_heads, dropout_rate=0, scatter=False, gather_mode=0):
         super().__init__()
         
         if d_model % n_heads != 0:
             raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
+        if gather_mode not in (0, 1):
+            raise ValueError(f"gather_mode must be 0 (Q, R and S anchored) or 1 (Q anchored only), got {gather_mode}")
+        if scatter and gather_mode != 0:
+            raise ValueError("scatter requires all three gathers (gather_mode=0)")
 
         self.d_model = d_model
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         self.scatter = scatter
+        self.gather_mode = gather_mode
         
         self.Wq = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
         self.Wr = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
         self.Ws = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
         
         value_proj_multiplier = 2 if self.scatter else 1
-        self.Wv_q = nn.Linear(d_model, n_heads * self.head_dim * value_proj_multiplier, bias=True)
+        # The Q-anchored gather never reads Vq, so the one-gather variant has no Wv_q.
+        self.Wv_q = None if gather_mode == 1 else nn.Linear(d_model, n_heads * self.head_dim * value_proj_multiplier, bias=True)
         self.Wv_r = nn.Linear(d_model, n_heads * self.head_dim * value_proj_multiplier, bias=True)
         self.Wv_s = nn.Linear(d_model, n_heads * self.head_dim * value_proj_multiplier, bias=True)
         
@@ -294,6 +302,8 @@ class HypergraphAttention(nn.Module):
         # Backward-compatible loading for Wv_* shapes across gather/scatter configs.
         for proj_name in ("Wv_q", "Wv_r", "Wv_s"):
             module = getattr(self, proj_name)
+            if module is None:
+                continue
             for suffix, target in (("weight", module.weight), ("bias", module.bias)):
                 key = f"{prefix}{proj_name}.{suffix}"
                 if key not in state_dict:
@@ -344,9 +354,9 @@ class HypergraphAttention(nn.Module):
             Vr_1, Vr_2 = Vr.reshape(batch_size, ntok, self.n_heads, self.head_dim * 2).permute(0, 2, 1, 3).split(self.head_dim, dim=-1)
             Vs_1, Vs_2 = Vs.reshape(batch_size, ntok, self.n_heads, self.head_dim * 2).permute(0, 2, 1, 3).split(self.head_dim, dim=-1)
         else:
-            Vq_1 = self.Wv_q(x).reshape(batch_size, ntok, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
             Vr_1 = self.Wv_r(x).reshape(batch_size, ntok, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
             Vs_1 = self.Wv_s(x).reshape(batch_size, ntok, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+            Vq_1 = torch.zeros_like(Vr_1) if self.Wv_q is None else self.Wv_q(x).reshape(batch_size, ntok, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
             Vq_2 = torch.zeros_like(Vq_1)
             Vr_2 = torch.zeros_like(Vr_1)
             Vs_2 = torch.zeros_like(Vs_1)
@@ -363,9 +373,12 @@ class HypergraphAttention(nn.Module):
             mask,
             self.dropout.p,
             self.scatter,
+            self.gather_mode,
         )
 
-        y = self.gelu(Y_q) + self.gelu(Y_r) + self.gelu(Y_s)
+        y = self.gelu(Y_q)
+        if self.gather_mode == 0:
+            y = y + self.gelu(Y_r) + self.gelu(Y_s)
         if self.scatter:
             y = y + self.gelu(Y_q_) + self.gelu(Y_r_) + self.gelu(Y_s_)
 

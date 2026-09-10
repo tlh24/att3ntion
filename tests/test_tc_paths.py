@@ -13,6 +13,10 @@ Both gates fail open into the scalar path — wrong D, or too little opt-in shar
 memory. Both kernels stream their col side, so both smem costs are flat in N and
 both engage at any N. So the dispatch matrix at the end of the file asserts
 which kernel ran via ck.tc_launches() rather than trusting the numbers alone.
+
+D=64 and D=128 are the tensor-core widths; D=128 doubles the accumulators and
+the smem, so the forward runs a smaller tile shape and the backward falls back
+to one on 99 KB devices (mirrored in _fwd_tc_shapes / _bwd_tc_shapes below).
 """
 import math
 import os
@@ -52,6 +56,11 @@ CONFIGS = [
     (2, 2, 256, 64, 1.0),
     (1, 2, 64, 64, 2.0),   # stress: larger logits
     (1, 2, 32, 64, 3.0),
+    (1, 2, 32, 128, 1.0),
+    (1, 2, 96, 128, 1.0),
+    (2, 2, 128, 128, 1.0),
+    (1, 2, 256, 128, 1.0),
+    (1, 2, 64, 128, 2.0),
 ]
 
 
@@ -156,11 +165,11 @@ def test_nonzero_scatter_grads_fall_back():
 # Masked path (Bwd_gather_tc<64, true>)
 # ===========================================================================
 
-# Mirror the kernels' smem layouts and dispatch gates. TC_* are forward.cu,
-# BTC_* backward.cu; DPAD is D=64 padded against bank conflicts.
-TC_BJ, TC_BK, TC_WARPS = 128, 64, 8
-BTC_BJ, BTC_BK, BTC_WARPS = 128, 32, 8
-DPAD = 64 + 8
+# Mirror the kernels' smem layouts (tc_smem_bytes / btc_smem_bytes) and the
+# tile shapes the host launchers try: one per D in the forward; the 8-warp
+# shape, then the one that fits 99 KB, in the backward. Both costs are
+# independent of N (streamed col side).
+TC_DIMS = (64, 128)
 
 
 def _smem_optin():
@@ -168,32 +177,42 @@ def _smem_optin():
     return props.shared_memory_per_block_optin if props.major >= 8 else 0
 
 
-# Independent of N: the forward streams its col side through two TC_BK tiles.
-FWD_TC_SMEM = (2 * (2 * TC_BJ * DPAD + 4 * TC_BK * DPAD)
-               + 4 * (2 * TC_BK + TC_BJ + TC_WARPS * 64 + TC_WARPS * 2 + 64 + 2 + 64))
+def _fwd_tc_smem(D, warps, bk):
+    bj, dpad = warps * 16, D + 8
+    return (2 * (2 * bj * dpad + 4 * bk * dpad)
+            + 4 * (2 * bk + bj + warps * D + warps * 2 + D + 2 + D))
 
 
-# Also independent of N: two staged BTC_BK col tiles + one tile's mask windows.
-def _tc_smem_bytes(masked):
-    total = 2 * (3 * BTC_BJ * DPAD + 6 * BTC_BK * DPAD)
-    total += 4 * (3 * 64 + 6 * BTC_BK + 3 * BTC_BJ + BTC_WARPS * 2 * 64 + 2 * 64)
+def _bwd_tc_smem(D, warps, bk, masked):
+    bj, dpad = warps * 16, D + 8
+    total = 2 * (4 * bj * dpad + 6 * bk * dpad)
+    total += 4 * (3 * D + 6 * bk + 3 * bj + warps * 2 * D + 2 * D)
     if masked:
-        total += 4 * 2 * (BTC_BJ + BTC_BK * (BTC_BJ // 32))
-        total += 4 * (2 * BTC_BK + BTC_BJ)
+        total += 4 * 2 * (bj + bk * (bj // 32)) + 4 * (2 * bk + bj)
     return total
 
 
-def _tc_fits(masked=True):
-    return _tc_smem_bytes(masked) <= _smem_optin()
+def _fwd_tc_shapes(D):
+    return [(4, 32)] if D == 128 else [(8, 64)]
+
+
+def _bwd_tc_shapes(D):
+    return [(8, 32), (2 if D == 128 else 4, 32)]
 
 
 def _expect_fwd_tc(N, D):
-    return D == 64 and FWD_TC_SMEM <= _smem_optin()
+    return D in TC_DIMS and any(_fwd_tc_smem(D, w, bk) <= _smem_optin()
+                                for w, bk in _fwd_tc_shapes(D))
 
 
 def _expect_bwd_tc(N, D, masked):
-    return (D == 64 and N % 16 == 0
-            and _tc_smem_bytes(masked) <= _smem_optin())
+    return (D in TC_DIMS and N % 16 == 0
+            and any(_bwd_tc_smem(D, w, bk, masked) <= _smem_optin()
+                    for w, bk in _bwd_tc_shapes(D)))
+
+
+def _tc_fits(masked=True, D=64):
+    return _expect_bwd_tc(16, D, masked)
 
 
 def _ref_gather_masked(Q, R, S, Vq1, Vr1, Vs1, mask):
@@ -291,7 +310,9 @@ def _run_masked(B, H, N, D, mask, scale=1.0, seed=0):
 MASK_CONFIGS = [(1, 1, 32, 64, 1.0), (2, 2, 32, 64, 1.0),
                 (1, 2, 64, 64, 1.0), (2, 2, 64, 64, 1.0),
                 (1, 2, 96, 64, 1.0), (1, 2, 128, 64, 1.0),
-                (1, 2, 64, 64, 2.0)]
+                (1, 2, 64, 64, 2.0),
+                (1, 2, 32, 128, 1.0), (1, 2, 96, 128, 1.0),
+                (1, 2, 128, 128, 1.0), (1, 2, 64, 128, 2.0)]
 
 
 @pytest.mark.parametrize("kind", MASK_KINDS)
@@ -321,14 +342,15 @@ def test_tc_masked_backward_matches_reference(kind, B, H, N, D, scale):
 
 @pytest.mark.parametrize("kind", ["causal", "prefix_lm_pad"])
 @pytest.mark.parametrize("N", [192, 256])
-def test_masked_tc_matches_scalar_path_large_n(kind, N):
+@pytest.mark.parametrize("D", TC_DIMS)
+def test_masked_tc_matches_scalar_path_large_n(kind, N, D):
     """Beyond N=128 the fp32 cube reference is too large to differentiate, so
     check TC against the scalar path (itself validated against the reference at
     smaller N). Tolerances are looser than an exact match because TC rounds the
     softmax weights to bf16 for its output GEMMs."""
-    if not _tc_fits(masked=True):
-        pytest.skip(f"device opt-in smem too small for masked TC at N={N}")
-    B, H, D = 1, 1, 64
+    if not _tc_fits(masked=True, D=D):
+        pytest.skip(f"device opt-in smem too small for masked TC at N={N} D={D}")
+    B, H = 1, 1
     torch.manual_seed(4242 + N)
     mask = _make_mask(kind, B, N, "cuda")
     tc, sc, _ = _run_masked(B, H, N, D, mask, seed=7 + N)
@@ -343,13 +365,14 @@ def test_masked_tc_matches_scalar_path_large_n(kind, N):
 
 
 @pytest.mark.parametrize("N", [32, 64, 128, 256])
-def test_masked_tc_path_actually_engages(N):
+@pytest.mark.parametrize("D", TC_DIMS)
+def test_masked_tc_path_actually_engages(N, D):
     """Guard against the masked gate silently falling back: the TC and scalar
     paths differ numerically (bf16 GEMM operands vs fp32 scalar), so bitwise
     equality means the gate did not fire."""
-    if not _tc_fits(masked=True):
-        pytest.skip(f"device opt-in smem too small for masked TC at N={N}")
-    B, H, D = 1, 2, 64
+    if not _tc_fits(masked=True, D=D):
+        pytest.skip(f"device opt-in smem too small for masked TC at N={N} D={D}")
+    B, H = 1, 2
     mask = _make_mask("causal", B, N, "cuda")
     tc, sc, _ = _run_masked(B, H, N, D, mask, seed=5)
     assert not all(torch.equal(tc[i], sc[i]) for i in range(3)), (
@@ -365,8 +388,9 @@ TC_VARIANTS = [(16, None), (96, None), (128, None), (256, None),
 
 
 @pytest.mark.parametrize("N,kind", TC_VARIANTS)
-def test_tc_variants_finite(N, kind):
-    B, H, D = 1, 1, 64
+@pytest.mark.parametrize("D", TC_DIMS)
+def test_tc_variants_finite(N, kind, D):
+    B, H = 1, 1
     dev = "cuda"
     torch.manual_seed(7 + N)
     mask = _make_mask(kind, B, N, dev) if kind else None
@@ -417,14 +441,16 @@ def _dispatch_run(B, H, N, D, mask, tc=True, valid=None, seed=0):
     return bf, out, grads, (after[0] - before[0], after[1] - before[1])
 
 
-# D: only 64 is TC. N: 128/256 reach the unmasked forward variant, everything
-# else the masked one (n_rows % TC_BJ). 384/512 pin that both kernels stream.
+# D: 64 and 128 are TC. N: 128/256 reach the unmasked forward variant,
+# everything else the masked one (n_rows % BJ). 384/512 pin that both kernels
+# stream.
 DISPATCH_CELLS = [(N, D, kind)
                   for N in [16, 32, 96, 128, 160, 256]
-                  for D in [16, 32, 64]
+                  for D in [16, 32, 64, 128]
                   for kind in (None, "causal")]
 DISPATCH_CELLS += [(272, 64, None), (272, 64, "causal"),
-                   (384, 64, None), (512, 64, None), (512, 64, "causal")]
+                   (384, 64, None), (512, 64, None), (512, 64, "causal"),
+                   (272, 128, "causal"), (384, 128, None), (512, 128, "causal")]
 
 
 @pytest.mark.parametrize("N,D,kind", DISPATCH_CELLS)
@@ -443,10 +469,11 @@ def test_dispatch_selects_expected_path(N, D, kind):
 @pytest.mark.parametrize("reference", ["scalar", "torch"])
 @pytest.mark.parametrize("kind", [None] + MASK_KINDS)
 @pytest.mark.parametrize("N", [32, 96, 128, 256, 384, 512])
-def test_forward_tc_matches_reference(N, kind, reference):
+@pytest.mark.parametrize("D", TC_DIMS)
+def test_forward_tc_matches_reference(N, kind, reference, D):
     """TC-vs-scalar isolates the tensor-core kernel; TC-vs-torch is the actual
     oracle, and catches a wrong assumption both kernels happen to share."""
-    B, H, D = 1, 2, 64
+    B, H = 1, 2
     if not _expect_fwd_tc(N, D):
         pytest.skip(f"device opt-in smem too small for forward TC at N={N}")
     if reference == "torch" and N > 128:
@@ -478,10 +505,11 @@ def test_forward_tc_matches_reference(N, kind, reference):
 
 
 @pytest.mark.parametrize("N,valid", [(32, 19), (128, 100), (256, 200)])
-def test_partial_valid_matches_scalar(N, valid):
+@pytest.mark.parametrize("D", TC_DIMS)
+def test_partial_valid_matches_scalar(N, valid, D):
     """I/J/K_valid < N drives the masked TC variant with no mask tensor — the
     shape _autograd emits for a padded sequence."""
-    B, H, D = 1, 2, 64
+    B, H = 1, 2
     if not _expect_fwd_tc(N, D):
         pytest.skip(f"device opt-in smem too small for forward TC at N={N}")
     _, out, grads, (fwd, _) = _dispatch_run(B, H, N, D, None, valid=valid, seed=valid)
@@ -505,12 +533,13 @@ def test_partial_valid_matches_scalar(N, valid):
 # sequence lengths reach the kernels at N values no fixed sweep generates.
 @pytest.mark.parametrize("N", [16, 19, 32, 48, 100, 129])
 @pytest.mark.parametrize("kind", [None, "causal"])
-def test_autograd_padded_n_engages_tc(N, kind):
+@pytest.mark.parametrize("d_head", TC_DIMS)
+def test_autograd_padded_n_engages_tc(N, kind, d_head):
     torch.manual_seed(N)
-    B, d_model, H = 2, 128, 2          # d_head = 64, the one TC shape
-    mod = HypergraphAttention(d_model=d_model, n_heads=H, dropout_rate=0.0,
+    B, H = 2, 2
+    mod = HypergraphAttention(d_model=H * d_head, n_heads=H, dropout_rate=0.0,
                               scatter=False).to("cuda", torch.float32)
-    x = torch.randn(B, N, d_model, device="cuda")
+    x = torch.randn(B, N, H * d_head, device="cuda")
     mask = _make_mask(kind, B, N, "cuda") if kind else None
 
     before = ck.tc_launches()
@@ -521,17 +550,18 @@ def test_autograd_padded_n_engages_tc(N, kind):
 
     padded = -(-N // 16) * 16
     assert torch.isfinite(y).all()
-    assert fwd == (3 if _expect_fwd_tc(padded, 64) else 0), (
+    assert fwd == (3 if _expect_fwd_tc(padded, d_head) else 0), (
         f"forward: {fwd} TC launches at N={N} (padded {padded}) mask={kind}")
-    assert bwd == (3 if _expect_bwd_tc(padded, 64, kind is not None) else 0), (
+    assert bwd == (3 if _expect_bwd_tc(padded, d_head, kind is not None) else 0), (
         f"backward: {bwd} TC launches at N={N} (padded {padded}) mask={kind}")
 
 
 @pytest.mark.parametrize("N", [32, 64])
-def test_all_true_mask_matches_unmasked(N):
+@pytest.mark.parametrize("D", TC_DIMS)
+def test_all_true_mask_matches_unmasked(N, D):
     """An all-true mask must reproduce the unmasked kernel exactly: same
     softmax support, same arithmetic, only the gate selects differ."""
-    B, H, D = 1, 2, 64
+    B, H = 1, 2
     dev = "cuda"
     torch.manual_seed(11)
     names = ["Q", "R", "S", "Vq_1", "Vq_2", "Vr_1", "Vr_2", "Vs_1", "Vs_2"]
