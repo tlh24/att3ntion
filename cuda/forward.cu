@@ -2,8 +2,8 @@
  * @file forward.cu
  * @brief Forward pass CUDA kernels for hypergraph attention.
  *
- * Implements gather and scatter attention patterns using online softmax
- * (FlashAttention-style) for memory efficiency. Supports FP32 and BF16.
+ * Gather and scatter attention with online softmax (FlashAttention-style) on
+ * bf16 inputs, plus the single query-gather entry points.
  *
  * Copyright (c) 2026 Springtail AI. MIT License.
  */
@@ -26,8 +26,8 @@ constexpr int N_I_GATHER = 4;       // anchor vectors per block in the split gat
 constexpr int GATHER_SMEM_PAD = 4;  // bf16 tile-row padding against bank conflicts
 constexpr int SCAT_SMEM_PAD = 4;
 constexpr int SCAT_ATTN_PAD = 2;
-constexpr int MIN_SPLIT_CHUNKS = 4;  // Only split loops across blocks when >= this many chunks
-constexpr int MAX_SPLIT_CHUNKS = 16; // Cap split workspace growth and reducer scratch.
+constexpr int MIN_SPLIT_CHUNKS = 4;  // split loops across blocks only at >= this many chunks
+constexpr int MAX_SPLIT_CHUNKS = 16; // caps split workspace and reducer scratch
 
 // Both members of a pair must be visible from mask row `row`.
 __device__ __forceinline__ bool mask_pair_allowed(
@@ -48,8 +48,7 @@ __device__ __forceinline__ bool mask_pair_allowed(
 // =============================================================================
 // Tensor-core gather (Y_q/Y_r/Y_s, D=64/128, any n_cols)
 // =============================================================================
-// FlashAttention-style reformulation (cuda_docs/gather_readme.md). The trilinear
-// score is symmetric in Q/R/S, so Y_q/Y_r/Y_s are this one kernel with the three
+// FlashAttention-style reformulation. The trilinear score is symmetric in Q/R/S, so Y_q/Y_r/Y_s are this one kernel with the three
 // modes bound to different roles (see the role table at launch_tc): `anchor` is
 // the output mode, one CTA per (b, h, anchor index); `rows` is the GEMM-1 M side
 // and supplies V_rows; `cols` stays resident in shared memory and supplies
@@ -64,9 +63,9 @@ __device__ __forceinline__ bool mask_pair_allowed(
 //   Y[i,d]  = sum_j exp(m_j - M) * V_rows[j,d] * U[j,d] / L,  L = sum_j exp(m_j-M) l_j
 //
 // The joint (j,k) softmax is recovered exactly by the log-sum-exp reweighting of
-// rows in the epilogue, so split-row partials and the reducer pass disappear: the
-// kernel writes Y (bf16) and the anchor-side m / l stats directly, with semantics
-// identical to reduce_gather_partials (backward consumes them unchanged).
+// rows in the epilogue, so there are no split partials or reducer: the kernel
+// writes Y (bf16) and the anchor-side m / l directly, with the same semantics as
+// reduce_gather_partials (backward consumes them unchanged).
 //
 // cols and V_cols stream through a double-buffered BK-column stage (tile k+1
 // issued with cp.async under the mma pipe), so smem is O(BJ + BK) and any
@@ -77,19 +76,17 @@ __device__ __forceinline__ bool mask_pair_allowed(
 // never round-trips through shared memory.
 
 // Tile shape: WARPS x 16 rows per block iteration, BK cols per inner iteration.
-// D=64 runs 8x64 (76 KB). D=128 doubles every per-thread accumulator and runs
-// 4x32 (74 KB): 3 CTAs/SM on an H100 where 8x64 (142 KB) gets 1, measured
-// faster there, and it also fits the 99 KB of sm_86/89.
+// D=64 defaults to 8x64 (76 KB smem). D=128 doubles every per-thread
+// accumulator and defaults to 4x32 (72 KB): 3 CTAs/SM on H100, where 8x64
+// (142 KB) fits 1, and within the 99 KB opt-in of sm_86/89.
 constexpr int TC_WARPS = 8;
 constexpr int TC_BK = 64;
 // A GEMM-1 accumulator this negative marks a masked cell (valid |scores| are
 // bounded far below this; NEG_INF itself is -1e30).
 constexpr float TC_MASKED_THRESH = -5e29f;
 
-// single_tile=true drops the second column buffer: the caller promises every
-// query visits at most one BK-wide column tile (win <= bk), so there is no
-// next tile to prefetch and the double buffer this kernel otherwise carries
-// for the cp.async pipeline is unused space.
+// single_tile drops the second col buffer: with at most one BK-wide col tile
+// per query (win <= bk) there is nothing to prefetch.
 constexpr size_t tc_smem_bytes(int D, int warps, int bk, bool single_tile = false) {
     const int bj = warps * 16, dpad = D + 8;
     const int cb = single_tile ? 1 : 2;  // column buffer count
@@ -97,25 +94,17 @@ constexpr size_t tc_smem_bytes(int D, int warps, int bk, bool single_tile = fals
            sizeof(float) * ((size_t)cb * bk + bj + warps * D + warps * 2 + D + 2 + D);
 }
 
-// mma_bf16_m16n8k16 / pack_bf162 / ldmatrix_x4 / ldmatrix_x4_trans /
-// cp_async16 live in common.cuh (shared with the tensor-core backward).
-
-// MASKED=false is the fast path for the common case (no attention mask, no
-// row/col padding): score masking, col_mul/row_mul reads, and the masked-exp
-// selects drop out of the hot loop entirely.
-// The two default shapes are held to the residency the measured defaults rely
-// on: 8 warps at D=64 to 128 registers (2 CTAs/SM), 4 warps at D=128 to 170
-// (3 CTAs/SM). nvcc drifted to 132 / 194 once the loop bounds became runtime
-// values, halving residency and costing 14-36% at N=256. Other shapes are
-// left to the compiler.
-// SINGLE_TILE (see docs/KERNEL_HISTORY.md): the caller
-// guarantees win > 0, win <= BK (one column tile) and win <= WARPS*16 (one row
-// tile), so both the column double-buffer/prefetch and the row-tile running
-// (M, L, N) merge are provably dead work here. It changes neither the
-// contraction nor the set of attended pairs -- only which already-degenerate
-// bookkeeping is compiled out. Reserved for the narrow (warps=2) instantiations
-// dispatched from single_gather_forward_cuda; the general shapes keep SINGLE_TILE
-// = false unchanged.
+// MASKED=false is the fast path (no mask, no row/col padding): score masking,
+// the col_mul/row_mul reads and the masked-exp selects drop out of the loop.
+// The launch bounds hold the two default shapes to their residency: 8 warps at
+// D=64 to 2 CTAs/SM (128 regs), 4 warps at D=128 to 3 CTAs/SM (170 regs).
+// Without them nvcc exceeds those caps because the loop bounds are runtime
+// values. Other shapes are left to the compiler.
+// SINGLE_TILE: the caller guarantees 0 < win <= BK and win <= WARPS*16, so each
+// query has one col tile and one row tile; the col prefetch and the running
+// (M, L, N) merge across row tiles are compiled out. The contraction and the
+// attended pairs are unchanged. Only the narrow shapes (warps=2, BK 16/32)
+// instantiate it.
 template<int D_CONST, bool MASKED, int WARPS, int BK, bool SINGLE_TILE = false>
 __global__ __launch_bounds__(WARPS * 32, (WARPS == 8 && D_CONST == 64) ? 2 : (WARPS == 4 && D_CONST == 128) ? 3 : 1)
 void Y_gather_tc(
@@ -124,7 +113,7 @@ void Y_gather_tc(
     const bf16* __restrict__ X_cols,
     const bf16* __restrict__ V_rows,
     const bf16* __restrict__ V_cols,
-    bf16*  __restrict__ Y,          // [B,H,n_anchor,D] final output (no reducer pass)
+    bf16*  __restrict__ Y,          // [B,H,n_anchor,D]
     float* __restrict__ m_out,      // [B,H,n_anchor]
     float* __restrict__ l_out,      // [B,H,n_anchor]
     const bool* __restrict__ mask,  // [B,N,N] or null
@@ -135,7 +124,7 @@ void Y_gather_tc(
     static_assert(D_CONST == 64 || D_CONST == 128, "Y_gather_tc supports D=64/128");
     static_assert(WARPS * 32 * 2 >= D_CONST, "the (M, L, N) fold holds two channels per thread");
     constexpr int D = D_CONST;
-    constexpr int DPAD = D + 8;     // bf16 row stride: 144 B, conflict-free for frags
+    constexpr int DPAD = D + 8;     // +16 B per row keeps ldmatrix conflict-free
     constexpr int BJ = WARPS * 16;  // rows per block iteration, one m16 tile per warp
     constexpr int KS = D / 16;      // GEMM-1 k-steps (D contracted)
     constexpr int NT = D / 8;       // GEMM-2 n-tiles (D output)
@@ -274,9 +263,8 @@ void Y_gather_tc(
 
         int cur = 0;
         for (int k0 = k_lo; k0 < k_hi; k0 += BK) {
-            // Prefetch k0+1 into the idle buffer; the closing barrier publishes it
-            // and frees `cur` for reuse. SINGLE_TILE's caller-guaranteed single
-            // trip never reuses the buffer, so there is nothing to prefetch.
+            // Prefetch the next col tile into the idle buffer; the closing
+            // barrier publishes it and frees `cur`. SINGLE_TILE makes one trip.
             int nxt = cur;
             if constexpr (!SINGLE_TILE) {
                 nxt = cur ^ 1;
@@ -336,7 +324,7 @@ void Y_gather_tc(
             m0 = mn0; m1 = mn1;
 
             // exp + repack: two adjacent GEMM-1 C tiles form one GEMM-2 A
-            // fragment (identical thread layouts) — no shuffles, no smem.
+            // fragment (identical thread layouts), so no shuffles or smem.
             uint32_t pfr[BK / 16][4];
             #pragma unroll
             for (int s2 = 0; s2 < BK / 16; s2++) {
@@ -362,7 +350,7 @@ void Y_gather_tc(
                 }
             }
 
-            // GEMM 2: U += P @ V2 (V2 row-major, B fragments via ldmatrix.trans).
+            // GEMM 2: U += P @ V_cols (row-major, B fragments via ldmatrix.trans).
             #pragma unroll
             for (int s2 = 0; s2 < BK / 16; s2++) {
                 const bf16* bp = v_cols_cur + (s2 * 16 + lrow) * DPAD + lcol8;
@@ -382,7 +370,7 @@ void Y_gather_tc(
             }
         }
 
-        // ---- epilogue: V1-weighted row collapse of this warp's 16 rows ----
+        // ---- epilogue: V_rows-weighted collapse of this warp's 16 rows ----
         #pragma unroll
         for (int off = 1; off <= 2; off <<= 1) {
             l0 += __shfl_xor_sync(0xFFFFFFFF, l0, off);
@@ -433,14 +421,10 @@ void Y_gather_tc(
         __syncthreads();
 
         // ---- fold the warp results into the CTA running (M, L, N) ----
-        // SINGLE_TILE's caller-guaranteed single row tile means this is always
-        // the first and only fold: the prior running state is the identity
-        // element (Mold = -inf, Lold = 0), so its rescale (aR = exp(Mold -
-        // Mnew) = 0) is dead arithmetic and redN/redML need not be read here.
-        // The general (multi-tile) case still must seed Mnew from the running
-        // Mold=redML[0]: it can exceed every wML this iteration, and dropping
-        // it here would both understate the new max and make the redN/redML
-        // rescale below (aR = exp(Mold-Mnew)) exceed 1, corrupting the carry.
+        // Mnew must include the running max redML[0]: it can exceed every wML,
+        // and leaving it out would make the carry rescale exp(Mold - Mnew)
+        // exceed 1. SINGLE_TILE folds once, onto the identity (M = -inf, L = 0),
+        // so the carry is skipped.
         constexpr int NTHR = WARPS * 32;  // two channels/thread when D=128, WARPS=2
         float Mnew = NEG_INF;
         if constexpr (!SINGLE_TILE) Mnew = redML[0];
@@ -478,7 +462,7 @@ void Y_gather_tc(
     }
     __syncthreads();
 
-    // ---- final normalize + direct output (reducer semantics) ----
+    // ---- normalize and write Y, m, l ----
     const float Lfin = redML[1];
     const float inv = (Lfin > 1e-20f) ? (1.0f / Lfin) : 0.0f;
     const int64_t ybase = bh * n_anchor + i;
@@ -518,10 +502,9 @@ static bool launch_Y_gather_tc(
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_tc));
         attr_device = attribute_current_device;
     }
-    // SINGLE_TILE (hopper_plan.md Phase 1) is only compiled for the narrow
-    // shapes single_gather_forward_cuda dispatches when win <= 32; the general
-    // shapes are unaffected. win <= BK and win <= WARPS*16 together are exactly
-    // sg_row_bounds/sg_col_bounds' single-tile condition for the anchor side.
+    // SINGLE_TILE exists only for the narrow shapes. win <= BK and
+    // win <= WARPS*16 is exactly the anchor-side single-tile condition of
+    // sg_row_bounds/sg_col_bounds.
     constexpr bool NARROW_SHAPE = (WARPS == 2) && (BK == 16 || BK == 32);
     constexpr size_t smem_st = NARROW_SHAPE ? tc_smem_bytes(D, WARPS, BK, true) : smem_tc;
     if constexpr (NARROW_SHAPE) {
@@ -649,8 +632,7 @@ void Y_gather(
     __syncthreads();
 
     for (int j0 = row_start; j0 < row_end; j0 += TILE_J) {
-        // R / V1 depend only on j0, so load them once per j-tile rather than
-        // re-fetching on every k0 iteration (the inner loop only varies k).
+        // rows / V_rows depend only on j0: load once per row tile.
         for (int idx = tid; idx < TILE_J * D_CONST; idx += block_size) {
             int jt = idx / D_CONST;
             int d = idx % D_CONST;
@@ -1113,9 +1095,6 @@ void Y_scatter(
                 for (int i0 = 0; i0 < 4; i0++) {
                     #pragma unroll
                     for (int i1 = 0; i1 < 4; i1++) {
-                        // Hoist q*r outside the i2 loop: each (i0,i1) is reused
-                        // across all 4 values of i2, so the two q*r FMULs need
-                        // happen only once per (i0,i1,db) instead of per i2.
                         const float qrx = qa[i0].x * ra[i1].x;
                         const float qry = qa[i0].y * ra[i1].y;
                         #pragma unroll
@@ -1163,8 +1142,9 @@ void Y_scatter(
 
             // --- Apply Softmax Scaling ---
             if (da == 0) {
-                // Fuse exp(logit-m_rt)*l_rt * exp(logit-m_ct)*l_ct into a single
-                // exp(2*logit - m_rt - m_ct) * l_rt * l_ct: halves MUFU expf traffic.
+                // exp(logit-m_rt)*l_rt * exp(logit-m_ct)*l_ct as one
+                // exp(2*logit - m_rt - m_ct) * l_rt * l_ct: one special-function
+                // unit (MUFU) exp per cell instead of two.
                 const float two_scale = 2.0f * scale;
                 #pragma unroll
                 for (int i0 = 0; i0 < 4; i0++) {
@@ -1203,9 +1183,8 @@ void Y_scatter(
             __syncthreads();
 
             // --- Accumulate Output (factored outer product: f = u^T (A v)) ---
-            // dy depends only on (tid % load_pairs); since tpb=256 is a multiple
-            // of load_pairs=32, dy is identical across both n=0 and n=1 iters —
-            // so v_row_d/v_col_d can be loaded once and reused.
+            // dy depends only on tid % load_pairs and 256 is a multiple of
+            // load_pairs, so dy is the same for every n: load v_row_d/v_col_d once.
             const int dy_h = (tid % load_pairs) * 2;
             float2 v_row_d[TILE_J];
             float2 v_col_d[TILE_K];
@@ -1224,10 +1203,8 @@ void Y_scatter(
                 if (tid_n < TILE_I * load_pairs) {
                     int iy = tid_n / load_pairs;
 
-                    // Pair-process 2 jy values per outer iter: 4 parallel inner
-                    // FMA chains (vs 2 with single jy), keeping the FFMA pipe
-                    // saturated through dependency latency. No extra reduction
-                    // adds — each `fx +=` is one FMA, two of them per outer iter.
+                    // Two jy per iteration: four independent FMA chains hide
+                    // the FMA dependency latency.
                     float fx = 0.0f, fy = 0.0f;
                     #pragma unroll
                     for (int jy = 0; jy < TILE_J; jy += 2) {
@@ -1319,16 +1296,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     }
     const bool* mask_ptr = use_mask ? mask.data_ptr<bool>() : nullptr;
 
-    // Default I_valid/J_valid/K_valid to the padded sizes (no masking) when
-    // callers don't supply them. This preserves the legacy behavior where the
-    // softmax denominator includes padded slots.
+    // Unset *_valid default to the padded sizes: padded slots stay in the softmax.
     if (I_valid <= 0 || I_valid > I) I_valid = I;
     if (J_valid <= 0 || J_valid > J) J_valid = J;
     if (K_valid <= 0 || K_valid > K) K_valid = K;
 
     const float scale = 1.0f / sqrtf((float)D); 
 
-    // allocate outputs on GPU
     auto opts = Q.options();
     auto opts_fp32 = Q.options().dtype(at::kFloat);
     auto Y_q  = torch::zeros({B,H,I,D}, opts);
@@ -1338,8 +1312,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     auto Y_r_ = torch::zeros({B,H,J,D}, opts);
     auto Y_s_ = torch::zeros({B,H,K,D}, opts);
     
-    // Allocate softmax stats tensors - gather kernels will populate these
-    // Stats are computed during gather and reused by scatter kernels + backward pass
+    // Softmax stats: written by the gathers, read by the scatters and backward.
     auto m_i = torch::zeros({B,H,I}, opts_fp32);
     auto l_i = torch::zeros({B,H,I}, opts_fp32);
     auto m_j = torch::zeros({B,H,J}, opts_fp32);
@@ -1350,13 +1323,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     const int TpB = 128;
     dim3 block(TpB);
 
-    // Create 3 streams for parallel kernel execution
+    // One stream per role so the three gathers (then scatters) run concurrently.
     cudaStream_t streams[3];
     for (int i = 0; i < 3; i++) {
         AT_CUDA_CHECK(cudaStreamCreate(&streams[i]));
     }
     
-    // Create events for synchronization barrier between gather and scatter
+    // Every scatter reads all three gathers' stats.
     cudaEvent_t gather_done[3];
     for (int i = 0; i < 3; i++) {
         AT_CUDA_CHECK(cudaEventCreate(&gather_done[i]));
@@ -1417,7 +1390,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     TORCH_CHECK(num_i_chunks_s <= MAX_SPLIT_CHUNKS, "num_i_chunks_s exceeds MAX_SPLIT_CHUNKS");
 
     // Allocate scatter partial buffers
-    // Layout: [B*H*N_out*num_chunks*D] — simple additive reduce, no softmax stats
+    // Layout: [B*H*N_out*num_chunks*D]; additive reduce, no softmax stats
     at::Tensor Yq_scat_part, Yr_scat_part, Ys_scat_part;
 
     Yq_scat_part = torch::empty({B * H * I * scat_j_chunks_q * D_TMPL}, opts_fp32);
@@ -1429,21 +1402,20 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     constexpr int SCAT_ATTN_K_STRIDE = TILE_K + SCAT_ATTN_PAD;
     const size_t scatter_smem_size =
         sizeof(bf16) * (
-            TILE_I * SCAT_DP +             // q_tile (anchor)
-            TILE_J * SCAT_DP +             // r_tile
-            TILE_K * SCAT_DP +             // s_tile
-            TILE_J * SCAT_DP +             // v1_tile
-            TILE_K * SCAT_DP               // v2_tile
+            TILE_I * SCAT_DP +             // anchor_tile
+            TILE_J * SCAT_DP +             // row_tile
+            TILE_K * SCAT_DP +             // col_tile
+            TILE_J * SCAT_DP +             // v_row_tile
+            TILE_K * SCAT_DP               // v_col_tile
         ) +
         sizeof(float) * (
             TILE_I * TILE_J * SCAT_ATTN_K_STRIDE + // attn_tile
-            TILE_J + TILE_J +              // mj_tile, lj_tile
-            TILE_K + TILE_K                // mk_tile, lk_tile
+            TILE_J + TILE_J +              // m_row_tile, l_row_inv
+            TILE_K + TILE_K                // m_col_tile, l_col_inv
         );
 
-    // Tensor-core fast path for D=64/128, any n_cols (cuda_docs/gather_readme.md):
-    // the fused FlashAttention-style kernel writes Y/m/l directly, no reducer.
-    // All three gathers use it with permuted roles. Disable with ATT3_YQ_TC=0.
+    // Tensor-core path for D=64/128: all three gathers with permuted roles,
+    // writing Y/m/l directly. Disabled by ATT3_YQ_TC=0 or tc_set_enabled.
     bool yq_tc_done = false, yr_tc_done = false, ys_tc_done = false;
     if (D_TMPL >= 64) {
         // sm_80+ only: below that the kernel body compiles to a no-op (bf16
@@ -1486,7 +1458,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
         m_k.fill_(1e30f); l_k.fill_(1.0f);
     }
 
-    // Legacy split gather + exact reducer, for streams the TC path didn't take.
+    // Split gather + exact reducer for the roles the TC path did not take.
     // Role table matches launch_tc: anchor / rows (split dim) / cols (looped dim).
     auto launch_gather = [&](const at::Tensor& anchor, const at::Tensor& rows,
                              const at::Tensor& cols, const at::Tensor& V_rows,
@@ -1501,8 +1473,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
         constexpr int DP = D_TMPL + GATHER_SMEM_PAD;
         const size_t smem_size =
             sizeof(bf16) * (
-                N_I_GATHER * D_TMPL +               // q_vecs
-                2 * TILE_J * DP + 2 * TILE_K * DP   // r/s/v1/v2 tiles (padded)
+                N_I_GATHER * D_TMPL +               // anchor_vecs
+                2 * TILE_J * DP + 2 * TILE_K * DP   // row/col/v_row/v_col tiles
             ) +
             sizeof(float) * (
                 N_I_GATHER * TILE_J * TILE_K +      // p_tiles
@@ -1565,8 +1537,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     // SCATTER kernels (split outer loops for occupancy, additive reduce).
     // When all V2 operands are zero (scatter unused) the scatter outputs are
     // identically zero; Y_q_/Y_r_/Y_s_ are zero-initialized, so the kernels
-    // can be skipped outright. Single host round-trip, mirrors the backward's
-    // scatter gate.
+    // can be skipped. One host sync; the backward gates its scatter the same way.
     const bool scatter_used =
         (Vq_2.ne(0).any() | Vr_2.ne(0).any() | Vs_2.ne(0).any()).item<bool>();
     if (scatter_used) {
@@ -1616,18 +1587,16 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
 
     }); // end FWD_DISPATCH_D
 
-    // Synchronize all streams before returning to Python
+    // The outputs were written on private streams.
     for (int i = 0; i < 3; i++) {
         AT_CUDA_CHECK(cudaStreamSynchronize(streams[i]));
     }
     
-    // Cleanup
     for (int i = 0; i < 3; i++) {
         AT_CUDA_CHECK(cudaEventDestroy(gather_done[i]));
         AT_CUDA_CHECK(cudaStreamDestroy(streams[i]));
     }
 
-    // Return outputs + softmax stats (for reuse in backward pass)
     return std::make_tuple(Y_q, Y_r, Y_s, Y_q_, Y_r_, Y_s_,
                            m_i, l_i, m_j, l_j, m_k, l_k);
 }
@@ -1713,11 +1682,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> single_gather_forward_cuda(
     auto l = torch::empty({B, H, N}, Q.options().dtype(at::kFloat));
 
     const int optin = sg_smem_optin(Q);
-    // Tile shape: the sg_set_config() override when set, else the measured
-    // defaults for wide/dense attention (8x64 at D=64, 4x32 at D=128).
-    // Narrow windows use 32 rows and at most 32 columns to avoid empty tiles.
-    // Every 2/4/8-warp x 16/32/64-col
-    // combination is instantiated so the benchmark can sweep them.
+    // Tile shape: the sg_set_config override, else 8x64 at D=64 and 4x32 at
+    // D=128; windows <= 32 use 2 warps (32 rows) and bk 16/32 so tiles are not
+    // mostly empty. Every 2/4/8-warp x 16/32/64-col shape is instantiated so
+    // sg_set_config can pick any of them.
     auto& st = att3_tc::state();
     const bool narrow = win > 0 && win <= 32;
     const int warps = st.sg_cfg.fwd_warps ? st.sg_cfg.fwd_warps : (narrow ? 2 : (D == 64 ? TC_WARPS : 4));
@@ -1750,9 +1718,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> single_gather_forward_cuda(
     return std::make_tuple(Y, m, l);
 }
 
-// Experimental shared-KV forward: the four KV tensors are [B,1,N,128] and are
-// read in place (no replication) through the kernel's KV-head offset. Bounded
-// to the quick prototype's contract: D=128, Hkv=1, window=32 with its mask.
+// Shared-KV forward: the four KV tensors [B,1,N,128] are read in place through
+// the kernel's KV-head offset (Hkv = 1).
 std::tuple<at::Tensor, at::Tensor, at::Tensor> single_gather_shared_forward_cuda(
     at::Tensor Q, at::Tensor R, at::Tensor S, at::Tensor Vr, at::Tensor Vs,
     at::Tensor mask, int64_t window, int64_t fwd_group)
@@ -1774,13 +1741,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> single_gather_shared_forward_cuda
         ok = launch_Y_gather_shared_auto(Q,R,S,Vr,Vs,Y,m,l,mask_ptr,B,H,N,scale,optin,stream,int(window),implementation);
     }
     if (!ok && actual_group == 1) {
-        // BK 32 would cover w32 in one SINGLE_TILE tile instead of two
-        // double-buffered BK16 tiles, but measured H100 paired benchmarks
-        // (N128/256/512) showed that single wide tile is slower: the BK16
-        // double buffer overlaps tile 2's cp.async load with tile 1's
-        // tensor-core compute, and losing that overlap costs more than the
-        // extra tile visit saves. Native reads with the window tile shape
-        // the experiment-2 final dispatch uses.
+        // BK16 rather than one SINGLE_TILE BK32 tile at w32: the double
+        // buffer overlaps the second tile's cp.async with the first's MMAs.
         ok = launch_Y_gather_tc<128, 2, 16>(Q, R, S, Vr, Vs, Y, m, l, mask_ptr,
                  B, H, N, N, N, N, N, scale, optin, stream, (int)window, 1);
     } else if (!ok) {

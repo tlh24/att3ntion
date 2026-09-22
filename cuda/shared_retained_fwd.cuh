@@ -1,11 +1,8 @@
 #pragma once
-// F04 one-warp geometry at w16; F10 private probability-fragment retention,
-// short-lived value accumulators, raw windows retained across four queries,
-// and dead transformed-row storage reused by the epilogue; F07 exact row-tile
-// merging for grouped heads at w64/128. Independently derived from owned code.
-// No query/head shares transformed features, probabilities or derivatives.
-// Fixed-baseline timings and failed ablations are summarized in
-// docs/KERNEL_HISTORY.md.
+// Grouped shared-KV forward (2 heads per CTA, D=128), one schedule per window:
+// w16 one warp per head; w32 raw KV window kept in shared memory across four
+// queries; w64/w128 merge several row tiles. Scaled rows, probabilities and
+// softmax state stay private to each (query, head).
 #include <ATen/cuda/CUDAContext.h>
 #include "common.cuh"
 namespace att3_shared_fwd {
@@ -17,12 +14,6 @@ constexpr int SG_BJ = SG_WPH * 16;        // rows per head tile
 constexpr int SG_BK = 16;                 // cols per tile
 constexpr float SG_MASKED_THRESH = -5e29f;
 
-// Measured on H100 (paired before/after, N128/256/512): a single BK=32 tile
-// (matching w32 in one shot) is geometrically single-tile but *slower* than
-// two double-buffered BK=16 tiles -- the cp.async prefetch of tile 2 overlaps
-// tile 1's tensor-core compute, and that overlap outweighs visiting fewer,
-// wider tiles. So BK stays 16 and double-buffered here; only the row-tile
-// fold below (win == 32 == BJ makes it the only row tile) is simplified.
 constexpr size_t fwd_grouped_smem(int G) {
     // rowp[G] + raw rows + V rows + 2 x (cols, V cols) in bf16; col_mul, row_mul,
     // anchor[G], wN[G][WPH], wML[G][WPH], redN[G], redML[G] in fp32.
@@ -30,9 +21,7 @@ constexpr size_t fwd_grouped_smem(int G) {
          + sizeof(float) * ((size_t)2 * SG_BK + SG_BJ + (size_t)G * (SG_D + SG_WPH * SG_D + SG_WPH * 2 + SG_D + 2));
 }
 
-// =============================================================================
-// Grouped forward: block = (query i, G heads, batch b)
-// =============================================================================
+// block = (query i, G heads, batch b)
 template<int G>
 __global__ __launch_bounds__(G * SG_WPH * 32)
 void Y_gather_tc_grouped(
@@ -78,9 +67,6 @@ void Y_gather_tc_grouped(
         const int hh = t / D, d = t % D;
         anchor_sm[t] = scale * bf2f(Q[(((int64_t)b * H + h0 + hh) * N + i) * D + d]);
     }
-    // redN/redML need no prior-state init: the fold below always runs as the
-    // first (and only) row tile, so it writes them outright rather than
-    // merging into an old value.
 
     auto stage_cols = [&](int k0, int buf) {
         bf16* cs = cols_sm + buf * BK * DPAD;
@@ -131,8 +117,8 @@ void Y_gather_tc_grouped(
         asm volatile("cp.async.wait_all;\n" ::);
         __syncthreads();
 
-        // Head-scaled row tile, private per head: the same fp32 product and single
-        // bf16 rounding as the per-head kernel's staging.
+        // Head-scaled row tile: same fp32 product and single bf16 rounding as
+        // the per-head kernel.
         {
             const float* anc = anchor_sm + lh * D;
             bf16* rp_h = rowp_sm + (size_t)lh * BJ * DPAD;
@@ -278,10 +264,8 @@ void Y_gather_tc_grouped(
         if (lane == 0) { wML[(lh * WPH + warp % WPH) * 2] = Mw; wML[(lh * WPH + warp % WPH) * 2 + 1] = Lw; }
         __syncthreads();
 
-        // ---- combine the head's warps into (M, L, N): win == 32 == BJ makes
-        // this the only row tile (single_gather_shared_check enforces window
-        // == 32), so there is no prior running state to fold in -- Mold is
-        // always -inf and Lold always 0, making their rescale dead weight.
+        // ---- combine the head's warps into (M, L, N). win == BJ, so this is
+        // the only row tile and the result is written outright.
         {
             const float* wML_h = wML + lh * WPH * 2;
             const float* wN_hh = wN + lh * WPH * D;
@@ -325,12 +309,6 @@ constexpr int SG_BJ = SG_WPH * 16;        // rows per head tile
 constexpr int SG_BK = 16;                 // cols per tile
 constexpr float SG_MASKED_THRESH = -5e29f;
 
-// Measured on H100 (paired before/after, N128/256/512): a single BK=32 tile
-// (matching w32 in one shot) is geometrically single-tile but *slower* than
-// two double-buffered BK=16 tiles -- the cp.async prefetch of tile 2 overlaps
-// tile 1's tensor-core compute, and that overlap outweighs visiting fewer,
-// wider tiles. So BK stays 16 and double-buffered here; only the row-tile
-// fold below (win == 32 == BJ makes it the only row tile) is simplified.
 constexpr size_t fwd_grouped_smem(int G) {
     // rowp[G] + raw rows + V rows + 2 x (cols, V cols) in bf16; col_mul, row_mul,
     // anchor[G], wN[G][WPH], wML[G][WPH], redN[G], redML[G] in fp32.
@@ -338,9 +316,7 @@ constexpr size_t fwd_grouped_smem(int G) {
          + sizeof(float) * ((size_t)2 * SG_BK + SG_BJ + (size_t)G * (SG_D + SG_WPH * SG_D + SG_WPH * 2 + SG_D + 2));
 }
 
-// =============================================================================
-// Grouped forward: block = (query i, G heads, batch b)
-// =============================================================================
+// block = (query i, G heads, batch b)
 template<int G, int QCOUNT, bool REUSE>
 __global__ __launch_bounds__(G * SG_WPH * 32)
 void Y_gather_tc_lifetime(
@@ -375,6 +351,9 @@ void Y_gather_tc_lifetime(
     float* col_mul = reinterpret_cast<float*>(rawVs + CACHE * DPAD);
     float* row_mul = col_mul + 2 * BK;                                  // [BJ]
     float* anchor_sm = row_mul + BJ;                                    // [G][D]
+    // wN/wML reuse rowp_sm, which is dead once a_rowp is in registers.
+    // redN/redML alias wN/wML; the barrier in the combine orders the reads
+    // before the writes.
     float* wN  = reinterpret_cast<float*>(rowp_sm);                                     // [G][WPH][D]
     float* wML = wN + G * WPH * D;                                      // [G][WPH][2]
     float* redN = wN;                                    // [G][D]
@@ -413,9 +392,6 @@ void Y_gather_tc_lifetime(
         const int hh = t / D, d = t % D;
         anchor_sm[t] = scale * bf2f(Q[(((int64_t)b * H + h0 + hh) * N + i) * D + d]);
     }
-    // redN/redML need no prior-state init: the fold below always runs as the
-    // first (and only) row tile, so it writes them outright rather than
-    // merging into an old value.
 
     auto stage_cols = [&](int k0, int buf) {
         for (int kl = tid; kl < BK; kl += NTHR) {
@@ -441,8 +417,8 @@ void Y_gather_tc_lifetime(
         asm volatile("cp.async.wait_all;\n" ::);
         __syncthreads();
 
-        // Head-scaled row tile, private per head: the same fp32 product and single
-        // bf16 rounding as the per-head kernel's staging.
+        // Head-scaled row tile: same fp32 product and single bf16 rounding as
+        // the per-head kernel.
         {
             const float* anc = anchor_sm + lh * D;
             bf16* rp_h = rowp_sm + (size_t)lh * BJ * DPAD;
@@ -468,8 +444,8 @@ void Y_gather_tc_lifetime(
             ldmatrix_x4(a_rowp[ks], rowp_h + (rw + lrow) * DPAD + ks * 16 + lcol8);
         }
         float m0 = NEG_INF, m1 = NEG_INF, l0 = 0.0f, l1 = 0.0f;
-        // Raw R has no further readers. Reuse its storage for per-query
-        // probability fragments and the original online rescaling factors.
+        // At most two BK tiles (win == 32). Keep each tile's probability
+        // fragment and rescale factors in registers; PV runs in the epilogue.
         uint32_t saved_p[2][4];
         float saved_alpha[2][2];
         int cur = 0;
@@ -559,8 +535,8 @@ void Y_gather_tc_lifetime(
         for (int off = 4; off <= 16; off <<= 1) Lw += __shfl_xor_sync(0xFFFFFFFF, Lw, off);
 
         float* wN_h = wN + (lh * WPH + warp % WPH) * D;
-        // One output microtile remains live at a time. The exact sequence
-        // first-PV -> original alpha -> second-PV is unchanged for each value.
+        // One output microtile live at a time. Per value the order stays
+        // first PV, alpha rescale, second PV, as in the streaming loop.
         #pragma unroll
         for (int np=0; np<NT/2; ++np) {
             float u[2][4] = {};
@@ -601,10 +577,8 @@ void Y_gather_tc_lifetime(
         if (lane == 0) { wML[(lh * WPH + warp % WPH) * 2] = Mw; wML[(lh * WPH + warp % WPH) * 2 + 1] = Lw; }
         __syncthreads();
 
-        // ---- combine the head's warps into (M, L, N): win == 32 == BJ makes
-        // this the only row tile (single_gather_shared_check enforces window
-        // == 32), so there is no prior running state to fold in -- Mold is
-        // always -inf and Lold always 0, making their rescale dead weight.
+        // ---- combine the head's warps into (M, L, N). win == BJ, so this is
+        // the only row tile and the result is written outright.
         {
             const float* wML_h = wML + lh * WPH * 2;
             const float* wN_hh = wN + lh * WPH * D;
@@ -641,7 +615,7 @@ void Y_gather_tc_lifetime(
         if (tid_h == 0) { m_out[ybase] = redML[lh * 2]; l_out[ybase] = Lfin; }
     }
     __syncthreads();
-    } // sequential queries; the accumulator set is reused
+    }
 #endif
 }
 
@@ -660,12 +634,6 @@ constexpr int SG_BJ = SG_WPH * 16;        // rows per head tile
 constexpr int SG_BK = 16;                 // cols per tile
 constexpr float SG_MASKED_THRESH = -5e29f;
 
-// Measured on H100 (paired before/after, N128/256/512): a single BK=32 tile
-// (matching w32 in one shot) is geometrically single-tile but *slower* than
-// two double-buffered BK=16 tiles -- the cp.async prefetch of tile 2 overlaps
-// tile 1's tensor-core compute, and that overlap outweighs visiting fewer,
-// wider tiles. So BK stays 16 and double-buffered here; only the row-tile
-// fold below (win == 32 == BJ makes it the only row tile) is simplified.
 constexpr size_t fwd_grouped_smem(int G) {
     // rowp[G] + raw rows + V rows + 2 x (cols, V cols) in bf16; col_mul, row_mul,
     // anchor[G], wN[G][WPH], wML[G][WPH], redN[G], redML[G] in fp32.
@@ -673,9 +641,7 @@ constexpr size_t fwd_grouped_smem(int G) {
          + sizeof(float) * ((size_t)2 * SG_BK + SG_BJ + (size_t)G * (SG_D + SG_WPH * SG_D + SG_WPH * 2 + SG_D + 2));
 }
 
-// =============================================================================
-// Grouped forward: block = (query i, G heads, batch b)
-// =============================================================================
+// block = (query i, G heads, batch b)
 template<int G>
 __global__ __launch_bounds__(G * SG_WPH * 32)
 void Y_gather_tc_grouped(
@@ -721,9 +687,6 @@ void Y_gather_tc_grouped(
         const int hh = t / D, d = t % D;
         anchor_sm[t] = scale * bf2f(Q[(((int64_t)b * H + h0 + hh) * N + i) * D + d]);
     }
-    // redN/redML need no prior-state init: the fold below always runs as the
-    // first (and only) row tile, so it writes them outright rather than
-    // merging into an old value.
 
     auto stage_cols = [&](int k0, int buf) {
         bf16* cs = cols_sm + buf * BK * DPAD;
@@ -777,8 +740,8 @@ void Y_gather_tc_grouped(
         asm volatile("cp.async.wait_all;\n" ::);
         __syncthreads();
 
-        // Head-scaled row tile, private per head: the same fp32 product and single
-        // bf16 rounding as the per-head kernel's staging.
+        // Head-scaled row tile: same fp32 product and single bf16 rounding as
+        // the per-head kernel.
         {
             const float* anc = anchor_sm + lh * D;
             bf16* rp_h = rowp_sm + (size_t)lh * BJ * DPAD;
@@ -924,10 +887,7 @@ void Y_gather_tc_grouped(
         if (lane == 0) { wML[(lh * WPH + warp % WPH) * 2] = Mw; wML[(lh * WPH + warp % WPH) * 2 + 1] = Lw; }
         __syncthreads();
 
-        // ---- combine the head's warps into (M, L, N): win == 32 == BJ makes
-        // this the only row tile (single_gather_shared_check enforces window
-        // == 32), so there is no prior running state to fold in -- Mold is
-        // always -inf and Lold always 0, making their rescale dead weight.
+        // ---- merge the head's warps into the running (M, L, N).
         {
             const float* wML_h = wML + lh * WPH * 2;
             const float* wN_hh = wN + lh * WPH * D;

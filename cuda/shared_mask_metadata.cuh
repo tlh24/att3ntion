@@ -2,8 +2,9 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 namespace att3_mask_metadata {
-// One warp owns a query row. Metadata is shared by every head and gradient
-// direction. Saturated support is sufficient for exact empty/singleton rules.
+// One warp per query row: packs the windowed mask row into bit words and
+// counts visible keys, saturated at 2 (enough to tell empty / singleton /
+// more). Shared by every head and gradient direction.
 __global__ void prepare(const bool* mask,uint32_t* words,uint8_t* support,
     int B,int N,int win,int row_words) {
   const int lane=threadIdx.x&31;

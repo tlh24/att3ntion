@@ -1,15 +1,8 @@
 /**
  * @file single_gather_shared.cu
- * @brief Grouped shared-KV kernels for the quick prototype
- * (docs/KERNEL_HISTORY.md): one CTA serves G
- * consecutive query heads of one (batch, KV head) and loads the raw KV tiles
- * once for all of them. Everything head-dependent -- the anchor-scaled row
- * tile, the softmax state, the accumulators, the forward statistics and the
- * outputs -- stays private to the head. Forward uses two warps per head
- * and is selected only for windows <= 32. Backward G2 preserves BJ32
- * summation; G4 uses BJ16, which changes FP32 addition order. Both retain
- * raw Q/dY in shared memory for the tile's epilogue. D=128, Hkv=1.
- * See docs/KERNEL_HISTORY.md for measured results.
+ * @brief Grouped shared-KV kernels (D=128, Hkv=1): one CTA serves G consecutive
+ * query heads of one (batch, KV head) and loads each raw KV tile once for all
+ * of them. Everything head-dependent stays private to the head.
  *
  * Copyright (c) 2026 Springtail AI. MIT License.
  */
@@ -32,12 +25,8 @@ constexpr int SG_BJ = SG_WPH * 16;        // rows per head tile
 constexpr int SG_BK = 16;                 // cols per tile
 constexpr float SG_MASKED_THRESH = -5e29f;
 
-// Measured on H100 (paired before/after, N128/256/512): a single BK=32 tile
-// (matching w32 in one shot) is geometrically single-tile but *slower* than
-// two double-buffered BK=16 tiles -- the cp.async prefetch of tile 2 overlaps
-// tile 1's tensor-core compute, and that overlap outweighs visiting fewer,
-// wider tiles. So BK stays 16 and double-buffered here; only the row-tile
-// fold below (win == 32 == BJ makes it the only row tile) is simplified.
+// BK stays 16 even at w32: two double-buffered tiles let the second tile's
+// cp.async overlap the first tile's MMAs, which beats one BK=32 tile.
 constexpr size_t fwd_grouped_smem(int G) {
     // rowp[G] + raw rows + V rows + 2 x (cols, V cols) in bf16; col_mul, row_mul,
     // anchor[G], wN[G][WPH], wML[G][WPH], redN[G], redML[G] in fp32.
@@ -45,9 +34,7 @@ constexpr size_t fwd_grouped_smem(int G) {
          + sizeof(float) * ((size_t)2 * SG_BK + SG_BJ + (size_t)G * (SG_D + SG_WPH * SG_D + SG_WPH * 2 + SG_D + 2));
 }
 
-// =============================================================================
-// Grouped forward: block = (query i, G heads, batch b)
-// =============================================================================
+// Grouped forward: block = (query i, G heads, batch b).
 template<int G>
 __global__ __launch_bounds__(G * SG_WPH * 32)
 void Y_gather_tc_grouped(
@@ -93,9 +80,6 @@ void Y_gather_tc_grouped(
         const int hh = t / D, d = t % D;
         anchor_sm[t] = scale * bf2f(Q[(((int64_t)b * H + h0 + hh) * N + i) * D + d]);
     }
-    // redN/redML need no prior-state init: the fold below always runs as the
-    // first (and only) row tile, so it writes them outright rather than
-    // merging into an old value.
 
     auto stage_cols = [&](int k0, int buf) {
         bf16* cs = cols_sm + buf * BK * DPAD;
@@ -146,8 +130,8 @@ void Y_gather_tc_grouped(
         asm volatile("cp.async.wait_all;\n" ::);
         __syncthreads();
 
-        // Head-scaled row tile, private per head: the same fp32 product and single
-        // bf16 rounding as the per-head kernel's staging.
+        // Head-scaled row tile: same fp32 product and single bf16 rounding as
+        // the per-head kernel.
         {
             const float* anc = anchor_sm + lh * D;
             bf16* rp_h = rowp_sm + (size_t)lh * BJ * DPAD;
@@ -293,10 +277,9 @@ void Y_gather_tc_grouped(
         if (lane == 0) { wML[(lh * WPH + warp % WPH) * 2] = Mw; wML[(lh * WPH + warp % WPH) * 2 + 1] = Lw; }
         __syncthreads();
 
-        // ---- combine the head's warps into (M, L, N): win == 32 == BJ makes
-        // this the only row tile (single_gather_shared_check enforces window
-        // == 32), so there is no prior running state to fold in -- Mold is
-        // always -inf and Lold always 0, making their rescale dead weight.
+        // ---- combine the head's warps into (M, L, N). The grouped path runs
+        // only for win <= 32 == BJ, so this is the only row tile and the result
+        // is written outright instead of merged into a running state.
         {
             const float* wML_h = wML + lh * WPH * 2;
             const float* wN_hh = wN + lh * WPH * D;
@@ -335,12 +318,11 @@ void Y_gather_tc_grouped(
 #endif
 }
 
-// =============================================================================
-// Grouped R/S-owned backward pass: block = (KV position a, G query heads, batch b)
-// =============================================================================
+// Grouped R/S-owned backward pass: block = (KV position a, G query heads, batch b).
+// G2 keeps the per-head kernel's BJ32 summation order; G4 uses BJ16, which
+// changes it. With RAW, raw Q/dY of the current row tile stay in shared memory
+// for the row collapse.
 constexpr size_t bwd_grouped_smem(int G) {
-    // R14 (G2) keeps BJ32 summation; R11 (G4) uses BJ16. Raw Q/dY are
-    // retained only for this query-row tile, then reused in its row collapse.
     const int WPH = G == 4 ? 1 : 2, BK = G == 4 ? 16 : 32;
     const int BJ = WPH * 16, D = 128, DPAD = 136;
     return sizeof(bf16) * ((size_t)4 * G * BJ * DPAD + (size_t)4 * BK * DPAD)
@@ -621,9 +603,8 @@ void Bwd_rows_tc_grouped(
 }
 
 
-// R26: one CTA has independent R and S warps for each of two heads.
-// Only raw Q/dY staging is shared between directions. Scores, probabilities,
-// derivative contractions and row reductions remain private to each warp.
+// One CTA runs separate R and S warps for each of G/2 heads. Only the raw Q/dY
+// staging is shared between the two directions; everything else is per warp.
 template<int G, int WPH, int BK, bool RAW=false>
 __global__ __launch_bounds__(G * WPH * 32, 1)
 void Bwd_rows_tc_dual(
@@ -660,10 +641,10 @@ void Bwd_rows_tc_dual(
     bf16* a2_sm = a0_sm + (size_t)G * BJ * DPAD;                // [G][BJ][DPAD] dY_h o Va
     bf16* rawQ_sm = a2_sm + (size_t)G * BJ * DPAD;
     bf16* rawDY_sm = rawQ_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
-    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);                // [2][BK][DPAD]
-    bf16* vc_sm = xc_sm + 4 * BK * DPAD;                        // [2][BK][DPAD]
-    float* anchX = reinterpret_cast<float*>(vc_sm + 4 * BK * DPAD);   // [D]
-    float* anchV = anchX + 2 * D;                                   // [D]
+    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);                // [role][2][BK][DPAD]
+    bf16* vc_sm = xc_sm + 4 * BK * DPAD;                        // [role][2][BK][DPAD]
+    float* anchX = reinterpret_cast<float*>(vc_sm + 4 * BK * DPAD);   // [role][D]
+    float* anchV = anchX + 2 * D;                                   // [role][D]
     float* mr_sm = anchV + 2 * D;                                   // [G][BJ]
     float* ilr_sm = mr_sm + G * BJ;
     float* sr_sm = ilr_sm + G * BJ;
@@ -986,8 +967,8 @@ bool launch_bwd_rows_shared_grouped(
 {
     auto fp = [](const at::Tensor& t) { return t.data_ptr<float>(); };
     if (G == 4) {
-        // G=4 selects the optimized strategy; its CTA has 2 heads x 2
-        // directions. H%4 validation is retained for API compatibility.
+        // G=4 runs the dual kernel: 2 heads x 2 directions per CTA. The grid
+        // only needs H % 2, but the shared check still requires H % 4.
         constexpr int HEADS = 2, WARPS = 4, BK = 16;
         constexpr size_t smem = dual_smem<WARPS, BK>();
         if (smem > (size_t)max_smem_optin) return false;

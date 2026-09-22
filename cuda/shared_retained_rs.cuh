@@ -1,7 +1,11 @@
 #pragma once
-// Independently derived raw-window residency family; exact masks and separate contractions.
+// Retained-MMA R/S backward for shared KV (D=128). One CTA per anchor a: warp group
+// lh has role lh/HG (0: dXa/dVa, 1: dXc/dVc at a) for head lh%HG, with the whole key
+// window resident in shared memory. Outputs are per-head BF16 partials; the head
+// reduction is done by the caller.
 #include "common.cuh"
 namespace att3_shared_rs {
+// mask bits k..k+15 of a packed row
 __device__ __forceinline__ uint32_t load_packed_mask(const uint32_t* row,int words,int k) {
  const int word=k>>5,shift=k&31;
  const uint32_t lo=word<words?row[word]:0u;
@@ -9,6 +13,8 @@ __device__ __forceinline__ uint32_t load_packed_mask(const uint32_t* row,int wor
  return ((lo>>shift)|(shift?(hi<<(32-shift)):0u))&0xffffu;
 }
 
+// W=16. Walks BJ-row tiles of the queries j whose window holds anchor a; the Xc/Xa
+// window has CAP rows.
 template<int G, int WPH, int BK, bool RAW=false, bool SPECIAL=false>
 __device__ __forceinline__
 void Bwd_rows_w16_impl(
@@ -43,16 +49,16 @@ void Bwd_rows_w16_impl(
     extern __shared__ char smem_raw[];
     bf16* rawQ_sm = reinterpret_cast<bf16*>(smem_raw);
     bf16* rawDY_sm = rawQ_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
-    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);                // [2][BK][DPAD]
-    bf16* vc_sm = xc_sm + 2 * CAP * DPAD;                        // [2][BK][DPAD]
-    float* anchX = reinterpret_cast<float*>(vc_sm + 2 * CAP * DPAD);   // [D]
-    float* anchV = anchX + 2 * D;                                   // [D]
-    float* mr_sm = anchV + 2 * D;                                   // [G][BJ]
+    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);   // [2][CAP][DPAD]: role 0 window of Xc, role 1 of Xa
+    bf16* vc_sm = xc_sm + 2 * CAP * DPAD;   // [2][CAP][DPAD]: Vc, Va
+    float* anchX = reinterpret_cast<float*>(vc_sm + 2 * CAP * DPAD);   // [2][D]: scale*Xa[a], scale*Xc[a]
+    float* anchV = anchX + 2 * D;   // [2][D]: Va[a], Vc[a]
+    float* mr_sm = anchV + 2 * D;   // [G][BJ]
     float* ilr_sm = mr_sm + G * BJ;
     float* sr_sm = ilr_sm + G * BJ;
-    float* wOut = sr_sm + G * BJ;                               // [G][WPH][NOUT*D]
-    float* redOut = wOut + (size_t)G * WPH * NOUT * D;          // [G][NOUT*D]
-    uint32_t* msk_sm = reinterpret_cast<uint32_t*>(redOut + (size_t)G * NOUT * D);   // [2][BJ]
+    float* wOut = sr_sm + G * BJ;   // [G][WPH][NOUT*D]
+    float* redOut = wOut + (size_t)G * WPH * NOUT * D;   // [G][NOUT*D]
+    uint32_t* msk_sm = reinterpret_cast<uint32_t*>(redOut + (size_t)G * NOUT * D);   // [(k_hi-k_lo)/BK][BJ] 16-bit column masks
 
     const int64_t kv_off = (int64_t)b * N * D;
     const int64_t q_off_h = ((int64_t)b * H + h0 + head) * N * D;
@@ -111,7 +117,7 @@ void Bwd_rows_w16_impl(
             }
         }
 
-        // Per-head A operands from the head's own Q / dY rows and the shared anchor.
+        // per-row softmax stats; il=0 where query j cannot see anchor a
         {
             for (int jl = tid_h; jl < BJ; jl += WPH * 32) {
                 const int j = j0 + jl;
@@ -135,6 +141,7 @@ void Bwd_rows_w16_impl(
         const float mr0 = mr_sm[lh * BJ + jw + g], sr0 = sr_sm[lh * BJ + jw + g];
         const float mr1 = mr_sm[lh * BJ + jw + g + 8], sr1 = sr_sm[lh * BJ + jw + g + 8];
         const float ilr0 = ilr_sm[lh * BJ + jw + g], ilr1 = ilr_sm[lh * BJ + jw + g + 8];
+        // a query with a single visible key has P=1 exactly and no score gradient
         const bool single0=SPECIAL && (j0+jw+g<N) && support[(int64_t)b*N+j0+jw+g]==1;
         const bool single1=SPECIAL && (j0+jw+g+8<N) && support[(int64_t)b*N+j0+jw+g+8]==1;
         const bool rpad0 = (j0 + jw + g) >= N, rpad1 = (j0 + jw + g + 8) >= N;
@@ -223,7 +230,7 @@ void Bwd_rows_w16_impl(
 
         }
 
-        // ---- epilogue: Hadamard row-collapse of this warp's 16 rows (head's Q / dY rows) ----
+        // epilogue: fold this warp's 16 rows with the head's Q / dY rows, reduce over lanes and warps
         float ng[DH / 4], nv[DH / 4];
         const int64_t r0 = q_off_h + (int64_t)min(j0 + jw + g, N - 1) * D + 2 * tig;
         const int64_t r1 = q_off_h + (int64_t)min(j0 + jw + g + 8, N - 1) * D + 2 * tig;
@@ -278,14 +285,14 @@ void Bwd_rows_w16_impl(
 template<int G, int WPH, int BK, bool RAW=false>
 __global__ __launch_bounds__(G * WPH * 32, 1)
 void Bwd_rows_w16(
-    const bf16* __restrict__ Xa_bf,   // anchor stream (R or S), [B,1,N,D]
-    const bf16* __restrict__ Va_bf,   // its values (Vr or Vs)
-    const bf16* __restrict__ Xr_bf,   // Q [B,H,N,D]
-    const bf16* __restrict__ gYr_bf,  // dY [B,H,N,D]
-    const bf16* __restrict__ Xc_bf,   // other key stream (S or R), [B,1,N,D]
-    const bf16* __restrict__ Vc_bf,   // its values
-    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,   // [B,H,N]
-    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,   // per-head partials [B,H,N,D]
+    const bf16* __restrict__ Xa_bf,
+    const bf16* __restrict__ Va_bf,
+    const bf16* __restrict__ Xr_bf,
+    const bf16* __restrict__ gYr_bf,
+    const bf16* __restrict__ Xc_bf,
+    const bf16* __restrict__ Vc_bf,
+    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,
+    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,
     const uint8_t* __restrict__ support, const uint32_t* __restrict__ packed_mask, int mask_words, const bool* __restrict__ mask, int H, int N, float scale, int win)
 {
     const int a=blockIdx.x,b=blockIdx.z;
@@ -299,17 +306,18 @@ void Bwd_rows_w16(
 
 
 
+// W=32: as w16 with CAP=64. anchV holds BF16, so the dY*Va operand is a BF16 multiply.
 template<int G, int WPH, int BK, bool RAW=false, bool SPECIAL=false>
 __device__ __forceinline__
 void Bwd_rows_w32_impl(
-    const bf16* __restrict__ Xa_bf,   // anchor stream (R or S), [B,1,N,D]
-    const bf16* __restrict__ Va_bf,   // its values (Vr or Vs)
-    const bf16* __restrict__ Xr_bf,   // Q [B,H,N,D]
-    const bf16* __restrict__ gYr_bf,  // dY [B,H,N,D]
-    const bf16* __restrict__ Xc_bf,   // other key stream (S or R), [B,1,N,D]
-    const bf16* __restrict__ Vc_bf,   // its values
-    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,   // [B,H,N]
-    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,   // per-head partials [B,H,N,D]
+    const bf16* __restrict__ Xa_bf,
+    const bf16* __restrict__ Va_bf,
+    const bf16* __restrict__ Xr_bf,
+    const bf16* __restrict__ gYr_bf,
+    const bf16* __restrict__ Xc_bf,
+    const bf16* __restrict__ Vc_bf,
+    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,
+    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,
     const uint8_t* __restrict__ support, const uint32_t* __restrict__ packed_mask, int mask_words, const bool* __restrict__ mask, int H, int N, float scale, int win)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -333,16 +341,16 @@ void Bwd_rows_w32_impl(
     extern __shared__ char smem_raw[];
     bf16* rawQ_sm = reinterpret_cast<bf16*>(smem_raw);
     bf16* rawDY_sm = rawQ_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
-    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);                // [2][BK][DPAD]
-    bf16* vc_sm = xc_sm + 2 * CAP * DPAD;                        // [2][BK][DPAD]
-    float* anchX = reinterpret_cast<float*>(vc_sm + 2 * CAP * DPAD);   // [D]
-    float* anchV = anchX + 2 * D;                                   // [D]
-    float* mr_sm = anchV + 2 * D;                                   // [G][BJ]
+    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
+    bf16* vc_sm = xc_sm + 2 * CAP * DPAD;
+    float* anchX = reinterpret_cast<float*>(vc_sm + 2 * CAP * DPAD);
+    float* anchV = anchX + 2 * D;
+    float* mr_sm = anchV + 2 * D;
     float* ilr_sm = mr_sm + G * BJ;
     float* sr_sm = ilr_sm + G * BJ;
-    float* wOut = sr_sm + G * BJ;                               // [G][WPH][NOUT*D]
-    float* redOut = wOut + (size_t)G * WPH * NOUT * D;          // [G][NOUT*D]
-    uint32_t* msk_sm = reinterpret_cast<uint32_t*>(redOut + (size_t)G * NOUT * D);   // [2][BJ]
+    float* wOut = sr_sm + G * BJ;
+    float* redOut = wOut + (size_t)G * WPH * NOUT * D;
+    uint32_t* msk_sm = reinterpret_cast<uint32_t*>(redOut + (size_t)G * NOUT * D);
 
     const int64_t kv_off = (int64_t)b * N * D;
     const int64_t q_off_h = ((int64_t)b * H + h0 + head) * N * D;
@@ -401,7 +409,6 @@ void Bwd_rows_w32_impl(
             }
         }
 
-        // Per-head A operands from the head's own Q / dY rows and the shared anchor.
         {
             for (int jl = tid_h; jl < BJ; jl += WPH * 32) {
                 const int j = j0 + jl;
@@ -409,7 +416,7 @@ void Bwd_rows_w32_impl(
                     mr_sm[lh * BJ + jl] = m_r[st_off_h + j];
                     float il = 1.0f / fmaxf(l_r[st_off_h + j], DENOM_EPS);
                     sr_sm[lh * BJ + jl] = sum_r[st_off_h + j];
-                    if (!mb[(int64_t)j * N + a]) il = 0.0f;          // mask[query][anchor]
+                    if (!mb[(int64_t)j * N + a]) il = 0.0f;
                     ilr_sm[lh * BJ + jl] = il;
                 } else {
                     mr_sm[lh * BJ + jl] = 0.0f; ilr_sm[lh * BJ + jl] = 0.0f; sr_sm[lh * BJ + jl] = 0.0f;
@@ -515,7 +522,6 @@ void Bwd_rows_w32_impl(
 
         }
 
-        // ---- epilogue: Hadamard row-collapse of this warp's 16 rows (head's Q / dY rows) ----
         float ng[DH / 4], nv[DH / 4];
         const int64_t r0 = q_off_h + (int64_t)min(j0 + jw + g, N - 1) * D + 2 * tig;
         const int64_t r1 = q_off_h + (int64_t)min(j0 + jw + g + 8, N - 1) * D + 2 * tig;
@@ -570,14 +576,14 @@ void Bwd_rows_w32_impl(
 template<int G, int WPH, int BK, bool RAW=false>
 __global__ __launch_bounds__(G * WPH * 32, 1)
 void Bwd_rows_w32(
-    const bf16* __restrict__ Xa_bf,   // anchor stream (R or S), [B,1,N,D]
-    const bf16* __restrict__ Va_bf,   // its values (Vr or Vs)
-    const bf16* __restrict__ Xr_bf,   // Q [B,H,N,D]
-    const bf16* __restrict__ gYr_bf,  // dY [B,H,N,D]
-    const bf16* __restrict__ Xc_bf,   // other key stream (S or R), [B,1,N,D]
-    const bf16* __restrict__ Vc_bf,   // its values
-    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,   // [B,H,N]
-    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,   // per-head partials [B,H,N,D]
+    const bf16* __restrict__ Xa_bf,
+    const bf16* __restrict__ Va_bf,
+    const bf16* __restrict__ Xr_bf,
+    const bf16* __restrict__ gYr_bf,
+    const bf16* __restrict__ Xc_bf,
+    const bf16* __restrict__ Vc_bf,
+    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,
+    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,
     const uint8_t* __restrict__ support, const uint32_t* __restrict__ packed_mask, int mask_words, const bool* __restrict__ mask, int H, int N, float scale, int win)
 {
     const int a=blockIdx.x,b=blockIdx.z;
@@ -592,17 +598,19 @@ void Bwd_rows_w32(
 
 
 
+// W=64: as w32, but the window is a CAP-row ring filled per row tile. Requires WPH=1:
+// wOut aliases redOut and each warp accumulates into it directly.
 template<int G, int WPH, int BK, bool RAW=false, bool SPECIAL=false>
 __device__ __forceinline__
 void Bwd_rows_w64_impl(
-    const bf16* __restrict__ Xa_bf,   // anchor stream (R or S), [B,1,N,D]
-    const bf16* __restrict__ Va_bf,   // its values (Vr or Vs)
-    const bf16* __restrict__ Xr_bf,   // Q [B,H,N,D]
-    const bf16* __restrict__ gYr_bf,  // dY [B,H,N,D]
-    const bf16* __restrict__ Xc_bf,   // other key stream (S or R), [B,1,N,D]
-    const bf16* __restrict__ Vc_bf,   // its values
-    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,   // [B,H,N]
-    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,   // per-head partials [B,H,N,D]
+    const bf16* __restrict__ Xa_bf,
+    const bf16* __restrict__ Va_bf,
+    const bf16* __restrict__ Xr_bf,
+    const bf16* __restrict__ gYr_bf,
+    const bf16* __restrict__ Xc_bf,
+    const bf16* __restrict__ Vc_bf,
+    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,
+    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,
     const uint8_t* __restrict__ support, const uint32_t* __restrict__ packed_mask, int mask_words, const bool* __restrict__ mask, int H, int N, float scale, int win)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -626,16 +634,16 @@ void Bwd_rows_w64_impl(
     extern __shared__ char smem_raw[];
     bf16* rawQ_sm = reinterpret_cast<bf16*>(smem_raw);
     bf16* rawDY_sm = rawQ_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
-    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);                // [2][BK][DPAD]
-    bf16* vc_sm = xc_sm + 2 * CAP * DPAD;                        // [2][BK][DPAD]
-    float* anchX = reinterpret_cast<float*>(vc_sm + 2 * CAP * DPAD);   // [D]
-    float* anchV = anchX + 2 * D;                                   // [D]
-    float* mr_sm = anchV + 2 * D;                                   // [G][BJ]
+    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
+    bf16* vc_sm = xc_sm + 2 * CAP * DPAD;
+    float* anchX = reinterpret_cast<float*>(vc_sm + 2 * CAP * DPAD);
+    float* anchV = anchX + 2 * D;
+    float* mr_sm = anchV + 2 * D;
     float* ilr_sm = mr_sm + G * BJ;
     float* sr_sm = ilr_sm + G * BJ;
-    float* wOut = sr_sm + G * BJ;                               // [G][WPH][NOUT*D]
-    float* redOut = wOut;          // [G][NOUT*D]
-    uint32_t* msk_sm = reinterpret_cast<uint32_t*>(redOut + (size_t)G * NOUT * D);   // [2][BJ]
+    float* wOut = sr_sm + G * BJ;
+    float* redOut = wOut;
+    uint32_t* msk_sm = reinterpret_cast<uint32_t*>(redOut + (size_t)G * NOUT * D);
 
     const int64_t kv_off = (int64_t)b * N * D;
     const int64_t q_off_h = ((int64_t)b * H + h0 + head) * N * D;
@@ -699,7 +707,6 @@ void Bwd_rows_w64_impl(
             }
         }
 
-        // Per-head A operands from the head's own Q / dY rows and the shared anchor.
         {
             for (int jl = tid_h; jl < BJ; jl += WPH * 32) {
                 const int j = j0 + jl;
@@ -707,7 +714,7 @@ void Bwd_rows_w64_impl(
                     mr_sm[lh * BJ + jl] = m_r[st_off_h + j];
                     float il = 1.0f / fmaxf(l_r[st_off_h + j], DENOM_EPS);
                     sr_sm[lh * BJ + jl] = sum_r[st_off_h + j];
-                    if (!mb[(int64_t)j * N + a]) il = 0.0f;          // mask[query][anchor]
+                    if (!mb[(int64_t)j * N + a]) il = 0.0f;
                     ilr_sm[lh * BJ + jl] = il;
                 } else {
                     mr_sm[lh * BJ + jl] = 0.0f; ilr_sm[lh * BJ + jl] = 0.0f; sr_sm[lh * BJ + jl] = 0.0f;
@@ -817,7 +824,6 @@ void Bwd_rows_w64_impl(
 
         }
 
-        // ---- epilogue: Hadamard row-collapse of this warp's 16 rows (head's Q / dY rows) ----
         float ng[DH / 4], nv[DH / 4];
         const int64_t r0 = q_off_h + (int64_t)min(j0 + jw + g, N - 1) * D + 2 * tig;
         const int64_t r1 = q_off_h + (int64_t)min(j0 + jw + g + 8, N - 1) * D + 2 * tig;
@@ -865,14 +871,14 @@ void Bwd_rows_w64_impl(
 template<int G, int WPH, int BK, bool RAW=false>
 __global__ __launch_bounds__(G * WPH * 32, 1)
 void Bwd_rows_w64(
-    const bf16* __restrict__ Xa_bf,   // anchor stream (R or S), [B,1,N,D]
-    const bf16* __restrict__ Va_bf,   // its values (Vr or Vs)
-    const bf16* __restrict__ Xr_bf,   // Q [B,H,N,D]
-    const bf16* __restrict__ gYr_bf,  // dY [B,H,N,D]
-    const bf16* __restrict__ Xc_bf,   // other key stream (S or R), [B,1,N,D]
-    const bf16* __restrict__ Vc_bf,   // its values
-    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,   // [B,H,N]
-    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,   // per-head partials [B,H,N,D]
+    const bf16* __restrict__ Xa_bf,
+    const bf16* __restrict__ Va_bf,
+    const bf16* __restrict__ Xr_bf,
+    const bf16* __restrict__ gYr_bf,
+    const bf16* __restrict__ Xc_bf,
+    const bf16* __restrict__ Vc_bf,
+    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,
+    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,
     const uint8_t* __restrict__ support, const uint32_t* __restrict__ packed_mask, int mask_words, const bool* __restrict__ mask, int H, int N, float scale, int win)
 {
     const int a=blockIdx.x,b=blockIdx.z;
@@ -887,17 +893,18 @@ void Bwd_rows_w64(
 
 
 
+// Bwd_rows_w16 visiting 2 head groups serially, reusing the staged key window.
 template<int G, int WPH, int BK, bool RAW=false, bool SPECIAL=false>
 __device__ __forceinline__
 void Bwd_rows_w16_v2_impl(
-    const bf16* __restrict__ Xa_bf,   // anchor stream (R or S), [B,1,N,D]
-    const bf16* __restrict__ Va_bf,   // its values (Vr or Vs)
-    const bf16* __restrict__ Xr_bf,   // Q [B,H,N,D]
-    const bf16* __restrict__ gYr_bf,  // dY [B,H,N,D]
-    const bf16* __restrict__ Xc_bf,   // other key stream (S or R), [B,1,N,D]
-    const bf16* __restrict__ Vc_bf,   // its values
-    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,   // [B,H,N]
-    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,   // per-head partials [B,H,N,D]
+    const bf16* __restrict__ Xa_bf,
+    const bf16* __restrict__ Va_bf,
+    const bf16* __restrict__ Xr_bf,
+    const bf16* __restrict__ gYr_bf,
+    const bf16* __restrict__ Xc_bf,
+    const bf16* __restrict__ Vc_bf,
+    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,
+    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,
     const uint8_t* __restrict__ support, const uint32_t* __restrict__ packed_mask, int mask_words, const bool* __restrict__ mask, int H, int N, float scale, int win)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -921,16 +928,16 @@ void Bwd_rows_w16_v2_impl(
     extern __shared__ char smem_raw[];
     bf16* rawQ_sm = reinterpret_cast<bf16*>(smem_raw);
     bf16* rawDY_sm = rawQ_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
-    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);                // [2][BK][DPAD]
-    bf16* vc_sm = xc_sm + 2 * CAP * DPAD;                        // [2][BK][DPAD]
-    float* anchX = reinterpret_cast<float*>(vc_sm + 2 * CAP * DPAD);   // [D]
-    float* anchV = anchX + 2 * D;                                   // [D]
-    float* mr_sm = anchV + 2 * D;                                   // [G][BJ]
+    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
+    bf16* vc_sm = xc_sm + 2 * CAP * DPAD;
+    float* anchX = reinterpret_cast<float*>(vc_sm + 2 * CAP * DPAD);
+    float* anchV = anchX + 2 * D;
+    float* mr_sm = anchV + 2 * D;
     float* ilr_sm = mr_sm + G * BJ;
     float* sr_sm = ilr_sm + G * BJ;
-    float* wOut = sr_sm + G * BJ;                               // [G][WPH][NOUT*D]
-    float* redOut = wOut + (size_t)G * WPH * NOUT * D;          // [G][NOUT*D]
-    uint32_t* msk_sm = reinterpret_cast<uint32_t*>(redOut + (size_t)G * NOUT * D);   // [2][BJ]
+    float* wOut = sr_sm + G * BJ;
+    float* redOut = wOut + (size_t)G * WPH * NOUT * D;
+    uint32_t* msk_sm = reinterpret_cast<uint32_t*>(redOut + (size_t)G * NOUT * D);
 
     const int64_t kv_off = (int64_t)b * N * D;
 
@@ -994,7 +1001,6 @@ void Bwd_rows_w16_v2_impl(
             }
         }
 
-        // Per-head A operands from the head's own Q / dY rows and the shared anchor.
         {
             for (int jl = tid_h; jl < BJ; jl += WPH * 32) {
                 const int j = j0 + jl;
@@ -1002,7 +1008,7 @@ void Bwd_rows_w16_v2_impl(
                     mr_sm[lh * BJ + jl] = m_r[st_off_h + j];
                     float il = 1.0f / fmaxf(l_r[st_off_h + j], DENOM_EPS);
                     sr_sm[lh * BJ + jl] = sum_r[st_off_h + j];
-                    if (!mb[(int64_t)j * N + a]) il = 0.0f;          // mask[query][anchor]
+                    if (!mb[(int64_t)j * N + a]) il = 0.0f;
                     ilr_sm[lh * BJ + jl] = il;
                 } else {
                     mr_sm[lh * BJ + jl] = 0.0f; ilr_sm[lh * BJ + jl] = 0.0f; sr_sm[lh * BJ + jl] = 0.0f;
@@ -1106,7 +1112,6 @@ void Bwd_rows_w16_v2_impl(
 
         }
 
-        // ---- epilogue: Hadamard row-collapse of this warp's 16 rows (head's Q / dY rows) ----
         float ng[DH / 4], nv[DH / 4];
         const int64_t r0 = q_off_h + (int64_t)min(j0 + jw + g, N - 1) * D + 2 * tig;
         const int64_t r1 = q_off_h + (int64_t)min(j0 + jw + g + 8, N - 1) * D + 2 * tig;
@@ -1163,14 +1168,14 @@ void Bwd_rows_w16_v2_impl(
 template<int G, int WPH, int BK, bool RAW=false>
 __global__ __launch_bounds__(G * WPH * 32, 1)
 void Bwd_rows_w16_v2(
-    const bf16* __restrict__ Xa_bf,   // anchor stream (R or S), [B,1,N,D]
-    const bf16* __restrict__ Va_bf,   // its values (Vr or Vs)
-    const bf16* __restrict__ Xr_bf,   // Q [B,H,N,D]
-    const bf16* __restrict__ gYr_bf,  // dY [B,H,N,D]
-    const bf16* __restrict__ Xc_bf,   // other key stream (S or R), [B,1,N,D]
-    const bf16* __restrict__ Vc_bf,   // its values
-    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,   // [B,H,N]
-    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,   // per-head partials [B,H,N,D]
+    const bf16* __restrict__ Xa_bf,
+    const bf16* __restrict__ Va_bf,
+    const bf16* __restrict__ Xr_bf,
+    const bf16* __restrict__ gYr_bf,
+    const bf16* __restrict__ Xc_bf,
+    const bf16* __restrict__ Vc_bf,
+    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,
+    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,
     const uint8_t* __restrict__ support, const uint32_t* __restrict__ packed_mask, int mask_words, const bool* __restrict__ mask, int H, int N, float scale, int win)
 {
     const int a=blockIdx.x,b=blockIdx.z;
@@ -1184,17 +1189,18 @@ void Bwd_rows_w16_v2(
 
 
 
+// Bwd_rows_w16 visiting 4 head groups serially.
 template<int G, int WPH, int BK, bool RAW=false, bool SPECIAL=false>
 __device__ __forceinline__
 void Bwd_rows_w16_v4_impl(
-    const bf16* __restrict__ Xa_bf,   // anchor stream (R or S), [B,1,N,D]
-    const bf16* __restrict__ Va_bf,   // its values (Vr or Vs)
-    const bf16* __restrict__ Xr_bf,   // Q [B,H,N,D]
-    const bf16* __restrict__ gYr_bf,  // dY [B,H,N,D]
-    const bf16* __restrict__ Xc_bf,   // other key stream (S or R), [B,1,N,D]
-    const bf16* __restrict__ Vc_bf,   // its values
-    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,   // [B,H,N]
-    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,   // per-head partials [B,H,N,D]
+    const bf16* __restrict__ Xa_bf,
+    const bf16* __restrict__ Va_bf,
+    const bf16* __restrict__ Xr_bf,
+    const bf16* __restrict__ gYr_bf,
+    const bf16* __restrict__ Xc_bf,
+    const bf16* __restrict__ Vc_bf,
+    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,
+    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,
     const uint8_t* __restrict__ support, const uint32_t* __restrict__ packed_mask, int mask_words, const bool* __restrict__ mask, int H, int N, float scale, int win)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -1218,16 +1224,16 @@ void Bwd_rows_w16_v4_impl(
     extern __shared__ char smem_raw[];
     bf16* rawQ_sm = reinterpret_cast<bf16*>(smem_raw);
     bf16* rawDY_sm = rawQ_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
-    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);                // [2][BK][DPAD]
-    bf16* vc_sm = xc_sm + 2 * CAP * DPAD;                        // [2][BK][DPAD]
-    float* anchX = reinterpret_cast<float*>(vc_sm + 2 * CAP * DPAD);   // [D]
-    float* anchV = anchX + 2 * D;                                   // [D]
-    float* mr_sm = anchV + 2 * D;                                   // [G][BJ]
+    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
+    bf16* vc_sm = xc_sm + 2 * CAP * DPAD;
+    float* anchX = reinterpret_cast<float*>(vc_sm + 2 * CAP * DPAD);
+    float* anchV = anchX + 2 * D;
+    float* mr_sm = anchV + 2 * D;
     float* ilr_sm = mr_sm + G * BJ;
     float* sr_sm = ilr_sm + G * BJ;
-    float* wOut = sr_sm + G * BJ;                               // [G][WPH][NOUT*D]
-    float* redOut = wOut + (size_t)G * WPH * NOUT * D;          // [G][NOUT*D]
-    uint32_t* msk_sm = reinterpret_cast<uint32_t*>(redOut + (size_t)G * NOUT * D);   // [2][BJ]
+    float* wOut = sr_sm + G * BJ;
+    float* redOut = wOut + (size_t)G * WPH * NOUT * D;
+    uint32_t* msk_sm = reinterpret_cast<uint32_t*>(redOut + (size_t)G * NOUT * D);
 
     const int64_t kv_off = (int64_t)b * N * D;
 
@@ -1291,7 +1297,6 @@ void Bwd_rows_w16_v4_impl(
             }
         }
 
-        // Per-head A operands from the head's own Q / dY rows and the shared anchor.
         {
             for (int jl = tid_h; jl < BJ; jl += WPH * 32) {
                 const int j = j0 + jl;
@@ -1299,7 +1304,7 @@ void Bwd_rows_w16_v4_impl(
                     mr_sm[lh * BJ + jl] = m_r[st_off_h + j];
                     float il = 1.0f / fmaxf(l_r[st_off_h + j], DENOM_EPS);
                     sr_sm[lh * BJ + jl] = sum_r[st_off_h + j];
-                    if (!mb[(int64_t)j * N + a]) il = 0.0f;          // mask[query][anchor]
+                    if (!mb[(int64_t)j * N + a]) il = 0.0f;
                     ilr_sm[lh * BJ + jl] = il;
                 } else {
                     mr_sm[lh * BJ + jl] = 0.0f; ilr_sm[lh * BJ + jl] = 0.0f; sr_sm[lh * BJ + jl] = 0.0f;
@@ -1403,7 +1408,6 @@ void Bwd_rows_w16_v4_impl(
 
         }
 
-        // ---- epilogue: Hadamard row-collapse of this warp's 16 rows (head's Q / dY rows) ----
         float ng[DH / 4], nv[DH / 4];
         const int64_t r0 = q_off_h + (int64_t)min(j0 + jw + g, N - 1) * D + 2 * tig;
         const int64_t r1 = q_off_h + (int64_t)min(j0 + jw + g + 8, N - 1) * D + 2 * tig;
@@ -1460,14 +1464,14 @@ void Bwd_rows_w16_v4_impl(
 template<int G, int WPH, int BK, bool RAW=false>
 __global__ __launch_bounds__(G * WPH * 32, 1)
 void Bwd_rows_w16_v4(
-    const bf16* __restrict__ Xa_bf,   // anchor stream (R or S), [B,1,N,D]
-    const bf16* __restrict__ Va_bf,   // its values (Vr or Vs)
-    const bf16* __restrict__ Xr_bf,   // Q [B,H,N,D]
-    const bf16* __restrict__ gYr_bf,  // dY [B,H,N,D]
-    const bf16* __restrict__ Xc_bf,   // other key stream (S or R), [B,1,N,D]
-    const bf16* __restrict__ Vc_bf,   // its values
-    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,   // [B,H,N]
-    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,   // per-head partials [B,H,N,D]
+    const bf16* __restrict__ Xa_bf,
+    const bf16* __restrict__ Va_bf,
+    const bf16* __restrict__ Xr_bf,
+    const bf16* __restrict__ gYr_bf,
+    const bf16* __restrict__ Xc_bf,
+    const bf16* __restrict__ Vc_bf,
+    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,
+    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,
     const uint8_t* __restrict__ support, const uint32_t* __restrict__ packed_mask, int mask_words, const bool* __restrict__ mask, int H, int N, float scale, int win)
 {
     const int a=blockIdx.x,b=blockIdx.z;
@@ -1481,17 +1485,18 @@ void Bwd_rows_w16_v4(
 
 
 
+// Bwd_rows_w32 visiting 2 head groups serially, reusing the staged key window.
 template<int G, int WPH, int BK, bool RAW=false, bool SPECIAL=false>
 __device__ __forceinline__
 void Bwd_rows_w32_v2_impl(
-    const bf16* __restrict__ Xa_bf,   // anchor stream (R or S), [B,1,N,D]
-    const bf16* __restrict__ Va_bf,   // its values (Vr or Vs)
-    const bf16* __restrict__ Xr_bf,   // Q [B,H,N,D]
-    const bf16* __restrict__ gYr_bf,  // dY [B,H,N,D]
-    const bf16* __restrict__ Xc_bf,   // other key stream (S or R), [B,1,N,D]
-    const bf16* __restrict__ Vc_bf,   // its values
-    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,   // [B,H,N]
-    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,   // per-head partials [B,H,N,D]
+    const bf16* __restrict__ Xa_bf,
+    const bf16* __restrict__ Va_bf,
+    const bf16* __restrict__ Xr_bf,
+    const bf16* __restrict__ gYr_bf,
+    const bf16* __restrict__ Xc_bf,
+    const bf16* __restrict__ Vc_bf,
+    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,
+    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,
     const uint8_t* __restrict__ support, const uint32_t* __restrict__ packed_mask, int mask_words, const bool* __restrict__ mask, int H, int N, float scale, int win)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -1515,16 +1520,16 @@ void Bwd_rows_w32_v2_impl(
     extern __shared__ char smem_raw[];
     bf16* rawQ_sm = reinterpret_cast<bf16*>(smem_raw);
     bf16* rawDY_sm = rawQ_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
-    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);                // [2][BK][DPAD]
-    bf16* vc_sm = xc_sm + 2 * CAP * DPAD;                        // [2][BK][DPAD]
-    float* anchX = reinterpret_cast<float*>(vc_sm + 2 * CAP * DPAD);   // [D]
-    float* anchV = anchX + 2 * D;                                   // [D]
-    float* mr_sm = anchV + 2 * D;                                   // [G][BJ]
+    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
+    bf16* vc_sm = xc_sm + 2 * CAP * DPAD;
+    float* anchX = reinterpret_cast<float*>(vc_sm + 2 * CAP * DPAD);
+    float* anchV = anchX + 2 * D;
+    float* mr_sm = anchV + 2 * D;
     float* ilr_sm = mr_sm + G * BJ;
     float* sr_sm = ilr_sm + G * BJ;
-    float* wOut = sr_sm + G * BJ;                               // [G][WPH][NOUT*D]
-    float* redOut = wOut + (size_t)G * WPH * NOUT * D;          // [G][NOUT*D]
-    uint32_t* msk_sm = reinterpret_cast<uint32_t*>(redOut + (size_t)G * NOUT * D);   // [2][BJ]
+    float* wOut = sr_sm + G * BJ;
+    float* redOut = wOut + (size_t)G * WPH * NOUT * D;
+    uint32_t* msk_sm = reinterpret_cast<uint32_t*>(redOut + (size_t)G * NOUT * D);
 
     const int64_t kv_off = (int64_t)b * N * D;
 
@@ -1588,7 +1593,6 @@ void Bwd_rows_w32_v2_impl(
             }
         }
 
-        // Per-head A operands from the head's own Q / dY rows and the shared anchor.
         {
             for (int jl = tid_h; jl < BJ; jl += WPH * 32) {
                 const int j = j0 + jl;
@@ -1596,7 +1600,7 @@ void Bwd_rows_w32_v2_impl(
                     mr_sm[lh * BJ + jl] = m_r[st_off_h + j];
                     float il = 1.0f / fmaxf(l_r[st_off_h + j], DENOM_EPS);
                     sr_sm[lh * BJ + jl] = sum_r[st_off_h + j];
-                    if (!mb[(int64_t)j * N + a]) il = 0.0f;          // mask[query][anchor]
+                    if (!mb[(int64_t)j * N + a]) il = 0.0f;
                     ilr_sm[lh * BJ + jl] = il;
                 } else {
                     mr_sm[lh * BJ + jl] = 0.0f; ilr_sm[lh * BJ + jl] = 0.0f; sr_sm[lh * BJ + jl] = 0.0f;
@@ -1702,7 +1706,6 @@ void Bwd_rows_w32_v2_impl(
 
         }
 
-        // ---- epilogue: Hadamard row-collapse of this warp's 16 rows (head's Q / dY rows) ----
         float ng[DH / 4], nv[DH / 4];
         const int64_t r0 = q_off_h + (int64_t)min(j0 + jw + g, N - 1) * D + 2 * tig;
         const int64_t r1 = q_off_h + (int64_t)min(j0 + jw + g + 8, N - 1) * D + 2 * tig;
@@ -1759,14 +1762,14 @@ void Bwd_rows_w32_v2_impl(
 template<int G, int WPH, int BK, bool RAW=false>
 __global__ __launch_bounds__(G * WPH * 32, 1)
 void Bwd_rows_w32_v2(
-    const bf16* __restrict__ Xa_bf,   // anchor stream (R or S), [B,1,N,D]
-    const bf16* __restrict__ Va_bf,   // its values (Vr or Vs)
-    const bf16* __restrict__ Xr_bf,   // Q [B,H,N,D]
-    const bf16* __restrict__ gYr_bf,  // dY [B,H,N,D]
-    const bf16* __restrict__ Xc_bf,   // other key stream (S or R), [B,1,N,D]
-    const bf16* __restrict__ Vc_bf,   // its values
-    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,   // [B,H,N]
-    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,   // per-head partials [B,H,N,D]
+    const bf16* __restrict__ Xa_bf,
+    const bf16* __restrict__ Va_bf,
+    const bf16* __restrict__ Xr_bf,
+    const bf16* __restrict__ gYr_bf,
+    const bf16* __restrict__ Xc_bf,
+    const bf16* __restrict__ Vc_bf,
+    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,
+    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,
     const uint8_t* __restrict__ support, const uint32_t* __restrict__ packed_mask, int mask_words, const bool* __restrict__ mask, int H, int N, float scale, int win)
 {
     const int a=blockIdx.x,b=blockIdx.z;
@@ -1781,17 +1784,18 @@ void Bwd_rows_w32_v2(
 
 
 
+// Bwd_rows_w32 visiting 4 head groups serially.
 template<int G, int WPH, int BK, bool RAW=false, bool SPECIAL=false>
 __device__ __forceinline__
 void Bwd_rows_w32_v4_impl(
-    const bf16* __restrict__ Xa_bf,   // anchor stream (R or S), [B,1,N,D]
-    const bf16* __restrict__ Va_bf,   // its values (Vr or Vs)
-    const bf16* __restrict__ Xr_bf,   // Q [B,H,N,D]
-    const bf16* __restrict__ gYr_bf,  // dY [B,H,N,D]
-    const bf16* __restrict__ Xc_bf,   // other key stream (S or R), [B,1,N,D]
-    const bf16* __restrict__ Vc_bf,   // its values
-    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,   // [B,H,N]
-    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,   // per-head partials [B,H,N,D]
+    const bf16* __restrict__ Xa_bf,
+    const bf16* __restrict__ Va_bf,
+    const bf16* __restrict__ Xr_bf,
+    const bf16* __restrict__ gYr_bf,
+    const bf16* __restrict__ Xc_bf,
+    const bf16* __restrict__ Vc_bf,
+    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,
+    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,
     const uint8_t* __restrict__ support, const uint32_t* __restrict__ packed_mask, int mask_words, const bool* __restrict__ mask, int H, int N, float scale, int win)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -1815,16 +1819,16 @@ void Bwd_rows_w32_v4_impl(
     extern __shared__ char smem_raw[];
     bf16* rawQ_sm = reinterpret_cast<bf16*>(smem_raw);
     bf16* rawDY_sm = rawQ_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
-    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);                // [2][BK][DPAD]
-    bf16* vc_sm = xc_sm + 2 * CAP * DPAD;                        // [2][BK][DPAD]
-    float* anchX = reinterpret_cast<float*>(vc_sm + 2 * CAP * DPAD);   // [D]
-    float* anchV = anchX + 2 * D;                                   // [D]
-    float* mr_sm = anchV + 2 * D;                                   // [G][BJ]
+    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
+    bf16* vc_sm = xc_sm + 2 * CAP * DPAD;
+    float* anchX = reinterpret_cast<float*>(vc_sm + 2 * CAP * DPAD);
+    float* anchV = anchX + 2 * D;
+    float* mr_sm = anchV + 2 * D;
     float* ilr_sm = mr_sm + G * BJ;
     float* sr_sm = ilr_sm + G * BJ;
-    float* wOut = sr_sm + G * BJ;                               // [G][WPH][NOUT*D]
-    float* redOut = wOut + (size_t)G * WPH * NOUT * D;          // [G][NOUT*D]
-    uint32_t* msk_sm = reinterpret_cast<uint32_t*>(redOut + (size_t)G * NOUT * D);   // [2][BJ]
+    float* wOut = sr_sm + G * BJ;
+    float* redOut = wOut + (size_t)G * WPH * NOUT * D;
+    uint32_t* msk_sm = reinterpret_cast<uint32_t*>(redOut + (size_t)G * NOUT * D);
 
     const int64_t kv_off = (int64_t)b * N * D;
 
@@ -1888,7 +1892,6 @@ void Bwd_rows_w32_v4_impl(
             }
         }
 
-        // Per-head A operands from the head's own Q / dY rows and the shared anchor.
         {
             for (int jl = tid_h; jl < BJ; jl += WPH * 32) {
                 const int j = j0 + jl;
@@ -1896,7 +1899,7 @@ void Bwd_rows_w32_v4_impl(
                     mr_sm[lh * BJ + jl] = m_r[st_off_h + j];
                     float il = 1.0f / fmaxf(l_r[st_off_h + j], DENOM_EPS);
                     sr_sm[lh * BJ + jl] = sum_r[st_off_h + j];
-                    if (!mb[(int64_t)j * N + a]) il = 0.0f;          // mask[query][anchor]
+                    if (!mb[(int64_t)j * N + a]) il = 0.0f;
                     ilr_sm[lh * BJ + jl] = il;
                 } else {
                     mr_sm[lh * BJ + jl] = 0.0f; ilr_sm[lh * BJ + jl] = 0.0f; sr_sm[lh * BJ + jl] = 0.0f;
@@ -2002,7 +2005,6 @@ void Bwd_rows_w32_v4_impl(
 
         }
 
-        // ---- epilogue: Hadamard row-collapse of this warp's 16 rows (head's Q / dY rows) ----
         float ng[DH / 4], nv[DH / 4];
         const int64_t r0 = q_off_h + (int64_t)min(j0 + jw + g, N - 1) * D + 2 * tig;
         const int64_t r1 = q_off_h + (int64_t)min(j0 + jw + g + 8, N - 1) * D + 2 * tig;
@@ -2059,14 +2061,14 @@ void Bwd_rows_w32_v4_impl(
 template<int G, int WPH, int BK, bool RAW=false>
 __global__ __launch_bounds__(G * WPH * 32, 1)
 void Bwd_rows_w32_v4(
-    const bf16* __restrict__ Xa_bf,   // anchor stream (R or S), [B,1,N,D]
-    const bf16* __restrict__ Va_bf,   // its values (Vr or Vs)
-    const bf16* __restrict__ Xr_bf,   // Q [B,H,N,D]
-    const bf16* __restrict__ gYr_bf,  // dY [B,H,N,D]
-    const bf16* __restrict__ Xc_bf,   // other key stream (S or R), [B,1,N,D]
-    const bf16* __restrict__ Vc_bf,   // its values
-    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,   // [B,H,N]
-    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,   // per-head partials [B,H,N,D]
+    const bf16* __restrict__ Xa_bf,
+    const bf16* __restrict__ Va_bf,
+    const bf16* __restrict__ Xr_bf,
+    const bf16* __restrict__ gYr_bf,
+    const bf16* __restrict__ Xc_bf,
+    const bf16* __restrict__ Vc_bf,
+    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,
+    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,
     const uint8_t* __restrict__ support, const uint32_t* __restrict__ packed_mask, int mask_words, const bool* __restrict__ mask, int H, int N, float scale, int win)
 {
     const int a=blockIdx.x,b=blockIdx.z;
@@ -2081,17 +2083,19 @@ void Bwd_rows_w32_v4(
 
 
 
+// W=128: as w64, with Xc/Xa in the ring and Vc/Va streamed through VB BK-row buffers.
+// DPAD=128: rows are unpadded, 16-byte chunks XOR-swizzled by row&7 instead.
 template<int G, int WPH, int BK, bool RAW=false, bool SPECIAL=false>
 __device__ __forceinline__
 void Bwd_rows_w128_impl(
-    const bf16* __restrict__ Xa_bf,   // anchor stream (R or S), [B,1,N,D]
-    const bf16* __restrict__ Va_bf,   // its values (Vr or Vs)
-    const bf16* __restrict__ Xr_bf,   // Q [B,H,N,D]
-    const bf16* __restrict__ gYr_bf,  // dY [B,H,N,D]
-    const bf16* __restrict__ Xc_bf,   // other key stream (S or R), [B,1,N,D]
-    const bf16* __restrict__ Vc_bf,   // its values
-    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,   // [B,H,N]
-    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,   // per-head partials [B,H,N,D]
+    const bf16* __restrict__ Xa_bf,
+    const bf16* __restrict__ Va_bf,
+    const bf16* __restrict__ Xr_bf,
+    const bf16* __restrict__ gYr_bf,
+    const bf16* __restrict__ Xc_bf,
+    const bf16* __restrict__ Vc_bf,
+    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,
+    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,
     const uint8_t* __restrict__ support, const uint32_t* __restrict__ packed_mask, int mask_words, const bool* __restrict__ mask, int H, int N, float scale, int win)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -2115,16 +2119,16 @@ void Bwd_rows_w128_impl(
     extern __shared__ char smem_raw[];
     bf16* rawQ_sm = reinterpret_cast<bf16*>(smem_raw);
     bf16* rawDY_sm = rawQ_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
-    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);                // [2][BK][DPAD]
-    bf16* vc_sm = xc_sm + 2 * CAP * DPAD;                        // [2][BK][DPAD]
-    float* anchX = reinterpret_cast<float*>(vc_sm + 2 * VB * BK * DPAD);   // [D]
-    float* anchV = anchX + 2 * D;                                   // [D]
-    float* mr_sm = reinterpret_cast<float*>(reinterpret_cast<bf16*>(anchV)+2*D);                                   // [G][BJ]
+    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
+    bf16* vc_sm = xc_sm + 2 * CAP * DPAD;
+    float* anchX = reinterpret_cast<float*>(vc_sm + 2 * VB * BK * DPAD);
+    float* anchV = anchX + 2 * D;
+    float* mr_sm = reinterpret_cast<float*>(reinterpret_cast<bf16*>(anchV)+2*D);
     float* ilr_sm = mr_sm + G * BJ;
     float* sr_sm = ilr_sm + G * BJ;
-    float* wOut = sr_sm + G * BJ;                               // [G][WPH][NOUT*D]
-    float* redOut = wOut;          // [G][NOUT*D]
-    uint32_t* msk_sm = reinterpret_cast<uint32_t*>(redOut + (size_t)G * NOUT * D);   // [2][BJ]
+    float* wOut = sr_sm + G * BJ;
+    float* redOut = wOut;
+    uint32_t* msk_sm = reinterpret_cast<uint32_t*>(redOut + (size_t)G * NOUT * D);
 
     const int64_t kv_off = (int64_t)b * N * D;
     const int64_t q_off_h = ((int64_t)b * H + h0 + head) * N * D;
@@ -2202,7 +2206,6 @@ void Bwd_rows_w128_impl(
             }
         }
 
-        // Per-head A operands from the head's own Q / dY rows and the shared anchor.
         {
             for (int jl = tid_h; jl < BJ; jl += WPH * 32) {
                 const int j = j0 + jl;
@@ -2210,7 +2213,7 @@ void Bwd_rows_w128_impl(
                     mr_sm[lh * BJ + jl] = m_r[st_off_h + j];
                     float il = 1.0f / fmaxf(l_r[st_off_h + j], DENOM_EPS);
                     sr_sm[lh * BJ + jl] = sum_r[st_off_h + j];
-                    if (!mb[(int64_t)j * N + a]) il = 0.0f;          // mask[query][anchor]
+                    if (!mb[(int64_t)j * N + a]) il = 0.0f;
                     ilr_sm[lh * BJ + jl] = il;
                 } else {
                     mr_sm[lh * BJ + jl] = 0.0f; ilr_sm[lh * BJ + jl] = 0.0f; sr_sm[lh * BJ + jl] = 0.0f;
@@ -2328,7 +2331,6 @@ void Bwd_rows_w128_impl(
             }
         }
 
-        // ---- epilogue: Hadamard row-collapse of this warp's 16 rows (head's Q / dY rows) ----
         float ng[DH / 4], nv[DH / 4];
         const int64_t r0 = q_off_h + (int64_t)min(j0 + jw + g, N - 1) * D + 2 * tig;
         const int64_t r1 = q_off_h + (int64_t)min(j0 + jw + g + 8, N - 1) * D + 2 * tig;
@@ -2376,14 +2378,14 @@ void Bwd_rows_w128_impl(
 template<int G, int WPH, int BK, bool RAW=false>
 __global__ __launch_bounds__(G * WPH * 32, 1)
 void Bwd_rows_w128(
-    const bf16* __restrict__ Xa_bf,   // anchor stream (R or S), [B,1,N,D]
-    const bf16* __restrict__ Va_bf,   // its values (Vr or Vs)
-    const bf16* __restrict__ Xr_bf,   // Q [B,H,N,D]
-    const bf16* __restrict__ gYr_bf,  // dY [B,H,N,D]
-    const bf16* __restrict__ Xc_bf,   // other key stream (S or R), [B,1,N,D]
-    const bf16* __restrict__ Vc_bf,   // its values
-    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,   // [B,H,N]
-    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,   // per-head partials [B,H,N,D]
+    const bf16* __restrict__ Xa_bf,
+    const bf16* __restrict__ Va_bf,
+    const bf16* __restrict__ Xr_bf,
+    const bf16* __restrict__ gYr_bf,
+    const bf16* __restrict__ Xc_bf,
+    const bf16* __restrict__ Vc_bf,
+    const float* __restrict__ m_r, const float* __restrict__ l_r, const float* __restrict__ sum_r,
+    float* __restrict__ gradXa, float* __restrict__ gradVa, float* __restrict__ gradXc, float* __restrict__ gradVc,
     const uint8_t* __restrict__ support, const uint32_t* __restrict__ packed_mask, int mask_words, const bool* __restrict__ mask, int H, int N, float scale, int win)
 {
     const int a=blockIdx.x,b=blockIdx.z;
@@ -2398,8 +2400,7 @@ void Bwd_rows_w128(
 
 
 
-// Reference metadata producer. A shared mask-preparation pass can supply the
-// same [B,N] bytes (0=no support,1=singleton,2=multiple) without this launch.
+// support[b,row]: visible keys in the row's window, saturated at 2 (0 none, 1 singleton).
 __global__ void prepare_row_support(const bool* mask,uint8_t* support,int N,int win) {
  const int row=blockIdx.x,b=blockIdx.y,t=threadIdx.x,k=row-win+1+t;
  const bool admitted=t<win && k>=0 && k<N && mask[((int64_t)b*N+row)*N+k];
@@ -2416,8 +2417,8 @@ inline bool launch_retained_rs(
  float* gx,float* gv,float* gxc,float* gvc,const bool* mask,
  int B,int H,int N,int win,float scale,int max_smem_optin,cudaStream_t stream,const uint8_t* support,const uint32_t* packed_mask,int mask_words) {
  if(H%2) return false;
- // H100-only current launch heuristic: retain at least four CTA waves per SM,
- // and shorten visits near boundaries where anchor work varies most strongly.
+ // visits: head groups per CTA sharing one staged key window. More visits cut
+ // window reloads; the work thresholds (tuned on H100) keep the grid full.
  int visits=1;
  const int64_t work=(int64_t)B*H*N;
  if(win<=32 && H%8==0 && N>4*win && work>=4224) visits=4;
@@ -2520,4 +2521,4 @@ inline bool launch_retained_rs(
  }
 return false;
 }
-} // namespace overnight_rs_v4
+} // namespace att3_shared_rs

@@ -1,12 +1,7 @@
 /**
  * @file backward.cu
- * @brief Backward pass CUDA kernels for hypergraph attention.
- *
- * Computes gradients for Q, R, S, and all V tensors using online softmax
- * statistics for numerical stability. Includes Jacobian correction terms
- * for proper gradient flow through the softmax.
- *
- * Copyright (c) 2026 Springtail AI. MIT License.
+ * @brief Backward kernels for hypergraph and single-gather attention, using
+ * the softmax stats saved by the forward. Copyright (c) 2026 Springtail AI. MIT License.
  */
 
 #include <torch/extension.h>
@@ -19,7 +14,6 @@
 #include "common.cuh"
 #include "../cpp/cuda_bindings.h"
 
-// Backward-specific tile aliases for gradient kernels
 #ifndef T_I
 #define T_I TILE_I
 #endif
@@ -29,12 +23,6 @@
 #ifndef T_K
 #define T_K TILE_K
 #endif
-
-// =============================================================================
-// NOTE: Softmax stats (m_i, l_i, m_j, l_j, m_k, l_k) are computed during the
-// forward pass and passed to backward. The backward pass does NOT recompute
-// these stats - this avoids redundant work.
-// =============================================================================
 
 // Both members of a pair must be visible from mask row `row`.
 __device__ __forceinline__ bool mask_pair_allowed(
@@ -120,7 +108,6 @@ __global__ void V_gather_grad(
         gy_reg_vec[d] = bf2f(gY_regBH[reg_safe*D_CONST + d]);
     }
 
-    // Hoist reg-only stats out of the loop; pre-invert l_reg once.
     const float m_reg_val = m_regBH[reg_safe];
     const float inv_l_reg = 1.0f / fmaxf(l_regBH[reg_safe], DENOM_EPS);
 
@@ -131,8 +118,8 @@ __global__ void V_gather_grad(
     __shared__ float sh_l_inv[T_J];      // pre-inverted, multiply not divide
 
     for (int lBase=0; lBase<N; lBase+=T_J){
-        // Cooperative load: all threads together cover the D range.
-        int lt = threadIdx.y;                       // 0..T_K-1 (<= T_J)
+        // Row per thread y, D strided over thread x; needs T_K >= T_J.
+        int lt = threadIdx.y;
         if (lt < T_J && (lBase+lt) < N){
             int lGlob = lBase + lt;
             #pragma unroll
@@ -151,7 +138,6 @@ __global__ void V_gather_grad(
         if (active) {
             for (int lOff=0; lOff<T_J && (lBase+lOff)<N; ++lOff){
                 const int lGlob = lBase + lOff;
-                // logits = (X_out*X_reg) · X_loop — halved FMA vs the triple product
                 float logits=0.f;
                 #pragma unroll
                 for (int d=0; d<D_CONST; ++d)
@@ -205,8 +191,8 @@ __global__ void V_scatter_grad(
     const bool*  __restrict__ mask,
     int N, int H, float scale)
 {
-    const int tx = blockIdx.x * T_I + threadIdx.x;     // 0..N-1 (column)
-    const int ty = blockIdx.y * T_K + threadIdx.y;     // 0..N-1 (row)
+    const int tx = blockIdx.x * T_I + threadIdx.x;
+    const int ty = blockIdx.y * T_K + threadIdx.y;
     const int out0 = OUT_IS_Y ? ty : tx;
     const int reg0 = OUT_IS_Y ? tx : ty;
     const int bh = blockIdx.z;          // flattened (batch, head)
@@ -242,9 +228,9 @@ __global__ void V_scatter_grad(
         x_reg_vec[d]  = bf2f(X_regBH[reg_safe*D_CONST + d]);
         v_reg_vec[d]  = bf2f(V_regBH[reg_safe*D_CONST + d]);
     }
-    // gY_reg row: on thread y it is warp-uniform, so read it straight from
-    // global (broadcast, L1-hot) instead of spending a fourth D-long register
-    // array that spills. On thread x each lane wants its own row, so cache it.
+    // gY_reg row: on thread y it is warp-uniform, so read it from global
+    // (broadcast, L1-hot) rather than a fourth D-long register array that
+    // spills. On thread x each lane wants its own row, so cache it.
     const bf16* gy_reg_row = &gY_regBH[reg_safe*D_CONST];
     float gy_reg_cache[OUT_IS_Y ? D_CONST : 1];
     if constexpr (OUT_IS_Y) {
@@ -261,8 +247,8 @@ __global__ void V_scatter_grad(
     float* sh_l  = sh_m  + T_J;
 
     for (int lBase=0; lBase < N; lBase+=T_J){
-        // Cooperative load: all threads together cover the D range.
-        const int lt = threadIdx.y;  // reuse y for co-load rows
+        // Row per thread y, D strided over thread x; needs T_K >= T_J.
+        const int lt = threadIdx.y;
         if (lt < T_J && (lBase+lt) < N){
             const int lGlob = lBase + lt;
             for (int d=threadIdx.x; d<D_CONST; d+=T_I){
@@ -330,16 +316,16 @@ __global__ void V_scatter_grad(
 }
 
 // =============================================================================
-// Tensor-core backward (gather-only path, cuda_docs/backward_tensor_cores.md)
+// Tensor-core backward (gather-only path)
 // =============================================================================
-// Engaged when the scatter cotangents are all zero (scatter unused): the cross
-// terms d4/d5/d6 vanish, so every correction sum collapses FlashAttention-style
-// to rowsum(dY o Y), computed host-side with ATen. What remains is ONE cube
-// pass, run three times with permuted roles exactly like Y_gather_tc:
+// Used when the scatter cotangents are all zero: the cross terms d4/d5/d6
+// vanish, so every correction sum collapses FlashAttention-style to
+// rowsum(dY o Y), computed host-side. What remains is one cube pass, run three
+// times with permuted roles like Y_gather_tc:
 //
 //   anchor a (one CTA per (b,h,a)) / rows r (16-row warp tiles) / cols c
-//   (double-buffered BTC_BK-column stage, as in Y_gather_tc, so smem is flat
-//   in N). Score-shaped GEMMs per (r,c) tile, D contracted:
+//   (double-buffered BTC_BK-column stage, so smem is flat in N). Score-shaped
+//   GEMMs per (r,c) tile, D contracted:
 //
 //     x   = scale * sum_d Xa[d]  * Xr[r,d]  * Xc[c,d]      (logits)
 //     d_a =         sum_d gYa[d] * Vr[r,d]  * Vc[c,d]
@@ -348,7 +334,7 @@ __global__ void V_scatter_grad(
 //
 //   The anchor vector is folded into the A operands as a diagonal rescale of
 //   the raw rows, staged once per row block into four shared-memory tiles.
-//   Softmax weights come straight from the forward stats (no online pass):
+//   Softmax weights come straight from the forward stats:
 //
 //     P_a = exp(x - m_a)/l_a    P_r = exp(x - m_r[r])/l_r[r]    P_c likewise
 //     grad_A = (d_a - sum_a)*P_a + (d_r - sum_r[r])*P_r + (d_c - sum_c[c])*P_c
@@ -375,23 +361,21 @@ __global__ void V_scatter_grad(
 //   P_r live iff mask[r][a] && mask[r][c]
 //   P_c live iff mask[c][a] && mask[c][r]
 //
-// Four of the six factors are separable in the iteration space and are folded
-// into scales that the cell loop already multiplies by, so they cost nothing
-// per cell: mask[r][a] and (via a 0/1 float) mask[a][r] are per-row, while
-// mask[c][a] folds into P_c's inv-l and mask[a][c] into ilac_sm, the anchor's
-// inv-l staged per column. Folding requires exp to be finite even for dead
-// cells — a fully masked anchor carries m = NEG_INF and l = 0 from the forward,
-// and exp(x + 1e30) * 1e6 would be inf — so the exponent is clamped at 0. That
-// is free of consequence for live cells, where the forward's stats already
-// guarantee x <= m, and it also subsumes the pad test: pad rows and cols carry
-// a zero inv-l and read zero mask bits.
+// Four of the six factors are separable and fold into scales the cell loop
+// already multiplies by: mask[r][a] into P_r's inv-l and mask[a][r] as a 0/1
+// float per row, mask[c][a] into P_c's inv-l and mask[a][c] into ilac_sm, the
+// anchor's inv-l staged per column. Folding needs exp to stay finite on dead
+// cells (a fully masked anchor carries m = NEG_INF from the forward, so
+// exp(x - m) is inf and a zero gate gives NaN), hence the exponent is clamped
+// at 0. Live cells are untouched since the forward guarantees x <= m, and the
+// clamp also subsumes the pad test: pad rows and cols carry a zero inv-l and
+// read zero mask bits.
 //
-// The remaining two factors are genuinely 2-D non-separable, but a (r,c) tile
-// touches only the [BTC_BJ][BTC_BK] mask rectangle, staged per tile as two
-// bit-packed 512-byte windows: msk_sm packs mask[r][c] along c (one word per
-// row), mskT_sm packs mask[c][r] along r. Both pack along the mask's own fast
-// axis, so both load straight from global — no resident [N][N] copies, no
-// transpose. Pad rows and cols pack to zero bits, gating their cells off.
+// The other two factors are 2-D, but a (r,c) tile only touches a [BJ][BK]
+// mask rectangle, staged per tile as two bit-packed windows: msk_sm packs
+// mask[r][c] along c (one word per row), mskT_sm packs mask[c][r] along r.
+// Both pack along the mask's own fast axis, so both load straight from global
+// with no transpose. Pad rows and cols pack to zero bits.
 //
 // The collapsed correction sums are unaffected by masking: sum = rowsum(dY o Y)
 // holds for any weight matrix the forward actually used, and the forward
@@ -404,21 +388,17 @@ constexpr int BTC_WARPS = 8;
 constexpr int BTC_BK = 32;
 constexpr int BTC_BJ = BTC_WARPS * 16;
 
-// Which softmaxes a launch differentiates. BWD_ALL is the legacy pass above,
-// where every input owns one of the three gathers. The single-gather backward
-// (single_gather_backward_cuda) has one softmax, normalized over the query, so
-// it specializes on where that query sits in the pass: the anchor for the
-// Q-owned pass, the rows for the R/S-owned passes. Everything belonging to the
-// two absent softmaxes -- operand tiles, score GEMMs, weights, the value
-// accumulator when the anchor has no value -- drops out at compile time.
+// Which softmaxes a launch differentiates. BWD_ALL is the three-gather pass
+// above. The single-gather backward has one softmax, normalized over the
+// query, so it specializes on where the query sits in the pass: the anchor
+// for the Q-owned pass, the rows for the R/S-owned passes. Everything belonging
+// to the two absent softmaxes (operand tiles, score GEMMs, weights, the value
+// accumulator when the anchor has no value) drops out at compile time.
 enum BwdRole { BWD_ALL = 0, BWD_QUERY_ANCHOR = 1, BWD_QUERY_ROWS = 2 };
 
-// single_col=true drops the second column buffer, mirroring Y_gather_tc's
-// SINGLE_TILE (hopper_plan.md Phase 1): the caller promises win <= bk, so
-// there is exactly one column tile and the cp.async pipeline's second buffer
-// goes unused. The row loop already writes straight into redOut with a plain
-// sum (no online-softmax carry to simplify), so backward has no row-tile
-// counterpart to this flag.
+// single_col=true drops the second column buffer: the caller guarantees every
+// row block visits exactly one column tile, so the cp.async pipeline's second
+// buffer would go unused.
 constexpr size_t btc_smem_bytes(int D, int warps, int bk, bool masked, int role = BWD_ALL, bool single_col = false) {
     const int bj = warps * 16, dpad = D + 8;
     const int pa = role != BWD_QUERY_ROWS, pr = role != BWD_QUERY_ANCHOR, pc = role == BWD_ALL;
@@ -461,10 +441,9 @@ void Bwd_gather_tc(
     constexpr int BJ = WARPS * 16;
     constexpr int MRW = BJ / 32;    // words per col of a transposed mask window
     constexpr int KS = D / 16;      // score GEMM k-steps (D contracted)
-    // The output accumulators cover DH cols per pass over the col side; at
-    // D=128 the default DHT=64 makes two passes, recomputing the scores,
-    // rather than doubling the accumulator registers (DHT=128 is the
-    // single-pass variant under test).
+    // The output accumulators cover DH cols per pass over the col side. At
+    // D=128, DHT=64 makes two passes that recompute the scores rather than
+    // doubling the accumulator registers; DHT=128 is one pass.
     constexpr int DH = DHT;
     constexpr int NPASS = D / DH;
     constexpr bool PA = ROLE != BWD_QUERY_ROWS;    // anchor-normalized softmax
@@ -522,7 +501,7 @@ void Bwd_gather_tc(
     // the caller shares KV across query heads. With the query as anchor the
     // anchor side is query-indexed and rows/cols are KV; with the queries as rows
     // the anchor (R or S) is KV, the rows (Q, dY) are query-indexed, cols are KV.
-    // The legacy all-three pass always runs with Hkv == H.
+    // BWD_ALL always runs with Hkv == H.
     const int64_t bh = (int64_t)b * H + h;
     const int64_t kvh = (int64_t)b * Hkv + h / (H / Hkv);
     const int64_t q_off = bh * N * D, kv_off = kvh * N * D;
@@ -532,7 +511,7 @@ void Bwd_gather_tc(
     const int64_t nd_off   = kv_off;                                                      // Xc / Vc / gYc
     const int64_t st_off = bh * N;
 
-    // ---- one-time loads: anchor only (the col side stages per k tile) ----
+    // ---- one-time loads: anchor only ----
     constexpr int DV = D / 8;
     for (int d = tid; d < D; d += blockDim.x) {
         anchX[d] = scale * bf2f(Xa_bf[anc_off + d]);
@@ -550,7 +529,7 @@ void Bwd_gather_tc(
     // win > 0 restricts the row blocks and, per block, the col tiles to those
     // that can hold visible pairs (sg_row_bounds / sg_col_bounds, keyed on
     // which side of the pass the query sits); the mask still decides every
-    // cell. The legacy BWD_ALL launch passes 0 and stays dense.
+    // cell. BWD_ALL passes 0 and stays dense.
     constexpr int SIDE = (ROLE == BWD_QUERY_ROWS) ? SG_QUERY_ROWS : SG_QUERY_ANCHOR;
     int j_lo, j_hi;
     sg_row_bounds(SIDE, a, N, win, BJ, j_lo, j_hi);
@@ -560,8 +539,7 @@ void Bwd_gather_tc(
         sg_col_bounds(SIDE, a, j0, BJ, N, win, BK, k_lo, k_hi);
 
         // Stage col tile k0 into buffer `buf`: matrices, forward stats and
-        // (masked) mask windows. Zero-filled pads carry a zero inv-l and zero
-        // mask bits, gating the tail tile off with no per-cell test.
+        // (masked) mask windows. Pad cols carry a zero inv-l and zero mask bits.
         auto stage_cols = [&](int k0, int buf) {
             bf16* xs = xc_sm + buf * BK * DPAD;
             bf16* vs = vc_sm + buf * BK * DPAD;
@@ -590,8 +568,8 @@ void Bwd_gather_tc(
                     sc  = sum_c[st_off + k];
                 }
                 if constexpr (MASKED) {
-                    // Separable column factors, free per cell: mask[c][a]
-                    // zeroes P_c's inv-l, mask[a][c] rides in ilac_sm.
+                    // Separable column factors: mask[c][a] zeroes P_c's
+                    // inv-l, mask[a][c] rides in ilac_sm.
                     if (PC && (k >= N || !mb[(int64_t)k * N + a])) ilc = 0.0f;
                     if constexpr (PA) {
                         ilac_sm[buf * BK + kl] =
@@ -622,8 +600,7 @@ void Bwd_gather_tc(
         };
 
         // A operands: the anchor rescale is done in fp32 with a single bf16
-        // rounding, matching Y_gather_tc's Qp precision. Pad rows stage as
-        // zeros.
+        // rounding, matching Y_gather_tc's Qp precision. Pad rows stage as zeros.
         for (int idx = tid; idx < BJ * DV; idx += blockDim.x) {
             const int jl = idx / DV, dv = (idx % DV) * 8;
             const int j = j0 + jl;
@@ -668,9 +645,8 @@ void Bwd_gather_tc(
                     sr_sm[jl] = sum_r[st_off + j];
                 }
                 if constexpr (MASKED) {
-                    // Both row-side factors are staged rather than kept in
-                    // registers: a live register costs more than a
-                    // rematerializable smem read.
+                    // Row-side factors go through smem rather than registers:
+                    // a rematerializable smem read is cheaper than a live register.
                     if (PR && !mb[(int64_t)j * N + a]) il = 0.0f;          // mask[r][a]
                     if constexpr (PA) par_sm[jl] = mb[(int64_t)a * N + j] ? 1.0f : 0.0f;  // mask[a][r]
                 }
@@ -694,11 +670,9 @@ void Bwd_gather_tc(
         const bool rpad0 = (j0 + jw + g)     >= N;
         const bool rpad1 = (j0 + jw + g + 8) >= N;
 
-        // The two row-side mask factors were folded into ilr_sm / par_sm during
-        // staging above. Pad rows pack to zero bits in both windows, so no
-        // per-cell pad test is needed. Rows jw+g and jw+g+8 always share one
-        // word of the transposed window (a 16-row tile never straddles a 32-row
-        // boundary), so one load covers both at shifts 0 and 8.
+        // Rows jw+g and jw+g+8 share one word of the transposed window (a
+        // 16-row tile never straddles a 32-row boundary), so one load covers
+        // both at shifts 0 and 8.
         const int rwd = (jw + g) >> 5;
         const int rb  = (jw + g) & 31;
 
@@ -721,9 +695,8 @@ void Bwd_gather_tc(
 
             int cur = 0;
             for (int k0 = k_lo; k0 < k_hi; k0 += BK) {
-                // Prefetch k0+1; the closing barrier publishes it and frees `cur`.
-                // SINGLE_COL's caller-guaranteed single trip never reuses the
-                // buffer, so there is nothing to prefetch.
+                // Prefetch the next tile; the closing barrier publishes it and
+                // frees `cur`. SINGLE_COL has a single trip, nothing to prefetch.
                 int nxt = cur;
                 if constexpr (!SINGLE_COL) {
                     nxt = cur ^ 1;
@@ -787,11 +760,10 @@ void Bwd_gather_tc(
                         const float mc0 = PC ? mc_cur[cl]     : 0.0f, ilc0 = PC ? ilc_cur[cl]     : 0.0f;
                         const float mc1 = PC ? mc_cur[cl + 1] : 0.0f, ilc1 = PC ? ilc_cur[cl + 1] : 0.0f;
                         const float sc0 = PC ? sc_cur[cl] : 0.0f, sc1 = PC ? sc_cur[cl + 1] : 0.0f;
-                        // Only the two 2-D factors are left per cell, one aligned load
-                        // per pair in either window: bits 0/1 of rc* are mask[r][c] and
-                        // mask[r][c+1] (c even, so the pair shares a word), bits 0/8 of
-                        // cr* are mask[c][r] and mask[c][r+8]. So rc* indexes by row and
-                        // cr* by col — the windows' packing axes, swapped.
+                        // The two 2-D factors, one aligned load per pair in either
+                        // window: bits 0/1 of rc* are mask[r][c] and mask[r][c+1] (c
+                        // even, so the pair shares a word), bits 0/8 of cr* are
+                        // mask[c][r] and mask[c][r+8].
                         uint32_t rc0 = ~0u, rc1 = ~0u, cr0 = ~0u, cr1 = ~0u;
                         float ilac0 = 0.0f, ilac1 = 0.0f;
                         if constexpr (MASKED && PR) {
@@ -821,23 +793,14 @@ void Bwd_gather_tc(
                             float Pa = 0.0f;
                             Pr[e] = 0.0f; Pc[e] = 0.0f;
                             if constexpr (MASKED) {
-                                // Clamping the exponent at 0 is what lets every gate be
-                                // a plain multiply or select: live cells always have
-                                // x <= m so the clamp never touches them, while dead
-                                // ones can no longer reach inf and turn 0*inf into NaN.
-                                // That kills the pad test too (pad rows/cols carry a
-                                // zero inv-l and zero mask bits), so no `pad` term
-                                // appears below. Remaining per cell: mask[r][c] and
-                                // mask[c][r]; the anchor's own factors already rode in
-                                // via ilac (col) and par (row).
+                                // Exponent clamped at 0 so every gate can be a plain
+                                // multiply or select (see the MASKED notes above).
                                 const float x = ax[hf][e];
                                 const float ilac = c1 ? ilac1 : ilac0;
                                 const float par  = hi ? par1 : par0;
-                                // Gate the *scale*, never the exp. Guarding the whole
+                                // Gate the inv-l, never the exp: guarding the whole
                                 // expression lets nvcc branch around the MUFU, and a
-                                // scattered mask then diverges inside the warp and runs
-                                // both sides: that cost `random` 21% over `causal`.
-                                // Selecting on inv-l keeps every cell's cost identical.
+                                // scattered mask then diverges inside the warp.
                                 const float ilrg = (((hi ? rc1 : rc0) >> c1) & 1u) ? ilr : 0.0f;
                                 const float ilcg = (((c1 ? cr1 : cr0) >> (hi ? 8 : 0)) & 1u)
                                                  ? ilc : 0.0f;
@@ -896,12 +859,8 @@ void Bwd_gather_tc(
                     }
                 }
 
-                // The multi-pass D=128/DHT=64 split re-primes this single
-                // buffer via stage_cols() at the top of the next pass, so the
-                // barrier protecting readers from that overwrite is still
-                // needed even with nothing left to prefetch; only the
-                // wait_all (nothing in flight) and the buffer toggle (never
-                // reused) are SINGLE_COL-dead.
+                // SINGLE_COL still needs the barrier: with NPASS > 1 the next
+                // pass re-stages this buffer. Only the wait and toggle are dead.
                 if constexpr (!SINGLE_COL) {
                     asm volatile("cp.async.wait_all;\n" ::);
                     cur = nxt;
@@ -976,38 +935,17 @@ void Bwd_gather_tc(
 }
 
 // =============================================================================
-// NOTE: The old 3D jacobian_corrections kernel has been replaced by two-pass
-// 2D-tiled correction passes using QS_grad_kernel<true> and R_grad_kernel<true>.
-// This eliminates the 3D thread grid (8192 blocks) in favor of 2D grids
-// (128 blocks each), reducing atomic contention by 32x.
+// Gradient Kernels for Q, R, S (with Jacobian corrections)
 // =============================================================================
-
-
-
-// =============================================================================
-// Gradient Kernels for Q, R, S (with integrated Jacobian corrections)
-// =============================================================================
-//
-// Architecture: Two-pass 2D-tiled approach
-//   Phase 1: QS_grad_kernel<true>  → computes sum_q, sum_s (correction sums)
-//            R_grad_kernel<true>   → computes sum_r (correction sum)
-//   Phase 2: QS_grad_kernel<false> → computes gradQ, gradS using corrections
-//            R_grad_kernel<false>  → computes gradR using corrections
-//
-// This replaces the old 3D jacobian_corrections kernel (8192 blocks, 512
-// threads, 256 atomics/element) with 2D-tiled correction passes (128 blocks,
-// 256 threads, 8 atomics/element) — a 32x reduction in atomic contention.
-//
-// Both kernels use a compile-time template bool CORRECTION_ONLY to share
-// 95% of the code between correction and gradient modes.
-//
-// =============================================================================
+// Two passes over 2D (i,k) or (j,k) tiles, streaming the third mode:
+//   1. QS_grad_kernel<true>  -> correction sums sum_q, sum_r, sum_s
+//   2. QS_grad_kernel<false> -> gradQ, gradS;  R_grad_kernel<false> -> gradR
 
 /**
- * QS_grad_kernel - Computes gradQ and gradS with Jacobian corrections.
- * 
- * CORRECTION_ONLY=true:  Computes correction sums (sum_q, sum_r, sum_s)
- * CORRECTION_ONLY=false: Computes gradQ and gradS using precomputed corrections
+ * QS_grad_kernel - gradQ and gradS over (i,k) tiles, streaming j.
+ *
+ * CORRECTION_ONLY=true:  correction sums (sum_q, sum_r, sum_s)
+ * CORRECTION_ONLY=false: gradQ and gradS from precomputed corrections
  */
 template<bool CORRECTION_ONLY, int BLOCK_I, int BLOCK_J, int BLOCK_K, int D_CONST, int REG_CAP = D_CONST>
 __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
@@ -1138,10 +1076,9 @@ __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
 
     float reg_sum_q = 0.0f, reg_sum_s = 0.0f;
     float sumQi = 0.0f, sumSk = 0.0f;
-    // Algebraic factoring: accumulate rj_weighted[d] = Σⱼ grad_A_j * bf2f(R[j,d])
-    // Then gradQ[d] = rj_weighted[d] * bf2f(S[k,d]), gradS[d] = rj_weighted[d] * bf2f(Q[i,d])
-    // This replaces two D-sized accumulators with one, saving 64 registers and
-    // reducing the hot inner loop from 3 shmem loads/d to 1 shmem load/d.
+    // Factored accumulation: rj_weighted[d] = sum_j grad_A_j * R[j,d], then
+    // gradQ[i,d] = rj_weighted[d] * S[k,d] and gradS[k,d] = rj_weighted[d] * Q[i,d]
+    // in the epilogue. One D-long accumulator instead of two, one shmem load per d.
     float rj_weighted[REG_CAP];
     if constexpr (!CORRECTION_ONLY) {
         if (valid) {
@@ -1198,20 +1135,13 @@ __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
         }
         __syncthreads();
 
-        // ============================================================
-        // D-tiled dot products with j sub-tiling.
-        // Precomputes i/k pairwise products per D_TILE, then sweeps j.
-        // i/k values are loaded once per D_TILE instead of once per
-        // (j, d) pair, eliminating 50% of shmem loads.
-        //
-        // Shmem loads per j-tile: 6,144 (was 12,288).
-        // Register cost: 7 × J_SUB = 28 per-j accumulators (was 7 scalar).
-        // ============================================================
-        constexpr int J_SUB  = 4;  // j sub-tile size
-        constexpr int D_TILE = 4;  // d tile size
+        // D-tiled dot products with j sub-tiling: the i/k pairwise products are
+        // formed once per D_TILE and reused across J_SUB rows of j, at the cost
+        // of 7 x J_SUB per-j accumulators.
+        constexpr int J_SUB  = 4;
+        constexpr int D_TILE = 4;
 
         for (int jSub = 0; jSub < BLOCK_J && (jBase + jSub) < N; jSub += J_SUB) {
-            // Per-j accumulators for this sub-tile
             float dot_j[J_SUB], d1_j[J_SUB], d2_j[J_SUB], d3_j[J_SUB];
             float d4_j[J_SUB], d5_j[J_SUB], d6_j[J_SUB];
             #pragma unroll
@@ -1220,9 +1150,7 @@ __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
                 d4_j[jj] = 0.f; d5_j[jj] = 0.f; d6_j[jj] = 0.f;
             }
 
-            // D-tiled precomputation: d-outer, j-inner
             for (int d_base = 0; d_base < D_CONST; d_base += D_TILE) {
-                // Precompute 7 i/k pairwise products (8 shmem loads × D_TILE)
                 float p_dot[D_TILE], p_d1[D_TILE], p_d2[D_TILE], p_d3[D_TILE];
                 float p_d4[D_TILE], p_d5[D_TILE], p_d6[D_TILE];
                 #pragma unroll
@@ -1248,9 +1176,9 @@ __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
                     p_d6[dd]  = vq2i * dyk2;
                 }
 
-                // Accumulate over j sub-tile. j-arrays have stride D_CONST
-                // (no padding) and d_base is a multiple of D_TILE=4, so each
-                // 4-float slice is 16-byte aligned → one LDS.128 per array.
+                // j-arrays have stride D_CONST (no padding) and d_base is a
+                // multiple of 4, so each 4-float slice is 16-byte aligned: one
+                // LDS.128 per array.
                 #pragma unroll
                 for (int jj = 0; jj < J_SUB; jj++) {
                     const int jOff = jSub + jj;
@@ -1279,7 +1207,6 @@ __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
                 }
             }
 
-            // Process accumulated dot products for this sub-tile
             #pragma unroll
             for (int jj = 0; jj < J_SUB; jj++) {
                 const int jOff = jSub + jj;
@@ -1306,7 +1233,6 @@ __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
                     const float grad_A = (gAq - sumQi) * Aq
                                        + (gAr - sh_sumr[jOff]) * Ar
                                        + (gAs - sumSk) * As;
-                    // Factored accumulation: float4 load per 4 d's (LDS.128).
                     #pragma unroll
                     for (int d = 0; d < D_CONST; d += 4) {
                         const float4 rj4 = *reinterpret_cast<const float4*>(&sh_R[jOff*D_CONST + d]);
@@ -1352,10 +1278,7 @@ __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
         if (threadIdx.x == 0 && k0 < N)
             atomicAdd(&sum_sBH[k0], reduce_buf[threadIdx.y]);
     } else {
-        // Algebraic factoring epilogue:
-        //   gradQ[i,d] = scale * rj_weighted[d] * bf2f(S[k,d])
-        //   gradS[k,d] = scale * rj_weighted[d] * bf2f(Q[i,d])
-        // bf2f(S[k,d]) and bf2f(Q[i,d]) are still in shared memory (loaded before j-loop).
+        // S[k] and Q[i] rows are still in shared memory from before the j loop.
         float* gQbh = gradQ + bh * stride_BH;
         float* gSbh = gradS + bh * stride_BH;
         if (valid) {
@@ -1369,10 +1292,10 @@ __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
 }
 
 /**
- * R_grad_kernel - Computes gradR with Jacobian corrections.
+ * R_grad_kernel - gradR over (j,k) tiles, streaming i.
  *
- * CORRECTION_ONLY=true:  Computes correction sum sum_r[j]
- * CORRECTION_ONLY=false: Computes gradR using precomputed corrections
+ * CORRECTION_ONLY=true:  correction sum sum_r[j]
+ * CORRECTION_ONLY=false: gradR from precomputed corrections
  */
 template<bool CORRECTION_ONLY, int BLOCK_J, int BLOCK_I, int BLOCK_K, int D_CONST, int REG_CAP = D_CONST>
 __global__ void __launch_bounds__(256, 1) R_grad_kernel(
@@ -1441,11 +1364,8 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
     float* sh_dYk  = sh_Vs2k + BLOCK_K * D_PAD;
     float* sh_dYk2 = sh_dYk  + BLOCK_K * D_PAD;
 
-    // I-tile data (streamed). Stride is D_CONST (not D_PAD) so that
-    // 4-element rows are 16-byte aligned and inner-loop reads can use
-    // float4 LDS.128. Bank conflicts are handled at the cooperative-store
-    // site by the linear-tid mapping below (warp covers one row × 32 cols).
-
+    // Streamed i-tile, stride D_CONST (not D_PAD) so 4-float slices are
+    // 16-byte aligned for LDS.128.
     float* sh_Q    = sh_dYk2 + BLOCK_K * D_PAD;
     float* sh_Vq1  = sh_Q    + BLOCK_I * D_CONST;
     float* sh_Vq2  = sh_Vq1  + BLOCK_I * D_CONST;
@@ -1456,7 +1376,6 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
     float* sh_li   = sh_mi   + BLOCK_I;
     float* sh_sumq = sh_li   + BLOCK_I;
 
-    // Cooperative load of j-indexed and k-indexed data into shared memory
     {
         const int tid = threadIdx.x + threadIdx.y * BLOCK_J;
         const int nThreads = BLOCK_J * BLOCK_K;
@@ -1520,12 +1439,10 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
     const int sh_j_off = threadIdx.x * D_PAD;
     const int sh_k_off = threadIdx.y * D_PAD;
 
-    // Stream i-tiles through shared memory
     const int tid_l       = threadIdx.x + threadIdx.y * BLOCK_J;
     const int nThreads_l  = BLOCK_J * BLOCK_K;
     for (int iBase = 0; iBase < N; iBase += BLOCK_I) {
-        // Cooperative load of i-tile. We keep the linear tid mapping and pack
-        // stores as float4 to lower shared-store instruction pressure.
+        // float4 stores to cut shared-store instruction count.
         constexpr int D_VEC = 4;
         const int nVecPerRow = D_CONST / D_VEC;
         for (int idx4 = tid_l; idx4 < BLOCK_I * nVecPerRow; idx4 += nThreads_l) {
@@ -1591,9 +1508,8 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
         }
         __syncthreads();
 
-        // D-tiled dot products with i sub-tiling.
-        // Mirrors the QS kernel strategy: precompute thread-invariant j/k products
-        // once per D_TILE and reuse them across several i rows.
+        // Same D-tiling as QS_grad_kernel, with the j/k products reused across
+        // I_SUB rows of i.
         constexpr int I_SUB  = 4;
         constexpr int D_TILE = 4;
         for (int iSub = 0; iSub < BLOCK_I && (iBase + iSub) < N; iSub += I_SUB) {
@@ -1635,8 +1551,6 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
                 for (int ii = 0; ii < I_SUB; ++ii) {
                     const int iOff = iSub + ii;
                     if (iBase + iOff >= N) break;
-                    // i-tile is stored at stride D_CONST (not D_PAD) so each
-                    // 4-float slice is 16-byte aligned: one LDS.128 per array.
                     const int iRow = iOff * D_CONST + d_base;
                     const float4 qi4  = *reinterpret_cast<const float4*>(&sh_Q  [iRow]);
                     const float4 vq14 = *reinterpret_cast<const float4*>(&sh_Vq1[iRow]);
@@ -1687,9 +1601,8 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
                     const float grad_A = (gAq - sumQi) * Aq
                                        + (gAr - sumRj) * Ar
                                        + (gAs - sumSk) * As;
-                    // sh_Q stride D_CONST → float4-aligned; sh_Sk stride D_PAD
-                    // (=D+1) is not 16-byte aligned at sh_k_off for ty>0, so
-                    // it stays scalar.
+                    // sh_Sk has stride D_PAD, not 16-byte aligned for ty > 0,
+                    // so it stays scalar.
                     const int iRow = iOff * D_CONST;
                     #pragma unroll
                     for (int d = 0; d < D_CONST; d += 4) {
@@ -1705,10 +1618,9 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
         __syncthreads();
     }
 
-    // ======== EPILOGUE ========
     if constexpr (CORRECTION_ONLY) {
-        // Block reduction for sum_r[j]: reduce reg_sum_r across k-dim (threadIdx.y)
-        float* reduce_buf = shmem;  // reuse shared memory (i-tile data done)
+        // Reduce reg_sum_r across k (threadIdx.y), reusing shared memory.
+        float* reduce_buf = shmem;
 
         // Transposed [k][j] layout makes warp-contiguous x-lanes hit distinct banks.
         const int reduce_idx = threadIdx.y * BLOCK_J + threadIdx.x;
@@ -1724,7 +1636,7 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
         if (threadIdx.y == 0 && j0 < N)
             atomicAdd(&sum_rBH[j0], reduce_buf[threadIdx.x]);
     } else {
-        // Write result (atomic due to k-dimension overlap)
+        // Atomic: every k tile contributes to the same gradR rows.
         float* gRbh = gradR + bh * stride_BH;
         if (valid) {
             for (int d = 0; d < D_CONST; ++d)
@@ -1735,8 +1647,8 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
 
 
 
-// Largest tile shape whose smem fits the device, or nullptr. Halving the warp
-// count is what brings D=64 (4 warps) and D=128 (2 warps) under 99 KB.
+// WARPS if its smem fits the device, else the minimum shape (4 warps at D=64,
+// 2 at D=128), else nullptr.
 template<int D, int WARPS, int BK, int ROLE = BWD_ALL>
 static decltype(&Bwd_gather_tc<64, false, 8, 32>) pick_bwd_tc(
     bool use_mask, int max_smem_optin, size_t& smem, int& threads)
@@ -1762,10 +1674,9 @@ static decltype(&Bwd_gather_tc<64, false, 8, 32>) pick_bwd_tc(
     return k;
 }
 
-// Exact tile shape for the single-gather roles, no fallback ladder: the
-// benchmark sweeps these, so an unavailable shape must fail loudly rather
-// than silently time a different one. Legal set: 2/4/8 warps x BK 16/32, and
-// at D=128 the one-pass DHT=128 output variant.
+// Exact tile shape for the single-gather roles, no fallback: a requested shape
+// that does not fit returns nullptr instead of silently running another one.
+// Legal set: 2/4/8 warps x BK 16/32, and at D=128 also DHT=128.
 using BwdTcKernel = decltype(&Bwd_gather_tc<64, false, 8, 32>);
 
 template<int D, int WARPS, int BK, int ROLE, int DHT, bool SINGLE_COL = false>
@@ -1786,9 +1697,8 @@ static BwdTcKernel sg_bwd_variant(bool use_mask, int max_smem_optin, size_t& sme
     return k;
 }
 
-// SINGLE_COL (hopper_plan.md Phase 1) is only compiled for the WARPS=2 shape
-// single_gather_backward_cuda dispatches when win <= 32; wider shapes are
-// unaffected. The caller passes single_col = win > 0 && win <= bk.
+// SINGLE_COL is only compiled for WARPS=2, the shape used for win <= 32;
+// other shapes ignore single_col.
 template<int D, int WARPS, int BK, int ROLE, int DHT>
 static BwdTcKernel sg_bwd_pick_variant(bool use_mask, bool single_col, int max_smem_optin,
                                        size_t& smem, int& threads)
@@ -1836,9 +1746,6 @@ static BwdTcKernel sg_pick_bwd(int D, int warps, int bk, int dh, int role, bool 
     else { TORCH_CHECK(false, "backward: unsupported D=", (D_VAL), ". Supported: 16, 32, 64, 128"); } \
   }()
 
-// =============================================================================
-// Internal implementation that uses pre-computed softmax stats
-// =============================================================================
 static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor,
@@ -1895,7 +1802,7 @@ backward_impl(torch::Tensor grad_Y_q,
 
   const int B = Q.size(0);
   const int H = Q.size(1);
-  const int N = Q.size(2); //i think N and I/J/K are aliases, deal with later
+  const int N = Q.size(2);
   const int I = Q.size(2);
   const int J = R.size(2);
   const int K = S.size(2);
@@ -1931,11 +1838,11 @@ backward_impl(torch::Tensor grad_Y_q,
   auto sum_s = torch::zeros({B, H, N}, options_fp32);
 
   // ============================================================================
-  // 2b. TENSOR-CORE FAST PATH (gather-only; see Bwd_gather_tc above)
+  // 2b. TENSOR-CORE FAST PATH (gather-only; see Bwd_gather_tc)
   // ============================================================================
   // Requires the forward outputs Y_q/Y_r/Y_s (for the collapsed correction
-  // sums) and all-zero scatter cotangents. Anything else takes the scalar
-  // path below unchanged. Disable with ATT3_BWD_TC=0.
+  // sums) and all-zero scatter cotangents; otherwise falls through to the
+  // scalar path. Disable with ATT3_BWD_TC=0.
   if ((D == 64 || D == 128) && I == J && J == K && (N % 16 == 0)
       && Y_q.defined() && Y_r.defined() && Y_s.defined()) {
     static const int max_smem_optin = []() {
@@ -1958,7 +1865,7 @@ backward_impl(torch::Tensor grad_Y_q,
               .item<bool>();
       if (!scatter_active) {
         // With no scatter cross terms every correction sum collapses to
-        // rowsum(dY o Y) — the FA2 shortcut (probe-validated).
+        // rowsum(dY o Y), as in FA2.
         sum_q = (grad_Y_q.to(at::kFloat) * Y_q.to(at::kFloat)).sum(-1).contiguous();
         sum_r = (grad_Y_r.to(at::kFloat) * Y_r.to(at::kFloat)).sum(-1).contiguous();
         sum_s = (grad_Y_s.to(at::kFloat) * Y_s.to(at::kFloat)).sum(-1).contiguous();
@@ -1984,7 +1891,7 @@ backward_impl(torch::Tensor grad_Y_q,
                 mask_ptr, H, N, 0, scale, H);
             ++att3_tc::state().bwd_launches;
         };
-        // Role table (anchor / rows / cols), one launch per gradient family:
+        // Role table (anchor / rows / cols), one launch per gradient family.
         launch(Q, Vq_1, grad_Y_q,  R, Vr_1, grad_Y_r,  S, Vs_1, grad_Y_s,
                m_i, l_i, sum_q,  m_j, l_j, sum_r,  m_k, l_k, sum_s,
                grad_Q, grad_Vq_1);
@@ -1995,8 +1902,6 @@ backward_impl(torch::Tensor grad_Y_q,
                m_k, l_k, sum_s,  m_i, l_i, sum_q,  m_j, l_j, sum_r,
                grad_S, grad_Vs_1);
         AT_CUDA_CHECK(cudaGetLastError());
-        // No device sync: everything above is ordered on the current stream,
-        // so the usual PyTorch stream semantics cover consumers.
 
         // Scatter value grads are identically zero here (their cotangents are).
         return std::make_tuple(
@@ -2023,8 +1928,7 @@ backward_impl(torch::Tensor grad_Y_q,
     dim3 grid_dim((N + TI - 1) / TI, (N + TK - 1) / TK, B * H);
 
     // Role table (out / reg / loop), one launch per V_1 gradient; the last arg
-    // puts out on thread y, which the grad_Vs permutation wants. Gather kernels
-    // use static shared memory sized by D_TMPL.
+    // puts out on thread y, which the grad_Vs permutation wants.
     auto launch = [&](const at::Tensor& X_out, const at::Tensor& X_reg,
                       const at::Tensor& X_loop, const at::Tensor& V_reg,
                       const at::Tensor& V_loop, const at::Tensor& gY_loop,
@@ -2101,12 +2005,11 @@ backward_impl(torch::Tensor grad_Y_q,
   AT_CUDA_CHECK(cudaGetLastError());
 
 
-  // ===========================================================================
+  // ============================================================================
   // 5. JACOBIAN CORRECTIONS + 6. GRAD Q/S/R
-  //    All dispatched through D template
   // ============================================================================
   DISPATCH_D(D, {
-    // Phase 1: Correction sums: sum_q, sum_r, sum_s
+    // Correction sums sum_q, sum_r, sum_s
     {
       constexpr int corrI = 8;
       constexpr int corrK = 8;
@@ -2162,9 +2065,9 @@ backward_impl(torch::Tensor grad_Y_q,
       AT_CUDA_CHECK(cudaGetLastError());
     }
 
-    // Phase 2: grad_Q + grad_S (fused)
+    // grad_Q + grad_S
     {
-      constexpr int tileI = D_TMPL == 128 ? 8 : TILE_I;   // 16x16 tiles need 124 KB at D=128
+      constexpr int tileI = D_TMPL == 128 ? 8 : TILE_I;   // 16x16 tiles need 124 KB smem at D=128
       constexpr int tileK = D_TMPL == 128 ? 8 : TILE_K;
       constexpr int tileJ = 16;
 
@@ -2218,7 +2121,7 @@ backward_impl(torch::Tensor grad_Y_q,
       AT_CUDA_CHECK(cudaGetLastError());
     }
 
-    // Phase 3: grad_R
+    // grad_R
     {
       constexpr int tileJ = D_TMPL == 128 ? 8 : TILE_J;
       constexpr int tileK = D_TMPL == 128 ? 8 : TILE_K;
@@ -2243,8 +2146,6 @@ backward_impl(torch::Tensor grad_Y_q,
 
       R_grad_kernel<false, tileJ, tileI, tileK, D_TMPL>
           <<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
-
-             // the input tensors
               reinterpret_cast<const bf16*>(Q.data_ptr<at::BFloat16>()),
               reinterpret_cast<const bf16*>(R.data_ptr<at::BFloat16>()),
               reinterpret_cast<const bf16*>(S.data_ptr<at::BFloat16>()),
@@ -2255,7 +2156,6 @@ backward_impl(torch::Tensor grad_Y_q,
               reinterpret_cast<const bf16*>(Vs_1.data_ptr<at::BFloat16>()),
               reinterpret_cast<const bf16*>(Vs_2.data_ptr<at::BFloat16>()),
 
-              // the gradient of the output 
               reinterpret_cast<const bf16*>(grad_Y_q.data_ptr<at::BFloat16>()),
               reinterpret_cast<const bf16*>(grad_Y_r.data_ptr<at::BFloat16>()),
               reinterpret_cast<const bf16*>(grad_Y_s.data_ptr<at::BFloat16>()),
@@ -2263,7 +2163,6 @@ backward_impl(torch::Tensor grad_Y_q,
               reinterpret_cast<const bf16*>(grad_Y_r_.data_ptr<at::BFloat16>()),
               reinterpret_cast<const bf16*>(grad_Y_s_.data_ptr<at::BFloat16>()),
 
-              // softmax stats
               m_i.data_ptr<float>(),
               l_i.data_ptr<float>(),
               m_j.data_ptr<float>(),
@@ -2271,12 +2170,10 @@ backward_impl(torch::Tensor grad_Y_q,
               m_k.data_ptr<float>(),
               l_k.data_ptr<float>(),
 
-              // jacobian correction sums
               sum_q.data_ptr<float>(),
               sum_r.data_ptr<float>(),
               sum_s.data_ptr<float>(),
 
-              // the gradient we want to compute
               grad_R.data_ptr<float>(),
 
               mask_ptr, N, H, scale);
@@ -2300,9 +2197,8 @@ backward_impl(torch::Tensor grad_Y_q,
 }
 
 // =============================================================================
-// Public API: backward_cuda (uses pre-computed softmax stats from forward pass)
+// Public API: backward_cuda
 // =============================================================================
-// NOTE: The forward pass computes and returns softmax stats (m_i, l_i, m_j, l_j, m_k, l_k).
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor,
@@ -2335,7 +2231,6 @@ backward_cuda(torch::Tensor grad_Y_q,
               torch::Tensor Y_r,
               torch::Tensor Y_s) {
 
-  // Ensure all tensors are contiguous
   grad_Y_q = grad_Y_q.contiguous();
   grad_Y_r = grad_Y_r.contiguous();
   grad_Y_s = grad_Y_s.contiguous();
@@ -2364,7 +2259,6 @@ backward_cuda(torch::Tensor grad_Y_q,
   if (Y_r.defined()) Y_r = Y_r.contiguous();
   if (Y_s.defined()) Y_s = Y_s.contiguous();
 
-  // Call the internal implementation directly with provided stats
   return backward_impl(
       grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_,
       Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
@@ -2417,13 +2311,10 @@ single_gather_backward_cuda(
   int major = 0, optin = 0;
   cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, Q.device().index());
   if (major >= 8) cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, Q.device().index());
-  // Narrow windows need at most 32 rows in either ownership pass. Honor
-  // explicit tuning overrides; otherwise use two warps for win <= 32.
-  // Wider/dense shapes retain 8 warps x BK 32
-  // with the two 64-channel output passes at D=128, dropping to the widest
-  // shape that fits the device's opt-in shared memory (4 warps at D=64, 2 at
-  // D=128 inside 99 KB). Q-owned (anchor) and R/S-owned (rows) are tuned
-  // separately.
+  // Tile shape: sg_cfg overrides if set, else 2 warps for win <= 32 (at most
+  // 32 rows are visible in either pass), else 8 warps x BK 32, falling back to
+  // 4 warps at D=64 / 2 at D=128 when smem does not fit. The anchor (Q) and
+  // rows (R/S) passes are tuned separately.
   auto& st = att3_tc::state();
   const int dh = st.sg_cfg.bwd_dh ? st.sg_cfg.bwd_dh : 64;
   size_t smem_a = 0, smem_r = 0;
@@ -2497,14 +2388,12 @@ single_gather_backward_cuda(
 
 
 // =============================================================================
-// Experimental shared-KV backward (Hkv = 1, D = 128, window 32)
+// Shared-KV backward (Hkv = 1, D = 128)
 // =============================================================================
 // Same three passes as single_gather_backward_cuda with the KV operands read in
-// place through the kernel's KV-head offset (Hkv = 1). The R/S passes write
-// private fp32 partials per query head ([B,Hq,N,D], one CTA per (anchor, head)
-// still owns its row, so nothing is accumulated and repeated calls overwrite);
-// the head reduction reproduces the adapter's contract exactly: round each
-// head's partial to bf16, sum the heads in fp32, cast once. No atomics.
+// place through the kernel's KV-head offset. The R/S passes write per-query-head
+// partials [B,Hq,N,D] (each CTA owns its row, so no atomics); the head
+// reduction rounds each partial to bf16, sums the heads in fp32, casts once.
 #include "shared_reduction.cuh"
 #include "shared_hopper.h"
 #ifdef ATT3NTION_WITH_HOPPER
@@ -2517,8 +2406,8 @@ single_gather_backward_cuda(
 
 #include "shared_wide_dq.cuh"
 
-// Validate every raw-pointer operand before padding or any CUDA launch.
-// Shape/dtype alone do not make a pointer safe on the guarded Q device.
+// Validate every raw-pointer operand, including its device, before padding or
+// any launch.
 static void shared_backward_check_state(
     const at::Tensor& Q, const at::Tensor& dY, const at::Tensor& Y,
     const at::Tensor& m, const at::Tensor& l) {
@@ -2574,8 +2463,8 @@ single_gather_shared_backward_auto(
       reinterpret_cast<const bf16*>(Y.data_ptr<at::BFloat16>()),
       delta.data_ptr<float>(), B*H*N, stream));
   auto fp32 = Q.options().dtype(at::kFloat);
-  // Each KV head partial is rounded to BF16 before head reduction in the
-  // established contract. Materialize exactly that value, after FP32 accumulation.
+  // R/S partials are stored as bf16 (fp32 accumulation, one rounding), which is
+  // exactly the per-head value the reduction consumes.
   auto gQ = torch::empty({B,H,N,D},fp32);
   auto pR = torch::empty_like(Q), pS = torch::empty_like(Q),
        pVr = torch::empty_like(Q), pVs = torch::empty_like(Q);
@@ -2583,11 +2472,9 @@ single_gather_shared_backward_auto(
   AT_CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, Q.device().index()));
   AT_CUDA_CHECK(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, Q.device().index()));
   if (major >= 8) cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, Q.device().index());
-  // At w32, two warps cover all 32 key rows; four warps compute 32 masked
-  // rows even with tight bounds. Keep BK 32 and the one-pass D128 output.
+  // Fallback Q pass: 2 warps x 16 rows cover a w32 window, BK 32, one-pass
+  // D=128 output; single column tile when win <= 32.
   size_t smem_a = 0; int thr_a = 0; bool legal = false;
-  // Only windows <= BK fit one column tile. Wider windows use the existing
-  // general Q backward, including its multi-tile accumulation.
   auto* ka = sg_pick_bwd(128, 2, 32, 128, BWD_QUERY_ANCHOR, true, optin, smem_a, thr_a, legal, win <= 32);
   TORCH_CHECK(ka != nullptr, "single_gather_shared_backward: Q pass unavailable on this device");
   auto bp = [](const at::Tensor& t) { return reinterpret_cast<const bf16*>(t.data_ptr<at::BFloat16>()); };
@@ -2608,8 +2495,8 @@ single_gather_shared_backward_auto(
   bool used_retained = false;
   bool used_hopper_rs = false;
 #ifdef ATT3NTION_WITH_HOPPER
-  // Validated moving48 register-A schedule. Keep other shapes on the
-  // exact retained-MMA family; both write the same BF16 partial contract.
+  // Hopper wgmma R/S kernels for w32 / w64; other shapes use the retained-MMA
+  // kernels. All write the same bf16 partials.
   if (major == 9 && minor == 0 && win == 32 && H >= 16 && H % 4 == 0 && N >= 96) {
     AT_CUDA_CHECK((cudaError_t)att3_shared_rs_wgmma_w32(
         bp(R),bp(Vr),bp(Q),bp(dY),bp(S),bp(Vs),fp(m),fp(l),fp(delta),
@@ -2618,8 +2505,6 @@ single_gather_shared_backward_auto(
         B,H,N,win,scale,stream,support_ptr,packed_ptr,true));
     used_hopper_rs = used_retained = true;
   }
-  // Reuse dead Q/dY staging for a swizzled FP32 projection tile at w64.
-  // Keep small grids on the measured retained-MMA path.
   if (!used_retained && major == 9 && minor == 0 && win == 64 && H % 4 == 0
       && N >= 128 && int64_t(B)*H*N >= 6144) {
     AT_CUDA_CHECK((cudaError_t)att3_shared_rs_wgmma64_w64(
@@ -2641,7 +2526,7 @@ single_gather_shared_backward_auto(
     TORCH_CHECK(used_retained,"single_gather_shared_backward: packed R/S schedule unavailable on this device");
   }
   AT_CUDA_CHECK(cudaGetLastError());
-  // Head reduction with the adapter's rounding contract: bf16 per head, fp32 sum, bf16 once.
+  // Head reduction: bf16 per head, fp32 sum, bf16 once.
   auto dQ = torch::empty_like(Q);
   auto dR = torch::empty_like(R), dS = torch::empty_like(S),
        dVr = torch::empty_like(Vr), dVs = torch::empty_like(Vs);
@@ -2689,11 +2574,9 @@ single_gather_shared_backward_cuda(
   int major = 0, optin = 0;
   cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, Q.device().index());
   if (major >= 8) cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, Q.device().index());
-  // At w32, two warps cover all 32 key rows; four warps compute 32 masked
-  // rows even with tight bounds. Keep BK 32 and the one-pass D128 output.
+  // Q pass: 2 warps x 16 rows cover a w32 window, BK 32, one-pass D=128
+  // output; single column tile when win <= 32.
   size_t smem_a = 0; int thr_a = 0; bool legal = false;
-  // Only windows <= BK fit one column tile. Wider windows use the existing
-  // general Q backward, including its multi-tile accumulation.
   auto* ka = sg_pick_bwd(128, 2, 32, 128, BWD_QUERY_ANCHOR, true, optin, smem_a, thr_a, legal, win <= 32);
   TORCH_CHECK(ka != nullptr, "single_gather_shared_backward: Q pass unavailable on this device");
   auto bp = [](const at::Tensor& t) { return reinterpret_cast<const bf16*>(t.data_ptr<at::BFloat16>()); };
@@ -2703,7 +2586,7 @@ single_gather_shared_backward_cuda(
       fp(m), fp(l), fp(delta),  nullptr, nullptr, nullptr,  nullptr, nullptr, nullptr,
       gQ.data_ptr<float>(), nullptr, mask_ptr, H, N, win, scale, 1);
   if (rs_group == 1) {
-    // R/S-owned passes, native reads: 2 warps, BK 16, one-pass output (the window table).
+    // R/S-owned passes: 2 warps, BK 16, one-pass output.
     size_t smem_r = 0; int thr_r = 0;
     auto* kr = sg_pick_bwd(128, 2, 16, 128, BWD_QUERY_ROWS, true, optin, smem_r, thr_r, legal);
     TORCH_CHECK(kr != nullptr, "single_gather_shared_backward: R/S pass unavailable on this device");
@@ -2721,7 +2604,7 @@ single_gather_shared_backward_cuda(
                 "single_gather_shared_backward: grouped R/S pass unavailable on this device");
   }
   AT_CUDA_CHECK(cudaGetLastError());
-  // Head reduction with the adapter's rounding contract: bf16 per head, fp32 sum, bf16 once.
+  // Head reduction: bf16 per head, fp32 sum, bf16 once.
   auto reduce = [&](const at::Tensor& part) {
     return part.to(at::kBFloat16).to(at::kFloat).view({B, 1, H, N, D}).sum(2).to(at::kBFloat16);
   };

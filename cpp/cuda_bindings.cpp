@@ -2,9 +2,6 @@
  * @file cuda_bindings.cpp
  * @brief Python bindings for the hypergraph attention CUDA kernels.
  *
- * This file provides the pybind11 interface between Python and the CUDA
- * implementations in cuda/forward.cu and cuda/backward.cu.
- *
  * Copyright (c) 2026 Springtail AI. MIT License.
  */
 
@@ -29,10 +26,6 @@ State& state() {
 }
 
 }  // namespace att3_tc
-
-// =============================================================================
-// Python Bindings
-// =============================================================================
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("tc_launches", []() {
@@ -123,7 +116,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def("sg_tile_ranges", [](int64_t N, int64_t window, int64_t a, int64_t side,
                               int64_t bj, int64_t bk) {
-        // The host copy of the bounds the kernels run, for the visit-coverage test:
+        // The kernels' own bounds code, for the visit-coverage test:
         // [(j0, k_lo, k_hi), ...] per row block of the CTA anchored at `a`.
         std::vector<std::tuple<int, int, int>> out;
         int j_lo = 0, j_hi = 0;

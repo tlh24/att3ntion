@@ -1,9 +1,6 @@
 /**
  * @file common.cuh
- * @brief Shared constants, utilities, and kernels for hypergraph attention.
- *
- * This header consolidates common definitions used by both forward and backward
- * CUDA kernels, eliminating duplication and ensuring consistency.
+ * @brief Shared constants, tile sizes and device helpers for the attention kernels.
  */
 
 #pragma once
@@ -29,7 +26,6 @@ constexpr float NEG_INF = -1e30f;
 // =============================================================================
 // Tile Size Configuration
 // =============================================================================
-// These control shared memory usage and parallelism. Tune based on GPU arch.
 
 #ifndef TILE_I
 #define TILE_I 16
@@ -65,23 +61,20 @@ constexpr float NEG_INF = -1e30f;
 // Utility Functions
 // =============================================================================
 
-/** Integer division rounded up */
 __host__ __device__ __forceinline__ int ceil_div(int a, int b) {
     return (a + b - 1) / b;
 }
 
-// Structured visibility bounds for the single-gather kernels. win > 0 is the
-// caller's promise that every pair a query i attends has i - win < j <= i on
-// both key axes (win >= N is plain causal); 0 makes no promise and visits every
-// tile. The mask is still applied cell by cell, so the bounds only need to
-// cover the visible set, and a partial tile keeps its exact masking. Which
-// side the query sits on decides the ranges: with the query as anchor a, rows
-// and cols are both [a-win+1, a]; with the anchor a as a key and the queries
-// as rows, the queries that see it are [a, a+win-1] and a row block starting
-// at j0 needs cols [j0-win+1, min(j0+bj, a+win, N)-1]. Starts follow the
-// visible interval, NOT the global tile grid. D=64/128 token rows remain
-// vector-aligned; only the bool mask needs an unaligned-start-safe loader.
-// Ends are exclusive; col padding is relative to lo, not token zero.
+// Tile bounds for the single-gather kernels. win > 0 promises that every pair
+// query i attends has i - win < j <= i on both key axes (win >= N: causal);
+// win <= 0 visits every tile. The mask is still applied per cell, so bounds
+// only need to cover the visible set. With the query as anchor a, rows and
+// cols are both [a-win+1, a]. With a as a key and the queries as rows, the
+// rows that see it are [a, a+win-1] and a row block at j0 needs cols
+// [j0-win+1, min(j0+bj, a+win, N)-1]. Ranges start on the visible interval,
+// not the tile grid: token rows stay 16-byte aligned, but the bool mask loader
+// must handle unaligned starts. Ends are exclusive; col padding to bk is
+// relative to lo.
 enum SgQuerySide { SG_QUERY_ANCHOR = 0, SG_QUERY_ROWS = 1 };
 
 __host__ __device__ __forceinline__ void sg_row_bounds(
@@ -101,8 +94,7 @@ __host__ __device__ __forceinline__ void sg_col_bounds(
     if (win <= 0) { lo = 0; hi = ceil_div(N, bk) * bk; return; }
     int l = (side == SG_QUERY_ANCHOR) ? a - win + 1 : j0 - win + 1;
     int h = (side == SG_QUERY_ANCHOR) ? a + 1 : j0 + bj;
-    // A partial query tile must not widen the opposite-key union to queries
-    // that cannot see the anchored key. Their mask factors are zero anyway.
+    // rows past a+win-1 cannot see key a; don't widen the cols for them.
     if (side == SG_QUERY_ROWS && h > a + win) h = a + win;
     l = l < 0 ? 0 : l;
     h = h > N ? N : h;
@@ -110,10 +102,9 @@ __host__ __device__ __forceinline__ void sg_col_bounds(
     hi = lo + ceil_div(h - lo, bk) * bk;
 }
 
-// Up to 32 mask bools -> one word. Shifted windows need not start on a
-// four-byte boundary. Peel bytes until aligned, then vector-load only full
-// groups inside [row, row+lim); never read before the row or past its tail.
-// Host-callable so the same packing code can be checked without a GPU.
+// Up to 32 mask bools -> one word. row need not be 4-byte aligned: peel bytes
+// until aligned, then vector-load full groups inside [row, row+lim); never
+// reads outside that range. Host-callable for tests/single_gather_bounds_host.cpp.
 __host__ __device__ __forceinline__ uint32_t sg_pack_mask32(const bool* row, int lim) {
     uint32_t bits = 0u;
     int t = 0;
@@ -154,7 +145,7 @@ __device__ __forceinline__ bf16 f2bf(float x) {
 }
 
 // =============================================================================
-// Tensor-core primitives (sm_80+), shared by Y_gather_tc and Bwd_gather_tc
+// Tensor-core primitives (sm_80+; compiled to no-ops below that)
 // =============================================================================
 
 __device__ __forceinline__ void mma_bf16_m16n8k16(

@@ -1,7 +1,7 @@
 #define CUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED
-// Independent R/S schedule: four heads share raw opposing inputs; each direction
-// owns its scores/derivatives. Key and value projections have disjoint accumulator
-// lifetimes. CuTe instruction atoms/layouts are standard documented prior art.
+// sm_90a WGMMA R/S backward for the shared-KV single gather (D=128, W=32). One CTA
+// per anchor a and 4 heads (one warp each); direction 0 writes dR/dVr[a], 1 dS/dVs[a].
+// Each 16-query tile scores a K=48-key slice of the staged opposite window.
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -20,6 +20,7 @@ template<>struct PAtom<32>{using T=GMMA::Layout_K_SW64_Atom<bf16>;};
 template<>struct PAtom<64>{using T=GMMA::Layout_K_SW128_Atom<bf16>;};
 template<>struct PAtom<48>{using T=GMMA::Layout_K_SW32_Atom<bf16>;};
 using Projection=decltype(make_tiled_mma(SM90_64x128x16_F32BF16BF16_RS<GMMA::Major::K,GMMA::Major::MN>{}));
+// check the hand-written accumulator (row, col) indexing against CuTe's layout
 template<class Mma,int N,int Tid>constexpr bool mapping_valid(){
  using TV=decltype(Mma{}.get_layoutC_TV());constexpr TV tv{};
  for(int nt=0;nt<N/8;++nt)for(int e=0;e<4;++e){
@@ -33,6 +34,7 @@ static_assert(mappings<Projection,128>(std::make_integer_sequence<int,128>{}));
 static_assert(mappings<decltype(make_tiled_mma(ScoreAtom<32>::T{})),32>(std::make_integer_sequence<int,128>{}));
 static_assert(mappings<decltype(make_tiled_mma(ScoreAtom<64>::T{})),64>(std::make_integer_sequence<int,128>{}));
 
+// score C order equals projection A order, so P/dP feed the projection from registers
 template<int K,int Tid>constexpr bool derivative_order(){
  using A=decltype(Projection{}.get_layoutA_TV());constexpr A atv{};
  using M=decltype(make_tiled_mma(typename ScoreAtom<K>::T{}));
@@ -61,12 +63,12 @@ __device__ __forceinline__ void work(
  auto al=tile_to_shape(GMMA::Layout_K_SW128_Atom<bf16>{},make_shape(Int<64>{},Int<D>{}));
  auto bl=tile_to_shape(GMMA::Layout_K_SW128_Atom<bf16>{},make_shape(Int<CAP>{},Int<D>{}));
  auto pl=tile_to_shape(typename PAtom<K>::T{},make_shape(Int<64>{},Int<K>{}));
- // Preserve the raw score layout exactly, swapping only its logical axes.
+ // transposed view of the key/value tile, the projection's B operand
  auto vl=composition(bl,make_layout(make_shape(Int<D>{},Int<CAP>{}),make_stride(Int<CAP>{},Int<1>{})));
  extern __shared__ __align__(128) char storage[];
  bf16* rq=reinterpret_cast<bf16*>(storage),*ry=rq+64*RPAD;
  bf16* kp=ry+64*RPAD,*vp=kp+CAP*D;
- bf16* pp=vp+CAP*D,*gp=pp; // logical shape carriers only; no shared P/gA accesses
+ bf16* pp=vp+CAP*D,*gp=pp; // P/GA only shape register fragments; grad overlays this memory
  float* grad=reinterpret_cast<float*>(pp);
  float* anchor=grad+2*4*D;
  auto ql=make_layout(make_shape(Int<64>{},Int<D>{}),make_stride(Int<RPAD>{},Int<1>{}));
@@ -130,7 +132,7 @@ __device__ __forceinline__ void work(
     }
    }
    warpgroup_fence_operand(fp);warpgroup_fence_operand(fg);
-   // Deliberately one 64-float projection accumulator per thread at a time.
+   // one 64-float projection accumulator live at a time, for register pressure
    #pragma unroll 1
    for(int kind=0;kind<2;++kind){
     auto u=pt.make_fragment_C(pc);clear(u);
@@ -138,9 +140,7 @@ __device__ __forceinline__ void work(
     if(kind==0)gemm(pmma,fg,fpx,u);else gemm(pmma,fp,fpv,u);
     warpgroup_commit_batch();warpgroup_wait<0>();warpgroup_fence_operand(u);
     const bf16* raw=kind?ry:rq;
-    // Reuse private projection registers: each channel pair keeps exactly
-    // the original multiply/add/shuffle tree, with independent channels
-    // exposed before issuing shared-gradient stores.
+    // fold the row pair in place in u, then reduce over the 8 row lanes
     #pragma unroll
     for(int nt=0;nt<NT;++nt){int d=nt*8+2*tig;
      auto q0=__bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(raw+row0*RPAD+d));auto q1=__bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(raw+row1*RPAD+d));

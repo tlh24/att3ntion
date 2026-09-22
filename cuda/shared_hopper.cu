@@ -1,14 +1,11 @@
-// Independent Hopper experiment derived from the project's own WGMMA forward
-// checkpoint, with vector asynchronous input staging, raw Q staging once/head,
-// static fragment indexing, and head geometry W16xG4 or W32xG2.
-// CuTe/CUTLASS v3.5.1 provides documented layouts and WGMMA instruction atoms;
-// these primitives are prior art, not claimed inventions of this project.
+// sm_90a WGMMA forward for the shared-KV single gather (D=128, Hkv=1). One CTA per
+// query and head group: the query's R/Vr/S/Vs window is staged once and reused by
+// every head the CTA visits. Built as a separate object with CuTe (see setup.py).
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cute/tensor.hpp>
 #include <cutlass/arch/barrier.h>
-// Optional F13 + F16 translation unit; ordinary MMA objects stay compiled for sm90.
 namespace att3_shared_hopper_impl {
 using namespace cute;
 using bf16 = cute::bfloat16_t;
@@ -23,7 +20,7 @@ template<int W>struct PSwizzle;
 template<>struct PSwizzle<16>{using T=GMMA::Layout_K_SW32_Atom<bf16>;};
 template<>struct PSwizzle<64>{using T=GMMA::Layout_K_SW128_Atom<bf16>;};
 template<>struct PSwizzle<32>{using T=GMMA::Layout_K_SW64_Atom<bf16>;};
-// Prove the fixed score/value register indexing against CuTe's own mapping.
+// Check the hand-written accumulator (row, col) indexing against CuTe's layout.
 template<int N,int Tid>constexpr bool mapping_valid(){
  using Mma=decltype(make_tiled_mma(typename Atom<N>::T{}));
  using TV=decltype(Mma{}.get_layoutC_TV());constexpr TV tv{};
@@ -47,6 +44,8 @@ __device__ __forceinline__ void copy16(void* sm,const void* gm){
  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"::"r"(addr),"l"(gm));
 }
 
+// Window W, G=64/W heads per warpgroup with W/16 warps each: the 64 MMA rows are
+// G heads x W keys j. HV head groups are visited serially.
 template<int W,int HV=1>
 __global__ __launch_bounds__(128) void retained_warpgroup(
  const bf16* __restrict__ Q,const bf16* __restrict__ R,const bf16* __restrict__ S,
@@ -100,8 +99,8 @@ __global__ __launch_bounds__(128) void retained_warpgroup(
  asm volatile("cp.async.wait_all;"::);
  __syncthreads();
 
- // Each thread visits different rows but the same eight channels. Load its
- // scaled-Q fragment once; its registers die before the score/value epilogue.
+ // each thread visits different rows but the same eight channels: load its
+ // scaled-Q fragment once, scoped so the registers die before the epilogue
  {
  const int fragment_d=(th%(D/8))*8;
  float anchor_fragment[8];
@@ -115,7 +114,7 @@ __global__ __launch_bounds__(128) void retained_warpgroup(
   for(int e=0;e<4;++e){auto f=__bfloat1622float2(pairs[e]);pairs[e]=__floats2bfloat162_rn(anchor_fragment[e*2]*f.x,anchor_fragment[e*2+1]*f.y);}
   *reinterpret_cast<uint4*>(&A(lh*W+row,d))=v;
  }
- } // private anchor-fragment lifetime
+ }
  cutlass::arch::fence_view_async_shared();__syncthreads();
  Score smma;auto st=smma.get_thread_slice(tid);
  auto fa=st.make_fragment_A(st.partition_A(A));auto fb=st.make_fragment_B(st.partition_B(B));
@@ -148,7 +147,7 @@ __global__ __launch_bounds__(128) void retained_warpgroup(
  auto fp=vt.make_fragment_A(vt.partition_A(P));auto fv=vt.make_fragment_B(vt.partition_B(V));
  auto cu=make_identity_tensor(make_shape(Int<64>{},Int<D>{}));auto uc=vt.partition_C(cu);auto u=vt.make_fragment_C(uc);clear(u);
  warpgroup_fence_operand(u);warpgroup_arrive();gemm(vmma,fp,fv,u);warpgroup_commit_batch();
- // Independent scalar normalization work overlaps the asynchronous value MMA.
+ // scalar normalization overlaps the asynchronous value MMA
  #pragma unroll
  for(int off=1;off<=2;off<<=1){l0+=__shfl_xor_sync(0xffffffff,l0,off);l1+=__shfl_xor_sync(0xffffffff,l1,off);}
  float mw=fmaxf(m0,m1);
@@ -192,7 +191,7 @@ __global__ __launch_bounds__(128) void retained_warpgroup(
   Y[out*D+d]=bf16(val*inv);
  }
  if(th==0){mout[out]=mh;lout[out]=l;}
- } // private head-group visit
+ } // head-group visit
 }
 
 template<int W>constexpr size_t bytes(){return sizeof(bf16)*(64*D+W*D+64*W+D*W+2*W*D+8*W)+sizeof(float)*((64/W)*D+4*D+8);}
@@ -227,7 +226,6 @@ template<int W>struct PSwizzle;
 template<>struct PSwizzle<16>{using T=GMMA::Layout_K_SW32_Atom<bf16>;};
 template<>struct PSwizzle<64>{using T=GMMA::Layout_K_SW128_Atom<bf16>;};
 template<>struct PSwizzle<32>{using T=GMMA::Layout_K_SW64_Atom<bf16>;};
-// Prove the fixed score/value register indexing against CuTe's own mapping.
 template<int N,int Tid>constexpr bool mapping_valid(){
  using Mma=decltype(make_tiled_mma(typename Atom<N>::T{}));
  using TV=decltype(Mma{}.get_layoutC_TV());constexpr TV tv{};
@@ -251,6 +249,8 @@ __device__ __forceinline__ void copy16(void* sm,const void* gm){
  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"::"r"(addr),"l"(gm));
 }
 
+// retained_warpgroup with the value MMA split into two 64-channel halves, halving the
+// value accumulator and operand. STASH holds Vs in registers across the score MMA.
 template<int W,int HV=1,bool STASH=false>
 __global__ __launch_bounds__(128) void split_value_warpgroup(
  const bf16* __restrict__ Q,const bf16* __restrict__ R,const bf16* __restrict__ S,
@@ -350,7 +350,6 @@ __global__ __launch_bounds__(128) void split_value_warpgroup(
   l0+=p0+p1;l1+=p2+p3;
  }
  cutlass::arch::fence_view_async_shared();__syncthreads();
- // Independent scalar normalization work overlaps the asynchronous value MMA.
  #pragma unroll
  for(int off=1;off<=2;off<<=1){l0+=__shfl_xor_sync(0xffffffff,l0,off);l1+=__shfl_xor_sync(0xffffffff,l1,off);}
  float mw=fmaxf(m0,m1);
@@ -410,9 +409,9 @@ __global__ __launch_bounds__(128) void split_value_warpgroup(
  }
  if(th==0){mout[out]=mh;lout[out]=l;}
 
-  __syncthreads(); // recycle value operand and per-warp output scratch safely
+  __syncthreads(); // V and wn are reused by the next channel half
  } // channel half
- } // private head-group visit
+ } // head-group visit
 }
 
 template<int W>constexpr size_t bytes(){return sizeof(bf16)*(64*D+W*D+(D/2)*W+2*W*D+8*W)+sizeof(float)*((64/W)*D+8);}
@@ -448,7 +447,6 @@ template<>struct PSwizzle<128>{using T=GMMA::Layout_K_SW128_Atom<bf16>;};
 template<>struct PSwizzle<16>{using T=GMMA::Layout_K_SW32_Atom<bf16>;};
 template<>struct PSwizzle<64>{using T=GMMA::Layout_K_SW128_Atom<bf16>;};
 template<>struct PSwizzle<32>{using T=GMMA::Layout_K_SW64_Atom<bf16>;};
-// Prove the fixed score/value register indexing against CuTe's own mapping.
 template<int N,int Tid>constexpr bool mapping_valid(){
  using Mma=decltype(make_tiled_mma(typename Atom<N>::T{}));
  using TV=decltype(Mma{}.get_layoutC_TV());constexpr TV tv{};
@@ -472,6 +470,9 @@ __device__ __forceinline__ void copy16(void* sm,const void* gm){
  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"::"r"(addr),"l"(gm));
 }
 
+// W=128, one head per visit: R/Vr stream in as two 64-row tiles (jt) and the two
+// partial softmaxes are merged through `partial`. Grid x starts at query 64; the
+// first 64 queries fit a 64-wide window and run split_value_warpgroup<64>.
 template<int W,int HV=1,bool STASH=false>
 __global__ __launch_bounds__(128) void row_stream_warpgroup(
  const bf16* __restrict__ Q,const bf16* __restrict__ R,const bf16* __restrict__ S,
@@ -583,7 +584,6 @@ __global__ __launch_bounds__(128) void row_stream_warpgroup(
   l0+=p0+p1;l1+=p2+p3;
  }
  cutlass::arch::fence_view_async_shared();__syncthreads();
- // Independent scalar normalization work overlaps the asynchronous value MMA.
  #pragma unroll
  for(int off=1;off<=2;off<<=1){l0+=__shfl_xor_sync(0xffffffff,l0,off);l1+=__shfl_xor_sync(0xffffffff,l1,off);}
  float mw=fmaxf(m0,m1);
@@ -652,9 +652,9 @@ __global__ __launch_bounds__(128) void row_stream_warpgroup(
   else{mout[out]=mergedm;lout[out]=mergedl;}
  }
 
-  __syncthreads(); // recycle value operand and per-warp output scratch safely
+  __syncthreads(); // V and wn are reused by the next channel half
  } // channel half
- } // private head-group visit
+ } // head-group visit
  __syncthreads(); // all heads finished before raw row tile is overwritten
  } // streamed row tile
 }
@@ -687,8 +687,8 @@ bool launch(const void* q,const void* r,const void* s,const void* vr,const void*
 
 bool launch_att3_shared_hopper(const void* q,const void* r,const void* s,const void* vr,const void* vs,
  void* y,float* m,float* l,const bool* mask,int B,int H,int N,float scale,int max_smem,cudaStream_t stream,int win){
- // Validated performance envelope; arithmetic supports smaller cases, but
- // existing MMA paths preserve useful parallelism for those small grids.
+ // false: caller falls back to the MMA path, which keeps more parallelism on
+ // small grids than one CTA per query and head group.
  if(B<1 || N<128 || N%16 || H<16 || !mask)return false;
  if((win==16 && H%4)||(win==32 && H%2)||((win==64 || win==128) && H%8)||(win!=16 && win!=32 && win!=64 && win!=128))return false;
  int device=0,major=0,minor=0;
@@ -700,7 +700,7 @@ bool launch_att3_shared_hopper(const void* q,const void* r,const void* s,const v
   return att3_shared_hopper_w128_impl::launch(q,r,s,vr,vs,y,m,l,mask,B,H,N,scale,max_smem,stream,device);
  }
  if(win==64){
-  // At least2048 CTAs before SM assignment; avoid the measured small-grid loss.
+  // split-value only once the grid has >= 2048 CTAs (N*H/8)
   if(H>=64 && (int64_t)H*N>=16384)
    return att3_shared_hopper_split_impl::launch<64,8>(q,r,s,vr,vs,y,m,l,mask,B,H,N,scale,max_smem,stream,device);
   return launch<64,8>(q,r,s,vr,vs,y,m,l,mask,B,H,N,scale,max_smem,stream,device);

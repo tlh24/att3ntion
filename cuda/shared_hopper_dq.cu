@@ -1,7 +1,6 @@
 #include <stdexcept>
-// Independent dQ experiment: private heads form a Hopper warp group.
-// Only original raw inputs are reused. CuTe layouts/instruction atoms are
-// documented NVIDIA prior art, not claimed innovations of this project.
+// sm_90a WGMMA dQ for the shared-KV single gather (D=128, W in {16,32,64}). One CTA
+// per query a; G=64/W heads fill the 64 MMA rows, reusing one staged R/Vr/S/Vs window.
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -16,6 +15,7 @@ template<int W,bool REG>struct ScoreAtom;
 ATOM(16) ATOM(32) ATOM(64)
 #undef ATOM
 using Projection=decltype(make_tiled_mma(SM90_64x128x16_F32BF16BF16_RS<GMMA::Major::K,GMMA::Major::MN>{}));
+// check the hand-written accumulator (row, col) indexing against CuTe's layout
 template<class Mma,int N,int Tid>constexpr bool mapping_valid(){
  using TV=decltype(Mma{}.get_layoutC_TV());constexpr TV tv{};
  for(int nt=0;nt<N/8;++nt)for(int e=0;e<4;++e){
@@ -26,6 +26,8 @@ template<class Mma,int N,int Tid>constexpr bool mapping_valid(){
 template<class M,int N,int...T>constexpr bool mappings(std::integer_sequence<int,T...>){return (mapping_valid<M,N,T>()&&...);}
 static_assert(mappings<Projection,128>(std::make_integer_sequence<int,128>{}));
 static_assert(mappings<decltype(make_tiled_mma(ScoreAtom<32,false>::T{})),32>(std::make_integer_sequence<int,128>{}));
+// the score accumulator's register order equals the projection's A-fragment order,
+// so dP can be fed to the projection MMA from registers without a shuffle
 template<int W,int Tid>constexpr bool derivative_order(){
  using A=decltype(Projection{}.get_layoutA_TV());constexpr A atv{};
  using S=decltype(make_tiled_mma(typename ScoreAtom<W,true>::T{}));
@@ -51,6 +53,7 @@ __global__ __launch_bounds__(128) void kernel(
  const int lo=max(0,a-W+1),hi=min(N,a+1),row0=warp*16+g,row1=row0+8;
  const int j0=lo+row0%W,j1=lo+row1%W;
  const bool* mrow=mask+((int64_t)b*N+a)*N;
+ // a query with at most one visible key has a constant softmax, so dQ is zero
  int count;
  if(support)count=support[(int64_t)b*N+a];
  else{count=0;for(int k=lo;k<hi;k+=32)count+=__popc(__ballot_sync(0xffffffff,k+lane<hi&&mrow[k+lane]));}
@@ -72,7 +75,7 @@ __global__ __launch_bounds__(128) void kernel(
  auto X=make_tensor(make_smem_ptr(sp),bl),V=make_tensor(make_smem_ptr(vp),bl);
  auto XP=make_tensor(make_smem_ptr(sp),vl);
  auto A=make_tensor(make_smem_ptr(ap),al),Y=make_tensor(make_smem_ptr(yp),al);
- auto GA=make_tensor(make_smem_ptr(ap),gl); // shape carrier only; no memory access
+ auto GA=make_tensor(make_smem_ptr(ap),gl); // shape carrier for register fragments; never dereferenced
  Score smma;auto st=smma.get_thread_slice(tid);
  auto fx=st.make_fragment_B(st.partition_B(X)),fv=st.make_fragment_B(st.partition_B(V));
  auto ac=st.partition_A(make_identity_tensor(make_shape(Int<64>{},Int<D>{})));
@@ -99,7 +102,7 @@ __global__ __launch_bounds__(128) void kernel(
    for(int z=0;z<size(fa);++z){int row=get<0>(ac(z)),d=get<1>(ac(z));fa(z)=bf16(float(rawr[(row%W)*RP+d])*anchor[(row/W)*D+d]);}
    warpgroup_fence_operand(fa);warpgroup_fence_operand(score);warpgroup_arrive();gemm(smma,fa,fx,score);warpgroup_commit_batch();
    if constexpr(OVERLAP){
-    // Keep score's A alive; assemble independent dY*Vr while score executes.
+    // separate fragment keeps score's A alive; build dY*Vr while the score MMA runs
     auto fy=st.make_fragment_A(st.partition_A(A));
     #pragma unroll
     for(int z=0;z<size(fy);++z){int row=get<0>(ac(z)),d=get<1>(ac(z));fy(z)=bf16(float(rawvr[(row%W)*RP+d])*anchor[G*D+(row/W)*D+d]);}
@@ -127,7 +130,7 @@ __global__ __launch_bounds__(128) void kernel(
   #pragma unroll
   for(int z=0;z<size(fg);++z){
    int row=get<0>(gc(z)),col=get<1>(gc(z));
-   // Proven above: C score order equals projection A order, including K slices.
+   // derivative_order: C score order equals projection A order, including K slices
    constexpr bool DIRECT=true;
    int f=DIRECT?z:(col/8)*4+((row%16)/8)*2+col%2;
    int j=lo+row%W,k=lo+col;
@@ -147,7 +150,7 @@ __global__ __launch_bounds__(128) void kernel(
   __syncthreads();
   for(int d=th;d<D;d+=WPH*32){float val=0.f;
    if constexpr(WPH==4){
-    // Match the original two-row-tile reduction tree exactly.
+    // fixed pairwise tree over the four 16-row warps
     val=(wn[d]+wn[D+d])+(wn[2*D+d]+wn[3*D+d]);
    }else{
     #pragma unroll
@@ -175,8 +178,7 @@ template<int W>bool launch(const void* q,const void* dy,const void* r,const void
  auto e=cudaGetLastError();if(e!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(e));return true;
 }
 }
-// Compile this translation unit for sm_90a with CuTe/CUTLASS 3.5.1.
-// All dimensions outside the measured envelope return false for caller fallback.
+// false: shape unsupported here, caller falls back to the MMA path
 bool launch_att3_shared_hopper_dq(const void* q,const void* dy,const void* r,const void* vr,const void* s,const void* vs,
  const float* m,const float* l,const float* delta,float* dq,const bool* mask,int B,int H,int N,int win,
  float scale,cudaStream_t stream,const uint8_t* support){

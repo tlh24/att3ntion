@@ -43,6 +43,7 @@ def get_cuda_arch_flags():
 	return flags
 
 
+# Optional sm_90a kernels: set ATT3NTION_CUTLASS_INCLUDE to a CUTLASS include dir.
 CUTLASS_INCLUDE = os.environ.get('ATT3NTION_CUTLASS_INCLUDE')
 HOPPER_ENABLED = bool(CUTLASS_INCLUDE)
 
@@ -52,6 +53,8 @@ class Att3BuildExtension(BuildExtension):
             include = Path(CUTLASS_INCLUDE).resolve()
             if not (include / 'cute/tensor.hpp').is_file():
                 raise RuntimeError('ATT3NTION_CUTLASS_INCLUDE must contain CuTe headers (validated: CUTLASS 3.5.1)')
+            # nvcc directly: these need -arch=sm_90a and CuTe, which the extension's
+            # flags do not carry; the objects link into _cuda_kernels.
             objects=[]
             for source in ('shared_hopper','shared_hopper_dq','shared_hopper_rs','shared_hopper_rs64'):
                 target = Path(self.build_temp).resolve() / (source+'.o')

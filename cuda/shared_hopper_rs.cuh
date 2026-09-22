@@ -2,10 +2,10 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cstdint>
-// Four private heads, moving48 projection, phased in-register fold.
-// D128,w32,H%4==0; exact masks/support metadata prepared by the caller.
-// packed_partials=true writes BF16[B,H,N,D] after full per-head accumulation;
-// false writes FP32 partials. Head reduction is external.
+// sm_90a R/S backward, D=128, win=32, H%4==0. The caller prepares support[B,N] and
+// packed[B,N,ceil(N/32)] (masks already intersected with each query's window).
+// Outputs are per-head partials [B,H,N,D]: BF16 if packed_partials (rounded once per
+// head after FP32 accumulation), else FP32; the head reduction is the caller's.
 extern "C" int att3_shared_rs_wgmma_info(int* info,bool packed_partials=false);
 extern "C" int att3_shared_rs_wgmma_w32(
  const __nv_bfloat16* R,const __nv_bfloat16* Vr,

@@ -1,12 +1,11 @@
-"""Experimental autograd bridge for the shared-KV single query-gather prototype.
+"""Autograd bridge for the shared-KV single query-gather kernels.
 
-Same operator as `single_gather_attention` with the four KV tensors shared by
-every query head ([B,1,N,128]), read in place by the kernels: no replication
-to Hq heads. Fixed contract (see docs/KERNEL_HISTORY.md):
-D = 128, Hkv = 1, an equal causal window of 16, 32, 64 or 128 (an extra mask may only remove
-pairs inside that window; it is intersected with it here). The bridge pads N
-to a multiple of 16 at the logical KV size and keeps padded queries and keys
-invisible; gradients come back cropped, KV gradients in [B,1,N,128].
+Same operator as `single_gather_attention`, with R, S, Vr, Vs shared by every
+query head ([B,1,N,128]) and read in place rather than replicated to Hq heads.
+Contract: D = 128, Hkv = 1, an equal causal window of 16, 32, 64 or 128; an
+extra mask may only remove pairs inside that window (it is intersected with it
+here). N is padded to a multiple of 16 with padded queries and keys invisible;
+gradients come back cropped, KV gradients as [B,1,N,128].
 """
 import torch
 from torch.autograd import Function
@@ -44,20 +43,18 @@ class _SharedFn(Function):
 
 
 def single_gather_shared_attention(Q, R, S, Vr, Vs, mask=None, fwd_group=0, rs_group=0, window=WINDOW):
-    """Q: [B,Hq,N,128]; R, S, Vr, Vs: [B,1,N,128]; causal window on both key axes,
-    optionally narrowed by `mask` ([B,N,N] or [N,N] bool). fwd_group / rs_group in
-    {0, 1, 2, 4}. Mode 0 (default) selects the measured H100 schedules and
-    gives singleton queries zero score-gradient contributions while preserving
-    their value gradients. Explicit modes 1/2/4 retain their legacy
-    arithmetic; Hq must be divisible by each explicitly selected group.
-    Windows are 16/32/64/128. Automatic mode uses optional Hopper warpgroup
-    kernels when built with CuTe, with retained-MMA schedules for other shapes.
-    Explicit R/S strategy 4 uses two heads and two independent directions per CTA,
-    reusing raw Q/dY loads. Its smaller row tiles can change rounding relative
-    to group 1/2; the mathematical operator and numerical tolerances are the same.
-    Inputs and dY are converted to BF16 internally; returning a wider input
-    dtype does not increase arithmetic precision. All visible ordered key pairs
-    are evaluated, with BF16 intermediate operands and FP32 accumulation.
-    See docs/KERNEL_HISTORY.md for the
-    measured accuracy gates and known numerical stress limits."""
+    """Q: [B,Hq,N,128]; R, S, Vr, Vs: [B,1,N,128]. Causal `window` (16, 32, 64 or
+    128) on both key axes, optionally narrowed by `mask` ([B,N,N] or [N,N] bool).
+
+    fwd_group / rs_group select the forward and R/S-backward schedules. 0 (default)
+    chooses per shape: on H100, the sm_90a warpgroup kernels when built with CuTe,
+    else the retained-MMA kernels; elsewhere a fixed schedule. 1, 2 or 4 force a
+    fixed schedule (4: two heads and both directions per CTA, reusing Q/dY loads)
+    and need Hq divisible by the group. In mode 0 on H100 a query with a single
+    visible key gets exactly zero score gradients (other modes: zero up to
+    rounding); value gradients are unaffected. Schedules differ only in rounding.
+
+    Inputs and dY are cast to BF16, so a wider dtype adds no precision. Every
+    visible ordered key pair is evaluated, with BF16 operands and FP32
+    accumulation."""
     return _SharedFn.apply(Q, R, S, Vr, Vs, mask, fwd_group, rs_group, window)

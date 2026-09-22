@@ -1,8 +1,8 @@
 #pragma once
 #include <cuda_runtime_api.h>
 #include <cstdint>
-// Compile this declaration's implementation as its own sm90a object. The
-// fallback is deliberately link-free when the optional Hopper object is absent.
+// Implemented in the optional sm_90a objects (shared_hopper*.cu). Without them the
+// stubs return false, so callers fall back and nothing extra has to link.
 #ifdef ATT3NTION_WITH_HOPPER
 bool launch_att3_shared_hopper(const void*,const void*,const void*,const void*,const void*,
  void*,float*,float*,const bool*,int,int,int,float,int,cudaStream_t,int);

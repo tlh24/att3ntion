@@ -4,12 +4,8 @@
 namespace sg_wide_dq {
 enum BwdRole { BWD_ALL = 0, BWD_QUERY_ANCHOR = 1, BWD_QUERY_ROWS = 2 };
 
-// single_col=true drops the second column buffer, mirroring Y_gather_tc's
-// SINGLE_TILE (hopper_plan.md Phase 1): the caller promises win <= bk, so
-// there is exactly one column tile and the cp.async pipeline's second buffer
-// goes unused. The row loop already writes straight into redOut with a plain
-// sum (no online-softmax carry to simplify), so backward has no row-tile
-// counterpart to this flag.
+// single_col drops the second column buffer: the caller promises win <= bk,
+// so there is exactly one column tile.
 __host__ __device__ constexpr size_t btc_smem_bytes(int D, int warps, int bk, bool masked, int role = BWD_ALL, bool single_col = false) {
     const int bj = warps * 16, dpad = D + 8;
     const int pa = role != BWD_QUERY_ROWS, pr = role != BWD_QUERY_ANCHOR, pc = role == BWD_ALL;
@@ -24,6 +20,18 @@ __host__ __device__ constexpr size_t btc_smem_bytes(int D, int warps, int bk, bo
     return b;
 }
 
+// backward.cu's Bwd_gather_tc extended for the shared-KV dQ pass (D=128,
+// Hkv=1): QG queries x HG heads per CTA, run sequentially. CACHE selects the
+// raw operands kept in shared memory: 0 none (epilogue re-reads rows from
+// global), 1 the current row tile, 2 the R/Vr window, 3 R/Vr/S/Vs with S/Vs
+// copied into the col buffers, 4 the R window, 5 R/Vr/S/Vs with S/Vs read in
+// place, 6 S/Vs in place plus the row tile as in 1. PREFETCH loads the next
+// head's Q/dY anchor row during the current head. SINGLETON writes exact zero
+// dQ for queries with at most one visible key.
+// ROW_OUTER swaps the loops (row tiles outer, heads inner, one redOut per
+// head) so only one raw row tile is kept; RELOAD_ROWS restages it per head;
+// ACTIVE_LOADS copies only rows the window can reach; KEEP_VR=false reads Vr
+// from global; TRIM / TRIM_STATS drop the unused anchV and stats buffers.
 template<int D_CONST, bool MASKED, int WARPS, int BK, int ROLE = BWD_ALL, int DHT = 64, bool SINGLE_COL = false, int QG = 1, int CACHE = 0, int HG = 1, bool PREFETCH = false, bool SINGLETON = false, bool ROW_OUTER = false, bool RELOAD_ROWS = false, bool TRIM = false, bool KEEP_VR = true, bool TRIM_STATS = false, bool ACTIVE_LOADS = false>
 __global__ __launch_bounds__(WARPS * 32, 1)
 void Bwd_gather_tc(
@@ -53,9 +61,8 @@ void Bwd_gather_tc(
     constexpr int MRW = BJ / 32;    // words per col of a transposed mask window
     constexpr int KS = D / 16;      // score GEMM k-steps (D contracted)
     // The output accumulators cover DH cols per pass over the col side; at
-    // D=128 the default DHT=64 makes two passes, recomputing the scores,
-    // rather than doubling the accumulator registers (DHT=128 is the
-    // single-pass variant under test).
+    // D=128, DHT=64 makes two passes, recomputing the scores, rather than
+    // doubling the accumulator registers. DHT=128 is one pass.
     constexpr int DH = DHT;
     constexpr int NPASS = D / DH;
     constexpr bool PA = ROLE != BWD_QUERY_ROWS;    // anchor-normalized softmax
@@ -88,8 +95,7 @@ void Bwd_gather_tc(
     const int COLCAP = CACHE>=5 ? ((((win+max(BJ,BK)-1)/max(BJ,BK))*max(BJ,BK)+QG-1+15)/16)*16 : CB*BK;
     extern __shared__ char smem_raw[];
     // The four A operands, anchor already folded in: scale*Xa o Xr, gYa o Vr,
-    // Va o gYr, Va o Vr. Staged per row block; the epilogue re-reads the raw
-    // rows from global instead of keeping a second copy here.
+    // Va o gYr, Va o Vr. Staged per row block.
     bf16* a0_sm   = reinterpret_cast<bf16*>(smem_raw);            // [BJ][DPAD]
     bf16* a1_sm   = a0_sm + BJ * DPAD;                            // PA
     bf16* a2_sm   = a1_sm + (PA ? BJ * DPAD : 0);                 // PR
@@ -121,7 +127,6 @@ void Bwd_gather_tc(
     // the caller shares KV across query heads. With the query as anchor the
     // anchor side is query-indexed and rows/cols are KV; with the queries as rows
     // the anchor (R or S) is KV, the rows (Q, dY) are query-indexed, cols are KV.
-    // The legacy all-three pass always runs with Hkv == H.
     const int64_t bh = (int64_t)b * H + h;
     const int64_t kvh = (int64_t)b * Hkv + h / (H / Hkv);
     const int64_t q_off = bh * N * D, kv_off = kvh * N * D;
@@ -212,7 +217,7 @@ void Bwd_gather_tc(
     // win > 0 restricts the row blocks and, per block, the col tiles to those
     // that can hold visible pairs (sg_row_bounds / sg_col_bounds, keyed on
     // which side of the pass the query sits); the mask still decides every
-    // cell. The legacy BWD_ALL launch passes 0 and stays dense.
+    // cell.
     constexpr int SIDE = (ROLE == BWD_QUERY_ROWS) ? SG_QUERY_ROWS : SG_QUERY_ANCHOR;
     int j_lo, j_hi;
     sg_row_bounds(SIDE, a, N, win, BJ, j_lo, j_hi);
@@ -467,7 +472,7 @@ void Bwd_gather_tc(
                         // per pair in either window: bits 0/1 of rc* are mask[r][c] and
                         // mask[r][c+1] (c even, so the pair shares a word), bits 0/8 of
                         // cr* are mask[c][r] and mask[c][r+8]. So rc* indexes by row and
-                        // cr* by col — the windows' packing axes, swapped.
+                        // cr* by col: the windows' packing axes, swapped.
                         uint32_t rc0 = ~0u, rc1 = ~0u, cr0 = ~0u, cr1 = ~0u;
                         float ilac0 = 0.0f, ilac1 = 0.0f;
                         if constexpr (MASKED && PR) {
@@ -512,8 +517,8 @@ void Bwd_gather_tc(
                                 // Gate the *scale*, never the exp. Guarding the whole
                                 // expression lets nvcc branch around the MUFU, and a
                                 // scattered mask then diverges inside the warp and runs
-                                // both sides: that cost `random` 21% over `causal`.
-                                // Selecting on inv-l keeps every cell's cost identical.
+                                // both sides. Selecting on inv-l keeps every cell's cost
+                                // identical.
                                 const float ilrg = (((hi ? rc1 : rc0) >> c1) & 1u) ? ilr : 0.0f;
                                 const float ilcg = (((c1 ? cr1 : cr0) >> (hi ? 8 : 0)) & 1u)
                                                  ? ilc : 0.0f;
@@ -572,12 +577,9 @@ void Bwd_gather_tc(
                     }
                 }
 
-                // The multi-pass D=128/DHT=64 split re-primes this single
-                // buffer via stage_cols() at the top of the next pass, so the
-                // barrier protecting readers from that overwrite is still
-                // needed even with nothing left to prefetch; only the
-                // wait_all (nothing in flight) and the buffer toggle (never
-                // reused) are SINGLE_COL-dead.
+                // With SINGLE_COL the next pass's stage_cols() overwrites this
+                // buffer, so the barrier is still needed; only the wait_all and
+                // the buffer toggle are dead.
                 if constexpr (!SINGLE_COL) {
                     asm volatile("cp.async.wait_all;\n" ::);
                     cur = nxt;
@@ -586,7 +588,8 @@ void Bwd_gather_tc(
             }
 
             // ---- epilogue: Hadamard row-collapse of this warp's 16 rows ----
-            // Raw rows come from global (L2-hot); pad rows contribute zeros.
+            // Raw rows come from rawR when cached, else global (L2-hot); pad
+            // rows contribute zeros.
             float ng[DH / 4], nv[PR ? DH / 4 : 1];
             const int64_t r0 = rows_off + (int64_t)min(j0 + jw + g, N - 1) * D + d0 + 2 * tig;
             const int64_t r1 = rows_off + (int64_t)min(j0 + jw + g + 8, N - 1) * D + d0 + 2 * tig;
@@ -671,8 +674,8 @@ inline cudaError_t launch(const bf16* q,const bf16* dy,const bf16* r,const bf16*
   m,l,delta,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,dq,nullptr,mask,H,N,win,scale,1,support_meta);
  return cudaGetLastError();
 }
-// Returns false outside the measured profitable envelope. Caller then uses
-// the sealed narrow/ordinary dQ dispatcher, including singleton correction.
+// Returns false outside the w64/w128 shapes this schedule is used for; the
+// caller then falls back to launch_retained_dq.
 inline bool launch_wide_dq(const bf16* q,const bf16* dy,const bf16* r,const bf16* vr,
  const bf16* s,const bf16* vs,const float* m,const float* l,const float* delta,
  float* dq,const bool* mask,int B,int H,int N,int win,float scale,cudaStream_t stream,

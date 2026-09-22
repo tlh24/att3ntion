@@ -1,11 +1,11 @@
-// Independently derived supporting kernels. No external attention code.
+// Shared-KV backward helpers: delta = rowsum(dY * Y) and the head reduction.
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cstdint>
 using bf16 = __nv_bfloat16;
 
-// Four warps handle four independent D128 rows. Multiplication is explicitly
-// rounded before summation, matching the original materialized FP32 products.
+// One warp per D=128 row, four rows per CTA. __fmul_rn keeps each product
+// rounded before the sum (no FMA), as if dY * Y were materialized in fp32.
 __global__ void delta128(const bf16* dy, const bf16* y, float* delta, int rows) {
   const int lane = threadIdx.x & 31;
   const int row = blockIdx.x * 4 + (threadIdx.x >> 5);
@@ -22,9 +22,8 @@ __global__ void delta128(const bf16* dy, const bf16* y, float* delta, int rows) 
   if (lane == 0 && row < rows) delta[row] = sum;
 }
 
-// Preserve BF16 rounding of each individual head before FP32 head reduction.
-// The FP32 reduction order is serial in H, explicitly different from ATen's
-// parallel sum tree. This is exact operator semantics, not bitwise equivalence.
+// Each head's partial is rounded to bf16 before the fp32 sum over H. The sum is
+// serial in H, so it matches ATen's semantics but not its bitwise result.
 template<bool CAST_Q>
 __global__ void rounded_heads(const float* q, const float* r, const float* s,
     const float* vr, const float* vs, bf16* dq, bf16* dr, bf16* ds,

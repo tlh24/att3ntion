@@ -1,8 +1,8 @@
 #include "shared_delta.cuh"
 
-// Partition the head dimension among cooperative thread groups. Each input
-// still rounds to BF16 before summation; two short reduction levels replace
-// a long dependent head loop. Shared memory is only 1 KiB per CTA.
+// rounded_heads with H split across HG thread groups, then summed in shared
+// memory. Each input is still rounded to bf16 before summation. PACKED sources
+// already hold bf16 partials.
 template<int HG, bool CAST_Q, bool PACKED=false>
 __global__ void rounded_heads_split(const float* q, const float* r, const float* s,
     const float* vr, const float* vs, bf16* dq, bf16* dr, bf16* ds,
