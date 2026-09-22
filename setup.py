@@ -1,7 +1,9 @@
 import os
-from setuptools import setup
+from setuptools import setup, find_packages
+from pathlib import Path
+import subprocess
 import torch
-from torch.utils.cpp_extension import CppExtension, BuildExtension, CUDAExtension
+from torch.utils.cpp_extension import CppExtension, BuildExtension, CUDAExtension, CUDA_HOME
 
 def get_cuda_arch_flags():
 	"""Generate nvcc -gencode flags for all detected GPU architectures.
@@ -40,8 +42,32 @@ def get_cuda_arch_flags():
 
 	return flags
 
+
+CUTLASS_INCLUDE = os.environ.get('ATT3NTION_CUTLASS_INCLUDE')
+HOPPER_ENABLED = bool(CUTLASS_INCLUDE)
+
+class Att3BuildExtension(BuildExtension):
+    def build_extensions(self):
+        if HOPPER_ENABLED:
+            include = Path(CUTLASS_INCLUDE).resolve()
+            if not (include / 'cute/tensor.hpp').is_file():
+                raise RuntimeError('ATT3NTION_CUTLASS_INCLUDE must contain CuTe headers (validated: CUTLASS 3.5.1)')
+            objects=[]
+            for source in ('shared_hopper','shared_hopper_dq','shared_hopper_rs','shared_hopper_rs64'):
+                target = Path(self.build_temp).resolve() / (source+'.o')
+                target.parent.mkdir(parents=True,exist_ok=True)
+                subprocess.run([str(Path(CUDA_HOME)/'bin/nvcc'),'-std=c++17','--expt-relaxed-constexpr',
+                    '-O3','-lineinfo','-arch=sm_90a','-Xcompiler=-fPIC,-fvisibility=hidden',
+                    '-I'+str(include),'-c',str(Path('cuda',source+'.cu').resolve()),'-o',str(target)],check=True)
+                objects.append(str(target))
+            for extension in self.extensions:
+                if extension.name == 'att3ntion._cuda_kernels':
+                    extension.extra_objects = list(extension.extra_objects or []) + objects
+        super().build_extensions()
+
 setup(
     name='att3ntion',
+    packages=find_packages(include=['att3ntion','att3ntion.*']),
     version='0.2.0',
     ext_modules=[
         CppExtension(
@@ -50,14 +76,17 @@ setup(
         ),
         CUDAExtension(
             name='att3ntion._cuda_kernels',
+            define_macros=[('ATT3NTION_WITH_HOPPER',None)] if HOPPER_ENABLED else [],
             sources=[
                 'cpp/cuda_bindings.cpp',
                 'cuda/forward.cu',
-                'cuda/backward.cu'
+                'cuda/backward.cu',
+                'cuda/single_gather_shared.cu'
             ],
             extra_compile_args={
-                'cxx': ['-O3'],
+                'cxx': ['-O3','-fvisibility=hidden'],
                 'nvcc': [
+                    '-Xcompiler=-fvisibility=hidden',
                     '-O3',
                     *get_cuda_arch_flags(),
                     # '-DTORCH_USE_CUDA_DSA',  #for debugging
@@ -67,6 +96,6 @@ setup(
         ),
     ],
     cmdclass={
-        "build_ext": BuildExtension
+        "build_ext": Att3BuildExtension
     }
 ) 

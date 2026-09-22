@@ -11,6 +11,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cstdint>
 
 // =============================================================================
 // Numerical Stability Constants
@@ -67,6 +68,64 @@ constexpr float NEG_INF = -1e30f;
 /** Integer division rounded up */
 __host__ __device__ __forceinline__ int ceil_div(int a, int b) {
     return (a + b - 1) / b;
+}
+
+// Structured visibility bounds for the single-gather kernels. win > 0 is the
+// caller's promise that every pair a query i attends has i - win < j <= i on
+// both key axes (win >= N is plain causal); 0 makes no promise and visits every
+// tile. The mask is still applied cell by cell, so the bounds only need to
+// cover the visible set, and a partial tile keeps its exact masking. Which
+// side the query sits on decides the ranges: with the query as anchor a, rows
+// and cols are both [a-win+1, a]; with the anchor a as a key and the queries
+// as rows, the queries that see it are [a, a+win-1] and a row block starting
+// at j0 needs cols [j0-win+1, min(j0+bj, a+win, N)-1]. Starts follow the
+// visible interval, NOT the global tile grid. D=64/128 token rows remain
+// vector-aligned; only the bool mask needs an unaligned-start-safe loader.
+// Ends are exclusive; col padding is relative to lo, not token zero.
+enum SgQuerySide { SG_QUERY_ANCHOR = 0, SG_QUERY_ROWS = 1 };
+
+__host__ __device__ __forceinline__ void sg_row_bounds(
+    int side, int a, int N, int win, int bj, int& lo, int& hi)
+{
+    if (win <= 0) { lo = 0; hi = N; return; }
+    int l = (side == SG_QUERY_ANCHOR) ? a - win + 1 : a;
+    int h = (side == SG_QUERY_ANCHOR) ? a + 1 : a + win;
+    l = l < 0 ? 0 : l;
+    hi = h > N ? N : h;
+    lo = l;
+}
+
+__host__ __device__ __forceinline__ void sg_col_bounds(
+    int side, int a, int j0, int bj, int N, int win, int bk, int& lo, int& hi)
+{
+    if (win <= 0) { lo = 0; hi = ceil_div(N, bk) * bk; return; }
+    int l = (side == SG_QUERY_ANCHOR) ? a - win + 1 : j0 - win + 1;
+    int h = (side == SG_QUERY_ANCHOR) ? a + 1 : j0 + bj;
+    // A partial query tile must not widen the opposite-key union to queries
+    // that cannot see the anchored key. Their mask factors are zero anyway.
+    if (side == SG_QUERY_ROWS && h > a + win) h = a + win;
+    l = l < 0 ? 0 : l;
+    h = h > N ? N : h;
+    lo = l;
+    hi = lo + ceil_div(h - lo, bk) * bk;
+}
+
+// Up to 32 mask bools -> one word. Shifted windows need not start on a
+// four-byte boundary. Peel bytes until aligned, then vector-load only full
+// groups inside [row, row+lim); never read before the row or past its tail.
+// Host-callable so the same packing code can be checked without a GPU.
+__host__ __device__ __forceinline__ uint32_t sg_pack_mask32(const bool* row, int lim) {
+    uint32_t bits = 0u;
+    int t = 0;
+    const int prefix = (4 - (reinterpret_cast<uintptr_t>(row) & 3)) & 3;
+    for (; t < prefix && t < lim; ++t) if (row[t]) bits |= 1u << t;
+    for (; t + 4 <= lim; t += 4) {
+        const uchar4 v = *reinterpret_cast<const uchar4*>(row + t);
+        bits |= ((v.x ? 1u : 0u) << t)       | ((v.y ? 1u : 0u) << (t + 1))
+              | ((v.z ? 1u : 0u) << (t + 2)) | ((v.w ? 1u : 0u) << (t + 3));
+    }
+    for (; t < lim; ++t) if (row[t]) bits |= 1u << t;
+    return bits;
 }
 
 /** Three-way element-wise dot product: sum(a[d] * b[d] * c[d]) */
@@ -140,4 +199,3 @@ __device__ __forceinline__ void cp_async16(bf16* dst, const bf16* src) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(d), "l"(src));
 #endif
 }
-

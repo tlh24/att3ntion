@@ -98,6 +98,13 @@ def check(name, actual, ref):
     rel, mx = errors(actual, ref)
     rtol, mtol = TOL[name]
     assert rel <= rtol and mx <= mtol, f"{name}: rel L2 {rel:.4f} (<= {rtol}), max {mx:.4f} (<= {mtol})"
+    # Per (b, h) as well, so one broken head cannot hide inside the aggregate.
+    for b in range(actual.size(0)):
+        for h in range(actual.size(1)):
+            if ref[b, h].abs().max().item() == 0.0:
+                continue
+            rel, mx = errors(actual[b, h], ref[b, h])
+            assert rel <= rtol and mx <= mtol, f"{name}[b={b},h={h}]: rel L2 {rel:.4f}, max {mx:.4f}"
 
 
 def lse_from_ml(m, l):
@@ -282,3 +289,232 @@ def test_sanitizer_smoke(D, N, kind):
     g = ck.single_gather_backward(dY, *[xs[n] for n in NAMES], Y, m, l, mask)
     torch.cuda.synchronize()
     assert torch.isfinite(Y).all() and all(torch.isfinite(x).all() for x in g)
+
+
+# ---------------------------------------------------------------------------
+# Structured tile bounds (window metadata), boundary lengths, tile shapes
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def default_tiles():
+    yield
+    ck.sg_set_config({k: 0 for k in ck.sg_get_config()})
+
+
+def _window(N, w):
+    i = torch.arange(N)
+    return (i[None, :] <= i[:, None]) & (i[None, :] > i[:, None] - w)
+
+
+@pytest.mark.parametrize("N,w", [(16, 16), (48, 48), (64, 7), (64, 16), (96, 32), (128, 128), (128, 1), (256, 32), (272, 40)])
+@pytest.mark.parametrize("bj,bk", [(32, 16), (64, 32), (128, 32), (128, 64)])
+def test_tile_ranges_cover_visible_pairs_exactly_once(N, w, bj, bk):
+    """Host enumerator over the bounds the kernels run: for every CTA (anchor a,
+    both query sides) every visible (row, col) pair falls in exactly one
+    visited tile, and the dense setting (window 0) visits every tile."""
+    mask = _window(N, w)
+    # A tail tile is padded relative to its shifted start, so it can extend
+    # beyond ceil(N / tile) * tile. Reserve a full tile beyond N on each axis.
+    Kp = N + bk
+    dense = -(-N // bj) * -(-N // bk)
+    visited = 0
+    for side in (0, 1):
+        for a in range(N):
+            ranges = ck.sg_tile_ranges(N, w, a, side, bj, bk)
+            cover = torch.zeros(N + bj, Kp, dtype=torch.int32)
+            last = -1
+            for j0, k_lo, k_hi in ranges:
+                assert 0 <= j0 < N and 0 <= k_lo < N
+                assert (k_hi - k_lo) % bk == 0 and k_lo < k_hi < Kp
+                assert j0 > last, "row blocks must be visited once, in order"
+                last = j0
+                cover[j0:j0 + bj, k_lo:k_hi] += 1
+                visited += (k_hi - k_lo) // bk
+            assert cover.max().item() <= 1
+            if side == 0:       # query is the anchor: rows j and cols k both visible to a
+                need = mask[a][:, None] & mask[a][None, :]
+            else:               # anchor is a key: queries i that see it, and the cols they see
+                need = mask[:, a][:, None] & mask
+            assert bool(cover[:N, :N][need].all()), f"side {side} anchor {a}: visible pair skipped"
+            full = ck.sg_tile_ranges(N, 0, a, side, bj, bk)
+            assert sum((k_hi - k_lo) // bk for _, k_lo, k_hi in full) == dense
+    assert visited <= 2 * N * dense
+    if 2 * w <= N and 2 * bj <= N and 2 * bk <= N:
+        assert visited < 2 * N * dense, "a window half the sequence must skip tiles"
+
+
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.sanitizer
+@pytest.mark.parametrize("N,w", [(64, 64), (80, 7), (80, 31), (80, 33), (96, 40),
+                                 (128, 16), (256, 256), (256, 32), (48, 48)])
+def test_shifted_window_metadata_matches_oracle(D, N, w):
+    """Tight starts change BF16 grouping. Both dense and bounded traversals
+    must meet the original oracle tolerances, including holes and a dead row."""
+    xs, dY = draw(1, 2, N, D, 4, 1.0)
+    mask = _window(N, w)[None].expand(1, -1, -1).contiguous().cuda()
+    mask[:, N // 2, :] = False
+    mask[:, -1, max(0, N - w):N:3] = False
+    Y_ref, lse_ref, g_ref = run_reference(xs, dY, mask)
+    Y0, m0, l0 = ck.single_gather_forward(*[xs[n] for n in NAMES], mask)
+    g0 = ck.single_gather_backward(dY, *[xs[n] for n in NAMES], Y0, m0, l0, mask)
+    Y1, m1, l1 = ck.single_gather_forward(*[xs[n] for n in NAMES], mask, w)
+    g1 = ck.single_gather_backward(dY, *[xs[n] for n in NAMES], Y1, m1, l1, mask, w)
+    torch.cuda.synchronize()
+    dead = lse_ref == float("-inf")
+    for Y, m, l, grads in [(Y0, m0, l0, g0), (Y1, m1, l1, g1)]:
+        check("Y", Y, Y_ref)
+        assert Y[dead].abs().max().item() == 0.0
+        lse = lse_from_ml(m, l)
+        assert torch.equal(dead, lse == float("-inf"))
+        assert (lse[~dead] - lse_ref[~dead]).abs().max().item() <= LSE_MAX
+        for name, grad in zip(["dQ", "dR", "dS", "dVr", "dVs"], grads):
+            check(name, grad, g_ref[name])
+    assert "win=%d" % w in ck.sg_dispatch()["last_bwd"]
+
+
+def test_window_metadata_requires_mask():
+    xs, _ = draw(1, 1, 32, 64, 0, 1.0)
+    with pytest.raises(RuntimeError):
+        ck.single_gather_forward(*[xs[n] for n in NAMES], None, 16)
+
+
+@pytest.mark.parametrize("N", [33, 65, 100])
+def test_bridge_builds_window_mask(N):
+    """window= without a mask builds the equal causal window (padding stays
+    invisible) and matches the explicit-mask call and the oracle."""
+    B, H, D, w = 1, 2, 64, 16
+    xs, dY = draw(B, H, N, D, 9, 1.0)
+    mask = _window(N, w)[None].expand(B, -1, -1).contiguous().cuda()
+    Y_ref, lse_ref, g_ref = run_reference(xs, dY, mask)
+    a = {n: xs[n].clone().requires_grad_(True) for n in NAMES}
+    Ya = single_gather_attention(*[a[n] for n in NAMES], window=w)
+    Ya.backward(dY)
+    b = {n: xs[n].clone().requires_grad_(True) for n in NAMES}
+    Yb = single_gather_attention(*[b[n] for n in NAMES], mask, window=w)
+    Yb.backward(dY)
+    assert torch.equal(Ya, Yb)
+    for n in NAMES:
+        assert torch.equal(a[n].grad, b[n].grad)
+    check("Y", Ya, Y_ref)
+    for g, n in zip(["dQ", "dR", "dS", "dVr", "dVs"], NAMES):
+        check(g, a[n].grad, g_ref[g])
+
+
+# Boundary lengths around every tile size, a covering set rather than the
+# Cartesian product: D, mask kind and batch/head shape rotate through the list;
+# the window cases also run with the metadata declared.
+BOUNDARY_N = [15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257]
+_KINDS = ["causal", "window16", "none", "random_dead"]
+_SHAPES = [(1, 2), (2, 1), (1, 3)]
+BOUNDARY = [(N, 64 if i % 2 == 0 else 128, _KINDS[i % 4], *_SHAPES[i % 3]) for i, N in enumerate(BOUNDARY_N)]
+
+
+@pytest.mark.parametrize("N,D,kind,B,H", BOUNDARY)
+def test_boundary_lengths(N, D, kind, B, H):
+    xs, dY = draw(B, H, N, D, 13, 1.0)
+    mask = make_mask(kind, B, N, "cuda", 13)
+    Y_ref, lse_ref, g_ref = run_reference(xs, dY, mask)
+    window = {"causal": N, "window16": 16}.get(kind, 0)
+    for win in ({0, window} if window else {0}):
+        leaves = {n: xs[n].clone().requires_grad_(True) for n in NAMES}
+        Y = single_gather_attention(*[leaves[n] for n in NAMES], mask, window=win)
+        Y.backward(dY)
+        check("Y", Y, Y_ref)
+        dead = lse_ref == float("-inf")
+        if dead.any():
+            assert Y[dead].abs().max().item() == 0.0
+        for g, n in zip(["dQ", "dR", "dS", "dVr", "dVs"], NAMES):
+            check(g, leaves[n].grad, g_ref[g])
+
+
+TILE_CONFIGS = [dict(fwd_warps=2, fwd_bk=16), dict(fwd_warps=4, fwd_bk=64), dict(fwd_warps=8, fwd_bk=16),
+                dict(fwd_warps=8, fwd_bk=32), dict(bwd_a_warps=2, bwd_a_bk=16, bwd_r_warps=2, bwd_r_bk=16),
+                dict(bwd_a_warps=4, bwd_a_bk=32, bwd_r_warps=4, bwd_r_bk=16), dict(bwd_a_warps=8, bwd_a_bk=16, bwd_r_warps=8, bwd_r_bk=16),
+                dict(bwd_dh=128), dict(bwd_dh=128, bwd_a_warps=4, bwd_a_bk=16, bwd_r_warps=4, bwd_r_bk=32)]
+
+
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("cfg", TILE_CONFIGS)
+@pytest.mark.parametrize("kind", ["causal", "random_dead"])
+def test_tile_shape_variants(default_tiles, D, cfg, kind):
+    """Every tile shape the tuner may pick passes the oracle (the D=128
+    one-pass output variant is illegal at D=64 and must raise)."""
+    if cfg.get("bwd_dh") == 128 and D == 64:
+        ck.sg_set_config(cfg)
+        xs, dY = draw(1, 1, 32, D, 0, 1.0)
+        Y, m, l = ck.single_gather_forward(*[xs[n] for n in NAMES], None)
+        with pytest.raises(RuntimeError):
+            ck.single_gather_backward(dY, *[xs[n] for n in NAMES], Y, m, l, None)
+        return
+    ck.sg_set_config(cfg)
+    B, H, N = 1, 2, 80
+    xs, dY = draw(B, H, N, D, 21, 1.0)
+    mask = make_mask(kind, B, N, "cuda", 21)
+    Y_ref, lse_ref, g_ref = run_reference(xs, dY, mask)
+    win = N if kind == "causal" else 0
+    Y, m, l = ck.single_gather_forward(*[xs[n] for n in NAMES], mask, win)
+    grads = dict(zip(["dQ", "dR", "dS", "dVr", "dVs"],
+                     ck.single_gather_backward(dY, *[xs[n] for n in NAMES], Y, m, l, mask, win)))
+    disp = ck.sg_dispatch()
+    for k, v in cfg.items():
+        if k.startswith("fwd"):
+            assert f"{k[4:]}={v}" in disp["last_fwd"]
+    check("Y", Y, Y_ref)
+    lse = lse_from_ml(m, l)
+    dead = lse_ref == float("-inf")
+    if (~dead).any():
+        assert (lse[~dead] - lse_ref[~dead]).abs().max().item() <= LSE_MAX
+    for g in grads:
+        check(g, grads[g], g_ref[g])
+
+
+def test_illegal_tile_shape_raises(default_tiles):
+    xs, dY = draw(1, 1, 32, 64, 0, 1.0)
+    ck.sg_set_config(dict(fwd_bk=48))
+    with pytest.raises(RuntimeError):
+        ck.single_gather_forward(*[xs[n] for n in NAMES], None)
+    ck.sg_set_config(dict(fwd_bk=0, bwd_r_bk=64))
+    Y, m, l = ck.single_gather_forward(*[xs[n] for n in NAMES], None)
+    with pytest.raises(RuntimeError):
+        ck.single_gather_backward(dY, *[xs[n] for n in NAMES], Y, m, l, None)
+    with pytest.raises(ValueError):
+        ck.sg_set_config(dict(nonsense=1))
+
+
+# Numerical diagnostics beyond the std-2.0 stress rows: scale sweeps, extreme
+# upstream gradients, concentrated (peaky) and near-uniform softmaxes. Same
+# thresholds, reported separately (-m stress); frozen before final selection.
+def draw_dist(B, H, N, D, seed, dist, device="cuda"):
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    s_qrs, s_v, s_dy = {"scale0.25": (0.25, 0.25, 1.0), "scale4": (4.0, 4.0, 1.0), "dy1e-3": (1.0, 1.0, 1e-3),
+                        "dy1e3": (1.0, 1.0, 1e3), "concentrated": (3.0, 1.0, 1.0), "uniform": (0.05, 1.0, 1.0),
+                        "cancel": (1.0, 1.0, 1.0)}[dist]
+    xs = {}
+    for n in NAMES:
+        sc = s_qrs if n in ("Q", "R", "S") else s_v
+        xs[n] = (torch.randn(B, H, N, D, generator=g) * sc).to(torch.bfloat16).to(device)
+    if dist == "cancel":        # values with a large common offset: Y is a small difference of big numbers
+        xs["Vr"] = (xs["Vr"].float() + 8.0).to(torch.bfloat16)
+        xs["Vs"] = (xs["Vs"].float() - 8.0).to(torch.bfloat16)
+    dY = (torch.randn(B, H, N, D, generator=g) * s_dy).to(torch.bfloat16).to(device)
+    return xs, dY
+
+
+DISTS = ["scale0.25", "scale4", "dy1e-3", "dy1e3", "concentrated", "uniform", "cancel"]
+
+
+@pytest.mark.stress
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("dist", DISTS)
+@pytest.mark.parametrize("seed", [0, 1])
+def test_stress_distributions(D, dist, seed):
+    B, H, N = 1, 2, 65
+    xs, dY = draw_dist(B, H, N, D, seed, dist)
+    mask = make_mask("causal", B, N, "cuda")
+    Y_ref, lse_ref, g_ref = run_reference(xs, dY, mask)
+    leaves = {n: xs[n].clone().requires_grad_(True) for n in NAMES}
+    Y = single_gather_attention(*[leaves[n] for n in NAMES], mask, window=N)
+    Y.backward(dY)
+    check("Y", Y, Y_ref)
+    for g, n in zip(["dQ", "dR", "dS", "dVr", "dVs"], NAMES):
+        check(g, leaves[n].grad, g_ref[g])

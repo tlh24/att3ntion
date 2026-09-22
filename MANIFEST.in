@@ -1,0 +1,2 @@
+recursive-include cuda *.cu *.cuh *.h *.hpp
+recursive-include cpp *.cpp *.h *.hpp

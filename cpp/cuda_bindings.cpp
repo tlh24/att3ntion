@@ -13,6 +13,7 @@
 #include <tuple>
 #include <cuda_runtime.h>
 #include "cuda_bindings.h"
+#include "../cuda/common.cuh"
 
 namespace att3_tc {
 
@@ -47,30 +48,95 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         d["bwd_rows_launches"] = s.sg_bwd_rows_launches.load();
         d["last_fwd"] = s.sg_last_fwd;
         d["last_bwd"] = s.sg_last_bwd;
+        d["shared_fwd_launches"] = s.sg_shared_fwd_launches.load();
+        d["shared_bwd_launches"] = s.sg_shared_bwd_launches.load();
+        d["last_shared_fwd"] = s.sg_last_shared_fwd;
+        d["last_shared_bwd"] = s.sg_last_shared_bwd;
         return d;
     }, "single_gather_* launch counts per specialization and last selected tile shapes");
 
     m.def("single_gather_forward",
         [](at::Tensor Q, at::Tensor R, at::Tensor S, at::Tensor Vr, at::Tensor Vs,
-           c10::optional<at::Tensor> mask) {
+           c10::optional<at::Tensor> mask, int64_t window) {
             return single_gather_forward_cuda(Q, R, S, Vr, Vs,
-                                              mask.has_value() ? *mask : at::Tensor());
+                                              mask.has_value() ? *mask : at::Tensor(), window);
         },
-        "Single query-gather forward (returns Y, m, l; LSE = m + log l)",
+        "Single query-gather forward (returns Y, m, l; LSE = m + log l). window > 0 "
+        "declares the mask an equal causal window of that width (>= N: causal) so "
+        "tiles outside it are skipped; the mask is still applied.",
         py::arg("Q"), py::arg("R"), py::arg("S"), py::arg("Vr"), py::arg("Vs"),
-        py::arg("mask") = py::none());
+        py::arg("mask") = py::none(), py::arg("window") = 0);
 
     m.def("single_gather_backward",
         [](at::Tensor dY, at::Tensor Q, at::Tensor R, at::Tensor S, at::Tensor Vr,
            at::Tensor Vs, at::Tensor Y, at::Tensor m, at::Tensor l,
-           c10::optional<at::Tensor> mask) {
+           c10::optional<at::Tensor> mask, int64_t window) {
             return single_gather_backward_cuda(dY, Q, R, S, Vr, Vs, Y, m, l,
-                                               mask.has_value() ? *mask : at::Tensor());
+                                               mask.has_value() ? *mask : at::Tensor(), window);
         },
-        "Single query-gather backward (returns dQ, dR, dS, dVr, dVs)",
+        "Single query-gather backward (returns dQ, dR, dS, dVr, dVs); window as in forward",
         py::arg("dY"), py::arg("Q"), py::arg("R"), py::arg("S"), py::arg("Vr"),
         py::arg("Vs"), py::arg("Y"), py::arg("m"), py::arg("l"),
-        py::arg("mask") = py::none());
+        py::arg("mask") = py::none(), py::arg("window") = 0);
+
+    m.def("single_gather_shared_forward", &single_gather_shared_forward_cuda,
+        "Experimental shared-KV forward: KV tensors [B,1,N,128] read in place; window 16, 32, 64 or 128 "
+        "(default 128) with its mask; fwd_group 1 (native) / 2 / 4 (heads per CTA sharing the KV tiles)",
+        py::arg("Q"), py::arg("R"), py::arg("S"), py::arg("Vr"), py::arg("Vs"), py::arg("mask"),
+        py::arg("window") = 128, py::arg("fwd_group") = 1);
+
+    m.def("single_gather_shared_backward", &single_gather_shared_backward_cuda,
+        "Experimental shared-KV backward: returns dQ [B,Hq,N,128] and dR/dS/dVr/dVs [B,1,N,128] "
+        "(per-head bf16 partials summed in fp32); rs_group as fwd_group for the R/S passes",
+        py::arg("dY"), py::arg("Q"), py::arg("R"), py::arg("S"), py::arg("Vr"), py::arg("Vs"),
+        py::arg("Y"), py::arg("m"), py::arg("l"), py::arg("mask"), py::arg("window") = 128,
+        py::arg("rs_group") = 1);
+
+    m.def("sg_set_config", [](py::dict cfg) {
+        auto& c = att3_tc::state().sg_cfg;
+        for (auto item : cfg) {
+            const std::string k = py::cast<std::string>(item.first);
+            const int v = py::cast<int>(item.second);
+            if (k == "fwd_warps") c.fwd_warps = v;
+            else if (k == "fwd_bk") c.fwd_bk = v;
+            else if (k == "bwd_a_warps") c.bwd_a_warps = v;
+            else if (k == "bwd_a_bk") c.bwd_a_bk = v;
+            else if (k == "bwd_r_warps") c.bwd_r_warps = v;
+            else if (k == "bwd_r_bk") c.bwd_r_bk = v;
+            else if (k == "bwd_dh") c.bwd_dh = v;
+            else throw std::invalid_argument("sg_set_config: unknown key " + k);
+        }
+    }, "Override single_gather_* tile shapes: fwd_warps/fwd_bk, bwd_a_warps/bwd_a_bk "
+       "(Q-owned pass), bwd_r_warps/bwd_r_bk (R/S-owned passes), bwd_dh (64 or D). "
+       "0 restores the default. Illegal shapes raise at the next call.",
+       py::arg("cfg"));
+
+    m.def("sg_get_config", []() {
+        const auto& c = att3_tc::state().sg_cfg;
+        py::dict d;
+        d["fwd_warps"] = c.fwd_warps; d["fwd_bk"] = c.fwd_bk;
+        d["bwd_a_warps"] = c.bwd_a_warps; d["bwd_a_bk"] = c.bwd_a_bk;
+        d["bwd_r_warps"] = c.bwd_r_warps; d["bwd_r_bk"] = c.bwd_r_bk;
+        d["bwd_dh"] = c.bwd_dh;
+        return d;
+    }, "Current sg_set_config() overrides (0 = default)");
+
+    m.def("sg_tile_ranges", [](int64_t N, int64_t window, int64_t a, int64_t side,
+                              int64_t bj, int64_t bk) {
+        // The host copy of the bounds the kernels run, for the visit-coverage test:
+        // [(j0, k_lo, k_hi), ...] per row block of the CTA anchored at `a`.
+        std::vector<std::tuple<int, int, int>> out;
+        int j_lo = 0, j_hi = 0;
+        sg_row_bounds((int)side, (int)a, (int)N, (int)window, (int)bj, j_lo, j_hi);
+        for (int j0 = j_lo; j0 < j_hi; j0 += (int)bj) {
+            int k_lo = 0, k_hi = 0;
+            sg_col_bounds((int)side, (int)a, j0, (int)bj, (int)N, (int)window, (int)bk, k_lo, k_hi);
+            out.emplace_back(j0, k_lo, k_hi);
+        }
+        return out;
+    }, "Row blocks and col-tile ranges a single-gather CTA visits (side 0 = query is the "
+       "anchor, 1 = queries are the rows)",
+       py::arg("N"), py::arg("window"), py::arg("a"), py::arg("side"), py::arg("bj"), py::arg("bk"));
 
     m.def("tc_set_enabled", [](bool forward, bool backward) {
         auto prev = std::make_pair(att3_tc::state().fwd_enabled,

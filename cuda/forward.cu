@@ -86,10 +86,15 @@ constexpr int TC_BK = 64;
 // bounded far below this; NEG_INF itself is -1e30).
 constexpr float TC_MASKED_THRESH = -5e29f;
 
-constexpr size_t tc_smem_bytes(int D, int warps, int bk) {
+// single_tile=true drops the second column buffer: the caller promises every
+// query visits at most one BK-wide column tile (win <= bk), so there is no
+// next tile to prefetch and the double buffer this kernel otherwise carries
+// for the cp.async pipeline is unused space.
+constexpr size_t tc_smem_bytes(int D, int warps, int bk, bool single_tile = false) {
     const int bj = warps * 16, dpad = D + 8;
-    return sizeof(bf16) * ((size_t)2 * bj * dpad + (size_t)4 * bk * dpad) +
-           sizeof(float) * ((size_t)2 * bk + bj + warps * D + warps * 2 + D + 2 + D);
+    const int cb = single_tile ? 1 : 2;  // column buffer count
+    return sizeof(bf16) * ((size_t)2 * bj * dpad + (size_t)2 * cb * bk * dpad) +
+           sizeof(float) * ((size_t)cb * bk + bj + warps * D + warps * 2 + D + 2 + D);
 }
 
 // mma_bf16_m16n8k16 / pack_bf162 / ldmatrix_x4 / ldmatrix_x4_trans /
@@ -98,8 +103,21 @@ constexpr size_t tc_smem_bytes(int D, int warps, int bk) {
 // MASKED=false is the fast path for the common case (no attention mask, no
 // row/col padding): score masking, col_mul/row_mul reads, and the masked-exp
 // selects drop out of the hot loop entirely.
-template<int D_CONST, bool MASKED, int WARPS, int BK>
-__global__ __launch_bounds__(WARPS * 32)
+// The two default shapes are held to the residency the measured defaults rely
+// on: 8 warps at D=64 to 128 registers (2 CTAs/SM), 4 warps at D=128 to 170
+// (3 CTAs/SM). nvcc drifted to 132 / 194 once the loop bounds became runtime
+// values, halving residency and costing 14-36% at N=256. Other shapes are
+// left to the compiler.
+// SINGLE_TILE (see docs/KERNEL_HISTORY.md): the caller
+// guarantees win > 0, win <= BK (one column tile) and win <= WARPS*16 (one row
+// tile), so both the column double-buffer/prefetch and the row-tile running
+// (M, L, N) merge are provably dead work here. It changes neither the
+// contraction nor the set of attended pairs -- only which already-degenerate
+// bookkeeping is compiled out. Reserved for the narrow (warps=2) instantiations
+// dispatched from single_gather_forward_cuda; the general shapes keep SINGLE_TILE
+// = false unchanged.
+template<int D_CONST, bool MASKED, int WARPS, int BK, bool SINGLE_TILE = false>
+__global__ __launch_bounds__(WARPS * 32, (WARPS == 8 && D_CONST == 64) ? 2 : (WARPS == 4 && D_CONST == 128) ? 3 : 1)
 void Y_gather_tc(
     const bf16* __restrict__ X_anchor,
     const bf16* __restrict__ X_rows,
@@ -111,10 +129,11 @@ void Y_gather_tc(
     float* __restrict__ l_out,      // [B,H,n_anchor]
     const bool* __restrict__ mask,  // [B,N,N] or null
     int H, int n_anchor, int n_rows, int n_cols, int n_cols_pad, float scale,
-    int rows_valid, int cols_valid)
+    int rows_valid, int cols_valid, int win, int Hkv)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     static_assert(D_CONST == 64 || D_CONST == 128, "Y_gather_tc supports D=64/128");
+    static_assert(WARPS * 32 * 2 >= D_CONST, "the (M, L, N) fold holds two channels per thread");
     constexpr int D = D_CONST;
     constexpr int DPAD = D + 8;     // bf16 row stride: 144 B, conflict-free for frags
     constexpr int BJ = WARPS * 16;  // rows per block iteration, one m16 tile per warp
@@ -138,25 +157,31 @@ void Y_gather_tc(
     const int brow  = (lane & 7) + ((lane >> 4) & 1) * 8;
     const int bcol8 = ((lane >> 3) & 1) * 8;
 
+    constexpr int CB = SINGLE_TILE ? 1 : 2;  // column buffer count
+
     extern __shared__ char smem_raw[];
     bf16* rowp_sm    = reinterpret_cast<bf16*>(smem_raw);            // [BJ][DPAD]
     bf16* v_rows_sm  = rowp_sm + BJ * DPAD;                          // [BJ][DPAD]
-    bf16* cols_sm    = v_rows_sm + BJ * DPAD;                        // [2][BK][DPAD]
-    bf16* v_cols_sm  = cols_sm + 2 * BK * DPAD;                      // [2][BK][DPAD]
-    float* col_mul   = reinterpret_cast<float*>(v_cols_sm + 2 * BK * DPAD);  // [2][BK]
-    float* row_mul   = col_mul + 2 * BK;                             // [BJ]
+    bf16* cols_sm    = v_rows_sm + BJ * DPAD;                        // [CB][BK][DPAD]
+    bf16* v_cols_sm  = cols_sm + CB * BK * DPAD;                     // [CB][BK][DPAD]
+    float* col_mul   = reinterpret_cast<float*>(v_cols_sm + CB * BK * DPAD);  // [CB][BK]
+    float* row_mul   = col_mul + CB * BK;                            // [BJ]
     float* wN        = row_mul + BJ;                                 // [WARPS][D]
     float* wML       = wN + WARPS * D;                               // [WARPS][2]
     float* redN      = wML + WARPS * 2;                              // [D]
     float* redML     = redN + D;                                     // {M_run, L_run}
     float* anchor_sm = redML + 2;                                    // [D] fp32 scale*anchor
 
+    // Query-head operands (anchor, Y, m, l) live at (b*H + h); the key/value
+    // operands (rows, cols, V) at the KV head (b*Hkv + h / (H/Hkv)), which is the
+    // same index unless the caller shares KV across query heads (Hkv < H).
     const int64_t bh = (int64_t)b * H + h;
+    const int64_t kvh = (int64_t)b * Hkv + h / (H / Hkv);
     const bool* mrow = (mask != nullptr) ? (mask + ((int64_t)b * n_anchor + i) * n_anchor) : nullptr;
 
     // ---- one-time load: scale*anchor (cols/V_cols stage per k tile) ----
     constexpr int DV = D / 8;       // 16-byte vectors per row
-    const int64_t cols_off = bh * n_cols * D;
+    const int64_t cols_off = kvh * n_cols * D;
     const int64_t anchor_off = (bh * n_anchor + i) * D;
     for (int d = tid; d < D; d += blockDim.x) {
         anchor_sm[d] = scale * bf2f(X_anchor[anchor_off + d]);
@@ -190,15 +215,21 @@ void Y_gather_tc(
     for (int d = tid; d < D; d += blockDim.x) redN[d] = 0.0f;
 
     // ---- j blocks of BJ rows, one 16-row tile per warp ----
-    for (int j0 = 0; j0 < n_rows; j0 += BJ) {
+    // win > 0 restricts both loops to the tiles that can hold visible pairs
+    // (see sg_row_bounds); the mask still decides every cell.
+    int j_lo, j_hi;
+    sg_row_bounds(SG_QUERY_ANCHOR, i, n_rows, win, BJ, j_lo, j_hi);
+    for (int j0 = j_lo; j0 < j_hi; j0 += BJ) {
         __syncthreads();  // previous iteration's smem reads (and initial loads) done
+        int k_lo, k_hi;
+        sg_col_bounds(SG_QUERY_ANCHOR, i, j0, BJ, n_cols, win, BK, k_lo, k_hi);
 
         for (int idx = tid; idx < BJ * DV; idx += blockDim.x) {
             const int jl = idx / DV, dv = (idx % DV) * 8;
             const int j = j0 + jl;
             uint4 row_pack = make_uint4(0, 0, 0, 0), v_row_pack = row_pack;
             if (j < n_rows) {
-                const int64_t off = (bh * n_rows + j) * D + dv;
+                const int64_t off = (kvh * n_rows + j) * D + dv;
                 row_pack = *reinterpret_cast<const uint4*>(X_rows + off);
                 v_row_pack = *reinterpret_cast<const uint4*>(V_rows + off);
             }
@@ -218,7 +249,7 @@ void Y_gather_tc(
                 row_mul[jl] = (j < rows_valid && (mrow == nullptr || mrow[j])) ? 1.0f : 0.0f;
             }
         }
-        stage_cols(0, 0);
+        stage_cols(k_lo, 0);
         asm volatile("cp.async.wait_all;\n" ::);
         __syncthreads();
 
@@ -242,11 +273,15 @@ void Y_gather_tc(
         }
 
         int cur = 0;
-        for (int k0 = 0; k0 < n_cols_pad; k0 += BK) {
+        for (int k0 = k_lo; k0 < k_hi; k0 += BK) {
             // Prefetch k0+1 into the idle buffer; the closing barrier publishes it
-            // and frees `cur` for reuse.
-            const int nxt = cur ^ 1;
-            if (k0 + BK < n_cols_pad) stage_cols(k0 + BK, nxt);
+            // and frees `cur` for reuse. SINGLE_TILE's caller-guaranteed single
+            // trip never reuses the buffer, so there is nothing to prefetch.
+            int nxt = cur;
+            if constexpr (!SINGLE_TILE) {
+                nxt = cur ^ 1;
+                if (k0 + BK < k_hi) stage_cols(k0 + BK, nxt);
+            }
             const bf16* cols_cur   = cols_sm + cur * BK * DPAD;
             const bf16* v_cols_cur = v_cols_sm + cur * BK * DPAD;
 
@@ -340,9 +375,11 @@ void Y_gather_tc(
                 }
             }
 
-            asm volatile("cp.async.wait_all;\n" ::);
-            __syncthreads();
-            cur = nxt;
+            if constexpr (!SINGLE_TILE) {
+                asm volatile("cp.async.wait_all;\n" ::);
+                __syncthreads();
+                cur = nxt;
+            }
         }
 
         // ---- epilogue: V1-weighted row collapse of this warp's 16 rows ----
@@ -396,26 +433,47 @@ void Y_gather_tc(
         __syncthreads();
 
         // ---- fold the warp results into the CTA running (M, L, N) ----
-        const float Mold = redML[0], Lold = redML[1];
-        float Mnew = Mold;
+        // SINGLE_TILE's caller-guaranteed single row tile means this is always
+        // the first and only fold: the prior running state is the identity
+        // element (Mold = -inf, Lold = 0), so its rescale (aR = exp(Mold -
+        // Mnew) = 0) is dead arithmetic and redN/redML need not be read here.
+        // The general (multi-tile) case still must seed Mnew from the running
+        // Mold=redML[0]: it can exceed every wML this iteration, and dropping
+        // it here would both understate the new max and make the redN/redML
+        // rescale below (aR = exp(Mold-Mnew)) exceed 1, corrupting the carry.
+        constexpr int NTHR = WARPS * 32;  // two channels/thread when D=128, WARPS=2
+        float Mnew = NEG_INF;
+        if constexpr (!SINGLE_TILE) Mnew = redML[0];
         #pragma unroll
         for (int wd = 0; wd < WARPS; wd++) Mnew = fmaxf(Mnew, wML[wd * 2]);
-        const float aR = __expf(Mold - Mnew);
-        float nNew = 0.0f;
+        float nNew0 = 0.0f, nNew1 = 0.0f;
         if (tid < D) {
-            nNew = redN[tid] * aR;
+            if constexpr (!SINGLE_TILE) nNew0 = redN[tid] * __expf(redML[0] - Mnew);
             #pragma unroll
             for (int wd = 0; wd < WARPS; wd++) {
-                nNew += __expf(wML[wd * 2] - Mnew) * wN[wd * D + tid];
+                nNew0 += __expf(wML[wd * 2] - Mnew) * wN[wd * D + tid];
             }
         }
-        float lNew = Lold * aR;
+        if constexpr (NTHR < D) {
+            if (tid + NTHR < D) {
+                if constexpr (!SINGLE_TILE) nNew1 = redN[tid + NTHR] * __expf(redML[0] - Mnew);
+                #pragma unroll
+                for (int wd = 0; wd < WARPS; wd++) {
+                    nNew1 += __expf(wML[wd * 2] - Mnew) * wN[wd * D + tid + NTHR];
+                }
+            }
+        }
+        float lNew = 0.0f;
+        if constexpr (!SINGLE_TILE) lNew = redML[1] * __expf(redML[0] - Mnew);
         #pragma unroll
         for (int wd = 0; wd < WARPS; wd++) {
             lNew += __expf(wML[wd * 2] - Mnew) * wML[wd * 2 + 1];
         }
         __syncthreads();
-        if (tid < D) redN[tid] = nNew;
+        if (tid < D) redN[tid] = nNew0;
+        if constexpr (NTHR < D) {
+            if (tid + NTHR < D) redN[tid + NTHR] = nNew1;
+        }
         if (tid == 0) { redML[0] = Mnew; redML[1] = lNew; }
     }
     __syncthreads();
@@ -444,20 +502,37 @@ static bool launch_Y_gather_tc(
     const at::Tensor& V_rows, const at::Tensor& V_cols, at::Tensor& Yout,
     at::Tensor& m_out, at::Tensor& l_out, const bool* mask_ptr, int B, int H,
     int n_anchor, int n_rows, int rows_valid, int n_cols, int cols_valid,
-    float scale, int max_smem_optin, cudaStream_t stream)
+    float scale, int max_smem_optin, cudaStream_t stream, int win = 0, int Hkv = 0)
 {
     if constexpr (D < 64) {
         return false;
     } else {
     constexpr size_t smem_tc = tc_smem_bytes(D, WARPS, BK);
     if (smem_tc > (size_t)max_smem_optin) return false;
-    static bool attr_set = false;
-    if (!attr_set) {
+    int attribute_current_device=0; AT_CUDA_CHECK(cudaGetDevice(&attribute_current_device));
+    static thread_local int attr_device=-1;
+    if (attr_device != attribute_current_device) {
         AT_CUDA_CHECK(cudaFuncSetAttribute(Y_gather_tc<D, false, WARPS, BK>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_tc));
         AT_CUDA_CHECK(cudaFuncSetAttribute(Y_gather_tc<D, true, WARPS, BK>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_tc));
-        attr_set = true;
+        attr_device = attribute_current_device;
+    }
+    // SINGLE_TILE (hopper_plan.md Phase 1) is only compiled for the narrow
+    // shapes single_gather_forward_cuda dispatches when win <= 32; the general
+    // shapes are unaffected. win <= BK and win <= WARPS*16 together are exactly
+    // sg_row_bounds/sg_col_bounds' single-tile condition for the anchor side.
+    constexpr bool NARROW_SHAPE = (WARPS == 2) && (BK == 16 || BK == 32);
+    constexpr size_t smem_st = NARROW_SHAPE ? tc_smem_bytes(D, WARPS, BK, true) : smem_tc;
+    if constexpr (NARROW_SHAPE) {
+        static thread_local int attr_device_st=-1;
+        if (attr_device_st != attribute_current_device) {
+            AT_CUDA_CHECK(cudaFuncSetAttribute(Y_gather_tc<D, false, WARPS, BK, true>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_st));
+            AT_CUDA_CHECK(cudaFuncSetAttribute(Y_gather_tc<D, true, WARPS, BK, true>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_st));
+            attr_device_st = attribute_current_device;
+        }
     }
     const int cols_pad = ceil_div(n_cols, BK) * BK;
     // Fast path also requires whole row-blocks: a partial block's zero-filled
@@ -465,9 +540,17 @@ static bool launch_Y_gather_tc(
     const bool tc_masked = (mask_ptr != nullptr)
         || (rows_valid < n_rows) || (cols_valid < n_cols)
         || (cols_pad != n_cols) || (n_rows % (WARPS * 16) != 0);
-    auto* tc_kernel = tc_masked ? Y_gather_tc<D, true, WARPS, BK>
-                                : Y_gather_tc<D, false, WARPS, BK>;
-    tc_kernel<<<dim3(n_anchor, H, B), dim3(WARPS * 32), smem_tc, stream>>>(
+    const bool single_tile = NARROW_SHAPE && win > 0 && win <= BK && win <= WARPS * 16;
+    using TcKernel = decltype(&Y_gather_tc<D, false, WARPS, BK>);
+    TcKernel tc_kernel = tc_masked ? Y_gather_tc<D, true, WARPS, BK> : Y_gather_tc<D, false, WARPS, BK>;
+    size_t launch_smem = smem_tc;
+    if constexpr (NARROW_SHAPE) {
+        if (single_tile) {
+            tc_kernel = tc_masked ? Y_gather_tc<D, true, WARPS, BK, true> : Y_gather_tc<D, false, WARPS, BK, true>;
+            launch_smem = smem_st;
+        }
+    }
+    tc_kernel<<<dim3(n_anchor, H, B), dim3(WARPS * 32), launch_smem, stream>>>(
         reinterpret_cast<const bf16*>(anchor.data_ptr<at::BFloat16>()),
         reinterpret_cast<const bf16*>(rows.data_ptr<at::BFloat16>()),
         reinterpret_cast<const bf16*>(cols.data_ptr<at::BFloat16>()),
@@ -475,7 +558,7 @@ static bool launch_Y_gather_tc(
         reinterpret_cast<const bf16*>(V_cols.data_ptr<at::BFloat16>()),
         reinterpret_cast<bf16*>(Yout.data_ptr<at::BFloat16>()),
         m_out.data_ptr<float>(), l_out.data_ptr<float>(), mask_ptr,
-        H, n_anchor, n_rows, n_cols, cols_pad, scale, rows_valid, cols_valid);
+        H, n_anchor, n_rows, n_cols, cols_pad, scale, rows_valid, cols_valid, win, Hkv > 0 ? Hkv : H);
     ++att3_tc::state().fwd_launches;
     return true;
     }
@@ -1578,6 +1661,28 @@ void single_gather_check(const std::vector<at::Tensor>& xs, const at::Tensor& ma
     }
 }
 
+void single_gather_shared_check(const at::Tensor& Q, const std::vector<at::Tensor>& kv,
+                                const at::Tensor& mask, int64_t window, int64_t group) {
+    TORCH_CHECK(Q.defined() && Q.is_cuda() && Q.dim() == 4, "single_gather_shared: Q must be a CUDA [B,Hq,N,D] tensor");
+    const auto B = Q.size(0), H = Q.size(1), N = Q.size(2), D = Q.size(3);
+    TORCH_CHECK(B > 0 && H > 0, "single_gather_shared: empty batch/head dimensions are unsupported");
+    TORCH_CHECK(D == 128, "single_gather_shared: D must be 128 (prototype), got ", D);
+    TORCH_CHECK(N % 16 == 0 && N > 0, "single_gather_shared: N must be a positive multiple of 16, got ", N);
+    TORCH_CHECK((window == 16 || window == 32 || window == 64 || window == 128), "single_gather_shared: window must be 16, 32, 64 or 128, got ", window);
+    TORCH_CHECK(group == 1 || group == 2 || group == 4, "single_gather_shared: head group must be 1, 2 or 4, got ", group);
+    TORCH_CHECK(H % group == 0, "single_gather_shared: Hq=", H, " is not divisible by the head group ", group);
+    TORCH_CHECK(Q.scalar_type() == at::kBFloat16 && Q.is_contiguous(), "single_gather_shared: Q must be contiguous bf16");
+    for (const auto& x : kv) {
+        TORCH_CHECK(x.defined() && x.is_cuda() && x.device() == Q.device() && x.scalar_type() == at::kBFloat16
+                    && x.is_contiguous(), "single_gather_shared: KV tensors must be contiguous bf16 on Q's device");
+        TORCH_CHECK(x.sizes() == at::IntArrayRef({B, 1, N, D}),
+                    "single_gather_shared: KV tensors must be [B,1,N,D] (Hkv = 1), got ", x.sizes());
+    }
+    TORCH_CHECK(mask.defined() && mask.is_cuda() && mask.device() == Q.device() && mask.scalar_type() == at::kBool
+                && mask.is_contiguous() && mask.sizes() == at::IntArrayRef({B, N, N}),
+                "single_gather_shared: mask must be a contiguous bool [B,N,N] on Q's device (the window mask)");
+}
+
 // Opt-in shared memory of the tensors' device; 0 below sm_80, where the
 // tensor-core kernels compile to no-ops.
 static int sg_smem_optin(const at::Tensor& t) {
@@ -1591,12 +1696,15 @@ static int sg_smem_optin(const at::Tensor& t) {
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> single_gather_forward_cuda(
     at::Tensor Q, at::Tensor R, at::Tensor S, at::Tensor Vr, at::Tensor Vs,
-    at::Tensor mask)
+    at::Tensor mask, int64_t window)
 {
     single_gather_check({Q, R, S, Vr, Vs}, mask);
+    TORCH_CHECK(window <= 0 || mask.defined(),
+                "single_gather: window metadata needs the mask it describes");
     const int B = Q.size(0), H = Q.size(1), N = Q.size(2), D = Q.size(3);
     const float scale = 1.0f / sqrtf((float)D);
     const bool* mask_ptr = mask.defined() ? mask.data_ptr<bool>() : nullptr;
+    const int win = (int)std::max<int64_t>(window, 0);
 
     c10::cuda::CUDAGuard guard(Q.device());
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -1605,24 +1713,89 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> single_gather_forward_cuda(
     auto l = torch::empty({B, H, N}, Q.options().dtype(at::kFloat));
 
     const int optin = sg_smem_optin(Q);
-    const bool ok = (D == 64)
-        ? launch_Y_gather_tc<64, TC_WARPS, TC_BK>(Q, R, S, Vr, Vs, Y, m, l, mask_ptr,
-              B, H, N, N, N, N, N, scale, optin, stream)
-        : launch_Y_gather_tc<128, 4, 32>(Q, R, S, Vr, Vs, Y, m, l, mask_ptr,
-              B, H, N, N, N, N, N, scale, optin, stream);
+    // Tile shape: the sg_set_config() override when set, else the measured
+    // defaults for wide/dense attention (8x64 at D=64, 4x32 at D=128).
+    // Narrow windows use 32 rows and at most 32 columns to avoid empty tiles.
+    // Every 2/4/8-warp x 16/32/64-col
+    // combination is instantiated so the benchmark can sweep them.
+    auto& st = att3_tc::state();
+    const bool narrow = win > 0 && win <= 32;
+    const int warps = st.sg_cfg.fwd_warps ? st.sg_cfg.fwd_warps : (narrow ? 2 : (D == 64 ? TC_WARPS : 4));
+    const int bk = st.sg_cfg.fwd_bk ? st.sg_cfg.fwd_bk : (narrow ? (win <= 16 ? 16 : 32) : (D == 64 ? TC_BK : 32));
+    bool legal = false, ok = false;
+#define SG_FWD_CASE(W, K)                                                              \
+    if (warps == W && bk == K) {                                                       \
+        legal = true;                                                                  \
+        ok = (D == 64)                                                                 \
+            ? launch_Y_gather_tc<64, W, K>(Q, R, S, Vr, Vs, Y, m, l, mask_ptr,         \
+                  B, H, N, N, N, N, N, scale, optin, stream, win)                      \
+            : launch_Y_gather_tc<128, W, K>(Q, R, S, Vr, Vs, Y, m, l, mask_ptr,        \
+                  B, H, N, N, N, N, N, scale, optin, stream, win);                     \
+    }
+    SG_FWD_CASE(2, 16) SG_FWD_CASE(2, 32) SG_FWD_CASE(2, 64)
+    SG_FWD_CASE(4, 16) SG_FWD_CASE(4, 32) SG_FWD_CASE(4, 64)
+    SG_FWD_CASE(8, 16) SG_FWD_CASE(8, 32) SG_FWD_CASE(8, 64)
+#undef SG_FWD_CASE
+    TORCH_CHECK(legal, "single_gather_forward: no kernel for warps=", warps, " bk=", bk,
+                       " (warps in {2,4,8}, bk in {16,32,64})");
     TORCH_CHECK(ok, "single_gather_forward: tensor-core path unavailable on this device "
-                    "(needs sm_80+ and ", tc_smem_bytes(D, D == 64 ? TC_WARPS : 4, D == 64 ? TC_BK : 32),
+                    "(needs sm_80+ and ", tc_smem_bytes(D, warps, bk),
                     " B opt-in shared memory, have ", optin, ")");
     AT_CUDA_CHECK(cudaGetLastError());
-    auto& st = att3_tc::state();
     ++st.sg_fwd_launches;
-    st.sg_last_fwd = "D=" + std::to_string(D) + " warps=" + std::to_string(D == 64 ? TC_WARPS : 4)
-                   + " bk=" + std::to_string(D == 64 ? TC_BK : 32)
-                   + " masked=" + std::to_string(mask_ptr != nullptr || N % ((D == 64 ? TC_WARPS : 4) * 16) != 0
-                                                 || N % (D == 64 ? TC_BK : 32) != 0);
+    st.sg_last_fwd = "D=" + std::to_string(D) + " warps=" + std::to_string(warps)
+                   + " bk=" + std::to_string(bk)
+                   + " masked=" + std::to_string(mask_ptr != nullptr || N % (warps * 16) != 0 || N % bk != 0)
+                   + " win=" + std::to_string(win);
     return std::make_tuple(Y, m, l);
 }
 
+// Experimental shared-KV forward: the four KV tensors are [B,1,N,128] and are
+// read in place (no replication) through the kernel's KV-head offset. Bounded
+// to the quick prototype's contract: D=128, Hkv=1, window=32 with its mask.
+std::tuple<at::Tensor, at::Tensor, at::Tensor> single_gather_shared_forward_cuda(
+    at::Tensor Q, at::Tensor R, at::Tensor S, at::Tensor Vr, at::Tensor Vs,
+    at::Tensor mask, int64_t window, int64_t fwd_group)
+{
+    single_gather_shared_check(Q, {R, S, Vr, Vs}, mask, window, fwd_group == 0 ? 1 : fwd_group);
+    const int B = Q.size(0), H = Q.size(1), N = Q.size(2), D = Q.size(3);
+    const float scale = 1.0f / sqrtf((float)D);
+    const bool* mask_ptr = mask.data_ptr<bool>();
+    c10::cuda::CUDAGuard guard(Q.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto Y = torch::empty_like(Q);
+    auto m = torch::empty({B, H, N}, Q.options().dtype(at::kFloat));
+    auto l = torch::empty({B, H, N}, Q.options().dtype(at::kFloat));
+    const int optin = sg_smem_optin(Q);
+    bool ok = false;
+    const char* implementation="legacy";
+    const int actual_group = window > 32 ? 1 : (fwd_group == 0 ? (H%2 ? 1 : 2) : int(fwd_group));
+    if (fwd_group == 0) {
+        ok = launch_Y_gather_shared_auto(Q,R,S,Vr,Vs,Y,m,l,mask_ptr,B,H,N,scale,optin,stream,int(window),implementation);
+    }
+    if (!ok && actual_group == 1) {
+        // BK 32 would cover w32 in one SINGLE_TILE tile instead of two
+        // double-buffered BK16 tiles, but measured H100 paired benchmarks
+        // (N128/256/512) showed that single wide tile is slower: the BK16
+        // double buffer overlaps tile 2's cp.async load with tile 1's
+        // tensor-core compute, and losing that overlap costs more than the
+        // extra tile visit saves. Native reads with the window tile shape
+        // the experiment-2 final dispatch uses.
+        ok = launch_Y_gather_tc<128, 2, 16>(Q, R, S, Vr, Vs, Y, m, l, mask_ptr,
+                 B, H, N, N, N, N, N, scale, optin, stream, (int)window, 1);
+    } else if (!ok) {
+        ok = launch_Y_gather_shared_grouped(Q, R, S, Vr, Vs, Y, m, l, mask_ptr, B, H, N, scale,
+                                            optin, stream, (int)window, actual_group);
+    }
+    TORCH_CHECK(ok, "single_gather_shared_forward: tensor-core path unavailable on this device");
+    AT_CUDA_CHECK(cudaGetLastError());
+    auto& st = att3_tc::state();
+    ++st.sg_shared_fwd_launches;
+    st.sg_last_shared_fwd = "D=128 Hkv=1 fwd_group=" + std::to_string(fwd_group) + " actual_group=" + std::to_string(actual_group)
+                          + (actual_group == 1 ? " tiles=Y_gather_tc<128,masked,2,16>" : " tiles=Y_gather_tc_grouped<G,2 warps/head,16>")
+                          + " win=" + std::to_string(window) + " implementation=" + implementation;
+    return std::make_tuple(Y, m, l);
+}
 
 
 

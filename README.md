@@ -74,6 +74,21 @@ x = torch.randn(batch_size, seq_len, d_model, device='cuda')
 y = layer(x)  # Same shape as input
 ```
 
+## Shared-KV causal training on H100
+
+The shared single-gather path supports BF16 inputs with head dimension128,
+one KV head, and causal windows16/32/64/128. Its automatic dispatch includes
+the measured Hopper forward and backward schedules. Build with
+`ATT3NTION_CUTLASS_INCLUDE` pointing to CUTLASS3.5.1's `include` directory to
+enable them.
+
+See the [kernel history](docs/KERNEL_HISTORY.md) for measured results and
+every attempt that was kept or rejected.
+This path computes all visible ordered pairs and five first-order gradients,
+using BF16 operands and FP32 accumulation. It casts inputs and dY to BF16
+internally; FP32 callers do not get FP32 arithmetic. The linked numerical
+contract reports the unchanged FP64 validation gates and known stress limits.
+
 ## Synopsis
 
 

@@ -413,34 +413,27 @@ constexpr int BTC_BJ = BTC_WARPS * 16;
 // accumulator when the anchor has no value -- drops out at compile time.
 enum BwdRole { BWD_ALL = 0, BWD_QUERY_ANCHOR = 1, BWD_QUERY_ROWS = 2 };
 
-constexpr size_t btc_smem_bytes(int D, int warps, int bk, bool masked, int role = BWD_ALL) {
+// single_col=true drops the second column buffer, mirroring Y_gather_tc's
+// SINGLE_TILE (hopper_plan.md Phase 1): the caller promises win <= bk, so
+// there is exactly one column tile and the cp.async pipeline's second buffer
+// goes unused. The row loop already writes straight into redOut with a plain
+// sum (no online-softmax carry to simplify), so backward has no row-tile
+// counterpart to this flag.
+constexpr size_t btc_smem_bytes(int D, int warps, int bk, bool masked, int role = BWD_ALL, bool single_col = false) {
     const int bj = warps * 16, dpad = D + 8;
     const int pa = role != BWD_QUERY_ROWS, pr = role != BWD_QUERY_ANCHOR, pc = role == BWD_ALL;
     const int a_tiles = 1 + pa + pr + pc, c_tiles = 2 + pc, outs = 1 + pr;
-    size_t b = sizeof(bf16) * ((size_t)a_tiles * bj * dpad + (size_t)2 * c_tiles * bk * dpad)
-             + sizeof(float) * ((size_t)3 * D + 6 * bk + 3 * bj + warps * outs * D + outs * D);
+    const int cb = single_col ? 1 : 2;
+    size_t b = sizeof(bf16) * ((size_t)a_tiles * bj * dpad + (size_t)cb * c_tiles * bk * dpad)
+             + sizeof(float) * ((size_t)3 * D + cb * 3 * bk + 3 * bj + warps * outs * D + outs * D);
     if (masked) {
-        b += sizeof(uint32_t) * 2 * (size_t)(pr * bj + pc * bk * (bj / 32))
-           + sizeof(float) * (2 * (size_t)bk + bj) * pa;
+        b += sizeof(uint32_t) * cb * (size_t)(pr * bj + pc * bk * (bj / 32))
+           + sizeof(float) * (cb * (size_t)bk + bj) * pa;
     }
     return b;
 }
 
-// 32 mask bools -> one word, bit t = row[t]. Bases are 32-aligned and
-// N % 16 == 0, so the uchar4 reads are aligned; a short lim leaves zeros.
-__device__ __forceinline__ uint32_t pack_mask32(const bool* row, int lim) {
-    uint32_t bits = 0u;
-    int t = 0;
-    for (; t + 4 <= lim; t += 4) {
-        const uchar4 v = *reinterpret_cast<const uchar4*>(row + t);
-        bits |= ((v.x ? 1u : 0u) << t)       | ((v.y ? 1u : 0u) << (t + 1))
-              | ((v.z ? 1u : 0u) << (t + 2)) | ((v.w ? 1u : 0u) << (t + 3));
-    }
-    for (; t < lim; t++) if (row[t]) bits |= 1u << t;
-    return bits;
-}
-
-template<int D_CONST, bool MASKED, int WARPS, int BK, int ROLE = BWD_ALL>
+template<int D_CONST, bool MASKED, int WARPS, int BK, int ROLE = BWD_ALL, int DHT = 64, bool SINGLE_COL = false>
 __global__ __launch_bounds__(WARPS * 32, 1)
 void Bwd_gather_tc(
     const bf16* __restrict__ Xa_bf,  // anchor side [B,H,N,D]
@@ -458,19 +451,21 @@ void Bwd_gather_tc(
     float* __restrict__ gradXa,      // [B,H,N,D] fp32, direct store
     float* __restrict__ gradVa,      // [B,H,N,D] fp32, direct store
     const bool* __restrict__ mask,   // [B,N,N] or null (MASKED only)
-    int H, int N, int K_pad, float scale)
+    int H, int N, int win, float scale, int Hkv)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     static_assert(D_CONST == 64 || D_CONST == 128, "Bwd_gather_tc supports D=64/128");
+    static_assert(DHT == 64 || DHT == D_CONST, "output slice is 64 channels or all of D");
     constexpr int D = D_CONST;
     constexpr int DPAD = D + 8;
     constexpr int BJ = WARPS * 16;
     constexpr int MRW = BJ / 32;    // words per col of a transposed mask window
     constexpr int KS = D / 16;      // score GEMM k-steps (D contracted)
-    // The three output accumulators cover DH cols per pass over the col side;
-    // D=128 makes two passes, recomputing the scores, rather than doubling the
-    // accumulator registers.
-    constexpr int DH = 64;
+    // The output accumulators cover DH cols per pass over the col side; at
+    // D=128 the default DHT=64 makes two passes, recomputing the scores,
+    // rather than doubling the accumulator registers (DHT=128 is the
+    // single-pass variant under test).
+    constexpr int DH = DHT;
     constexpr int NPASS = D / DH;
     constexpr bool PA = ROLE != BWD_QUERY_ROWS;    // anchor-normalized softmax
     constexpr bool PR = ROLE != BWD_QUERY_ANCHOR;  // row-normalized softmax
@@ -491,6 +486,8 @@ void Bwd_gather_tc(
     const int brow  = (lane & 7) + ((lane >> 4) & 1) * 8;
     const int bcol8 = ((lane >> 3) & 1) * 8;
 
+    constexpr int CB = SINGLE_COL ? 1 : 2;  // column buffer count
+
     extern __shared__ char smem_raw[];
     // The four A operands, anchor already folded in: scale*Xa o Xr, gYa o Vr,
     // Va o gYr, Va o Vr. Staged per row block; the epilogue re-reads the raw
@@ -499,37 +496,48 @@ void Bwd_gather_tc(
     bf16* a1_sm   = a0_sm + BJ * DPAD;                            // PA
     bf16* a2_sm   = a1_sm + (PA ? BJ * DPAD : 0);                 // PR
     bf16* a3_sm   = a2_sm + (PR ? BJ * DPAD : 0);                 // PC
-    bf16* xc_sm   = a3_sm + (PC ? BJ * DPAD : 0);                 // [2][BK][DPAD]
-    bf16* vc_sm   = xc_sm + 2 * BK * DPAD;
-    bf16* gyc_sm  = vc_sm + 2 * BK * DPAD;                        // PC
-    float* anchX  = reinterpret_cast<float*>(gyc_sm + (PC ? 2 * BK * DPAD : 0));  // [D] scale*Xa
+    bf16* xc_sm   = a3_sm + (PC ? BJ * DPAD : 0);                 // [CB][BK][DPAD]
+    bf16* vc_sm   = xc_sm + CB * BK * DPAD;
+    bf16* gyc_sm  = vc_sm + CB * BK * DPAD;                       // PC
+    float* anchX  = reinterpret_cast<float*>(gyc_sm + (PC ? CB * BK * DPAD : 0));  // [D] scale*Xa
     float* anchV  = anchX + D;                                    // [D]
     float* anchG  = anchV + D;                                    // [D]
-    float* mc_sm  = anchG + D;                                    // [2][BK]
-    float* ilc_sm = mc_sm + 2 * BK;
-    float* sc_sm  = ilc_sm + 2 * BK;
-    float* mr_sm  = sc_sm + 2 * BK;                              // [BJ]
+    float* mc_sm  = anchG + D;                                    // [CB][BK]
+    float* ilc_sm = mc_sm + CB * BK;
+    float* sc_sm  = ilc_sm + CB * BK;
+    float* mr_sm  = sc_sm + CB * BK;                             // [BJ]
     float* ilr_sm = mr_sm + BJ;
     float* sr_sm  = ilr_sm + BJ;
     float* wOut   = sr_sm + BJ;                                  // [WARPS][NOUT*D]
     float* redOut = wOut + WARPS * NOUT * D;                     // [NOUT*D]
     // MASKED only (host omits these bytes): the tile in flight's mask windows.
-    uint32_t* msk_sm  = reinterpret_cast<uint32_t*>(redOut + NOUT * D);   // [2][BJ] PR
-    uint32_t* mskT_sm = msk_sm + (PR ? 2 * BJ : 0);                      // [2][BK][MRW] PC
-    float* ilac_sm = reinterpret_cast<float*>(mskT_sm + (PC ? 2 * BK * MRW : 0));  // [2][BK] PA
-    float* par_sm  = ilac_sm + 2 * BK;                                   // [BJ] PA
+    uint32_t* msk_sm  = reinterpret_cast<uint32_t*>(redOut + NOUT * D);   // [CB][BJ] PR
+    uint32_t* mskT_sm = msk_sm + (PR ? CB * BJ : 0);                     // [CB][BK][MRW] PC
+    float* ilac_sm = reinterpret_cast<float*>(mskT_sm + (PC ? CB * BK * MRW : 0));  // [CB][BK] PA
+    float* par_sm  = ilac_sm + CB * BK;                                  // [BJ] PA
 
+    // Offsets by operand role. Query-head operands (Q, dY, the forward stats and
+    // every output, including the per-head gradient partials) live at (b*H + h);
+    // key/value operands at the KV head (b*Hkv + h / (H/Hkv)), identical unless
+    // the caller shares KV across query heads. With the query as anchor the
+    // anchor side is query-indexed and rows/cols are KV; with the queries as rows
+    // the anchor (R or S) is KV, the rows (Q, dY) are query-indexed, cols are KV.
+    // The legacy all-three pass always runs with Hkv == H.
     const int64_t bh = (int64_t)b * H + h;
-    const int64_t nd_off = bh * N * D;
-    const int64_t a_off  = nd_off + (int64_t)a * D;
+    const int64_t kvh = (int64_t)b * Hkv + h / (H / Hkv);
+    const int64_t q_off = bh * N * D, kv_off = kvh * N * D;
+    const int64_t anc_off  = (ROLE == BWD_QUERY_ROWS ? kv_off : q_off) + (int64_t)a * D;  // Xa / Va / gYa reads
+    const int64_t a_off    = q_off + (int64_t)a * D;                                      // gradXa / gradVa stores
+    const int64_t rows_off = (ROLE == BWD_QUERY_ROWS ? q_off : kv_off);                   // Xr / Vr / gYr
+    const int64_t nd_off   = kv_off;                                                      // Xc / Vc / gYc
     const int64_t st_off = bh * N;
 
     // ---- one-time loads: anchor only (the col side stages per k tile) ----
     constexpr int DV = D / 8;
     for (int d = tid; d < D; d += blockDim.x) {
-        anchX[d] = scale * bf2f(Xa_bf[a_off + d]);
-        if constexpr (PR || PC) anchV[d] = bf2f(Va_bf[a_off + d]);
-        if constexpr (PA) anchG[d] = bf2f(gYa_bf[a_off + d]);
+        anchX[d] = scale * bf2f(Xa_bf[anc_off + d]);
+        if constexpr (PR || PC) anchV[d] = bf2f(Va_bf[anc_off + d]);
+        if constexpr (PA) anchG[d] = bf2f(gYa_bf[anc_off + d]);
     }
     for (int d = tid; d < NOUT * D; d += blockDim.x) redOut[d] = 0.0f;
 
@@ -539,8 +547,17 @@ void Bwd_gather_tc(
     const bool* mb  = MASKED ? mask + (int64_t)b * N * N : nullptr;
 
     // ---- row blocks of BJ rows, one 16-row tile per warp ----
-    for (int j0 = 0; j0 < N; j0 += BJ) {
+    // win > 0 restricts the row blocks and, per block, the col tiles to those
+    // that can hold visible pairs (sg_row_bounds / sg_col_bounds, keyed on
+    // which side of the pass the query sits); the mask still decides every
+    // cell. The legacy BWD_ALL launch passes 0 and stays dense.
+    constexpr int SIDE = (ROLE == BWD_QUERY_ROWS) ? SG_QUERY_ROWS : SG_QUERY_ANCHOR;
+    int j_lo, j_hi;
+    sg_row_bounds(SIDE, a, N, win, BJ, j_lo, j_hi);
+    for (int j0 = j_lo; j0 < j_hi; j0 += BJ) {
         __syncthreads();  // previous iteration's smem reads (and anchor) done
+        int k_lo, k_hi;
+        sg_col_bounds(SIDE, a, j0, BJ, N, win, BK, k_lo, k_hi);
 
         // Stage col tile k0 into buffer `buf`: matrices, forward stats and
         // (masked) mask windows. Zero-filled pads carry a zero inv-l and zero
@@ -589,7 +606,7 @@ void Bwd_gather_tc(
                 for (int jl = tid; jl < BJ; jl += blockDim.x) {
                     const int j = j0 + jl;
                     msk_sm[buf * BJ + jl] = (j < N)
-                        ? pack_mask32(mb + (int64_t)j * N + k0, min(BK, N - k0))
+                        ? sg_pack_mask32(mb + (int64_t)j * N + k0, min(BK, N - k0))
                         : 0u;
                 }
             }
@@ -598,7 +615,7 @@ void Bwd_gather_tc(
                     const int kl = idx / MRW, w = idx - kl * MRW;
                     const int k = k0 + kl, jb = j0 + w * 32;
                     mskT_sm[buf * BK * MRW + idx] = (k < N && jb < N)
-                        ? pack_mask32(mb + (int64_t)k * N + jb, min(32, N - jb))
+                        ? sg_pack_mask32(mb + (int64_t)k * N + jb, min(32, N - jb))
                         : 0u;
                 }
             }
@@ -612,7 +629,7 @@ void Bwd_gather_tc(
             const int j = j0 + jl;
             uint4 xq = make_uint4(0, 0, 0, 0), vq = xq, gq = xq;
             if (j < N) {
-                const int64_t off = nd_off + (int64_t)j * D + dv;
+                const int64_t off = rows_off + (int64_t)j * D + dv;
                 xq = *reinterpret_cast<const uint4*>(Xr_bf + off);
                 if constexpr (PA || PC) vq = *reinterpret_cast<const uint4*>(Vr_bf + off);
                 if constexpr (PR) gq = *reinterpret_cast<const uint4*>(gYr_bf + off);
@@ -687,7 +704,7 @@ void Bwd_gather_tc(
 
         for (int pass = 0; pass < NPASS; pass++) {
             const int d0 = pass * DH;   // this pass's output col slice
-            stage_cols(0, 0);
+            stage_cols(k_lo, 0);
             asm volatile("cp.async.wait_all;\n" ::);
             __syncthreads();
 
@@ -703,10 +720,15 @@ void Bwd_gather_tc(
             }
 
             int cur = 0;
-            for (int k0 = 0; k0 < K_pad; k0 += BK) {
+            for (int k0 = k_lo; k0 < k_hi; k0 += BK) {
                 // Prefetch k0+1; the closing barrier publishes it and frees `cur`.
-                const int nxt = cur ^ 1;
-                if (k0 + BK < K_pad) stage_cols(k0 + BK, nxt);
+                // SINGLE_COL's caller-guaranteed single trip never reuses the
+                // buffer, so there is nothing to prefetch.
+                int nxt = cur;
+                if constexpr (!SINGLE_COL) {
+                    nxt = cur ^ 1;
+                    if (k0 + BK < k_hi) stage_cols(k0 + BK, nxt);
+                }
                 const bf16* xc_cur  = xc_sm + cur * BK * DPAD;
                 const bf16* vc_cur  = vc_sm + cur * BK * DPAD;
                 const bf16* gyc_cur = gyc_sm + cur * BK * DPAD;
@@ -874,16 +896,24 @@ void Bwd_gather_tc(
                     }
                 }
 
-                asm volatile("cp.async.wait_all;\n" ::);
+                // The multi-pass D=128/DHT=64 split re-primes this single
+                // buffer via stage_cols() at the top of the next pass, so the
+                // barrier protecting readers from that overwrite is still
+                // needed even with nothing left to prefetch; only the
+                // wait_all (nothing in flight) and the buffer toggle (never
+                // reused) are SINGLE_COL-dead.
+                if constexpr (!SINGLE_COL) {
+                    asm volatile("cp.async.wait_all;\n" ::);
+                    cur = nxt;
+                }
                 __syncthreads();
-                cur = nxt;
             }
 
             // ---- epilogue: Hadamard row-collapse of this warp's 16 rows ----
             // Raw rows come from global (L2-hot); pad rows contribute zeros.
             float ng[DH / 4], nv[PR ? DH / 4 : 1];
-            const int64_t r0 = nd_off + (int64_t)min(j0 + jw + g, N - 1) * D + d0 + 2 * tig;
-            const int64_t r1 = nd_off + (int64_t)min(j0 + jw + g + 8, N - 1) * D + d0 + 2 * tig;
+            const int64_t r0 = rows_off + (int64_t)min(j0 + jw + g, N - 1) * D + d0 + 2 * tig;
+            const int64_t r1 = rows_off + (int64_t)min(j0 + jw + g + 8, N - 1) * D + d0 + 2 * tig;
             auto ld2 = [](const bf16* p, bool pad) {
                 return pad ? make_float2(0.0f, 0.0f)
                            : __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(p));
@@ -1722,13 +1752,76 @@ static decltype(&Bwd_gather_tc<64, false, 8, 32>) pick_bwd_tc(
     threads = WARPS * 32;
     auto* k = use_mask ? Bwd_gather_tc<D, true, WARPS, BK, ROLE>
                        : Bwd_gather_tc<D, false, WARPS, BK, ROLE>;
-    static bool attr_set[2] = {false, false};
-    if (!attr_set[use_mask]) {
+    int attribute_current_device=0; AT_CUDA_CHECK(cudaGetDevice(&attribute_current_device));
+    static thread_local int attr_device[2]={-1,-1};
+    if (attr_device[use_mask] != attribute_current_device) {
         AT_CUDA_CHECK(cudaFuncSetAttribute(
             k, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
-        attr_set[use_mask] = true;
+        attr_device[use_mask] = attribute_current_device;
     }
     return k;
+}
+
+// Exact tile shape for the single-gather roles, no fallback ladder: the
+// benchmark sweeps these, so an unavailable shape must fail loudly rather
+// than silently time a different one. Legal set: 2/4/8 warps x BK 16/32, and
+// at D=128 the one-pass DHT=128 output variant.
+using BwdTcKernel = decltype(&Bwd_gather_tc<64, false, 8, 32>);
+
+template<int D, int WARPS, int BK, int ROLE, int DHT, bool SINGLE_COL = false>
+static BwdTcKernel sg_bwd_variant(bool use_mask, int max_smem_optin, size_t& smem, int& threads)
+{
+    smem = btc_smem_bytes(D, WARPS, BK, use_mask, ROLE, SINGLE_COL);
+    if (smem > (size_t)max_smem_optin) return nullptr;
+    threads = WARPS * 32;
+    auto* k = use_mask ? Bwd_gather_tc<D, true, WARPS, BK, ROLE, DHT, SINGLE_COL>
+                       : Bwd_gather_tc<D, false, WARPS, BK, ROLE, DHT, SINGLE_COL>;
+    int attribute_current_device=0; AT_CUDA_CHECK(cudaGetDevice(&attribute_current_device));
+    static thread_local int attr_device[2]={-1,-1};
+    if (attr_device[use_mask] != attribute_current_device) {
+        AT_CUDA_CHECK(cudaFuncSetAttribute(
+            k, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+        attr_device[use_mask] = attribute_current_device;
+    }
+    return k;
+}
+
+// SINGLE_COL (hopper_plan.md Phase 1) is only compiled for the WARPS=2 shape
+// single_gather_backward_cuda dispatches when win <= 32; wider shapes are
+// unaffected. The caller passes single_col = win > 0 && win <= bk.
+template<int D, int WARPS, int BK, int ROLE, int DHT>
+static BwdTcKernel sg_bwd_pick_variant(bool use_mask, bool single_col, int max_smem_optin,
+                                       size_t& smem, int& threads)
+{
+    if constexpr (WARPS == 2) {
+        if (single_col) return sg_bwd_variant<D, WARPS, BK, ROLE, DHT, true>(use_mask, max_smem_optin, smem, threads);
+    }
+    return sg_bwd_variant<D, WARPS, BK, ROLE, DHT, false>(use_mask, max_smem_optin, smem, threads);
+}
+
+static BwdTcKernel sg_pick_bwd(int D, int warps, int bk, int dh, int role, bool use_mask,
+                               int max_smem_optin, size_t& smem, int& threads, bool& legal,
+                               bool single_col = false)
+{
+    legal = false;
+#define SG_BWD_CASE(DD, W, K, DHV)                                                        \
+    if (D == DD && warps == W && bk == K && dh == DHV) {                                  \
+        legal = true;                                                                    \
+        return role == BWD_QUERY_ANCHOR                                                  \
+            ? sg_bwd_pick_variant<DD, W, K, BWD_QUERY_ANCHOR, DHV>(use_mask, single_col, max_smem_optin, smem, threads) \
+            : sg_bwd_pick_variant<DD, W, K, BWD_QUERY_ROWS, DHV>(use_mask, single_col, max_smem_optin, smem, threads);  \
+    }
+    SG_BWD_CASE(64, 2, 16, 64)  SG_BWD_CASE(64, 2, 32, 64)
+    SG_BWD_CASE(64, 4, 16, 64)  SG_BWD_CASE(64, 4, 32, 64)
+    SG_BWD_CASE(64, 8, 16, 64)  SG_BWD_CASE(64, 8, 32, 64)
+    SG_BWD_CASE(128, 2, 16, 64) SG_BWD_CASE(128, 2, 32, 64)
+    SG_BWD_CASE(128, 4, 16, 64) SG_BWD_CASE(128, 4, 32, 64)
+    SG_BWD_CASE(128, 8, 16, 64) SG_BWD_CASE(128, 8, 32, 64)
+    SG_BWD_CASE(128, 2, 16, 128) SG_BWD_CASE(128, 2, 32, 128)
+    SG_BWD_CASE(128, 4, 16, 128) SG_BWD_CASE(128, 4, 32, 128)
+    SG_BWD_CASE(128, 8, 16, 128) SG_BWD_CASE(128, 8, 32, 128)
+#undef SG_BWD_CASE
+    return nullptr;
 }
 
 // =============================================================================
@@ -1858,7 +1951,6 @@ backward_impl(torch::Tensor grad_Y_q,
     auto* tc_kernel = (D == 64)
         ? pick_bwd_tc<64, BTC_WARPS, BTC_BK>(use_mask, max_smem_optin, smem_tc, threads_tc)
         : pick_bwd_tc<128, BTC_WARPS, BTC_BK>(use_mask, max_smem_optin, smem_tc, threads_tc);
-    const int K_pad = ceil_div(N, BTC_BK) * BTC_BK;
     if (att3_tc::state().bwd_enabled && tc_kernel != nullptr) {
       // Single host round-trip for the gate.
       const bool scatter_active =
@@ -1889,7 +1981,7 @@ backward_impl(torch::Tensor grad_Y_q,
                 mr.data_ptr<float>(), lr.data_ptr<float>(), sr.data_ptr<float>(),
                 mc.data_ptr<float>(), lc.data_ptr<float>(), sc.data_ptr<float>(),
                 gX.data_ptr<float>(), gV.data_ptr<float>(),
-                mask_ptr, H, N, K_pad, scale);
+                mask_ptr, H, N, 0, scale, H);
             ++att3_tc::state().bwd_launches;
         };
         // Role table (anchor / rows / cols), one launch per gradient family:
@@ -2296,10 +2388,14 @@ backward_cuda(torch::Tensor grad_Y_q,
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 single_gather_backward_cuda(
     at::Tensor dY, at::Tensor Q, at::Tensor R, at::Tensor S, at::Tensor Vr,
-    at::Tensor Vs, at::Tensor Y, at::Tensor m, at::Tensor l, at::Tensor mask)
+    at::Tensor Vs, at::Tensor Y, at::Tensor m, at::Tensor l, at::Tensor mask,
+    int64_t window)
 {
   single_gather_check({Q, R, S, Vr, Vs, dY, Y}, mask);
+  TORCH_CHECK(window <= 0 || mask.defined(),
+              "single_gather: window metadata needs the mask it describes");
   const int B = Q.size(0), H = Q.size(1), N = Q.size(2), D = Q.size(3);
+  const int win = (int)std::max<int64_t>(window, 0);
   for (const auto& s : {m, l}) {
     TORCH_CHECK(s.defined() && s.is_cuda() && s.device() == Q.device()
                 && s.scalar_type() == at::kFloat && s.is_contiguous()
@@ -2321,19 +2417,53 @@ single_gather_backward_cuda(
   int major = 0, optin = 0;
   cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, Q.device().index());
   if (major >= 8) cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, Q.device().index());
+  // Narrow windows need at most 32 rows in either ownership pass. Honor
+  // explicit tuning overrides; otherwise use two warps for win <= 32.
+  // Wider/dense shapes retain 8 warps x BK 32
+  // with the two 64-channel output passes at D=128, dropping to the widest
+  // shape that fits the device's opt-in shared memory (4 warps at D=64, 2 at
+  // D=128 inside 99 KB). Q-owned (anchor) and R/S-owned (rows) are tuned
+  // separately.
+  auto& st = att3_tc::state();
+  const int dh = st.sg_cfg.bwd_dh ? st.sg_cfg.bwd_dh : 64;
   size_t smem_a = 0, smem_r = 0;
   int thr_a = 0, thr_r = 0;
-  auto* ka = (D == 64)
-      ? pick_bwd_tc<64, BTC_WARPS, BTC_BK, BWD_QUERY_ANCHOR>(use_mask, optin, smem_a, thr_a)
-      : pick_bwd_tc<128, BTC_WARPS, BTC_BK, BWD_QUERY_ANCHOR>(use_mask, optin, smem_a, thr_a);
-  auto* kr = (D == 64)
-      ? pick_bwd_tc<64, BTC_WARPS, BTC_BK, BWD_QUERY_ROWS>(use_mask, optin, smem_r, thr_r)
-      : pick_bwd_tc<128, BTC_WARPS, BTC_BK, BWD_QUERY_ROWS>(use_mask, optin, smem_r, thr_r);
+  bool legal_a = false, legal_r = false;
+  const int default_warps = (win > 0 && win <= 32) ? 2 : BTC_WARPS;
+  // SINGLE_COL needs the worst-case column-tile width across every row tile
+  // the kernel will visit, which sg_col_bounds bounds differently by role: the
+  // anchor side ignores the row tile entirely (width <= win), but the rows
+  // side's opposite-key window widens toward the first row tile, up to
+  // min(bj, win) + win - 1 (see sg_col_bounds' SG_QUERY_ROWS branch).
+  auto single_col_for = [&](int role, int rw, int rbk) {
+    if (win <= 0) return false;
+    if (role == BWD_QUERY_ANCHOR) return win <= rbk;
+    return std::min(rw * 16, win) + win - 1 <= rbk;
+  };
+  auto pick = [&](int role, int cw, int cbk, size_t& smem, int& thr, bool& legal) -> BwdTcKernel {
+    if (cw || cbk) {
+      const int rw = cw ? cw : default_warps, rbk = cbk ? cbk : BTC_BK;
+      return sg_pick_bwd(D, rw, rbk, dh, role, use_mask,
+                         optin, smem, thr, legal, single_col_for(role, rw, rbk));
+    }
+    const bool single_col = single_col_for(role, default_warps, BTC_BK);
+    BwdTcKernel k = sg_pick_bwd(D, default_warps, BTC_BK, dh, role, use_mask, optin, smem, thr, legal, single_col);
+    if (k == nullptr && legal) {
+      const int rw = D == 128 ? 2 : 4;
+      k = sg_pick_bwd(D, rw, BTC_BK, dh, role, use_mask, optin, smem, thr, legal, single_col_for(role, rw, BTC_BK));
+    }
+    return k;
+  };
+  auto* ka = pick(BWD_QUERY_ANCHOR, st.sg_cfg.bwd_a_warps, st.sg_cfg.bwd_a_bk, smem_a, thr_a, legal_a);
+  auto* kr = pick(BWD_QUERY_ROWS, st.sg_cfg.bwd_r_warps, st.sg_cfg.bwd_r_bk, smem_r, thr_r, legal_r);
+  TORCH_CHECK(legal_a && legal_r,
+              "single_gather_backward: no kernel for warps=", st.sg_cfg.bwd_a_warps, "/",
+              st.sg_cfg.bwd_r_warps, " bk=", st.sg_cfg.bwd_a_bk, "/", st.sg_cfg.bwd_r_bk, " dh=", dh,
+              " (warps in {2,4,8}, bk in {16,32}, dh 64 or D)");
   TORCH_CHECK(ka != nullptr && kr != nullptr,
               "single_gather_backward: tensor-core path unavailable on this device "
               "(needs sm_80+ and ", std::max(smem_a, smem_r), " B opt-in shared memory, have ", optin, ")");
 
-  const int K_pad = ceil_div(N, BTC_BK) * BTC_BK;
   const dim3 grid(N, H, B);
   auto bp = [](const at::Tensor& t) {
     return t.defined() ? reinterpret_cast<const bf16*>(t.data_ptr<at::BFloat16>()) : nullptr;
@@ -2342,23 +2472,263 @@ single_gather_backward_cuda(
   ka<<<grid, thr_a, smem_a, stream>>>(
       bp(Q), nullptr, bp(dY),  bp(R), bp(Vr), nullptr,  bp(S), bp(Vs), nullptr,
       fp(m), fp(l), fp(delta),  nullptr, nullptr, nullptr,  nullptr, nullptr, nullptr,
-      gQ.data_ptr<float>(), nullptr, mask_ptr, H, N, K_pad, scale);
+      gQ.data_ptr<float>(), nullptr, mask_ptr, H, N, win, scale, H);
   kr<<<grid, thr_r, smem_r, stream>>>(
       bp(R), bp(Vr), nullptr,  bp(Q), nullptr, bp(dY),  bp(S), bp(Vs), nullptr,
       nullptr, nullptr, nullptr,  fp(m), fp(l), fp(delta),  nullptr, nullptr, nullptr,
-      gR.data_ptr<float>(), gVr.data_ptr<float>(), mask_ptr, H, N, K_pad, scale);
+      gR.data_ptr<float>(), gVr.data_ptr<float>(), mask_ptr, H, N, win, scale, H);
   kr<<<grid, thr_r, smem_r, stream>>>(
       bp(S), bp(Vs), nullptr,  bp(Q), nullptr, bp(dY),  bp(R), bp(Vr), nullptr,
       nullptr, nullptr, nullptr,  fp(m), fp(l), fp(delta),  nullptr, nullptr, nullptr,
-      gS.data_ptr<float>(), gVs.data_ptr<float>(), mask_ptr, H, N, K_pad, scale);
+      gS.data_ptr<float>(), gVs.data_ptr<float>(), mask_ptr, H, N, win, scale, H);
   AT_CUDA_CHECK(cudaGetLastError());
 
-  auto& st = att3_tc::state();
   ++st.sg_bwd_anchor_launches;
   st.sg_bwd_rows_launches += 2;
   st.sg_last_bwd = "D=" + std::to_string(D) + " warps=" + std::to_string(thr_a / 32) + "/"
-                 + std::to_string(thr_r / 32) + " bk=" + std::to_string(BTC_BK)
-                 + " masked=" + std::to_string(use_mask) + " roles=anchor,rows,rows";
+                 + std::to_string(thr_r / 32) + " bk="
+                 + std::to_string(st.sg_cfg.bwd_a_bk ? st.sg_cfg.bwd_a_bk : BTC_BK) + "/"
+                 + std::to_string(st.sg_cfg.bwd_r_bk ? st.sg_cfg.bwd_r_bk : BTC_BK)
+                 + " dh=" + std::to_string(dh) + " masked=" + std::to_string(use_mask)
+                 + " win=" + std::to_string(win) + " roles=anchor,rows,rows";
   return std::make_tuple(gQ.to(at::kBFloat16), gR.to(at::kBFloat16), gS.to(at::kBFloat16),
                          gVr.to(at::kBFloat16), gVs.to(at::kBFloat16));
+}
+
+
+// =============================================================================
+// Experimental shared-KV backward (Hkv = 1, D = 128, window 32)
+// =============================================================================
+// Same three passes as single_gather_backward_cuda with the KV operands read in
+// place through the kernel's KV-head offset (Hkv = 1). The R/S passes write
+// private fp32 partials per query head ([B,Hq,N,D], one CTA per (anchor, head)
+// still owns its row, so nothing is accumulated and repeated calls overwrite);
+// the head reduction reproduces the adapter's contract exactly: round each
+// head's partial to bf16, sum the heads in fp32, cast once. No atomics.
+#include "shared_reduction.cuh"
+#include "shared_hopper.h"
+#ifdef ATT3NTION_WITH_HOPPER
+#include "shared_hopper_rs.cuh"
+#include "shared_hopper_rs64.cuh"
+#endif
+#include "shared_retained_rs.cuh"
+#include "shared_retained_dq.cuh"
+#include "shared_mask_metadata.cuh"
+
+#include "shared_wide_dq.cuh"
+
+// Validate every raw-pointer operand before padding or any CUDA launch.
+// Shape/dtype alone do not make a pointer safe on the guarded Q device.
+static void shared_backward_check_state(
+    const at::Tensor& Q, const at::Tensor& dY, const at::Tensor& Y,
+    const at::Tensor& m, const at::Tensor& l) {
+  for (const auto& x : {dY, Y}) {
+    TORCH_CHECK(x.defined() && x.is_cuda() && x.device() == Q.device()
+                && x.scalar_type() == at::kBFloat16 && x.is_contiguous()
+                && x.sizes() == Q.sizes(),
+                "single_gather_shared_backward: dY and Y must be contiguous bf16 matching Q on Q's CUDA device");
+  }
+  for (const auto& s : {m, l}) {
+    TORCH_CHECK(s.defined() && s.is_cuda() && s.device() == Q.device()
+                && s.scalar_type() == at::kFloat && s.is_contiguous()
+                && s.sizes() == at::IntArrayRef({Q.size(0), Q.size(1), Q.size(2)}),
+                "single_gather_shared_backward: m/l must be contiguous fp32 [B,Hq,N] on Q's CUDA device");
+  }
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+single_gather_shared_backward_auto(
+    at::Tensor dY, at::Tensor Q, at::Tensor R, at::Tensor S, at::Tensor Vr,
+    at::Tensor Vs, at::Tensor Y, at::Tensor m, at::Tensor l, at::Tensor mask,
+    int64_t window, int64_t rs_group)
+{
+  single_gather_shared_check(Q, {R, S, Vr, Vs}, mask, window, 1);
+  shared_backward_check_state(Q,dY,Y,m,l);
+  rs_group = 4;
+  if (Q.size(1) % 2) {
+    const int64_t heads = Q.size(1);
+    auto extra = torch::zeros({Q.size(0),1,Q.size(2),Q.size(3)},Q.options());
+    auto extra_stats = torch::zeros({Q.size(0),1,Q.size(2)},m.options());
+    auto result = single_gather_shared_backward_auto(
+        torch::cat({dY,extra},1),torch::cat({Q,extra},1),R,S,Vr,Vs,
+        torch::cat({Y,extra},1),torch::cat({m,extra_stats},1),
+        torch::cat({l,torch::ones_like(extra_stats)},1),mask,window,4);
+    std::get<0>(result) = std::get<0>(result).narrow(1,0,heads).contiguous();
+    return result;
+  }
+  const int B = Q.size(0), H = Q.size(1), N = Q.size(2), D = Q.size(3);
+  const float scale = 1.0f / sqrtf((float)D);
+  const int win = (int)window;
+  const bool* mask_ptr = mask.data_ptr<bool>();
+  c10::cuda::CUDAGuard guard(Q.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const int mask_words = (N+31)/32;
+  auto packed_mask = torch::empty({B,N,mask_words}, Q.options().dtype(at::kInt));
+  auto support = torch::empty({B,N}, Q.options().dtype(at::kByte));
+  auto* packed_ptr = reinterpret_cast<uint32_t*>(packed_mask.data_ptr<int32_t>());
+  auto* support_ptr = support.data_ptr<uint8_t>();
+  AT_CUDA_CHECK(att3_mask_metadata::launch(mask_ptr,packed_ptr,support_ptr,B,N,win,stream));
+  auto delta = torch::empty({B,H,N}, Q.options().dtype(at::kFloat));
+  AT_CUDA_CHECK((cudaError_t)fusion_delta(
+      reinterpret_cast<const bf16*>(dY.data_ptr<at::BFloat16>()),
+      reinterpret_cast<const bf16*>(Y.data_ptr<at::BFloat16>()),
+      delta.data_ptr<float>(), B*H*N, stream));
+  auto fp32 = Q.options().dtype(at::kFloat);
+  // Each KV head partial is rounded to BF16 before head reduction in the
+  // established contract. Materialize exactly that value, after FP32 accumulation.
+  auto gQ = torch::empty({B,H,N,D},fp32);
+  auto pR = torch::empty_like(Q), pS = torch::empty_like(Q),
+       pVr = torch::empty_like(Q), pVs = torch::empty_like(Q);
+  int major = 0, minor = 0, optin = 0;
+  AT_CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, Q.device().index()));
+  AT_CUDA_CHECK(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, Q.device().index()));
+  if (major >= 8) cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, Q.device().index());
+  // At w32, two warps cover all 32 key rows; four warps compute 32 masked
+  // rows even with tight bounds. Keep BK 32 and the one-pass D128 output.
+  size_t smem_a = 0; int thr_a = 0; bool legal = false;
+  // Only windows <= BK fit one column tile. Wider windows use the existing
+  // general Q backward, including its multi-tile accumulation.
+  auto* ka = sg_pick_bwd(128, 2, 32, 128, BWD_QUERY_ANCHOR, true, optin, smem_a, thr_a, legal, win <= 32);
+  TORCH_CHECK(ka != nullptr, "single_gather_shared_backward: Q pass unavailable on this device");
+  auto bp = [](const at::Tensor& t) { return reinterpret_cast<const bf16*>(t.data_ptr<at::BFloat16>()); };
+  auto fp = [](const at::Tensor& t) { return t.data_ptr<float>(); };
+  const bool used_retained_dq = launch_att3_shared_hopper_dq(
+      bp(Q),bp(dY),bp(R),bp(Vr),bp(S),bp(Vs),fp(m),fp(l),fp(delta),
+      gQ.data_ptr<float>(),mask_ptr,B,H,N,win,scale,stream,support_ptr) || sg_wide_dq::launch_wide_dq(
+      bp(Q),bp(dY),bp(R),bp(Vr),bp(S),bp(Vs),fp(m),fp(l),fp(delta),
+      gQ.data_ptr<float>(),mask_ptr,B,H,N,win,scale,stream,support_ptr) || sg_retained_dq::launch_retained_dq(
+      bp(Q),bp(dY),bp(R),bp(Vr),bp(S),bp(Vs),fp(m),fp(l),fp(delta),
+      gQ.data_ptr<float>(),mask_ptr,B,H,N,win,scale,stream,support_ptr);
+  if (!used_retained_dq) {
+  ka<<<dim3(N, H, B), thr_a, smem_a, stream>>>(
+      bp(Q), nullptr, bp(dY),  bp(R), bp(Vr), nullptr,  bp(S), bp(Vs), nullptr,
+      fp(m), fp(l), fp(delta),  nullptr, nullptr, nullptr,  nullptr, nullptr, nullptr,
+      gQ.data_ptr<float>(), nullptr, mask_ptr, H, N, win, scale, 1);
+  }
+  bool used_retained = false;
+  bool used_hopper_rs = false;
+#ifdef ATT3NTION_WITH_HOPPER
+  // Validated moving48 register-A schedule. Keep other shapes on the
+  // exact retained-MMA family; both write the same BF16 partial contract.
+  if (major == 9 && minor == 0 && win == 32 && H >= 16 && H % 4 == 0 && N >= 96) {
+    AT_CUDA_CHECK((cudaError_t)att3_shared_rs_wgmma_w32(
+        bp(R),bp(Vr),bp(Q),bp(dY),bp(S),bp(Vs),fp(m),fp(l),fp(delta),
+        pR.data_ptr<at::BFloat16>(),pVr.data_ptr<at::BFloat16>(),
+        pS.data_ptr<at::BFloat16>(),pVs.data_ptr<at::BFloat16>(),
+        B,H,N,win,scale,stream,support_ptr,packed_ptr,true));
+    used_hopper_rs = used_retained = true;
+  }
+  // Reuse dead Q/dY staging for a swizzled FP32 projection tile at w64.
+  // Keep small grids on the measured retained-MMA path.
+  if (!used_retained && major == 9 && minor == 0 && win == 64 && H % 4 == 0
+      && N >= 128 && int64_t(B)*H*N >= 6144) {
+    AT_CUDA_CHECK((cudaError_t)att3_shared_rs_wgmma64_w64(
+        bp(R),bp(Vr),bp(Q),bp(dY),bp(S),bp(Vs),fp(m),fp(l),fp(delta),
+        pR.data_ptr<at::BFloat16>(),pVr.data_ptr<at::BFloat16>(),
+        pS.data_ptr<at::BFloat16>(),pVs.data_ptr<at::BFloat16>(),
+        B,H,N,win,scale,stream,support_ptr,packed_ptr,true));
+    used_hopper_rs = used_retained = true;
+  }
+#endif
+  if (!used_retained) {
+    used_retained = att3_shared_rs::launch_retained_rs(
+        bp(R),bp(Vr),bp(Q),bp(dY),bp(S),bp(Vs),fp(m),fp(l),fp(delta),
+        reinterpret_cast<float*>(pR.data_ptr<at::BFloat16>()),
+        reinterpret_cast<float*>(pVr.data_ptr<at::BFloat16>()),
+        reinterpret_cast<float*>(pS.data_ptr<at::BFloat16>()),
+        reinterpret_cast<float*>(pVs.data_ptr<at::BFloat16>()),
+        mask_ptr,B,H,N,win,scale,optin,stream,support_ptr,packed_ptr,mask_words);
+    TORCH_CHECK(used_retained,"single_gather_shared_backward: packed R/S schedule unavailable on this device");
+  }
+  AT_CUDA_CHECK(cudaGetLastError());
+  // Head reduction with the adapter's rounding contract: bf16 per head, fp32 sum, bf16 once.
+  auto dQ = torch::empty_like(Q);
+  auto dR = torch::empty_like(R), dS = torch::empty_like(S),
+       dVr = torch::empty_like(Vr), dVs = torch::empty_like(Vs);
+  auto outp = [](at::Tensor& t) { return reinterpret_cast<bf16*>(t.data_ptr<at::BFloat16>()); };
+  AT_CUDA_CHECK((cudaError_t)fusion_reduce_split(8,
+      fp(gQ), reinterpret_cast<float*>(pR.data_ptr<at::BFloat16>()), reinterpret_cast<float*>(pS.data_ptr<at::BFloat16>()), reinterpret_cast<float*>(pVr.data_ptr<at::BFloat16>()), reinterpret_cast<float*>(pVs.data_ptr<at::BFloat16>()),
+      outp(dQ), outp(dR), outp(dS), outp(dVr), outp(dVs), B,H,N*D,stream));
+  auto& st = att3_tc::state();
+  ++st.sg_shared_bwd_launches;
+  st.sg_last_shared_bwd = std::string("auto D=128 Hkv=1 R/S=")
+      + (used_hopper_rs ? (win == 64 ? "hopper-shared-projection-w64" : "hopper-register-A-moving48") : "retained-mma")
+      + (used_retained_dq ? " dQ=retained" : " dQ=legacy")
+      + " win=" + std::to_string(win)
+      + " partials=bf16 reduce=fused-bf16-per-head/fp32-split4-sum delta=warp128";
+  return std::make_tuple(dQ,dR,dS,dVr,dVs);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+single_gather_shared_backward_cuda(
+    at::Tensor dY, at::Tensor Q, at::Tensor R, at::Tensor S, at::Tensor Vr,
+    at::Tensor Vs, at::Tensor Y, at::Tensor m, at::Tensor l, at::Tensor mask,
+    int64_t window, int64_t rs_group)
+{
+  if (rs_group == 0) {
+    single_gather_shared_check(Q, {R,S,Vr,Vs}, mask, window, 1);
+    c10::cuda::CUDAGuard auto_guard(Q.device());
+    int major = 0;
+    AT_CUDA_CHECK(cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,Q.device().index()));
+    if (major == 9) return single_gather_shared_backward_auto(dY,Q,R,S,Vr,Vs,Y,m,l,mask,window,4);
+    rs_group = 1;
+  }
+  single_gather_shared_check(Q, {R, S, Vr, Vs}, mask, window, rs_group);
+  shared_backward_check_state(Q,dY,Y,m,l);
+  const int B = Q.size(0), H = Q.size(1), N = Q.size(2), D = Q.size(3);
+  const float scale = 1.0f / sqrtf((float)D);
+  const int win = (int)window;
+  const bool* mask_ptr = mask.data_ptr<bool>();
+  c10::cuda::CUDAGuard guard(Q.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto delta = (dY.to(at::kFloat) * Y.to(at::kFloat)).sum(-1).contiguous();
+  auto fp32 = Q.options().dtype(at::kFloat);
+  auto gQ = torch::empty({B, H, N, D}, fp32), pR = torch::empty({B, H, N, D}, fp32),
+       pS = torch::empty({B, H, N, D}, fp32), pVr = torch::empty({B, H, N, D}, fp32),
+       pVs = torch::empty({B, H, N, D}, fp32);
+  int major = 0, optin = 0;
+  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, Q.device().index());
+  if (major >= 8) cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, Q.device().index());
+  // At w32, two warps cover all 32 key rows; four warps compute 32 masked
+  // rows even with tight bounds. Keep BK 32 and the one-pass D128 output.
+  size_t smem_a = 0; int thr_a = 0; bool legal = false;
+  // Only windows <= BK fit one column tile. Wider windows use the existing
+  // general Q backward, including its multi-tile accumulation.
+  auto* ka = sg_pick_bwd(128, 2, 32, 128, BWD_QUERY_ANCHOR, true, optin, smem_a, thr_a, legal, win <= 32);
+  TORCH_CHECK(ka != nullptr, "single_gather_shared_backward: Q pass unavailable on this device");
+  auto bp = [](const at::Tensor& t) { return reinterpret_cast<const bf16*>(t.data_ptr<at::BFloat16>()); };
+  auto fp = [](const at::Tensor& t) { return t.data_ptr<float>(); };
+  ka<<<dim3(N, H, B), thr_a, smem_a, stream>>>(
+      bp(Q), nullptr, bp(dY),  bp(R), bp(Vr), nullptr,  bp(S), bp(Vs), nullptr,
+      fp(m), fp(l), fp(delta),  nullptr, nullptr, nullptr,  nullptr, nullptr, nullptr,
+      gQ.data_ptr<float>(), nullptr, mask_ptr, H, N, win, scale, 1);
+  if (rs_group == 1) {
+    // R/S-owned passes, native reads: 2 warps, BK 16, one-pass output (the window table).
+    size_t smem_r = 0; int thr_r = 0;
+    auto* kr = sg_pick_bwd(128, 2, 16, 128, BWD_QUERY_ROWS, true, optin, smem_r, thr_r, legal);
+    TORCH_CHECK(kr != nullptr, "single_gather_shared_backward: R/S pass unavailable on this device");
+    kr<<<dim3(N, H, B), thr_r, smem_r, stream>>>(
+        bp(R), bp(Vr), nullptr,  bp(Q), nullptr, bp(dY),  bp(S), bp(Vs), nullptr,
+        nullptr, nullptr, nullptr,  fp(m), fp(l), fp(delta),  nullptr, nullptr, nullptr,
+        pR.data_ptr<float>(), pVr.data_ptr<float>(), mask_ptr, H, N, win, scale, 1);
+    kr<<<dim3(N, H, B), thr_r, smem_r, stream>>>(
+        bp(S), bp(Vs), nullptr,  bp(Q), nullptr, bp(dY),  bp(R), bp(Vr), nullptr,
+        nullptr, nullptr, nullptr,  fp(m), fp(l), fp(delta),  nullptr, nullptr, nullptr,
+        pS.data_ptr<float>(), pVs.data_ptr<float>(), mask_ptr, H, N, win, scale, 1);
+  } else {
+    TORCH_CHECK(launch_bwd_rows_shared_grouped(Q, dY, R, Vr, S, Vs, m, l, delta, pR, pVr, pS, pVs, mask_ptr,
+                                               B, H, N, scale, optin, stream, win, (int)rs_group),
+                "single_gather_shared_backward: grouped R/S pass unavailable on this device");
+  }
+  AT_CUDA_CHECK(cudaGetLastError());
+  // Head reduction with the adapter's rounding contract: bf16 per head, fp32 sum, bf16 once.
+  auto reduce = [&](const at::Tensor& part) {
+    return part.to(at::kBFloat16).to(at::kFloat).view({B, 1, H, N, D}).sum(2).to(at::kBFloat16);
+  };
+  auto& st = att3_tc::state();
+  ++st.sg_shared_bwd_launches;
+  st.sg_last_shared_bwd = "D=128 Hkv=1 Q=Bwd_gather_tc<128,masked,2,32,anchor,dh128> rs_group=" + std::to_string(rs_group)
+                        + (rs_group == 1 ? " R/S=Bwd_gather_tc<128,masked,2,16,rows,dh128>" : (rs_group == 4 ? " R/S=dual<2heads,2directions,WPH1,BK16,rawQD>" : " R/S=grouped<G2,WPH2,BK32,rawQD>"))
+                        + " win=" + std::to_string(win) + " reduce=bf16-per-head/fp32-sum";
+  return std::make_tuple(gQ.to(at::kBFloat16), reduce(pR), reduce(pS), reduce(pVr), reduce(pVs));
 }
