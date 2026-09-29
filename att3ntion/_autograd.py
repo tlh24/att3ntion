@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import math
 import att3ntion._custom_op  # noqa: F401 — registers torch.ops.att3ntion.hypergraph_{forward,backward}
+from att3ntion._single_gather import single_gather_attention, window_mask
 # import att3ntion._torch_kernels as _torch_kernels
 from torch.autograd import Function
 
@@ -258,7 +259,7 @@ class HypergraphAttention(nn.Module):
     """
     3-way hypergraph attention layer backed by hand-written CUDA kernels.
     """
-    def __init__(self, d_model, n_heads, dropout_rate=0, scatter=False, gather_mode=0):
+    def __init__(self, d_model, n_heads, dropout_rate=0, scatter=False, gather_mode=0, window=0):
         super().__init__()
         
         if d_model % n_heads != 0:
@@ -267,12 +268,15 @@ class HypergraphAttention(nn.Module):
             raise ValueError(f"gather_mode must be 0 (Q, R and S anchored) or 1 (Q anchored only), got {gather_mode}")
         if scatter and gather_mode != 0:
             raise ValueError("scatter requires all three gathers (gather_mode=0)")
+        if window and gather_mode != 1:
+            raise ValueError("window requires the Q-anchored gather only (gather_mode=1)")
 
         self.d_model = d_model
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         self.scatter = scatter
         self.gather_mode = gather_mode
+        self.window = window
         
         self.Wq = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
         self.Wr = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
@@ -345,7 +349,19 @@ class HypergraphAttention(nn.Module):
         Q = self.Wq(x)
         R = self.Wr(x)
         S = self.Ws(x)
-        
+
+        if self.window:
+            win = window_mask(ntok, self.window, x.device)
+            mask = win if mask is None else mask.to(device=x.device, dtype=torch.bool) & win
+
+        # Single-gather kernels cover D = 64 / 128; other head sizes use the 3-gather kernels.
+        if self.gather_mode == 1 and self.head_dim in (64, 128):
+            heads = lambda t: t.reshape(batch_size, ntok, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+            y = single_gather_attention(heads(Q), heads(R), heads(S), heads(self.Wv_r(x)), heads(self.Wv_s(x)),
+                                        mask, min(self.window, ntok))
+            y = self.gelu(y).permute(0, 2, 1, 3).contiguous().view(batch_size, ntok, self.n_heads * self.head_dim)
+            return self.Wo(y)
+
         if self.scatter:
             Vq = self.Wv_q(x)
             Vr = self.Wv_r(x)

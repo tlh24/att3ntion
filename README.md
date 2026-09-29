@@ -72,14 +72,23 @@ layer = HypergraphAttention(d_model=64, n_heads=4).cuda()
 # Forward pass
 x = torch.randn(batch_size, seq_len, d_model, device='cuda')
 y = layer(x)  # Same shape as input
+
+# Q-anchored gather only, with an optional causal sliding window
+layer = HypergraphAttention(d_model=512, n_heads=4, gather_mode=1, window=128).cuda()
 ```
+
+`gather_mode=1` runs the single query-gather kernels when the head dimension is
+64 or 128 (other sizes fall back to the 3-gather kernels). `window=w` restricts
+each query to the previous `w` tokens, itself included. The functional forms are
+`att3ntion.single_gather_attention` and, for one shared KV head,
+`att3ntion.single_gather_shared_attention`.
 
 ## Shared-KV causal training on H100
 
-The shared single-gather path supports BF16 inputs with head dimension128,
-one KV head, and causal windows16/32/64/128. Its automatic dispatch includes
+The shared single-gather path supports BF16 inputs with head dimension 128,
+one KV head, and causal windows 16/32/64/128. Its automatic dispatch includes
 the measured Hopper forward and backward schedules. Build with
-`ATT3NTION_CUTLASS_INCLUDE` pointing to CUTLASS3.5.1's `include` directory to
+`ATT3NTION_CUTLASS_INCLUDE` pointing to CUTLASS 3.5.1's `include` directory to
 enable them.
 
 See the [kernel history](docs/KERNEL_HISTORY.md) for measured results and
