@@ -117,7 +117,7 @@ void Y_gather_tc(
     float* __restrict__ m_out,      // [B,H,n_anchor]
     float* __restrict__ l_out,      // [B,H,n_anchor]
     const bool* __restrict__ mask,  // [B,N,N] or null
-    int H, int n_anchor, int n_rows, int n_cols, int n_cols_pad, float scale,
+    int H, int n_anchor, int n_rows, int n_cols, float scale,
     int rows_valid, int cols_valid, int win, int Hkv)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -541,7 +541,7 @@ static bool launch_Y_gather_tc(
         reinterpret_cast<const bf16*>(V_cols.data_ptr<at::BFloat16>()),
         reinterpret_cast<bf16*>(Yout.data_ptr<at::BFloat16>()),
         m_out.data_ptr<float>(), l_out.data_ptr<float>(), mask_ptr,
-        H, n_anchor, n_rows, n_cols, cols_pad, scale, rows_valid, cols_valid, win, Hkv > 0 ? Hkv : H);
+        H, n_anchor, n_rows, n_cols, scale, rows_valid, cols_valid, win, Hkv > 0 ? Hkv : H);
     ++att3_tc::state().fwd_launches;
     return true;
     }
@@ -575,7 +575,7 @@ void Y_gather(
     float*       __restrict__ m_out,
     float*       __restrict__ l_out,
     const bool*  __restrict__ mask,
-    int B, int H, int n_anchor, int n_rows, int n_cols, float scale,
+    int H, int n_anchor, int n_rows, int n_cols, float scale,
     int num_chunks,
     int rows_valid, int cols_valid)
 {
@@ -953,7 +953,7 @@ void Y_scatter(
     const float* __restrict__ l_cols,
     float* __restrict__ Y_part,
     const bool* __restrict__ mask,
-    int B, int H, int n_anchor, int n_rows, int n_cols, float scale,
+    int H, int n_anchor, int n_rows, int n_cols, float scale,
     int num_chunks
 ) {
     // --- Grid/Block Mapping (split over rows) ---
@@ -1491,7 +1491,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
             m_part.data_ptr<float>(),
             l_part.data_ptr<float>(),
             mask_ptr,
-            B, H, n_anchor, n_rows, n_cols, scale,
+            H, n_anchor, n_rows, n_cols, scale,
             num_chunks,
             rows_valid, cols_valid
         );
@@ -1566,7 +1566,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
             m_cols.data_ptr<float>(), l_cols.data_ptr<float>(),
             Y_part.data_ptr<float>(),
             mask_ptr,
-            B, H, n_anchor, n_rows, n_cols, scale,
+            H, n_anchor, n_rows, n_cols, scale,
             num_chunks
         );
         reduce_scatter_partials<D_TMPL><<<dim3(n_anchor, H, B), D_TMPL, 0, stream>>>(

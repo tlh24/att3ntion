@@ -1,24 +1,20 @@
 #define CUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED
-// sm_90a WGMMA R/S backward for the shared-KV single gather (D=128, W=32). One CTA
+// sm_90a WGMMA R/S backward for the shared-KV single gather (D=128, W=64). One CTA
 // per anchor a and 4 heads (one warp each); direction 0 writes dR/dVr[a], 1 dS/dVs[a].
-// Each 16-query tile scores a K=48-key slice of the staged opposite window.
+// Each 16-query tile scores a K=80-key slice of the staged opposite window.
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cute/tensor.hpp>
 #include <cutlass/arch/barrier.h>
-namespace att3_shared_rs_wgmma {
+namespace att3_shared_rs_wgmma64 {
 using namespace cute;
 using bf16=cute::bfloat16_t;
 constexpr int D=128;
 template<int K> struct ScoreAtom;
-template<>struct ScoreAtom<32>{using T=SM90_64x32x16_F32BF16BF16_RS<GMMA::Major::K,GMMA::Major::K>;};
-template<>struct ScoreAtom<64>{using T=SM90_64x64x16_F32BF16BF16_RS<GMMA::Major::K,GMMA::Major::K>;};
-template<>struct ScoreAtom<48>{using T=SM90_64x48x16_F32BF16BF16_RS<GMMA::Major::K,GMMA::Major::K>;};
+template<>struct ScoreAtom<80>{using T=SM90_64x80x16_F32BF16BF16_RS<GMMA::Major::K,GMMA::Major::K>;};
 template<int K>struct PAtom;
-template<>struct PAtom<32>{using T=GMMA::Layout_K_SW64_Atom<bf16>;};
-template<>struct PAtom<64>{using T=GMMA::Layout_K_SW128_Atom<bf16>;};
-template<>struct PAtom<48>{using T=GMMA::Layout_K_SW32_Atom<bf16>;};
+template<>struct PAtom<80>{using T=GMMA::Layout_K_SW32_Atom<bf16>;};
 using Projection=decltype(make_tiled_mma(SM90_64x128x16_F32BF16BF16_RS<GMMA::Major::K,GMMA::Major::MN>{}));
 // check the hand-written accumulator (row, col) indexing against CuTe's layout
 template<class Mma,int N,int Tid>constexpr bool mapping_valid(){
@@ -29,10 +25,8 @@ template<class Mma,int N,int Tid>constexpr bool mapping_valid(){
  }return true;
 }
 template<class M,int N,int...T>constexpr bool mappings(std::integer_sequence<int,T...>){return (mapping_valid<M,N,T>()&&...);}
-static_assert(mappings<decltype(make_tiled_mma(ScoreAtom<48>::T{})),48>(std::make_integer_sequence<int,128>{}));
+static_assert(mappings<decltype(make_tiled_mma(ScoreAtom<80>::T{})),80>(std::make_integer_sequence<int,128>{}));
 static_assert(mappings<Projection,128>(std::make_integer_sequence<int,128>{}));
-static_assert(mappings<decltype(make_tiled_mma(ScoreAtom<32>::T{})),32>(std::make_integer_sequence<int,128>{}));
-static_assert(mappings<decltype(make_tiled_mma(ScoreAtom<64>::T{})),64>(std::make_integer_sequence<int,128>{}));
 
 // score C order equals projection A order, so P/dP feed the projection from registers
 template<int K,int Tid>constexpr bool derivative_order(){
@@ -43,24 +37,21 @@ template<int K,int Tid>constexpr bool derivative_order(){
  return true;
 }
 template<int K,int...T>constexpr bool derivative_orders(std::integer_sequence<int,T...>){return (derivative_order<K,T>()&&...);}
-static_assert(derivative_orders<48>(std::make_integer_sequence<int,128>{}));
-static_assert(derivative_orders<32>(std::make_integer_sequence<int,128>{}));
-static_assert(derivative_orders<64>(std::make_integer_sequence<int,128>{}));
+static_assert(derivative_orders<80>(std::make_integer_sequence<int,128>{}));
 
 __device__ __forceinline__ void copy16(void* s,const void* g){unsigned a=static_cast<unsigned>(__cvta_generic_to_shared(s));asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"::"r"(a),"l"(g));}
 __device__ __forceinline__ bool masked(const uint32_t* packed,int words,int b,int N,int j,int k){return j<N && k<N && ((packed[((int64_t)b*N+j)*words+k/32]>>(k%32))&1u);}
 
-template<int W,bool SPECIAL,bool PACKED>
+template<int W,bool SPECIAL>
 __device__ __forceinline__ void work(
  const bf16* R,const bf16* Vr,const bf16* Q,const bf16* dY,const bf16* S,const bf16* Vs,
  const float* m,const float* l,const float* delta,float* dR,float* dVr,float* dS,float* dVs,
  const uint8_t* support,const uint32_t* packed,int H,int N,float scale){
- constexpr int CAP=2*W,K=W==32?48:2*W,NT=D/8,KT=K/8,RPAD=136;
+ constexpr int CAP=2*W,K=W+16,NT=D/8,KT=K/8,RPAD=136;
  const int tid=threadIdx.x,warp=tid/32,lane=tid%32,g=lane/4,tig=lane%4;
  const int a=blockIdx.x,h0=blockIdx.y*4,b=blockIdx.z,lo=max(0,a-W+1),end=min(N,a+W),words=(N+31)/32;
  const int row0=warp*16+g,row1=row0+8;
  using Score=decltype(make_tiled_mma(typename ScoreAtom<K>::T{}));
- auto al=tile_to_shape(GMMA::Layout_K_SW128_Atom<bf16>{},make_shape(Int<64>{},Int<D>{}));
  auto bl=tile_to_shape(GMMA::Layout_K_SW128_Atom<bf16>{},make_shape(Int<CAP>{},Int<D>{}));
  auto pl=tile_to_shape(typename PAtom<K>::T{},make_shape(Int<64>{},Int<K>{}));
  // transposed view of the key/value tile, the projection's B operand
@@ -96,7 +87,7 @@ __device__ __forceinline__ void work(
   }
   asm volatile("cp.async.wait_all;"::);__syncthreads();
   for(int j0=a;j0<end;j0+=16){
-   const int shift=W==32?max(0,j0-W+1)-lo:0;
+   const int shift=max(0,j0-W+1)-lo;
    auto Xj=local_tile(domain_offset(make_coord(shift,0),X),make_tile(Int<K>{},Int<D>{}),make_coord(0,0));
    auto Vj=local_tile(domain_offset(make_coord(shift,0),V),make_tile(Int<K>{},Int<D>{}),make_coord(0,0));
    auto XPj=local_tile(domain_offset(make_coord(0,shift),XP),make_tile(Int<D>{},Int<K>{}),make_coord(0,0));
@@ -139,64 +130,62 @@ __device__ __forceinline__ void work(
     warpgroup_fence_operand(u);warpgroup_arrive();
     if(kind==0)gemm(pmma,fg,fpx,u);else gemm(pmma,fp,fpv,u);
     warpgroup_commit_batch();warpgroup_wait<0>();warpgroup_fence_operand(u);
-    const bf16* raw=kind?ry:rq;
-    // fold the row pair in place in u, then reduce over the 8 row lanes
+    // P/gA live in registers and rq/ry are no longer read, so their storage
+    // holds the FP32 u tile; the barrier orders all warps' last rq/ry reads
+    // before the first overwrite. Rows are XOR-swizzled in 8-float chunks.
+    if(kind==0)__syncthreads();
+    float* scratch=reinterpret_cast<float*>(storage);
     #pragma unroll
     for(int nt=0;nt<NT;++nt){int d=nt*8+2*tig;
-     auto q0=__bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(raw+row0*RPAD+d));auto q1=__bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(raw+row1*RPAD+d));
-     u(4*nt)=q0.x*u(4*nt)+q1.x*u(4*nt+2);
-     u(4*nt+1)=q0.y*u(4*nt+1)+q1.y*u(4*nt+3);
+     *reinterpret_cast<float2*>(scratch+row0*D+(d^((row0&3)*8)))=make_float2(u(4*nt),u(4*nt+1));
+     *reinterpret_cast<float2*>(scratch+row1*D+(d^((row1&3)*8)))=make_float2(u(4*nt+2),u(4*nt+3));
     }
+    // each warp only touches its own head's 16 rows, so a warp barrier suffices
+    __syncwarp();
+    const int d=lane*4;
+    float4 accum=make_float4(0.f,0.f,0.f,0.f);
+    const bf16* input=kind?dY:Q;
+    const int64_t head_offset=((int64_t)b*H+h0+warp)*N*D;
     #pragma unroll
-    for(int off=4;off<=16;off*=2){
-     #pragma unroll
-     for(int nt=0;nt<NT;++nt){
-      u(4*nt)+=__shfl_xor_sync(0xffffffff,u(4*nt),off);
-      u(4*nt+1)+=__shfl_xor_sync(0xffffffff,u(4*nt+1),off);
-     }
+    for(int jr=0;jr<16;++jr){int j=j0+jr,row=warp*16+jr;
+     const float4 value=*reinterpret_cast<const float4*>(scratch+row*D+(d^((row&3)*8)));
+     float2 x0=make_float2(0.f,0.f),x1=make_float2(0.f,0.f);
+     if(j<end){const auto* p=input+head_offset+(int64_t)j*D+d;x0=__bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(p));x1=__bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(p+2));}
+     accum.x=fmaf(x0.x,value.x,accum.x);accum.y=fmaf(x0.y,value.y,accum.y);
+     accum.z=fmaf(x1.x,value.z,accum.z);accum.w=fmaf(x1.y,value.w,accum.w);
     }
-    #pragma unroll
-    for(int nt=0;nt<NT;++nt){int d=nt*8+2*tig;
-     if(lane<4){grad[(kind*4+warp)*D+d]+=u(4*nt);grad[(kind*4+warp)*D+d+1]+=u(4*nt+1);}
-    }
+    grad[(kind*4+warp)*D+d]+=accum.x;grad[(kind*4+warp)*D+d+1]+=accum.y;
+    grad[(kind*4+warp)*D+d+2]+=accum.z;grad[(kind*4+warp)*D+d+3]+=accum.w;
+    __syncwarp();
    }
    __syncthreads();
   }
-  for(int z=tid;z<4*D;z+=128){int head=z/D,d=z%D;int64_t o=(((int64_t)b*H+h0+head)*N+a)*D+d;if constexpr(PACKED){reinterpret_cast<__nv_bfloat16*>(ox)[o]=__float2bfloat16_rn(scale*grad[z]);reinterpret_cast<__nv_bfloat16*>(ov)[o]=__float2bfloat16_rn(grad[4*D+z]);}else{ox[o]=scale*grad[z];ov[o]=grad[4*D+z];}}
+  for(int z=tid;z<4*D;z+=128){int head=z/D,d=z%D;int64_t o=(((int64_t)b*H+h0+head)*N+a)*D+d;reinterpret_cast<__nv_bfloat16*>(ox)[o]=__float2bfloat16_rn(scale*grad[z]);reinterpret_cast<__nv_bfloat16*>(ov)[o]=__float2bfloat16_rn(grad[4*D+z]);}
   __syncthreads();
  }
 }
-template<int W,bool PACKED=false>__global__ __launch_bounds__(128,3) void kernel(
+template<int W>__global__ __launch_bounds__(128) void kernel(
  const bf16* R,const bf16* Vr,const bf16* Q,const bf16* dY,const bf16* S,const bf16* Vs,
  const float* m,const float* l,const float* delta,float* dR,float* dVr,float* dS,float* dVs,
  const uint8_t* support,const uint32_t* packed,int H,int N,float scale){
  int j=blockIdx.x+threadIdx.x;bool special=__syncthreads_or(j<min(N,(int)blockIdx.x+W) && support[(int64_t)blockIdx.z*N+j]==1);
- if(special)work<W,true,PACKED>(R,Vr,Q,dY,S,Vs,m,l,delta,dR,dVr,dS,dVs,support,packed,H,N,scale);
- else work<W,false,PACKED>(R,Vr,Q,dY,S,Vs,m,l,delta,dR,dVr,dS,dVs,support,packed,H,N,scale);
+ if(special)work<W,true>(R,Vr,Q,dY,S,Vs,m,l,delta,dR,dVr,dS,dVs,support,packed,H,N,scale);
+ else work<W,false>(R,Vr,Q,dY,S,Vs,m,l,delta,dR,dVr,dS,dVs,support,packed,H,N,scale);
 }
 template<int W>constexpr int bytes(){return 2*(2*64*136+2*(2*W)*D)+4*(2*4*D+2*D);}
-
-
-template<bool PACKED>int configure(){
+int configure(){
  static thread_local int last_device=-1;int device=-1;auto e=cudaGetDevice(&device);if(e)return int(e);
- if(last_device!=device){e=cudaFuncSetAttribute(kernel<32,PACKED>,cudaFuncAttributeMaxDynamicSharedMemorySize,bytes<32>());if(e)return int(e);last_device=device;}
+ if(last_device!=device){e=cudaFuncSetAttribute(kernel<64>,cudaFuncAttributeMaxDynamicSharedMemorySize,bytes<64>());if(e)return int(e);last_device=device;}
  return 0;
 }
-} // namespace att3_shared_rs_wgmma
-extern "C" int att3_shared_rs_wgmma_info(int* info,bool packed_partials){
- int e=packed_partials?att3_shared_rs_wgmma::configure<true>():att3_shared_rs_wgmma::configure<false>();if(e)return e;
- const void* f=packed_partials?(const void*)att3_shared_rs_wgmma::kernel<32,true>:(const void*)att3_shared_rs_wgmma::kernel<32,false>;
- cudaFuncAttributes a;e=cudaFuncGetAttributes(&a,f);if(e)return e;int active=0;
- e=cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active,f,128,att3_shared_rs_wgmma::bytes<32>());
- info[0]=a.numRegs;info[1]=a.localSizeBytes;info[2]=att3_shared_rs_wgmma::bytes<32>();info[3]=active;info[4]=128;return e;
-}
-extern "C" int att3_shared_rs_wgmma_w32(
+} // namespace att3_shared_rs_wgmma64
+extern "C" int att3_shared_rs_wgmma64_w64(
  const __nv_bfloat16* R,const __nv_bfloat16* Vr,const __nv_bfloat16* Q,const __nv_bfloat16* dY,const __nv_bfloat16* S,const __nv_bfloat16* Vs,
  const float* m,const float* l,const float* delta,void* dR,void* dVr,void* dS,void* dVs,
- int B,int H,int N,int win,float scale,cudaStream_t stream,const uint8_t* support,const uint32_t* packed,bool packed_partials){
- if(win!=32 || H%4 || B<1 || N<1 || !support || !packed)return cudaErrorInvalidValue;
- int e=packed_partials?att3_shared_rs_wgmma::configure<true>():att3_shared_rs_wgmma::configure<false>();if(e)return e;
- const void* f=packed_partials?(const void*)att3_shared_rs_wgmma::kernel<32,true>:(const void*)att3_shared_rs_wgmma::kernel<32,false>;
+ int B,int H,int N,int win,float scale,cudaStream_t stream,const uint8_t* support,const uint32_t* packed){
+ if(win!=64 || H%4 || B<1 || N<1 || !support || !packed)return cudaErrorInvalidValue;
+ int e=att3_shared_rs_wgmma64::configure();if(e)return e;
+ const void* f=(const void*)att3_shared_rs_wgmma64::kernel<64>;
  void* args[]={&R,&Vr,&Q,&dY,&S,&Vs,&m,&l,&delta,&dR,&dVr,&dS,&dVs,&support,&packed,&H,&N,&scale};
- return cudaLaunchKernel(f,dim3(N,H/4,B),dim3(128),args,att3_shared_rs_wgmma::bytes<32>(),stream);
+ return cudaLaunchKernel(f,dim3(N,H/4,B),dim3(128),args,att3_shared_rs_wgmma64::bytes<64>(),stream);
 }

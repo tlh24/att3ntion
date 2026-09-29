@@ -4,7 +4,7 @@
 // queries; w64/w128 merge several row tiles. Scaled rows, probabilities and
 // softmax state stay private to each (query, head).
 #include <ATen/cuda/CUDAContext.h>
-#include "common.cuh"
+#include "../common.cuh"
 namespace att3_shared_fwd {
 namespace w16 {
 constexpr int SG_D = 128;
@@ -309,15 +309,8 @@ constexpr int SG_BJ = SG_WPH * 16;        // rows per head tile
 constexpr int SG_BK = 16;                 // cols per tile
 constexpr float SG_MASKED_THRESH = -5e29f;
 
-constexpr size_t fwd_grouped_smem(int G) {
-    // rowp[G] + raw rows + V rows + 2 x (cols, V cols) in bf16; col_mul, row_mul,
-    // anchor[G], wN[G][WPH], wML[G][WPH], redN[G], redML[G] in fp32.
-    return sizeof(bf16) * ((size_t)(G + 2) * SG_BJ * SG_DPAD + (size_t)4 * SG_BK * SG_DPAD)
-         + sizeof(float) * ((size_t)2 * SG_BK + SG_BJ + (size_t)G * (SG_D + SG_WPH * SG_D + SG_WPH * 2 + SG_D + 2));
-}
-
 // block = (query i, G heads, batch b)
-template<int G, int QCOUNT, bool REUSE>
+template<int G, int QCOUNT>
 __global__ __launch_bounds__(G * SG_WPH * 32)
 void Y_gather_tc_lifetime(
     const bf16* __restrict__ Q, const bf16* __restrict__ R, const bf16* __restrict__ S,
@@ -381,11 +374,10 @@ void Y_gather_tc_lifetime(
         asm volatile("cp.async.wait_all;\n" ::);
         __syncthreads();
     };
-    if constexpr (REUSE) stage_raw(union_lo);
+    stage_raw(union_lo);
     for (int qi = 0; qi < QCOUNT && i0 + qi < N; ++qi) {
     const int i = i0 + qi;
-    const int cache_lo = REUSE ? union_lo : max(0, i - win + 1);
-    if constexpr (!REUSE) stage_raw(cache_lo);
+    const int cache_lo = union_lo;
     const bool* mrow = mask + ((int64_t)b * N + i) * N;
 
     for (int t = tid; t < G * D; t += NTHR) {
@@ -456,7 +448,6 @@ void Y_gather_tc_lifetime(
             const int nxt = cur ^ 1;
             if (k0 + BK < k_hi) stage_cols(k0 + BK, nxt);
             const bf16* cols_cur = rawS + (k0 - cache_lo) * DPAD;
-            const bf16* v_cols_cur = rawVs + (k0 - cache_lo) * DPAD;
 
             float acc[CT][4];
             #pragma unroll
@@ -942,8 +933,8 @@ inline bool launch(const bf16* Q,const bf16* R,const bf16* S,const bf16* Vr,cons
   if(smem>(size_t)max_smem_optin)return false;
   int device=0; AT_CUDA_CHECK(cudaGetDevice(&device));
   static thread_local int attribute_device=-1;
-  if(attribute_device!=device){AT_CUDA_CHECK(cudaFuncSetAttribute(w32::Y_gather_tc_lifetime<2,4,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,smem));attribute_device=device;}
-  w32::Y_gather_tc_lifetime<2,4,true><<<dim3(ceil_div(N,4),H/2,B),128,smem,stream>>>(Q,R,S,Vr,Vs,Y,m,l,mask,H,N,scale,win);
+  if(attribute_device!=device){AT_CUDA_CHECK(cudaFuncSetAttribute(w32::Y_gather_tc_lifetime<2,4>,cudaFuncAttributeMaxDynamicSharedMemorySize,smem));attribute_device=device;}
+  w32::Y_gather_tc_lifetime<2,4><<<dim3(ceil_div(N,4),H/2,B),128,smem,stream>>>(Q,R,S,Vr,Vs,Y,m,l,mask,H,N,scale,win);
   return true;
  }
  if(win==64 || win==128){

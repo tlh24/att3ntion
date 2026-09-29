@@ -51,7 +51,7 @@ __global__ __launch_bounds__(128) void retained_warpgroup(
  const bf16* __restrict__ Q,const bf16* __restrict__ R,const bf16* __restrict__ S,
  const bf16* __restrict__ Vr,const bf16* __restrict__ Vs,bf16* __restrict__ Y,
  float* __restrict__ mout,float* __restrict__ lout,const bool* __restrict__ mask,
- int H,int N,float scale,int win){
+ int H,int N,float scale){
  constexpr int G=64/W,WPH=W/16,NT=D/8,CT=W/8;
  const int tid=threadIdx.x,warp=tid/32,lane=tid%32,g=lane/4,tig=lane%4;
  const int lh=warp/WPH,th=tid%(WPH*32),i=blockIdx.x,group_h0=blockIdx.y*G*HV,b=blockIdx.z;
@@ -208,7 +208,7 @@ template<int W,int HV>bool launch(const void* q,const void* r,const void* s,cons
  }
  retained_warpgroup<W,HV><<<dim3(N,H/((64/W)*HV),B),128,smem,stream>>>(
   reinterpret_cast<const bf16*>(q),reinterpret_cast<const bf16*>(r),reinterpret_cast<const bf16*>(s),
-  reinterpret_cast<const bf16*>(vr),reinterpret_cast<const bf16*>(vs),reinterpret_cast<bf16*>(y),m,l,mask,H,N,scale,W);
+  reinterpret_cast<const bf16*>(vr),reinterpret_cast<const bf16*>(vs),reinterpret_cast<bf16*>(y),m,l,mask,H,N,scale);
  return true;
 }
 }
@@ -218,14 +218,9 @@ using bf16 = cute::bfloat16_t;
 constexpr int D=128;
 constexpr float NEG=-1e30f;
 template<int N>struct Atom;
-template<>struct Atom<16>{using T=SM90_64x16x16_F32BF16BF16_SS<GMMA::Major::K,GMMA::Major::K>;};
 template<>struct Atom<64>{using T=SM90_64x64x16_F32BF16BF16_SS<GMMA::Major::K,GMMA::Major::K>;};
-template<>struct Atom<32>{using T=SM90_64x32x16_F32BF16BF16_SS<GMMA::Major::K,GMMA::Major::K>;};
-template<>struct Atom<128>{using T=SM90_64x128x16_F32BF16BF16_SS<GMMA::Major::K,GMMA::Major::MN>;};
 template<int W>struct PSwizzle;
-template<>struct PSwizzle<16>{using T=GMMA::Layout_K_SW32_Atom<bf16>;};
 template<>struct PSwizzle<64>{using T=GMMA::Layout_K_SW128_Atom<bf16>;};
-template<>struct PSwizzle<32>{using T=GMMA::Layout_K_SW64_Atom<bf16>;};
 template<int N,int Tid>constexpr bool mapping_valid(){
  using Mma=decltype(make_tiled_mma(typename Atom<N>::T{}));
  using TV=decltype(Mma{}.get_layoutC_TV());constexpr TV tv{};
@@ -240,23 +235,20 @@ template<int N,int Tid>constexpr bool mapping_valid(){
 }
 template<int N,int Tid>struct VerifiedMapping{static_assert(mapping_valid<N,Tid>(),"Re-derive register ownership for changed CuTe atom");static constexpr bool value=true;};
 template<int N,int...T>constexpr bool all_mappings(std::integer_sequence<int,T...>){return (VerifiedMapping<N,T>::value&&...);}
-static_assert(all_mappings<16>(std::make_integer_sequence<int,128>{}));
 static_assert(all_mappings<64>(std::make_integer_sequence<int,128>{}));
-static_assert(all_mappings<32>(std::make_integer_sequence<int,128>{}));
-static_assert(all_mappings<128>(std::make_integer_sequence<int,128>{}));
 __device__ __forceinline__ void copy16(void* sm,const void* gm){
  unsigned addr=static_cast<unsigned>(__cvta_generic_to_shared(sm));
  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"::"r"(addr),"l"(gm));
 }
 
 // retained_warpgroup with the value MMA split into two 64-channel halves, halving the
-// value accumulator and operand. STASH holds Vs in registers across the score MMA.
-template<int W,int HV=1,bool STASH=false>
+// value accumulator and operand. Vs is held in registers across the score MMA.
+template<int W,int HV=1>
 __global__ __launch_bounds__(128) void split_value_warpgroup(
  const bf16* __restrict__ Q,const bf16* __restrict__ R,const bf16* __restrict__ S,
  const bf16* __restrict__ Vr,const bf16* __restrict__ Vs,bf16* __restrict__ Y,
  float* __restrict__ mout,float* __restrict__ lout,const bool* __restrict__ mask,
- int H,int N,float scale,int win){
+ int H,int N,float scale){
  constexpr int G=64/W,WPH=W/16,VD=64,NT=VD/8,CT=W/8;
  const int tid=threadIdx.x,warp=tid/32,lane=tid%32,g=lane/4,tig=lane%4;
  const int lh=warp/WPH,th=tid%(WPH*32),i=blockIdx.x,group_h0=blockIdx.y*G*HV,b=blockIdx.z;
@@ -285,15 +277,13 @@ __global__ __launch_bounds__(128) void split_value_warpgroup(
  auto B=make_tensor(make_smem_ptr(sp),sl);
  auto P=make_tensor(make_smem_ptr(pp),pl);
  auto V=make_tensor(make_smem_ptr(vp),vl);
- uint4 vstash[STASH ? 2*(W*(VD/8)/128) : 1];
- if constexpr(STASH){
+ uint4 vstash[2*(W*(VD/8)/128)];
+ #pragma unroll
+ for(int part=0;part<2;++part){
   #pragma unroll
-  for(int part=0;part<2;++part){
-   #pragma unroll
-   for(int k=0;k<W*(VD/8)/128;++k){
-    const int idx=tid+k*128,j=idx/(VD/8),d=idx%(VD/8)*8+part*VD,tok=lo+j;
-    vstash[part*(W*(VD/8)/128)+k]=tok<N?*reinterpret_cast<const uint4*>(Vs+kv+(int64_t)tok*D+d):make_uint4(0,0,0,0);
-   }
+  for(int k=0;k<W*(VD/8)/128;++k){
+   const int idx=tid+k*128,j=idx/(VD/8),d=idx%(VD/8)*8+part*VD,tok=lo+j;
+   vstash[part*(W*(VD/8)/128)+k]=tok<N?*reinterpret_cast<const uint4*>(Vs+kv+(int64_t)tok*D+d):make_uint4(0,0,0,0);
   }
  }
  for(int idx=tid;idx<W*(D/8);idx+=128){
@@ -365,10 +355,8 @@ __global__ __launch_bounds__(128) void split_value_warpgroup(
  for(int part=0;part<2;++part){
   #pragma unroll
   for(int k=0;k<W*(VD/8)/128;++k){
-   const int idx=tid+k*128,j=idx/(VD/8),d=idx%(VD/8)*8,tok=lo+j;
-   if constexpr(STASH){*reinterpret_cast<uint4*>(&V(d,j))=vstash[part*(W*(VD/8)/128)+k];}
-   else if(tok<N){copy16(&V(d,j),Vs+kv+(int64_t)tok*D+part*VD+d);}
-   else{*reinterpret_cast<uint4*>(&V(d,j))=make_uint4(0,0,0,0);}
+   const int idx=tid+k*128,j=idx/(VD/8),d=idx%(VD/8)*8;
+   *reinterpret_cast<uint4*>(&V(d,j))=vstash[part*(W*(VD/8)/128)+k];
   }
   asm volatile("cp.async.wait_all;"::);
   cutlass::arch::fence_view_async_shared();__syncthreads();
@@ -421,13 +409,13 @@ template<int W,int HV>bool launch(const void* q,const void* r,const void* s,cons
  if(smem>(size_t)max_smem)return false;
  static thread_local int attribute_device=-1;
  if(attribute_device!=device){
-  auto e=cudaFuncSetAttribute(split_value_warpgroup<W,HV,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,smem);
+  auto e=cudaFuncSetAttribute(split_value_warpgroup<W,HV>,cudaFuncAttributeMaxDynamicSharedMemorySize,smem);
   if(e!=cudaSuccess)return false;
   attribute_device=device;
  }
- split_value_warpgroup<W,HV,true><<<dim3(N,H/((64/W)*HV),B),128,smem,stream>>>(
+ split_value_warpgroup<W,HV><<<dim3(N,H/((64/W)*HV),B),128,smem,stream>>>(
   reinterpret_cast<const bf16*>(q),reinterpret_cast<const bf16*>(r),reinterpret_cast<const bf16*>(s),
-  reinterpret_cast<const bf16*>(vr),reinterpret_cast<const bf16*>(vs),reinterpret_cast<bf16*>(y),m,l,mask,H,N,scale,W);
+  reinterpret_cast<const bf16*>(vr),reinterpret_cast<const bf16*>(vs),reinterpret_cast<bf16*>(y),m,l,mask,H,N,scale);
  return true;
 }
 }
@@ -438,15 +426,10 @@ using bf16 = cute::bfloat16_t;
 constexpr int D=128;
 constexpr float NEG=-1e30f;
 template<int N>struct Atom;
-template<>struct Atom<16>{using T=SM90_64x16x16_F32BF16BF16_SS<GMMA::Major::K,GMMA::Major::K>;};
 template<>struct Atom<64>{using T=SM90_64x64x16_F32BF16BF16_SS<GMMA::Major::K,GMMA::Major::K>;};
-template<>struct Atom<32>{using T=SM90_64x32x16_F32BF16BF16_SS<GMMA::Major::K,GMMA::Major::K>;};
 template<>struct Atom<128>{using T=SM90_64x128x16_F32BF16BF16_SS<GMMA::Major::K,GMMA::Major::K>;};
 template<int W>struct PSwizzle;
 template<>struct PSwizzle<128>{using T=GMMA::Layout_K_SW128_Atom<bf16>;};
-template<>struct PSwizzle<16>{using T=GMMA::Layout_K_SW32_Atom<bf16>;};
-template<>struct PSwizzle<64>{using T=GMMA::Layout_K_SW128_Atom<bf16>;};
-template<>struct PSwizzle<32>{using T=GMMA::Layout_K_SW64_Atom<bf16>;};
 template<int N,int Tid>constexpr bool mapping_valid(){
  using Mma=decltype(make_tiled_mma(typename Atom<N>::T{}));
  using TV=decltype(Mma{}.get_layoutC_TV());constexpr TV tv{};
@@ -461,9 +444,7 @@ template<int N,int Tid>constexpr bool mapping_valid(){
 }
 template<int N,int Tid>struct VerifiedMapping{static_assert(mapping_valid<N,Tid>(),"Re-derive register ownership for changed CuTe atom");static constexpr bool value=true;};
 template<int N,int...T>constexpr bool all_mappings(std::integer_sequence<int,T...>){return (VerifiedMapping<N,T>::value&&...);}
-static_assert(all_mappings<16>(std::make_integer_sequence<int,128>{}));
 static_assert(all_mappings<64>(std::make_integer_sequence<int,128>{}));
-static_assert(all_mappings<32>(std::make_integer_sequence<int,128>{}));
 static_assert(all_mappings<128>(std::make_integer_sequence<int,128>{}));
 __device__ __forceinline__ void copy16(void* sm,const void* gm){
  unsigned addr=static_cast<unsigned>(__cvta_generic_to_shared(sm));
@@ -473,12 +454,12 @@ __device__ __forceinline__ void copy16(void* sm,const void* gm){
 // W=128, one head per visit: R/Vr stream in as two 64-row tiles (jt) and the two
 // partial softmaxes are merged through `partial`. Grid x starts at query 64; the
 // first 64 queries fit a 64-wide window and run split_value_warpgroup<64>.
-template<int W,int HV=1,bool STASH=false>
+template<int W,int HV=1>
 __global__ __launch_bounds__(128) void row_stream_warpgroup(
  const bf16* __restrict__ Q,const bf16* __restrict__ R,const bf16* __restrict__ S,
  const bf16* __restrict__ Vr,const bf16* __restrict__ Vs,bf16* __restrict__ Y,
  float* __restrict__ mout,float* __restrict__ lout,const bool* __restrict__ mask,
- int H,int N,float scale,int win){
+ int H,int N,float scale){
  constexpr int G=1,WPH=4,JR=64,VD=64,NT=VD/8,CT=W/8;
  const int tid=threadIdx.x,warp=tid/32,lane=tid%32,g=lane/4,tig=lane%4;
  const int lh=warp/WPH,th=tid%(WPH*32),i=blockIdx.x+64,group_h0=blockIdx.y*G*HV,b=blockIdx.z;
@@ -508,15 +489,13 @@ __global__ __launch_bounds__(128) void row_stream_warpgroup(
  auto B=make_tensor(make_smem_ptr(sp),sl);
  auto P=make_tensor(make_smem_ptr(pp),pl);
  auto V=make_tensor(make_smem_ptr(vp),vl);
- uint4 vstash[STASH ? 2*(W*(VD/8)/128) : 1];
- if constexpr(STASH){
+ uint4 vstash[2*(W*(VD/8)/128)];
+ #pragma unroll
+ for(int part=0;part<2;++part){
   #pragma unroll
-  for(int part=0;part<2;++part){
-   #pragma unroll
-   for(int k=0;k<W*(VD/8)/128;++k){
-    const int idx=tid+k*128,j=idx/(VD/8),d=idx%(VD/8)*8+part*VD,tok=lo+j;
-    vstash[part*(W*(VD/8)/128)+k]=tok<N?*reinterpret_cast<const uint4*>(Vs+kv+(int64_t)tok*D+d):make_uint4(0,0,0,0);
-   }
+  for(int k=0;k<W*(VD/8)/128;++k){
+   const int idx=tid+k*128,j=idx/(VD/8),d=idx%(VD/8)*8+part*VD,tok=lo+j;
+   vstash[part*(W*(VD/8)/128)+k]=tok<N?*reinterpret_cast<const uint4*>(Vs+kv+(int64_t)tok*D+d):make_uint4(0,0,0,0);
   }
  }
  for(int idx=tid;idx<W*(D/8);idx+=128){
@@ -599,10 +578,8 @@ __global__ __launch_bounds__(128) void row_stream_warpgroup(
  for(int part=0;part<2;++part){
   #pragma unroll
   for(int k=0;k<W*(VD/8)/128;++k){
-   const int idx=tid+k*128,j=idx/(VD/8),d=idx%(VD/8)*8,tok=lo+j;
-   if constexpr(STASH){*reinterpret_cast<uint4*>(&V(d,j))=vstash[part*(W*(VD/8)/128)+k];}
-   else if(tok<N){copy16(&V(d,j),Vs+kv+(int64_t)tok*D+part*VD+d);}
-   else{*reinterpret_cast<uint4*>(&V(d,j))=make_uint4(0,0,0,0);}
+   const int idx=tid+k*128,j=idx/(VD/8),d=idx%(VD/8)*8;
+   *reinterpret_cast<uint4*>(&V(d,j))=vstash[part*(W*(VD/8)/128)+k];
   }
   asm volatile("cp.async.wait_all;"::);
   cutlass::arch::fence_view_async_shared();__syncthreads();
@@ -668,18 +645,18 @@ bool launch(const void* q,const void* r,const void* s,const void* vr,const void*
  if(smem>(size_t)max_smem)return false;
  static thread_local int attribute_device=-1;
  if(attribute_device!=device){
-  auto e=cudaFuncSetAttribute(row_stream_warpgroup<128,8,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,smem);
+  auto e=cudaFuncSetAttribute(row_stream_warpgroup<128,8>,cudaFuncAttributeMaxDynamicSharedMemorySize,smem);
   if(e!=cudaSuccess)return false;
-  e=cudaFuncSetAttribute(att3_shared_hopper_split_impl::split_value_warpgroup<64,8,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,edge_smem);
+  e=cudaFuncSetAttribute(att3_shared_hopper_split_impl::split_value_warpgroup<64,8>,cudaFuncAttributeMaxDynamicSharedMemorySize,edge_smem);
   if(e!=cudaSuccess)return false;
   attribute_device=device;
  }
- att3_shared_hopper_split_impl::split_value_warpgroup<64,8,true><<<dim3(64,H/8,B),128,edge_smem,stream>>>(
+ att3_shared_hopper_split_impl::split_value_warpgroup<64,8><<<dim3(64,H/8,B),128,edge_smem,stream>>>(
   reinterpret_cast<const bf16*>(q),reinterpret_cast<const bf16*>(r),reinterpret_cast<const bf16*>(s),
-  reinterpret_cast<const bf16*>(vr),reinterpret_cast<const bf16*>(vs),reinterpret_cast<bf16*>(y),m,l,mask,H,N,scale,64);
- row_stream_warpgroup<128,8,true><<<dim3(N-64,H/8,B),128,smem,stream>>>(
+  reinterpret_cast<const bf16*>(vr),reinterpret_cast<const bf16*>(vs),reinterpret_cast<bf16*>(y),m,l,mask,H,N,scale);
+ row_stream_warpgroup<128,8><<<dim3(N-64,H/8,B),128,smem,stream>>>(
   reinterpret_cast<const bf16*>(q),reinterpret_cast<const bf16*>(r),reinterpret_cast<const bf16*>(s),
-  reinterpret_cast<const bf16*>(vr),reinterpret_cast<const bf16*>(vs),reinterpret_cast<bf16*>(y),m,l,mask,H,N,scale,128);
+  reinterpret_cast<const bf16*>(vr),reinterpret_cast<const bf16*>(vs),reinterpret_cast<bf16*>(y),m,l,mask,H,N,scale);
  return true;
 }
 

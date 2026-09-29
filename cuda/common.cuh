@@ -39,24 +39,6 @@ constexpr float NEG_INF = -1e30f;
 #define TILE_K 16
 #endif
 
-// Smaller tiles for scatter kernels (higher register pressure)
-#ifndef TILE_I_SCATTER
-#define TILE_I_SCATTER 4
-#endif
-
-#ifndef TILE_J_SCATTER
-#define TILE_J_SCATTER 4
-#endif
-
-#ifndef TILE_K_SCATTER
-#define TILE_K_SCATTER 4
-#endif
-
-// Maximum embedding dimension that fits in registers
-#ifndef MAX_D_REG
-#define MAX_D_REG 64
-#endif
-
 // =============================================================================
 // Utility Functions
 // =============================================================================
@@ -117,21 +99,6 @@ __host__ __device__ __forceinline__ uint32_t sg_pack_mask32(const bool* row, int
     }
     for (; t < lim; ++t) if (row[t]) bits |= 1u << t;
     return bits;
-}
-
-/** Three-way element-wise dot product: sum(a[d] * b[d] * c[d]) */
-__device__ __forceinline__ float dot3(
-    const float* __restrict__ a,
-    const float* __restrict__ b,
-    const float* __restrict__ c,
-    int D
-) {
-    float sum = 0.0f;
-    #pragma unroll
-    for (int d = 0; d < D; ++d) {
-        sum += a[d] * b[d] * c[d];
-    }
-    return sum;
 }
 
 using bf16 = __nv_bfloat16;

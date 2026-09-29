@@ -22,7 +22,7 @@
 | Precision fix exists, not installed | A compensated w32 prototype (split each BF16 product into high + residual parts) passes 18 stress cells at 12-17% extra cost over P06 (`overnight_20260915/precision/`). A later compensated package (main checkout `overnight_20260916/`) is 1.2444x the time of P07. A compensated 128x128 candidate at N2048 still fails the concentrated dQ gate in its wide dQ path. |
 | Singleton rows | A query with <=1 visible key now gets exactly zero score gradients (fixed inherited bug, O10/CS06). |
 
-Which file holds what (`cuda/`):
+Which file holds what (`cuda/`; every shared-KV file below `common.cuh` lives in `cuda/shared_kv/`):
 
 | File | Contents |
 |---|---|

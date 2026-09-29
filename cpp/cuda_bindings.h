@@ -84,7 +84,7 @@ single_gather_shared_backward_cuda(
     at::Tensor dY, at::Tensor Q, at::Tensor R, at::Tensor S, at::Tensor Vr,
     at::Tensor Vs, at::Tensor Y, at::Tensor m, at::Tensor l, at::Tensor mask,
     int64_t window, int64_t rs_group);
-// Grouped kernels (cuda/single_gather_shared.cu); return false when the device
+// Grouped kernels (cuda/shared_kv/single_gather_shared.cu); return false when the device
 // cannot run them.
 bool launch_Y_gather_shared_grouped(
     const at::Tensor& Q, const at::Tensor& R, const at::Tensor& S, const at::Tensor& Vr,
@@ -148,7 +148,7 @@ backward_cuda(
     at::Tensor Y_r = at::Tensor(),
     at::Tensor Y_s = at::Tensor());
 
-// fwd_group 0 schedule (cuda/single_gather_shared.cu); sets `implementation`
+// fwd_group 0 schedule (cuda/shared_kv/single_gather_shared.cu); sets `implementation`
 // to the kernel that ran, returns false if none can.
 bool launch_Y_gather_shared_auto(
     const at::Tensor& Q,const at::Tensor& R,const at::Tensor& S,const at::Tensor& Vr,

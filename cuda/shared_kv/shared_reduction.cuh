@@ -1,9 +1,8 @@
 #include "shared_delta.cuh"
 
-// rounded_heads with H split across HG thread groups, then summed in shared
-// memory. Each input is still rounded to bf16 before summation. PACKED sources
-// already hold bf16 partials.
-template<int HG, bool CAST_Q, bool PACKED=false>
+// Head reduction with H split across HG thread groups, then summed in shared
+// memory. The sources hold bf16 per-head partials; dQ is cast from fp32.
+template<int HG>
 __global__ void rounded_heads_split(const float* q, const float* r, const float* s,
     const float* vr, const float* vs, bf16* dq, bf16* dr, bf16* ds,
     bf16* dvr, bf16* dvs, int H, int ND) {
@@ -17,11 +16,8 @@ __global__ void rounded_heads_split(const float* q, const float* r, const float*
   if(x<ND) {
     for(int h=hx;h<H;h+=HG) {
       const int64_t index=(int64_t(batch)*H+h)*ND+x;
-      if constexpr(PACKED) sum+=__bfloat162float(reinterpret_cast<const bf16*>(source)[index]);
-      else sum+=__bfloat162float(__float2bfloat16_rn(source[index]));
-      if constexpr(CAST_Q) {
-        if(tensor==0)dq[index]=__float2bfloat16_rn(q[index]);
-      }
+      sum+=__bfloat162float(reinterpret_cast<const bf16*>(source)[index]);
+      if(tensor==0)dq[index]=__float2bfloat16_rn(q[index]);
     }
   }
   partial[hx][cx]=sum;
@@ -34,16 +30,9 @@ __global__ void rounded_heads_split(const float* q, const float* r, const float*
   }
 }
 
-extern "C" int fusion_reduce_split(int mode,const float* q,const float* r,const float* s,
+extern "C" int fusion_reduce_split(const float* q,const float* r,const float* s,
     const float* vr,const float* vs,bf16* dq,bf16* dr,bf16* ds,
     bf16* dvr,bf16* dvs,int B,int H,int ND,cudaStream_t stream) {
-  #define RUN(ID,HG,CAST) case ID: rounded_heads_split<HG,CAST><<<dim3((ND+256/HG-1)/(256/HG),B,4),256,0,stream>>>(q,r,s,vr,vs,dq,dr,ds,dvr,dvs,H,ND);break;
-  switch(mode) {
-    RUN(2,2,false) RUN(3,4,false) RUN(4,8,false)
-    RUN(5,2,true) RUN(6,4,true) RUN(7,8,true)
-    case 8: rounded_heads_split<4,true,true><<<dim3((ND+63)/64,B,4),256,0,stream>>>(q,r,s,vr,vs,dq,dr,ds,dvr,dvs,H,ND);break;
-    default:return int(cudaErrorInvalidValue);
-  }
-  #undef RUN
+  rounded_heads_split<4><<<dim3((ND+63)/64,B,4),256,0,stream>>>(q,r,s,vr,vs,dq,dr,ds,dvr,dvs,H,ND);
   return int(cudaGetLastError());
 }

@@ -3,7 +3,7 @@
 // lh has role lh/HG (0: dXa/dVa, 1: dXc/dVc at a) for head lh%HG, with the whole key
 // window resident in shared memory. Outputs are per-head BF16 partials; the head
 // reduction is done by the caller.
-#include "common.cuh"
+#include "../common.cuh"
 namespace att3_shared_rs {
 // mask bits k..k+15 of a packed row
 __device__ __forceinline__ uint32_t load_packed_mask(const uint32_t* row,int words,int k) {
@@ -15,7 +15,7 @@ __device__ __forceinline__ uint32_t load_packed_mask(const uint32_t* row,int wor
 
 // W=16. Walks BJ-row tiles of the queries j whose window holds anchor a; the Xc/Xa
 // window has CAP rows.
-template<int G, int WPH, int BK, bool RAW=false, bool SPECIAL=false>
+template<int G, int WPH, int BK, bool SPECIAL=false>
 __device__ __forceinline__
 void Bwd_rows_w16_impl(
     const bf16* __restrict__ Xa_bf,   // anchor stream (R or S), [B,1,N,D]
@@ -48,8 +48,8 @@ void Bwd_rows_w16_impl(
 
     extern __shared__ char smem_raw[];
     bf16* rawQ_sm = reinterpret_cast<bf16*>(smem_raw);
-    bf16* rawDY_sm = rawQ_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
-    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);   // [2][CAP][DPAD]: role 0 window of Xc, role 1 of Xa
+    bf16* rawDY_sm = rawQ_sm + (size_t)HG * BJ * DPAD;
+    bf16* xc_sm = rawDY_sm + (size_t)HG * BJ * DPAD;   // [2][CAP][DPAD]: role 0 window of Xc, role 1 of Xa
     bf16* vc_sm = xc_sm + 2 * CAP * DPAD;   // [2][CAP][DPAD]: Vc, Va
     float* anchX = reinterpret_cast<float*>(vc_sm + 2 * CAP * DPAD);   // [2][D]: scale*Xa[a], scale*Xc[a]
     float* anchV = anchX + 2 * D;   // [2][D]: Va[a], Vc[a]
@@ -153,10 +153,7 @@ void Bwd_rows_w16_impl(
             for (int e = 0; e < 4; e++) { Ug[nt][e] = 0.0f; U1[nt][e] = 0.0f; }
         }
 
-        int cur = 0;
         for (int k0 = k_lo; k0 < k_hi; k0 += BK) {
-            const int nxt = cur ^ 1;
-
             const bf16* xc_cur = xc_sm + (role * CAP + k0-raw_lo) * DPAD;
             const bf16* vc_cur = vc_sm + (role * CAP + k0-raw_lo) * DPAD;
 
@@ -232,17 +229,15 @@ void Bwd_rows_w16_impl(
 
         // epilogue: fold this warp's 16 rows with the head's Q / dY rows, reduce over lanes and warps
         float ng[DH / 4], nv[DH / 4];
-        const int64_t r0 = q_off_h + (int64_t)min(j0 + jw + g, N - 1) * D + 2 * tig;
-        const int64_t r1 = q_off_h + (int64_t)min(j0 + jw + g + 8, N - 1) * D + 2 * tig;
         auto ld2 = [](const bf16* p, bool pad) {
             return pad ? make_float2(0.0f, 0.0f) : __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(p));
         };
         #pragma unroll
         for (int nt = 0; nt < DH / 8; nt++) {
-            const float2 x0 = ld2(RAW ? rawQ_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8 : Xr_bf + r0 + nt * 8, rpad0), x1 = ld2(RAW ? rawQ_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8 : Xr_bf + r1 + nt * 8, rpad1);
+            const float2 x0 = ld2(rawQ_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8, rpad0), x1 = ld2(rawQ_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8, rpad1);
             ng[2 * nt + 0] = x0.x * Ug[nt][0] + x1.x * Ug[nt][2];
             ng[2 * nt + 1] = x0.y * Ug[nt][1] + x1.y * Ug[nt][3];
-            const float2 g0 = ld2(RAW ? rawDY_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8 : gYr_bf + r0 + nt * 8, rpad0), g1 = ld2(RAW ? rawDY_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8 : gYr_bf + r1 + nt * 8, rpad1);
+            const float2 g0 = ld2(rawDY_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8, rpad0), g1 = ld2(rawDY_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8, rpad1);
             nv[2 * nt + 0] = g0.x * U1[nt][0] + g1.x * U1[nt][2];
             nv[2 * nt + 1] = g0.y * U1[nt][1] + g1.y * U1[nt][3];
         }
@@ -282,7 +277,7 @@ void Bwd_rows_w16_impl(
 #endif
 }
 
-template<int G, int WPH, int BK, bool RAW=false>
+template<int G, int WPH, int BK>
 __global__ __launch_bounds__(G * WPH * 32, 1)
 void Bwd_rows_w16(
     const bf16* __restrict__ Xa_bf,
@@ -300,14 +295,14 @@ void Bwd_rows_w16(
     for(int j=a+threadIdx.x;j<min(N,a+win);j+=blockDim.x)
         has_singleton=has_singleton || support[(int64_t)b*N+j]==1;
     const bool special=__syncthreads_or(has_singleton);
-    if(special) Bwd_rows_w16_impl<G,WPH,BK,RAW,true>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
-    else Bwd_rows_w16_impl<G,WPH,BK,RAW,false>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
+    if(special) Bwd_rows_w16_impl<G,WPH,BK,true>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
+    else Bwd_rows_w16_impl<G,WPH,BK,false>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
 }
 
 
 
 // W=32: as w16 with CAP=64. anchV holds BF16, so the dY*Va operand is a BF16 multiply.
-template<int G, int WPH, int BK, bool RAW=false, bool SPECIAL=false>
+template<int G, int WPH, int BK, bool SPECIAL=false>
 __device__ __forceinline__
 void Bwd_rows_w32_impl(
     const bf16* __restrict__ Xa_bf,
@@ -340,8 +335,8 @@ void Bwd_rows_w32_impl(
 
     extern __shared__ char smem_raw[];
     bf16* rawQ_sm = reinterpret_cast<bf16*>(smem_raw);
-    bf16* rawDY_sm = rawQ_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
-    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
+    bf16* rawDY_sm = rawQ_sm + (size_t)HG * BJ * DPAD;
+    bf16* xc_sm = rawDY_sm + (size_t)HG * BJ * DPAD;
     bf16* vc_sm = xc_sm + 2 * CAP * DPAD;
     float* anchX = reinterpret_cast<float*>(vc_sm + 2 * CAP * DPAD);
     float* anchV = anchX + 2 * D;
@@ -443,10 +438,7 @@ void Bwd_rows_w32_impl(
             for (int e = 0; e < 4; e++) { Ug[nt][e] = 0.0f; U1[nt][e] = 0.0f; }
         }
 
-        int cur = 0;
         for (int k0 = k_lo; k0 < k_hi; k0 += BK) {
-            const int nxt = cur ^ 1;
-
             const bf16* xc_cur = xc_sm + (role * CAP + k0-raw_lo) * DPAD;
             const bf16* vc_cur = vc_sm + (role * CAP + k0-raw_lo) * DPAD;
 
@@ -523,17 +515,15 @@ void Bwd_rows_w32_impl(
         }
 
         float ng[DH / 4], nv[DH / 4];
-        const int64_t r0 = q_off_h + (int64_t)min(j0 + jw + g, N - 1) * D + 2 * tig;
-        const int64_t r1 = q_off_h + (int64_t)min(j0 + jw + g + 8, N - 1) * D + 2 * tig;
         auto ld2 = [](const bf16* p, bool pad) {
             return pad ? make_float2(0.0f, 0.0f) : __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(p));
         };
         #pragma unroll
         for (int nt = 0; nt < DH / 8; nt++) {
-            const float2 x0 = ld2(RAW ? rawQ_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8 : Xr_bf + r0 + nt * 8, rpad0), x1 = ld2(RAW ? rawQ_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8 : Xr_bf + r1 + nt * 8, rpad1);
+            const float2 x0 = ld2(rawQ_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8, rpad0), x1 = ld2(rawQ_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8, rpad1);
             ng[2 * nt + 0] = x0.x * Ug[nt][0] + x1.x * Ug[nt][2];
             ng[2 * nt + 1] = x0.y * Ug[nt][1] + x1.y * Ug[nt][3];
-            const float2 g0 = ld2(RAW ? rawDY_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8 : gYr_bf + r0 + nt * 8, rpad0), g1 = ld2(RAW ? rawDY_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8 : gYr_bf + r1 + nt * 8, rpad1);
+            const float2 g0 = ld2(rawDY_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8, rpad0), g1 = ld2(rawDY_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8, rpad1);
             nv[2 * nt + 0] = g0.x * U1[nt][0] + g1.x * U1[nt][2];
             nv[2 * nt + 1] = g0.y * U1[nt][1] + g1.y * U1[nt][3];
         }
@@ -573,7 +563,7 @@ void Bwd_rows_w32_impl(
 #endif
 }
 
-template<int G, int WPH, int BK, bool RAW=false>
+template<int G, int WPH, int BK>
 __global__ __launch_bounds__(G * WPH * 32, 1)
 void Bwd_rows_w32(
     const bf16* __restrict__ Xa_bf,
@@ -591,8 +581,8 @@ void Bwd_rows_w32(
     for(int j=a+threadIdx.x;j<min(N,a+win);j+=blockDim.x)
         has_singleton=has_singleton || support[(int64_t)b*N+j]==1;
     const bool special=__syncthreads_or(has_singleton);
-    if(special) Bwd_rows_w32_impl<G,WPH,BK,RAW,true>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
-    else Bwd_rows_w32_impl<G,WPH,BK,RAW,false>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
+    if(special) Bwd_rows_w32_impl<G,WPH,BK,true>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
+    else Bwd_rows_w32_impl<G,WPH,BK,false>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
 }
 
 
@@ -600,7 +590,7 @@ void Bwd_rows_w32(
 
 // W=64: as w32, but the window is a CAP-row ring filled per row tile. Requires WPH=1:
 // wOut aliases redOut and each warp accumulates into it directly.
-template<int G, int WPH, int BK, bool RAW=false, bool SPECIAL=false>
+template<int G, int WPH, int BK, bool SPECIAL=false>
 __device__ __forceinline__
 void Bwd_rows_w64_impl(
     const bf16* __restrict__ Xa_bf,
@@ -633,8 +623,8 @@ void Bwd_rows_w64_impl(
 
     extern __shared__ char smem_raw[];
     bf16* rawQ_sm = reinterpret_cast<bf16*>(smem_raw);
-    bf16* rawDY_sm = rawQ_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
-    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
+    bf16* rawDY_sm = rawQ_sm + (size_t)HG * BJ * DPAD;
+    bf16* xc_sm = rawDY_sm + (size_t)HG * BJ * DPAD;
     bf16* vc_sm = xc_sm + 2 * CAP * DPAD;
     float* anchX = reinterpret_cast<float*>(vc_sm + 2 * CAP * DPAD);
     float* anchV = anchX + 2 * D;
@@ -741,10 +731,7 @@ void Bwd_rows_w64_impl(
             for (int e = 0; e < 4; e++) { Ug[nt][e] = 0.0f; U1[nt][e] = 0.0f; }
         }
 
-        int cur = 0;
         for (int k0 = k_lo; k0 < k_hi; k0 += BK) {
-            const int nxt = cur ^ 1;
-
             const bf16* xc_cur = xc_sm + role * CAP * DPAD;
             const bf16* vc_cur = vc_sm + role * CAP * DPAD;
 
@@ -825,17 +812,15 @@ void Bwd_rows_w64_impl(
         }
 
         float ng[DH / 4], nv[DH / 4];
-        const int64_t r0 = q_off_h + (int64_t)min(j0 + jw + g, N - 1) * D + 2 * tig;
-        const int64_t r1 = q_off_h + (int64_t)min(j0 + jw + g + 8, N - 1) * D + 2 * tig;
         auto ld2 = [](const bf16* p, bool pad) {
             return pad ? make_float2(0.0f, 0.0f) : __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(p));
         };
         #pragma unroll
         for (int nt = 0; nt < DH / 8; nt++) {
-            const float2 x0 = ld2(RAW ? rawQ_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8 : Xr_bf + r0 + nt * 8, rpad0), x1 = ld2(RAW ? rawQ_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8 : Xr_bf + r1 + nt * 8, rpad1);
+            const float2 x0 = ld2(rawQ_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8, rpad0), x1 = ld2(rawQ_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8, rpad1);
             ng[2 * nt + 0] = x0.x * Ug[nt][0] + x1.x * Ug[nt][2];
             ng[2 * nt + 1] = x0.y * Ug[nt][1] + x1.y * Ug[nt][3];
-            const float2 g0 = ld2(RAW ? rawDY_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8 : gYr_bf + r0 + nt * 8, rpad0), g1 = ld2(RAW ? rawDY_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8 : gYr_bf + r1 + nt * 8, rpad1);
+            const float2 g0 = ld2(rawDY_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8, rpad0), g1 = ld2(rawDY_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8, rpad1);
             nv[2 * nt + 0] = g0.x * U1[nt][0] + g1.x * U1[nt][2];
             nv[2 * nt + 1] = g0.y * U1[nt][1] + g1.y * U1[nt][3];
         }
@@ -868,7 +853,7 @@ void Bwd_rows_w64_impl(
 #endif
 }
 
-template<int G, int WPH, int BK, bool RAW=false>
+template<int G, int WPH, int BK>
 __global__ __launch_bounds__(G * WPH * 32, 1)
 void Bwd_rows_w64(
     const bf16* __restrict__ Xa_bf,
@@ -886,15 +871,15 @@ void Bwd_rows_w64(
     for(int j=a+threadIdx.x;j<min(N,a+win);j+=blockDim.x)
         has_singleton=has_singleton || support[(int64_t)b*N+j]==1;
     const bool special=__syncthreads_or(has_singleton);
-    if(special) Bwd_rows_w64_impl<G,WPH,BK,RAW,true>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
-    else Bwd_rows_w64_impl<G,WPH,BK,RAW,false>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
+    if(special) Bwd_rows_w64_impl<G,WPH,BK,true>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
+    else Bwd_rows_w64_impl<G,WPH,BK,false>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
 }
 
 
 
 
 // Bwd_rows_w16 visiting 2 head groups serially, reusing the staged key window.
-template<int G, int WPH, int BK, bool RAW=false, bool SPECIAL=false>
+template<int G, int WPH, int BK, bool SPECIAL=false>
 __device__ __forceinline__
 void Bwd_rows_w16_v2_impl(
     const bf16* __restrict__ Xa_bf,
@@ -927,8 +912,8 @@ void Bwd_rows_w16_v2_impl(
 
     extern __shared__ char smem_raw[];
     bf16* rawQ_sm = reinterpret_cast<bf16*>(smem_raw);
-    bf16* rawDY_sm = rawQ_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
-    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
+    bf16* rawDY_sm = rawQ_sm + (size_t)HG * BJ * DPAD;
+    bf16* xc_sm = rawDY_sm + (size_t)HG * BJ * DPAD;
     bf16* vc_sm = xc_sm + 2 * CAP * DPAD;
     float* anchX = reinterpret_cast<float*>(vc_sm + 2 * CAP * DPAD);
     float* anchV = anchX + 2 * D;
@@ -1035,10 +1020,7 @@ void Bwd_rows_w16_v2_impl(
             for (int e = 0; e < 4; e++) { Ug[nt][e] = 0.0f; U1[nt][e] = 0.0f; }
         }
 
-        int cur = 0;
         for (int k0 = k_lo; k0 < k_hi; k0 += BK) {
-            const int nxt = cur ^ 1;
-
             const bf16* xc_cur = xc_sm + (role * CAP + k0-raw_lo) * DPAD;
             const bf16* vc_cur = vc_sm + (role * CAP + k0-raw_lo) * DPAD;
 
@@ -1113,17 +1095,15 @@ void Bwd_rows_w16_v2_impl(
         }
 
         float ng[DH / 4], nv[DH / 4];
-        const int64_t r0 = q_off_h + (int64_t)min(j0 + jw + g, N - 1) * D + 2 * tig;
-        const int64_t r1 = q_off_h + (int64_t)min(j0 + jw + g + 8, N - 1) * D + 2 * tig;
         auto ld2 = [](const bf16* p, bool pad) {
             return pad ? make_float2(0.0f, 0.0f) : __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(p));
         };
         #pragma unroll
         for (int nt = 0; nt < DH / 8; nt++) {
-            const float2 x0 = ld2(RAW ? rawQ_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8 : Xr_bf + r0 + nt * 8, rpad0), x1 = ld2(RAW ? rawQ_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8 : Xr_bf + r1 + nt * 8, rpad1);
+            const float2 x0 = ld2(rawQ_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8, rpad0), x1 = ld2(rawQ_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8, rpad1);
             ng[2 * nt + 0] = x0.x * Ug[nt][0] + x1.x * Ug[nt][2];
             ng[2 * nt + 1] = x0.y * Ug[nt][1] + x1.y * Ug[nt][3];
-            const float2 g0 = ld2(RAW ? rawDY_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8 : gYr_bf + r0 + nt * 8, rpad0), g1 = ld2(RAW ? rawDY_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8 : gYr_bf + r1 + nt * 8, rpad1);
+            const float2 g0 = ld2(rawDY_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8, rpad0), g1 = ld2(rawDY_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8, rpad1);
             nv[2 * nt + 0] = g0.x * U1[nt][0] + g1.x * U1[nt][2];
             nv[2 * nt + 1] = g0.y * U1[nt][1] + g1.y * U1[nt][3];
         }
@@ -1165,7 +1145,7 @@ void Bwd_rows_w16_v2_impl(
 #endif
 }
 
-template<int G, int WPH, int BK, bool RAW=false>
+template<int G, int WPH, int BK>
 __global__ __launch_bounds__(G * WPH * 32, 1)
 void Bwd_rows_w16_v2(
     const bf16* __restrict__ Xa_bf,
@@ -1183,14 +1163,14 @@ void Bwd_rows_w16_v2(
     for(int j=a+threadIdx.x;j<min(N,a+win);j+=blockDim.x)
         has_singleton=has_singleton || support[(int64_t)b*N+j]==1;
     const bool special=__syncthreads_or(has_singleton);
-    if(special) Bwd_rows_w16_v2_impl<G,WPH,BK,RAW,true>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
-    else Bwd_rows_w16_v2_impl<G,WPH,BK,RAW,false>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
+    if(special) Bwd_rows_w16_v2_impl<G,WPH,BK,true>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
+    else Bwd_rows_w16_v2_impl<G,WPH,BK,false>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
 }
 
 
 
 // Bwd_rows_w16 visiting 4 head groups serially.
-template<int G, int WPH, int BK, bool RAW=false, bool SPECIAL=false>
+template<int G, int WPH, int BK, bool SPECIAL=false>
 __device__ __forceinline__
 void Bwd_rows_w16_v4_impl(
     const bf16* __restrict__ Xa_bf,
@@ -1223,8 +1203,8 @@ void Bwd_rows_w16_v4_impl(
 
     extern __shared__ char smem_raw[];
     bf16* rawQ_sm = reinterpret_cast<bf16*>(smem_raw);
-    bf16* rawDY_sm = rawQ_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
-    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
+    bf16* rawDY_sm = rawQ_sm + (size_t)HG * BJ * DPAD;
+    bf16* xc_sm = rawDY_sm + (size_t)HG * BJ * DPAD;
     bf16* vc_sm = xc_sm + 2 * CAP * DPAD;
     float* anchX = reinterpret_cast<float*>(vc_sm + 2 * CAP * DPAD);
     float* anchV = anchX + 2 * D;
@@ -1331,10 +1311,7 @@ void Bwd_rows_w16_v4_impl(
             for (int e = 0; e < 4; e++) { Ug[nt][e] = 0.0f; U1[nt][e] = 0.0f; }
         }
 
-        int cur = 0;
         for (int k0 = k_lo; k0 < k_hi; k0 += BK) {
-            const int nxt = cur ^ 1;
-
             const bf16* xc_cur = xc_sm + (role * CAP + k0-raw_lo) * DPAD;
             const bf16* vc_cur = vc_sm + (role * CAP + k0-raw_lo) * DPAD;
 
@@ -1409,17 +1386,15 @@ void Bwd_rows_w16_v4_impl(
         }
 
         float ng[DH / 4], nv[DH / 4];
-        const int64_t r0 = q_off_h + (int64_t)min(j0 + jw + g, N - 1) * D + 2 * tig;
-        const int64_t r1 = q_off_h + (int64_t)min(j0 + jw + g + 8, N - 1) * D + 2 * tig;
         auto ld2 = [](const bf16* p, bool pad) {
             return pad ? make_float2(0.0f, 0.0f) : __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(p));
         };
         #pragma unroll
         for (int nt = 0; nt < DH / 8; nt++) {
-            const float2 x0 = ld2(RAW ? rawQ_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8 : Xr_bf + r0 + nt * 8, rpad0), x1 = ld2(RAW ? rawQ_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8 : Xr_bf + r1 + nt * 8, rpad1);
+            const float2 x0 = ld2(rawQ_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8, rpad0), x1 = ld2(rawQ_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8, rpad1);
             ng[2 * nt + 0] = x0.x * Ug[nt][0] + x1.x * Ug[nt][2];
             ng[2 * nt + 1] = x0.y * Ug[nt][1] + x1.y * Ug[nt][3];
-            const float2 g0 = ld2(RAW ? rawDY_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8 : gYr_bf + r0 + nt * 8, rpad0), g1 = ld2(RAW ? rawDY_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8 : gYr_bf + r1 + nt * 8, rpad1);
+            const float2 g0 = ld2(rawDY_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8, rpad0), g1 = ld2(rawDY_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8, rpad1);
             nv[2 * nt + 0] = g0.x * U1[nt][0] + g1.x * U1[nt][2];
             nv[2 * nt + 1] = g0.y * U1[nt][1] + g1.y * U1[nt][3];
         }
@@ -1461,7 +1436,7 @@ void Bwd_rows_w16_v4_impl(
 #endif
 }
 
-template<int G, int WPH, int BK, bool RAW=false>
+template<int G, int WPH, int BK>
 __global__ __launch_bounds__(G * WPH * 32, 1)
 void Bwd_rows_w16_v4(
     const bf16* __restrict__ Xa_bf,
@@ -1479,14 +1454,14 @@ void Bwd_rows_w16_v4(
     for(int j=a+threadIdx.x;j<min(N,a+win);j+=blockDim.x)
         has_singleton=has_singleton || support[(int64_t)b*N+j]==1;
     const bool special=__syncthreads_or(has_singleton);
-    if(special) Bwd_rows_w16_v4_impl<G,WPH,BK,RAW,true>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
-    else Bwd_rows_w16_v4_impl<G,WPH,BK,RAW,false>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
+    if(special) Bwd_rows_w16_v4_impl<G,WPH,BK,true>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
+    else Bwd_rows_w16_v4_impl<G,WPH,BK,false>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
 }
 
 
 
 // Bwd_rows_w32 visiting 2 head groups serially, reusing the staged key window.
-template<int G, int WPH, int BK, bool RAW=false, bool SPECIAL=false>
+template<int G, int WPH, int BK, bool SPECIAL=false>
 __device__ __forceinline__
 void Bwd_rows_w32_v2_impl(
     const bf16* __restrict__ Xa_bf,
@@ -1519,8 +1494,8 @@ void Bwd_rows_w32_v2_impl(
 
     extern __shared__ char smem_raw[];
     bf16* rawQ_sm = reinterpret_cast<bf16*>(smem_raw);
-    bf16* rawDY_sm = rawQ_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
-    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
+    bf16* rawDY_sm = rawQ_sm + (size_t)HG * BJ * DPAD;
+    bf16* xc_sm = rawDY_sm + (size_t)HG * BJ * DPAD;
     bf16* vc_sm = xc_sm + 2 * CAP * DPAD;
     float* anchX = reinterpret_cast<float*>(vc_sm + 2 * CAP * DPAD);
     float* anchV = anchX + 2 * D;
@@ -1627,10 +1602,7 @@ void Bwd_rows_w32_v2_impl(
             for (int e = 0; e < 4; e++) { Ug[nt][e] = 0.0f; U1[nt][e] = 0.0f; }
         }
 
-        int cur = 0;
         for (int k0 = k_lo; k0 < k_hi; k0 += BK) {
-            const int nxt = cur ^ 1;
-
             const bf16* xc_cur = xc_sm + (role * CAP + k0-raw_lo) * DPAD;
             const bf16* vc_cur = vc_sm + (role * CAP + k0-raw_lo) * DPAD;
 
@@ -1707,17 +1679,15 @@ void Bwd_rows_w32_v2_impl(
         }
 
         float ng[DH / 4], nv[DH / 4];
-        const int64_t r0 = q_off_h + (int64_t)min(j0 + jw + g, N - 1) * D + 2 * tig;
-        const int64_t r1 = q_off_h + (int64_t)min(j0 + jw + g + 8, N - 1) * D + 2 * tig;
         auto ld2 = [](const bf16* p, bool pad) {
             return pad ? make_float2(0.0f, 0.0f) : __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(p));
         };
         #pragma unroll
         for (int nt = 0; nt < DH / 8; nt++) {
-            const float2 x0 = ld2(RAW ? rawQ_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8 : Xr_bf + r0 + nt * 8, rpad0), x1 = ld2(RAW ? rawQ_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8 : Xr_bf + r1 + nt * 8, rpad1);
+            const float2 x0 = ld2(rawQ_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8, rpad0), x1 = ld2(rawQ_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8, rpad1);
             ng[2 * nt + 0] = x0.x * Ug[nt][0] + x1.x * Ug[nt][2];
             ng[2 * nt + 1] = x0.y * Ug[nt][1] + x1.y * Ug[nt][3];
-            const float2 g0 = ld2(RAW ? rawDY_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8 : gYr_bf + r0 + nt * 8, rpad0), g1 = ld2(RAW ? rawDY_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8 : gYr_bf + r1 + nt * 8, rpad1);
+            const float2 g0 = ld2(rawDY_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8, rpad0), g1 = ld2(rawDY_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8, rpad1);
             nv[2 * nt + 0] = g0.x * U1[nt][0] + g1.x * U1[nt][2];
             nv[2 * nt + 1] = g0.y * U1[nt][1] + g1.y * U1[nt][3];
         }
@@ -1759,7 +1729,7 @@ void Bwd_rows_w32_v2_impl(
 #endif
 }
 
-template<int G, int WPH, int BK, bool RAW=false>
+template<int G, int WPH, int BK>
 __global__ __launch_bounds__(G * WPH * 32, 1)
 void Bwd_rows_w32_v2(
     const bf16* __restrict__ Xa_bf,
@@ -1777,15 +1747,15 @@ void Bwd_rows_w32_v2(
     for(int j=a+threadIdx.x;j<min(N,a+win);j+=blockDim.x)
         has_singleton=has_singleton || support[(int64_t)b*N+j]==1;
     const bool special=__syncthreads_or(has_singleton);
-    if(special) Bwd_rows_w32_v2_impl<G,WPH,BK,RAW,true>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
-    else Bwd_rows_w32_v2_impl<G,WPH,BK,RAW,false>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
+    if(special) Bwd_rows_w32_v2_impl<G,WPH,BK,true>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
+    else Bwd_rows_w32_v2_impl<G,WPH,BK,false>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
 }
 
 
 
 
 // Bwd_rows_w32 visiting 4 head groups serially.
-template<int G, int WPH, int BK, bool RAW=false, bool SPECIAL=false>
+template<int G, int WPH, int BK, bool SPECIAL=false>
 __device__ __forceinline__
 void Bwd_rows_w32_v4_impl(
     const bf16* __restrict__ Xa_bf,
@@ -1818,8 +1788,8 @@ void Bwd_rows_w32_v4_impl(
 
     extern __shared__ char smem_raw[];
     bf16* rawQ_sm = reinterpret_cast<bf16*>(smem_raw);
-    bf16* rawDY_sm = rawQ_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
-    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
+    bf16* rawDY_sm = rawQ_sm + (size_t)HG * BJ * DPAD;
+    bf16* xc_sm = rawDY_sm + (size_t)HG * BJ * DPAD;
     bf16* vc_sm = xc_sm + 2 * CAP * DPAD;
     float* anchX = reinterpret_cast<float*>(vc_sm + 2 * CAP * DPAD);
     float* anchV = anchX + 2 * D;
@@ -1926,10 +1896,7 @@ void Bwd_rows_w32_v4_impl(
             for (int e = 0; e < 4; e++) { Ug[nt][e] = 0.0f; U1[nt][e] = 0.0f; }
         }
 
-        int cur = 0;
         for (int k0 = k_lo; k0 < k_hi; k0 += BK) {
-            const int nxt = cur ^ 1;
-
             const bf16* xc_cur = xc_sm + (role * CAP + k0-raw_lo) * DPAD;
             const bf16* vc_cur = vc_sm + (role * CAP + k0-raw_lo) * DPAD;
 
@@ -2006,17 +1973,15 @@ void Bwd_rows_w32_v4_impl(
         }
 
         float ng[DH / 4], nv[DH / 4];
-        const int64_t r0 = q_off_h + (int64_t)min(j0 + jw + g, N - 1) * D + 2 * tig;
-        const int64_t r1 = q_off_h + (int64_t)min(j0 + jw + g + 8, N - 1) * D + 2 * tig;
         auto ld2 = [](const bf16* p, bool pad) {
             return pad ? make_float2(0.0f, 0.0f) : __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(p));
         };
         #pragma unroll
         for (int nt = 0; nt < DH / 8; nt++) {
-            const float2 x0 = ld2(RAW ? rawQ_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8 : Xr_bf + r0 + nt * 8, rpad0), x1 = ld2(RAW ? rawQ_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8 : Xr_bf + r1 + nt * 8, rpad1);
+            const float2 x0 = ld2(rawQ_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8, rpad0), x1 = ld2(rawQ_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8, rpad1);
             ng[2 * nt + 0] = x0.x * Ug[nt][0] + x1.x * Ug[nt][2];
             ng[2 * nt + 1] = x0.y * Ug[nt][1] + x1.y * Ug[nt][3];
-            const float2 g0 = ld2(RAW ? rawDY_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8 : gYr_bf + r0 + nt * 8, rpad0), g1 = ld2(RAW ? rawDY_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8 : gYr_bf + r1 + nt * 8, rpad1);
+            const float2 g0 = ld2(rawDY_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8, rpad0), g1 = ld2(rawDY_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8, rpad1);
             nv[2 * nt + 0] = g0.x * U1[nt][0] + g1.x * U1[nt][2];
             nv[2 * nt + 1] = g0.y * U1[nt][1] + g1.y * U1[nt][3];
         }
@@ -2058,7 +2023,7 @@ void Bwd_rows_w32_v4_impl(
 #endif
 }
 
-template<int G, int WPH, int BK, bool RAW=false>
+template<int G, int WPH, int BK>
 __global__ __launch_bounds__(G * WPH * 32, 1)
 void Bwd_rows_w32_v4(
     const bf16* __restrict__ Xa_bf,
@@ -2076,8 +2041,8 @@ void Bwd_rows_w32_v4(
     for(int j=a+threadIdx.x;j<min(N,a+win);j+=blockDim.x)
         has_singleton=has_singleton || support[(int64_t)b*N+j]==1;
     const bool special=__syncthreads_or(has_singleton);
-    if(special) Bwd_rows_w32_v4_impl<G,WPH,BK,RAW,true>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
-    else Bwd_rows_w32_v4_impl<G,WPH,BK,RAW,false>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
+    if(special) Bwd_rows_w32_v4_impl<G,WPH,BK,true>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
+    else Bwd_rows_w32_v4_impl<G,WPH,BK,false>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
 }
 
 
@@ -2085,7 +2050,7 @@ void Bwd_rows_w32_v4(
 
 // W=128: as w64, with Xc/Xa in the ring and Vc/Va streamed through VB BK-row buffers.
 // DPAD=128: rows are unpadded, 16-byte chunks XOR-swizzled by row&7 instead.
-template<int G, int WPH, int BK, bool RAW=false, bool SPECIAL=false>
+template<int G, int WPH, int BK, bool SPECIAL=false>
 __device__ __forceinline__
 void Bwd_rows_w128_impl(
     const bf16* __restrict__ Xa_bf,
@@ -2118,8 +2083,8 @@ void Bwd_rows_w128_impl(
 
     extern __shared__ char smem_raw[];
     bf16* rawQ_sm = reinterpret_cast<bf16*>(smem_raw);
-    bf16* rawDY_sm = rawQ_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
-    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
+    bf16* rawDY_sm = rawQ_sm + (size_t)HG * BJ * DPAD;
+    bf16* xc_sm = rawDY_sm + (size_t)HG * BJ * DPAD;
     bf16* vc_sm = xc_sm + 2 * CAP * DPAD;
     float* anchX = reinterpret_cast<float*>(vc_sm + 2 * VB * BK * DPAD);
     float* anchV = anchX + 2 * D;
@@ -2244,7 +2209,7 @@ void Bwd_rows_w128_impl(
         int cur = 0;
         for (int k0 = k_lo; k0 < k_hi; k0 += BK) {
             const int nxt = cur ^ 1;
-            if constexpr(VB==2) { if(k0+BK<k_hi) stage_values(k0+BK,nxt); }
+            if(k0+BK<k_hi) stage_values(k0+BK,nxt);
 
             const bf16* xc_cur = xc_sm + role * CAP * DPAD;
             const bf16* vc_cur = vc_sm + (role*VB+cur)*BK*DPAD;
@@ -2259,8 +2224,6 @@ void Bwd_rows_w128_impl(
                 }
                 const int br_unwrapped=k0-raw_lo+s2*16+brow;
                 const int br=br_unwrapped>=CAP?br_unwrapped-CAP:br_unwrapped;
-                const bf16* bx = xc_cur + br * DPAD + bcol8;
-                const bf16* bv = vc_cur + brow * DPAD + bcol8;
                 #pragma unroll
                 for (int ks = 0; ks < KS; ks++) {
                     uint32_t A0[4], A2[4], bfr[4];
@@ -2309,8 +2272,6 @@ void Bwd_rows_w128_impl(
 
                 const int pr_unwrapped=k0-raw_lo+s2*16+lrow;
                 const int pr=pr_unwrapped>=CAP?pr_unwrapped-CAP:pr_unwrapped;
-                const bf16* px = xc_cur + pr * DPAD + lcol8;
-                const bf16* pv = vc_cur + lrow * DPAD + lcol8;
                 #pragma unroll
                 for (int np = 0; np < DH / 16; np++) {
                     uint32_t bfr[4];
@@ -2324,25 +2285,22 @@ void Bwd_rows_w128_impl(
             }
 
             if(k0+BK<k_hi) {
-                if constexpr(VB==1) { __syncthreads();stage_values(k0+BK,0); }
                 asm volatile("cp.async.wait_all;\n" ::);
                 __syncthreads();
-                if constexpr(VB==2) cur=nxt;
+                cur=nxt;
             }
         }
 
         float ng[DH / 4], nv[DH / 4];
-        const int64_t r0 = q_off_h + (int64_t)min(j0 + jw + g, N - 1) * D + 2 * tig;
-        const int64_t r1 = q_off_h + (int64_t)min(j0 + jw + g + 8, N - 1) * D + 2 * tig;
         auto ld2 = [](const bf16* p, bool pad) {
             return pad ? make_float2(0.0f, 0.0f) : __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(p));
         };
         #pragma unroll
         for (int nt = 0; nt < DH / 8; nt++) {
-            const float2 x0 = ld2(RAW ? rawQ_sm + ((size_t)head * BJ + jw + g) * DPAD + ((2*tig+nt*8)^((g&7)*8)) : Xr_bf + r0 + nt * 8, rpad0), x1 = ld2(RAW ? rawQ_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + ((2*tig+nt*8)^((g&7)*8)) : Xr_bf + r1 + nt * 8, rpad1);
+            const float2 x0 = ld2(rawQ_sm + ((size_t)head * BJ + jw + g) * DPAD + ((2*tig+nt*8)^((g&7)*8)), rpad0), x1 = ld2(rawQ_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + ((2*tig+nt*8)^((g&7)*8)), rpad1);
             ng[2 * nt + 0] = x0.x * Ug[nt][0] + x1.x * Ug[nt][2];
             ng[2 * nt + 1] = x0.y * Ug[nt][1] + x1.y * Ug[nt][3];
-            const float2 g0 = ld2(RAW ? rawDY_sm + ((size_t)head * BJ + jw + g) * DPAD + ((2*tig+nt*8)^((g&7)*8)) : gYr_bf + r0 + nt * 8, rpad0), g1 = ld2(RAW ? rawDY_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + ((2*tig+nt*8)^((g&7)*8)) : gYr_bf + r1 + nt * 8, rpad1);
+            const float2 g0 = ld2(rawDY_sm + ((size_t)head * BJ + jw + g) * DPAD + ((2*tig+nt*8)^((g&7)*8)), rpad0), g1 = ld2(rawDY_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + ((2*tig+nt*8)^((g&7)*8)), rpad1);
             nv[2 * nt + 0] = g0.x * U1[nt][0] + g1.x * U1[nt][2];
             nv[2 * nt + 1] = g0.y * U1[nt][1] + g1.y * U1[nt][3];
         }
@@ -2375,7 +2333,7 @@ void Bwd_rows_w128_impl(
 #endif
 }
 
-template<int G, int WPH, int BK, bool RAW=false>
+template<int G, int WPH, int BK>
 __global__ __launch_bounds__(G * WPH * 32, 1)
 void Bwd_rows_w128(
     const bf16* __restrict__ Xa_bf,
@@ -2393,23 +2351,12 @@ void Bwd_rows_w128(
     for(int j=a+threadIdx.x;j<min(N,a+win);j+=blockDim.x)
         has_singleton=has_singleton || support[(int64_t)b*N+j]==1;
     const bool special=__syncthreads_or(has_singleton);
-    if(special) Bwd_rows_w128_impl<G,WPH,BK,RAW,true>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
-    else Bwd_rows_w128_impl<G,WPH,BK,RAW,false>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
+    if(special) Bwd_rows_w128_impl<G,WPH,BK,true>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
+    else Bwd_rows_w128_impl<G,WPH,BK,false>(Xa_bf,Va_bf,Xr_bf,gYr_bf,Xc_bf,Vc_bf,m_r,l_r,sum_r,gradXa,gradVa,gradXc,gradVc,support,packed_mask,mask_words,mask,H,N,scale,win);
 }
 
 
 
-
-// support[b,row]: visible keys in the row's window, saturated at 2 (0 none, 1 singleton).
-__global__ void prepare_row_support(const bool* mask,uint8_t* support,int N,int win) {
- const int row=blockIdx.x,b=blockIdx.y,t=threadIdx.x,k=row-win+1+t;
- const bool admitted=t<win && k>=0 && k<N && mask[((int64_t)b*N+row)*N+k];
- const int count=__syncthreads_count(admitted);
- if(t==0) support[(int64_t)b*N+row]=count>1?2:count;
-}
-inline void launch_row_support(const bool* mask,uint8_t* support,int B,int N,int win,cudaStream_t stream) {
- prepare_row_support<<<dim3(N,B),128,0,stream>>>(mask,support,N,win);
-}
 
 inline bool launch_retained_rs(
  const bf16* xa,const bf16* va,const bf16* xr,const bf16* dyr,
@@ -2429,10 +2376,10 @@ inline bool launch_retained_rs(
    int device=0; if(cudaGetDevice(&device)!=cudaSuccess) return false;
    static thread_local int initialized_device=-1;
    if(initialized_device!=device) {
-     if(cudaFuncSetAttribute(Bwd_rows_w16<4,1,16,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,int(smem))!=cudaSuccess) return false;
+     if(cudaFuncSetAttribute(Bwd_rows_w16<4,1,16>,cudaFuncAttributeMaxDynamicSharedMemorySize,int(smem))!=cudaSuccess) return false;
      initialized_device=device;
    }
-   Bwd_rows_w16<4,1,16,true><<<dim3(N,H/2,B),128,smem,stream>>>(xa,va,xr,dyr,xc,vc,m,l,delta,gx,gv,gxc,gvc,support,packed_mask,mask_words,mask,H,N,scale,win);
+   Bwd_rows_w16<4,1,16><<<dim3(N,H/2,B),128,smem,stream>>>(xa,va,xr,dyr,xc,vc,m,l,delta,gx,gv,gxc,gvc,support,packed_mask,mask_words,mask,H,N,scale,win);
    return true;
  }
  if(win==32 && visits==1) {
@@ -2441,10 +2388,10 @@ inline bool launch_retained_rs(
    int device=0; if(cudaGetDevice(&device)!=cudaSuccess) return false;
    static thread_local int initialized_device=-1;
    if(initialized_device!=device) {
-     if(cudaFuncSetAttribute(Bwd_rows_w32<4,1,16,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,int(smem))!=cudaSuccess) return false;
+     if(cudaFuncSetAttribute(Bwd_rows_w32<4,1,16>,cudaFuncAttributeMaxDynamicSharedMemorySize,int(smem))!=cudaSuccess) return false;
      initialized_device=device;
    }
-   Bwd_rows_w32<4,1,16,true><<<dim3(N,H/2,B),128,smem,stream>>>(xa,va,xr,dyr,xc,vc,m,l,delta,gx,gv,gxc,gvc,support,packed_mask,mask_words,mask,H,N,scale,win);
+   Bwd_rows_w32<4,1,16><<<dim3(N,H/2,B),128,smem,stream>>>(xa,va,xr,dyr,xc,vc,m,l,delta,gx,gv,gxc,gvc,support,packed_mask,mask_words,mask,H,N,scale,win);
    return true;
  }
  if(win==64 && visits==1) {
@@ -2453,10 +2400,10 @@ inline bool launch_retained_rs(
    int device=0; if(cudaGetDevice(&device)!=cudaSuccess) return false;
    static thread_local int initialized_device=-1;
    if(initialized_device!=device) {
-     if(cudaFuncSetAttribute(Bwd_rows_w64<4,1,16,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,int(smem))!=cudaSuccess) return false;
+     if(cudaFuncSetAttribute(Bwd_rows_w64<4,1,16>,cudaFuncAttributeMaxDynamicSharedMemorySize,int(smem))!=cudaSuccess) return false;
      initialized_device=device;
    }
-   Bwd_rows_w64<4,1,16,true><<<dim3(N,H/2,B),128,smem,stream>>>(xa,va,xr,dyr,xc,vc,m,l,delta,gx,gv,gxc,gvc,support,packed_mask,mask_words,mask,H,N,scale,win);
+   Bwd_rows_w64<4,1,16><<<dim3(N,H/2,B),128,smem,stream>>>(xa,va,xr,dyr,xc,vc,m,l,delta,gx,gv,gxc,gvc,support,packed_mask,mask_words,mask,H,N,scale,win);
    return true;
  }
  if(win==16 && visits==2) {
@@ -2465,10 +2412,10 @@ inline bool launch_retained_rs(
    int device=0; if(cudaGetDevice(&device)!=cudaSuccess) return false;
    static thread_local int initialized_device=-1;
    if(initialized_device!=device) {
-     if(cudaFuncSetAttribute(Bwd_rows_w16_v2<4,1,16,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,int(smem))!=cudaSuccess) return false;
+     if(cudaFuncSetAttribute(Bwd_rows_w16_v2<4,1,16>,cudaFuncAttributeMaxDynamicSharedMemorySize,int(smem))!=cudaSuccess) return false;
      initialized_device=device;
    }
-   Bwd_rows_w16_v2<4,1,16,true><<<dim3(N,H/4,B),128,smem,stream>>>(xa,va,xr,dyr,xc,vc,m,l,delta,gx,gv,gxc,gvc,support,packed_mask,mask_words,mask,H,N,scale,win);
+   Bwd_rows_w16_v2<4,1,16><<<dim3(N,H/4,B),128,smem,stream>>>(xa,va,xr,dyr,xc,vc,m,l,delta,gx,gv,gxc,gvc,support,packed_mask,mask_words,mask,H,N,scale,win);
    return true;
  }
  if(win==16 && visits==4) {
@@ -2477,10 +2424,10 @@ inline bool launch_retained_rs(
    int device=0; if(cudaGetDevice(&device)!=cudaSuccess) return false;
    static thread_local int initialized_device=-1;
    if(initialized_device!=device) {
-     if(cudaFuncSetAttribute(Bwd_rows_w16_v4<4,1,16,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,int(smem))!=cudaSuccess) return false;
+     if(cudaFuncSetAttribute(Bwd_rows_w16_v4<4,1,16>,cudaFuncAttributeMaxDynamicSharedMemorySize,int(smem))!=cudaSuccess) return false;
      initialized_device=device;
    }
-   Bwd_rows_w16_v4<4,1,16,true><<<dim3(N,H/8,B),128,smem,stream>>>(xa,va,xr,dyr,xc,vc,m,l,delta,gx,gv,gxc,gvc,support,packed_mask,mask_words,mask,H,N,scale,win);
+   Bwd_rows_w16_v4<4,1,16><<<dim3(N,H/8,B),128,smem,stream>>>(xa,va,xr,dyr,xc,vc,m,l,delta,gx,gv,gxc,gvc,support,packed_mask,mask_words,mask,H,N,scale,win);
    return true;
  }
  if(win==32 && visits==2) {
@@ -2489,10 +2436,10 @@ inline bool launch_retained_rs(
    int device=0; if(cudaGetDevice(&device)!=cudaSuccess) return false;
    static thread_local int initialized_device=-1;
    if(initialized_device!=device) {
-     if(cudaFuncSetAttribute(Bwd_rows_w32_v2<4,1,16,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,int(smem))!=cudaSuccess) return false;
+     if(cudaFuncSetAttribute(Bwd_rows_w32_v2<4,1,16>,cudaFuncAttributeMaxDynamicSharedMemorySize,int(smem))!=cudaSuccess) return false;
      initialized_device=device;
    }
-   Bwd_rows_w32_v2<4,1,16,true><<<dim3(N,H/4,B),128,smem,stream>>>(xa,va,xr,dyr,xc,vc,m,l,delta,gx,gv,gxc,gvc,support,packed_mask,mask_words,mask,H,N,scale,win);
+   Bwd_rows_w32_v2<4,1,16><<<dim3(N,H/4,B),128,smem,stream>>>(xa,va,xr,dyr,xc,vc,m,l,delta,gx,gv,gxc,gvc,support,packed_mask,mask_words,mask,H,N,scale,win);
    return true;
  }
  if(win==32 && visits==4) {
@@ -2501,10 +2448,10 @@ inline bool launch_retained_rs(
    int device=0; if(cudaGetDevice(&device)!=cudaSuccess) return false;
    static thread_local int initialized_device=-1;
    if(initialized_device!=device) {
-     if(cudaFuncSetAttribute(Bwd_rows_w32_v4<4,1,16,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,int(smem))!=cudaSuccess) return false;
+     if(cudaFuncSetAttribute(Bwd_rows_w32_v4<4,1,16>,cudaFuncAttributeMaxDynamicSharedMemorySize,int(smem))!=cudaSuccess) return false;
      initialized_device=device;
    }
-   Bwd_rows_w32_v4<4,1,16,true><<<dim3(N,H/8,B),128,smem,stream>>>(xa,va,xr,dyr,xc,vc,m,l,delta,gx,gv,gxc,gvc,support,packed_mask,mask_words,mask,H,N,scale,win);
+   Bwd_rows_w32_v4<4,1,16><<<dim3(N,H/8,B),128,smem,stream>>>(xa,va,xr,dyr,xc,vc,m,l,delta,gx,gv,gxc,gvc,support,packed_mask,mask_words,mask,H,N,scale,win);
    return true;
  }
  if(win==128) {
@@ -2513,10 +2460,10 @@ inline bool launch_retained_rs(
    int device=0; if(cudaGetDevice(&device)!=cudaSuccess) return false;
    static thread_local int initialized_device=-1;
    if(initialized_device!=device) {
-     if(cudaFuncSetAttribute(Bwd_rows_w128<4,1,16,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,int(smem))!=cudaSuccess) return false;
+     if(cudaFuncSetAttribute(Bwd_rows_w128<4,1,16>,cudaFuncAttributeMaxDynamicSharedMemorySize,int(smem))!=cudaSuccess) return false;
      initialized_device=device;
    }
-   Bwd_rows_w128<4,1,16,true><<<dim3(N,H/2,B),128,smem,stream>>>(xa,va,xr,dyr,xc,vc,m,l,delta,gx,gv,gxc,gvc,support,packed_mask,mask_words,mask,H,N,scale,win);
+   Bwd_rows_w128<4,1,16><<<dim3(N,H/2,B),128,smem,stream>>>(xa,va,xr,dyr,xc,vc,m,l,delta,gx,gv,gxc,gvc,support,packed_mask,mask_words,mask,H,N,scale,win);
    return true;
  }
 return false;

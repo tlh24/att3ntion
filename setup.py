@@ -61,7 +61,7 @@ class Att3BuildExtension(BuildExtension):
                 target.parent.mkdir(parents=True,exist_ok=True)
                 subprocess.run([str(Path(CUDA_HOME)/'bin/nvcc'),'-std=c++17','--expt-relaxed-constexpr',
                     '-O3','-lineinfo','-arch=sm_90a','-Xcompiler=-fPIC,-fvisibility=hidden',
-                    '-I'+str(include),'-c',str(Path('cuda',source+'.cu').resolve()),'-o',str(target)],check=True)
+                    '-I'+str(include),'-c',str(Path('cuda','shared_kv',source+'.cu').resolve()),'-o',str(target)],check=True)
                 objects.append(str(target))
             for extension in self.extensions:
                 if extension.name == 'att3ntion._cuda_kernels':
@@ -84,7 +84,7 @@ setup(
                 'cpp/cuda_bindings.cpp',
                 'cuda/forward.cu',
                 'cuda/backward.cu',
-                'cuda/single_gather_shared.cu'
+                'cuda/shared_kv/single_gather_shared.cu'
             ],
             extra_compile_args={
                 'cxx': ['-O3','-fvisibility=hidden'],

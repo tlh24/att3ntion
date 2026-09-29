@@ -10,8 +10,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include "common.cuh"
-#include "../cpp/cuda_bindings.h"
+#include "../common.cuh"
+#include "../../cpp/cuda_bindings.h"
 
 #include "shared_retained_fwd.cuh"
 #include "shared_hopper.h"
@@ -319,18 +319,17 @@ void Y_gather_tc_grouped(
 }
 
 // Grouped R/S-owned backward pass: block = (KV position a, G query heads, batch b).
-// G2 keeps the per-head kernel's BJ32 summation order; G4 uses BJ16, which
-// changes it. With RAW, raw Q/dY of the current row tile stay in shared memory
-// for the row collapse.
+// It keeps the per-head kernel's BJ32 summation order. Raw Q/dY of the current
+// row tile stay in shared memory for the row collapse.
 constexpr size_t bwd_grouped_smem(int G) {
-    const int WPH = G == 4 ? 1 : 2, BK = G == 4 ? 16 : 32;
+    const int WPH = 2, BK = 32;
     const int BJ = WPH * 16, D = 128, DPAD = 136;
     return sizeof(bf16) * ((size_t)4 * G * BJ * DPAD + (size_t)4 * BK * DPAD)
          + sizeof(float) * ((size_t)2 * D + (size_t)G * 3 * BJ + (size_t)G * WPH * 2 * D + (size_t)G * 2 * D)
          + sizeof(uint32_t) * 2 * BJ;
 }
 
-template<int G, int WPH, int BK, bool RAW=false>
+template<int G, int WPH, int BK>
 __global__ __launch_bounds__(G * WPH * 32, 1)
 void Bwd_rows_tc_grouped(
     const bf16* __restrict__ Xa_bf,   // anchor stream (R or S), [B,1,N,D]
@@ -363,8 +362,8 @@ void Bwd_rows_tc_grouped(
     bf16* a0_sm = reinterpret_cast<bf16*>(smem_raw);            // [G][BJ][DPAD] scale*Q_h o Xa
     bf16* a2_sm = a0_sm + (size_t)G * BJ * DPAD;                // [G][BJ][DPAD] dY_h o Va
     bf16* rawQ_sm = a2_sm + (size_t)G * BJ * DPAD;
-    bf16* rawDY_sm = rawQ_sm + (RAW ? (size_t)G * BJ * DPAD : 0);
-    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)G * BJ * DPAD : 0);                // [2][BK][DPAD]
+    bf16* rawDY_sm = rawQ_sm + (size_t)G * BJ * DPAD;
+    bf16* xc_sm = rawDY_sm + (size_t)G * BJ * DPAD;                // [2][BK][DPAD]
     bf16* vc_sm = xc_sm + 2 * BK * DPAD;                        // [2][BK][DPAD]
     float* anchX = reinterpret_cast<float*>(vc_sm + 2 * BK * DPAD);   // [D]
     float* anchV = anchX + D;                                   // [D]
@@ -428,10 +427,8 @@ void Bwd_rows_tc_grouped(
                     xq = *reinterpret_cast<const uint4*>(Xr_bf + off);
                     gq = *reinterpret_cast<const uint4*>(gYr_bf + off);
                 }
-                if constexpr (RAW) {
-                    *reinterpret_cast<uint4*>(rawQ_sm + ((size_t)lh * BJ + jl) * DPAD + dv) = xq;
-                    *reinterpret_cast<uint4*>(rawDY_sm + ((size_t)lh * BJ + jl) * DPAD + dv) = gq;
-                }
+                *reinterpret_cast<uint4*>(rawQ_sm + ((size_t)lh * BJ + jl) * DPAD + dv) = xq;
+                *reinterpret_cast<uint4*>(rawDY_sm + ((size_t)lh * BJ + jl) * DPAD + dv) = gq;
                 const __nv_bfloat162* xp = reinterpret_cast<const __nv_bfloat162*>(&xq);
                 const __nv_bfloat162* gp = reinterpret_cast<const __nv_bfloat162*>(&gq);
                 uint4 o0, o2;
@@ -552,17 +549,15 @@ void Bwd_rows_tc_grouped(
 
         // ---- epilogue: Hadamard row-collapse of this warp's 16 rows (head's Q / dY rows) ----
         float ng[DH / 4], nv[DH / 4];
-        const int64_t r0 = q_off_h + (int64_t)min(j0 + jw + g, N - 1) * D + 2 * tig;
-        const int64_t r1 = q_off_h + (int64_t)min(j0 + jw + g + 8, N - 1) * D + 2 * tig;
         auto ld2 = [](const bf16* p, bool pad) {
             return pad ? make_float2(0.0f, 0.0f) : __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(p));
         };
         #pragma unroll
         for (int nt = 0; nt < DH / 8; nt++) {
-            const float2 x0 = ld2(RAW ? rawQ_sm + ((size_t)lh * BJ + jw + g) * DPAD + 2 * tig + nt * 8 : Xr_bf + r0 + nt * 8, rpad0), x1 = ld2(RAW ? rawQ_sm + ((size_t)lh * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8 : Xr_bf + r1 + nt * 8, rpad1);
+            const float2 x0 = ld2(rawQ_sm + ((size_t)lh * BJ + jw + g) * DPAD + 2 * tig + nt * 8, rpad0), x1 = ld2(rawQ_sm + ((size_t)lh * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8, rpad1);
             ng[2 * nt + 0] = x0.x * Ug[nt][0] + x1.x * Ug[nt][2];
             ng[2 * nt + 1] = x0.y * Ug[nt][1] + x1.y * Ug[nt][3];
-            const float2 g0 = ld2(RAW ? rawDY_sm + ((size_t)lh * BJ + jw + g) * DPAD + 2 * tig + nt * 8 : gYr_bf + r0 + nt * 8, rpad0), g1 = ld2(RAW ? rawDY_sm + ((size_t)lh * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8 : gYr_bf + r1 + nt * 8, rpad1);
+            const float2 g0 = ld2(rawDY_sm + ((size_t)lh * BJ + jw + g) * DPAD + 2 * tig + nt * 8, rpad0), g1 = ld2(rawDY_sm + ((size_t)lh * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8, rpad1);
             nv[2 * nt + 0] = g0.x * U1[nt][0] + g1.x * U1[nt][2];
             nv[2 * nt + 1] = g0.y * U1[nt][1] + g1.y * U1[nt][3];
         }
@@ -605,7 +600,7 @@ void Bwd_rows_tc_grouped(
 
 // One CTA runs separate R and S warps for each of G/2 heads. Only the raw Q/dY
 // staging is shared between the two directions; everything else is per warp.
-template<int G, int WPH, int BK, bool RAW=false>
+template<int G, int WPH, int BK>
 __global__ __launch_bounds__(G * WPH * 32, 1)
 void Bwd_rows_tc_dual(
     const bf16* __restrict__ Xa_bf,   // anchor stream (R or S), [B,1,N,D]
@@ -640,8 +635,8 @@ void Bwd_rows_tc_dual(
     bf16* a0_sm = reinterpret_cast<bf16*>(smem_raw);            // [G][BJ][DPAD] scale*Q_h o Xa
     bf16* a2_sm = a0_sm + (size_t)G * BJ * DPAD;                // [G][BJ][DPAD] dY_h o Va
     bf16* rawQ_sm = a2_sm + (size_t)G * BJ * DPAD;
-    bf16* rawDY_sm = rawQ_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);
-    bf16* xc_sm = rawDY_sm + (RAW ? (size_t)HG * BJ * DPAD : 0);                // [role][2][BK][DPAD]
+    bf16* rawDY_sm = rawQ_sm + (size_t)HG * BJ * DPAD;
+    bf16* xc_sm = rawDY_sm + (size_t)HG * BJ * DPAD;                // [role][2][BK][DPAD]
     bf16* vc_sm = xc_sm + 4 * BK * DPAD;                        // [role][2][BK][DPAD]
     float* anchX = reinterpret_cast<float*>(vc_sm + 4 * BK * DPAD);   // [role][D]
     float* anchV = anchX + 2 * D;                                   // [role][D]
@@ -724,7 +719,6 @@ void Bwd_rows_tc_dual(
                 const int j = j0 + jl;
                 uint4 xq = make_uint4(0, 0, 0, 0), gq = xq;
                 if (j < N) {
-                    const int64_t off = q_off_h + (int64_t)j * D + dv;
                     xq = *reinterpret_cast<const uint4*>(rawQ_sm + ((size_t)head * BJ + jl) * DPAD + dv);
                     gq = *reinterpret_cast<const uint4*>(rawDY_sm + ((size_t)head * BJ + jl) * DPAD + dv);
                 }
@@ -848,17 +842,15 @@ void Bwd_rows_tc_dual(
 
         // ---- epilogue: Hadamard row-collapse of this warp's 16 rows (head's Q / dY rows) ----
         float ng[DH / 4], nv[DH / 4];
-        const int64_t r0 = q_off_h + (int64_t)min(j0 + jw + g, N - 1) * D + 2 * tig;
-        const int64_t r1 = q_off_h + (int64_t)min(j0 + jw + g + 8, N - 1) * D + 2 * tig;
         auto ld2 = [](const bf16* p, bool pad) {
             return pad ? make_float2(0.0f, 0.0f) : __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(p));
         };
         #pragma unroll
         for (int nt = 0; nt < DH / 8; nt++) {
-            const float2 x0 = ld2(RAW ? rawQ_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8 : Xr_bf + r0 + nt * 8, rpad0), x1 = ld2(RAW ? rawQ_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8 : Xr_bf + r1 + nt * 8, rpad1);
+            const float2 x0 = ld2(rawQ_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8, rpad0), x1 = ld2(rawQ_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8, rpad1);
             ng[2 * nt + 0] = x0.x * Ug[nt][0] + x1.x * Ug[nt][2];
             ng[2 * nt + 1] = x0.y * Ug[nt][1] + x1.y * Ug[nt][3];
-            const float2 g0 = ld2(RAW ? rawDY_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8 : gYr_bf + r0 + nt * 8, rpad0), g1 = ld2(RAW ? rawDY_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8 : gYr_bf + r1 + nt * 8, rpad1);
+            const float2 g0 = ld2(rawDY_sm + ((size_t)head * BJ + jw + g) * DPAD + 2 * tig + nt * 8, rpad0), g1 = ld2(rawDY_sm + ((size_t)head * BJ + jw + g + 8) * DPAD + 2 * tig + nt * 8, rpad1);
             nv[2 * nt + 0] = g0.x * U1[nt][0] + g1.x * U1[nt][2];
             nv[2 * nt + 1] = g0.y * U1[nt][1] + g1.y * U1[nt][3];
         }
@@ -928,16 +920,16 @@ bool launch_bwd_grouped(const bf16* Xa, const bf16* Va, const bf16* Xr, const bf
                         const float* m, const float* l, const float* sum, float* gX, float* gV, const bool* mask,
                         int B, int H, int N, float scale, int max_smem_optin, cudaStream_t stream, int win)
 {
-    constexpr int WPH = G == 4 ? 1 : 2, BK = G == 4 ? 16 : 32;
+    constexpr int WPH = 2, BK = 32;
     const size_t smem = bwd_grouped_smem(G);
     if (smem > (size_t)max_smem_optin) return false;
     int attribute_current_device=0; AT_CUDA_CHECK(cudaGetDevice(&attribute_current_device));
     static thread_local int attr_device=-1;
     if (attr_device != attribute_current_device) {
-        AT_CUDA_CHECK(cudaFuncSetAttribute(Bwd_rows_tc_grouped<G, WPH, BK, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+        AT_CUDA_CHECK(cudaFuncSetAttribute(Bwd_rows_tc_grouped<G, WPH, BK>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
         attr_device = attribute_current_device;
     }
-    Bwd_rows_tc_grouped<G, WPH, BK, true><<<dim3(N, H / G, B), G * WPH * 32, smem, stream>>>(Xa, Va, Xr, gYr, Xc, Vc, m, l, sum, gX, gV, mask, H, N, scale, win);
+    Bwd_rows_tc_grouped<G, WPH, BK><<<dim3(N, H / G, B), G * WPH * 32, smem, stream>>>(Xa, Va, Xr, gYr, Xc, Vc, m, l, sum, gX, gV, mask, H, N, scale, win);
     return true;
 }
 
@@ -975,11 +967,11 @@ bool launch_bwd_rows_shared_grouped(
         int attribute_current_device=0; AT_CUDA_CHECK(cudaGetDevice(&attribute_current_device));
     static thread_local int attr_device=-1;
         if (attr_device != attribute_current_device) {
-            AT_CUDA_CHECK(cudaFuncSetAttribute(Bwd_rows_tc_dual<WARPS, 1, BK, true>,
+            AT_CUDA_CHECK(cudaFuncSetAttribute(Bwd_rows_tc_dual<WARPS, 1, BK>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
             attr_device = attribute_current_device;
         }
-        Bwd_rows_tc_dual<WARPS, 1, BK, true><<<dim3(N, H / HEADS, B), WARPS * 32, smem, stream>>>(
+        Bwd_rows_tc_dual<WARPS, 1, BK><<<dim3(N, H / HEADS, B), WARPS * 32, smem, stream>>>(
             bp(R), bp(Vr), bp(Q), bp(dY), bp(S), bp(Vs), fp(m), fp(l), fp(delta),
             fp(pR), fp(pVr), fp(pS), fp(pVs), mask, H, N, scale, win);
         return true;
@@ -988,9 +980,6 @@ bool launch_bwd_rows_shared_grouped(
     if (G == 2) {
         ok = launch_bwd_grouped<2>(bp(R), bp(Vr), bp(Q), bp(dY), bp(S), bp(Vs), fp(m), fp(l), fp(delta), fp(pR), fp(pVr), mask, B, H, N, scale, max_smem_optin, stream, win)
           && launch_bwd_grouped<2>(bp(S), bp(Vs), bp(Q), bp(dY), bp(R), bp(Vr), fp(m), fp(l), fp(delta), fp(pS), fp(pVs), mask, B, H, N, scale, max_smem_optin, stream, win);
-    } else if (G == 4) {
-        ok = launch_bwd_grouped<4>(bp(R), bp(Vr), bp(Q), bp(dY), bp(S), bp(Vs), fp(m), fp(l), fp(delta), fp(pR), fp(pVr), mask, B, H, N, scale, max_smem_optin, stream, win)
-          && launch_bwd_grouped<4>(bp(S), bp(Vs), bp(Q), bp(dY), bp(R), bp(Vr), fp(m), fp(l), fp(delta), fp(pS), fp(pVs), mask, B, H, N, scale, max_smem_optin, stream, win);
     }
     return ok;
 }

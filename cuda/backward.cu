@@ -386,7 +386,6 @@ __global__ void V_scatter_grad(
 // H100; 4 at D=64 and 2 at D=128 inside the 99 KB of sm_86/89).
 constexpr int BTC_WARPS = 8;
 constexpr int BTC_BK = 32;
-constexpr int BTC_BJ = BTC_WARPS * 16;
 
 // Which softmaxes a launch differentiates. BWD_ALL is the three-gather pass
 // above. The single-gather backward has one softmax, normalized over the
@@ -939,7 +938,7 @@ void Bwd_gather_tc(
 // =============================================================================
 // Two passes over 2D (i,k) or (j,k) tiles, streaming the third mode:
 //   1. QS_grad_kernel<true>  -> correction sums sum_q, sum_r, sum_s
-//   2. QS_grad_kernel<false> -> gradQ, gradS;  R_grad_kernel<false> -> gradR
+//   2. QS_grad_kernel<false> -> gradQ, gradS;  R_grad_kernel -> gradR
 
 /**
  * QS_grad_kernel - gradQ and gradS over (i,k) tiles, streaming j.
@@ -947,7 +946,7 @@ void Bwd_gather_tc(
  * CORRECTION_ONLY=true:  correction sums (sum_q, sum_r, sum_s)
  * CORRECTION_ONLY=false: gradQ and gradS from precomputed corrections
  */
-template<bool CORRECTION_ONLY, int BLOCK_I, int BLOCK_J, int BLOCK_K, int D_CONST, int REG_CAP = D_CONST>
+template<bool CORRECTION_ONLY, int BLOCK_I, int BLOCK_J, int BLOCK_K, int D_CONST>
 __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
     const bf16* __restrict__ Q,
     const bf16* __restrict__ R,
@@ -1079,13 +1078,13 @@ __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
     // Factored accumulation: rj_weighted[d] = sum_j grad_A_j * R[j,d], then
     // gradQ[i,d] = rj_weighted[d] * S[k,d] and gradS[k,d] = rj_weighted[d] * Q[i,d]
     // in the epilogue. One D-long accumulator instead of two, one shmem load per d.
-    float rj_weighted[REG_CAP];
+    float rj_weighted[D_CONST];
     if constexpr (!CORRECTION_ONLY) {
         if (valid) {
             sumQi = sum_qBH[i0];
             sumSk = sum_sBH[k0];
         }
-        for (int d = 0; d < REG_CAP; ++d) rj_weighted[d] = 0.0f;
+        for (int d = 0; d < D_CONST; ++d) rj_weighted[d] = 0.0f;
     }
 
     const int sh_i_off = threadIdx.x * D_PAD;
@@ -1292,12 +1291,10 @@ __global__ void __launch_bounds__(256, 1) QS_grad_kernel(
 }
 
 /**
- * R_grad_kernel - gradR over (j,k) tiles, streaming i.
- *
- * CORRECTION_ONLY=true:  correction sum sum_r[j]
- * CORRECTION_ONLY=false: gradR from precomputed corrections
+ * R_grad_kernel - gradR over (j,k) tiles, streaming i, from precomputed
+ * corrections.
  */
-template<bool CORRECTION_ONLY, int BLOCK_J, int BLOCK_I, int BLOCK_K, int D_CONST, int REG_CAP = D_CONST>
+template<int BLOCK_J, int BLOCK_I, int BLOCK_K, int D_CONST>
 __global__ void __launch_bounds__(256, 1) R_grad_kernel(
     const bf16* __restrict__ Q, const bf16* __restrict__ R, const bf16* __restrict__ S,
     const bf16* __restrict__ Vq1, const bf16* __restrict__ Vq2,
@@ -1425,16 +1422,13 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
 
     __syncthreads();
 
-    float reg_sum_r = 0.0f;
     float sumRj = 0.0f, sumSk = 0.0f;
-    float grad_acc[REG_CAP];
-    if constexpr (!CORRECTION_ONLY) {
-        if (valid) {
-            sumRj = sum_rBH[j0];
-            sumSk = (sum_s + (int64_t)bh * N)[k0];
-        }
-        for (int d = 0; d < REG_CAP; ++d) grad_acc[d] = 0.0f;
+    float grad_acc[D_CONST];
+    if (valid) {
+        sumRj = sum_rBH[j0];
+        sumSk = (sum_s + (int64_t)bh * N)[k0];
     }
+    for (int d = 0; d < D_CONST; ++d) grad_acc[d] = 0.0f;
 
     const int sh_j_off = threadIdx.x * D_PAD;
     const int sh_k_off = threadIdx.y * D_PAD;
@@ -1495,15 +1489,11 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
             if (iGlob < N) {
                 sh_mi[tid_l] = miBH[iGlob];
                 sh_li[tid_l] = liBH[iGlob];
-                if constexpr (!CORRECTION_ONLY) {
-                    sh_sumq[tid_l] = (sum_q + (int64_t)bh * N)[iGlob];
-                }
+                sh_sumq[tid_l] = (sum_q + (int64_t)bh * N)[iGlob];
             } else {
                 sh_mi[tid_l] = 0.0f;
                 sh_li[tid_l] = 1.0f;  // avoid div-by-zero in OOB rows
-                if constexpr (!CORRECTION_ONLY) {
-                    sh_sumq[tid_l] = 0.0f;
-                }
+                sh_sumq[tid_l] = 0.0f;
             }
         }
         __syncthreads();
@@ -1565,11 +1555,11 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
                     #pragma unroll
                     for (int dd = 0; dd < D_TILE; ++dd) {
                         dot_i[ii] += qi[dd]  * p_dot[dd];
-                        if constexpr (!CORRECTION_ONLY) d1_i[ii] += dyi[dd] * p_d1[dd];
+                        d1_i[ii] += dyi[dd] * p_d1[dd];
                         d2_i[ii] += vq1[dd] * p_d2[dd];
-                        if constexpr (!CORRECTION_ONLY) d3_i[ii] += vq1[dd] * p_d3[dd];
+                        d3_i[ii] += vq1[dd] * p_d3[dd];
                         d4_i[ii] += dyi2[dd] * p_d4[dd];
-                        if constexpr (!CORRECTION_ONLY) d5_i[ii] += vq2[dd] * p_d5[dd];
+                        d5_i[ii] += vq2[dd] * p_d5[dd];
                         d6_i[ii] += vq2[dd] * p_d6[dd];
                     }
                 }
@@ -1592,56 +1582,33 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
                 const float As = as_valid ? (__expf(fminf(logits - mk, EXP_CLIP)) / fmaxf(lk, DENOM_EPS)) : 0.0f;
                 const float gAr = d2_i[ii] + d4_i[ii] * As + d6_i[ii] * Aq;
 
-                if constexpr (CORRECTION_ONLY) {
-                    reg_sum_r += gAr * Ar;
-                } else {
-                    const float sumQi = sh_sumq[iOff];
-                    const float gAq = d1_i[ii] + d5_i[ii] * As + d6_i[ii] * Ar;
-                    const float gAs = d3_i[ii] + d4_i[ii] * Ar + d5_i[ii] * Aq;
-                    const float grad_A = (gAq - sumQi) * Aq
-                                       + (gAr - sumRj) * Ar
-                                       + (gAs - sumSk) * As;
-                    // sh_Sk has stride D_PAD, not 16-byte aligned for ty > 0,
-                    // so it stays scalar.
-                    const int iRow = iOff * D_CONST;
-                    #pragma unroll
-                    for (int d = 0; d < D_CONST; d += 4) {
-                        const float4 qi4 = *reinterpret_cast<const float4*>(&sh_Q[iRow + d]);
-                        grad_acc[d+0] += grad_A * qi4.x * sh_Sk[sh_k_off + d + 0];
-                        grad_acc[d+1] += grad_A * qi4.y * sh_Sk[sh_k_off + d + 1];
-                        grad_acc[d+2] += grad_A * qi4.z * sh_Sk[sh_k_off + d + 2];
-                        grad_acc[d+3] += grad_A * qi4.w * sh_Sk[sh_k_off + d + 3];
-                    }
+                const float sumQi = sh_sumq[iOff];
+                const float gAq = d1_i[ii] + d5_i[ii] * As + d6_i[ii] * Ar;
+                const float gAs = d3_i[ii] + d4_i[ii] * Ar + d5_i[ii] * Aq;
+                const float grad_A = (gAq - sumQi) * Aq
+                                   + (gAr - sumRj) * Ar
+                                   + (gAs - sumSk) * As;
+                // sh_Sk has stride D_PAD, not 16-byte aligned for ty > 0,
+                // so it stays scalar.
+                const int iRow = iOff * D_CONST;
+                #pragma unroll
+                for (int d = 0; d < D_CONST; d += 4) {
+                    const float4 qi4 = *reinterpret_cast<const float4*>(&sh_Q[iRow + d]);
+                    grad_acc[d+0] += grad_A * qi4.x * sh_Sk[sh_k_off + d + 0];
+                    grad_acc[d+1] += grad_A * qi4.y * sh_Sk[sh_k_off + d + 1];
+                    grad_acc[d+2] += grad_A * qi4.z * sh_Sk[sh_k_off + d + 2];
+                    grad_acc[d+3] += grad_A * qi4.w * sh_Sk[sh_k_off + d + 3];
                 }
             }
         }
         __syncthreads();
     }
 
-    if constexpr (CORRECTION_ONLY) {
-        // Reduce reg_sum_r across k (threadIdx.y), reusing shared memory.
-        float* reduce_buf = shmem;
-
-        // Transposed [k][j] layout makes warp-contiguous x-lanes hit distinct banks.
-        const int reduce_idx = threadIdx.y * BLOCK_J + threadIdx.x;
-        reduce_buf[reduce_idx] = valid ? reg_sum_r : 0.0f;
-        __syncthreads();
-        for (int s = BLOCK_K / 2; s > 0; s >>= 1) {
-            if (threadIdx.y < s) {
-                reduce_buf[reduce_idx] +=
-                    reduce_buf[(threadIdx.y + s) * BLOCK_J + threadIdx.x];
-            }
-            __syncthreads();
-        }
-        if (threadIdx.y == 0 && j0 < N)
-            atomicAdd(&sum_rBH[j0], reduce_buf[threadIdx.x]);
-    } else {
-        // Atomic: every k tile contributes to the same gradR rows.
-        float* gRbh = gradR + bh * stride_BH;
-        if (valid) {
-            for (int d = 0; d < D_CONST; ++d)
-                atomicAdd(&gRbh[j0*D_CONST + d], scale * grad_acc[d]);
-        }
+    // Atomic: every k tile contributes to the same gradR rows.
+    float* gRbh = gradR + bh * stride_BH;
+    if (valid) {
+        for (int d = 0; d < D_CONST; ++d)
+            atomicAdd(&gRbh[j0*D_CONST + d], scale * grad_acc[d]);
     }
 }
 
@@ -1649,21 +1616,21 @@ __global__ void __launch_bounds__(256, 1) R_grad_kernel(
 
 // WARPS if its smem fits the device, else the minimum shape (4 warps at D=64,
 // 2 at D=128), else nullptr.
-template<int D, int WARPS, int BK, int ROLE = BWD_ALL>
+template<int D, int WARPS, int BK>
 static decltype(&Bwd_gather_tc<64, false, 8, 32>) pick_bwd_tc(
     bool use_mask, int max_smem_optin, size_t& smem, int& threads)
 {
-    smem = btc_smem_bytes(D, WARPS, BK, use_mask, ROLE);
+    smem = btc_smem_bytes(D, WARPS, BK, use_mask);
     if (smem > (size_t)max_smem_optin) {
         constexpr int MIN_WARPS = (D == 128) ? 2 : 4;
         if constexpr (WARPS > MIN_WARPS) {
-            return pick_bwd_tc<D, MIN_WARPS, BK, ROLE>(use_mask, max_smem_optin, smem, threads);
+            return pick_bwd_tc<D, MIN_WARPS, BK>(use_mask, max_smem_optin, smem, threads);
         }
         return nullptr;
     }
     threads = WARPS * 32;
-    auto* k = use_mask ? Bwd_gather_tc<D, true, WARPS, BK, ROLE>
-                       : Bwd_gather_tc<D, false, WARPS, BK, ROLE>;
+    auto* k = use_mask ? Bwd_gather_tc<D, true, WARPS, BK>
+                       : Bwd_gather_tc<D, false, WARPS, BK>;
     int attribute_current_device=0; AT_CUDA_CHECK(cudaGetDevice(&attribute_current_device));
     static thread_local int attr_device[2]={-1,-1};
     if (attr_device[use_mask] != attribute_current_device) {
@@ -1772,7 +1739,6 @@ backward_impl(torch::Tensor grad_Y_q,
               torch::Tensor m_k,
               torch::Tensor l_k,
               torch::Tensor mask,
-              double dropout_rate,
               torch::Tensor Y_q,
               torch::Tensor Y_r,
               torch::Tensor Y_s) {
@@ -2140,11 +2106,11 @@ backward_impl(torch::Tensor grad_Y_q,
           3 * tileI * sizeof(float);
 
       cudaFuncSetAttribute(
-          R_grad_kernel<false, tileJ, tileI, tileK, D_TMPL>,
+          R_grad_kernel<tileJ, tileI, tileK, D_TMPL>,
           cudaFuncAttributeMaxDynamicSharedMemorySize,
           shmem_bytes);
 
-      R_grad_kernel<false, tileJ, tileI, tileK, D_TMPL>
+      R_grad_kernel<tileJ, tileI, tileK, D_TMPL>
           <<<grid_dim, block_dim, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
               reinterpret_cast<const bf16*>(Q.data_ptr<at::BFloat16>()),
               reinterpret_cast<const bf16*>(R.data_ptr<at::BFloat16>()),
@@ -2262,7 +2228,7 @@ backward_cuda(torch::Tensor grad_Y_q,
   return backward_impl(
       grad_Y_q, grad_Y_r, grad_Y_s, grad_Y_q_, grad_Y_r_, grad_Y_s_,
       Q, R, S, Vq_1, Vq_2, Vr_1, Vr_2, Vs_1, Vs_2,
-      m_i, l_i, m_j, l_j, m_k, l_k, mask, dropout_rate, Y_q, Y_r, Y_s);
+      m_i, l_i, m_j, l_j, m_k, l_k, mask, Y_q, Y_r, Y_s);
 }
 
 
@@ -2394,17 +2360,17 @@ single_gather_backward_cuda(
 // place through the kernel's KV-head offset. The R/S passes write per-query-head
 // partials [B,Hq,N,D] (each CTA owns its row, so no atomics); the head
 // reduction rounds each partial to bf16, sums the heads in fp32, casts once.
-#include "shared_reduction.cuh"
-#include "shared_hopper.h"
+#include "shared_kv/shared_reduction.cuh"
+#include "shared_kv/shared_hopper.h"
 #ifdef ATT3NTION_WITH_HOPPER
-#include "shared_hopper_rs.cuh"
-#include "shared_hopper_rs64.cuh"
+#include "shared_kv/shared_hopper_rs.cuh"
+#include "shared_kv/shared_hopper_rs64.cuh"
 #endif
-#include "shared_retained_rs.cuh"
-#include "shared_retained_dq.cuh"
-#include "shared_mask_metadata.cuh"
+#include "shared_kv/shared_retained_rs.cuh"
+#include "shared_kv/shared_retained_dq.cuh"
+#include "shared_kv/shared_mask_metadata.cuh"
 
-#include "shared_wide_dq.cuh"
+#include "shared_kv/shared_wide_dq.cuh"
 
 // Validate every raw-pointer operand, including its device, before padding or
 // any launch.
@@ -2429,11 +2395,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 single_gather_shared_backward_auto(
     at::Tensor dY, at::Tensor Q, at::Tensor R, at::Tensor S, at::Tensor Vr,
     at::Tensor Vs, at::Tensor Y, at::Tensor m, at::Tensor l, at::Tensor mask,
-    int64_t window, int64_t rs_group)
+    int64_t window)
 {
   single_gather_shared_check(Q, {R, S, Vr, Vs}, mask, window, 1);
   shared_backward_check_state(Q,dY,Y,m,l);
-  rs_group = 4;
   if (Q.size(1) % 2) {
     const int64_t heads = Q.size(1);
     auto extra = torch::zeros({Q.size(0),1,Q.size(2),Q.size(3)},Q.options());
@@ -2441,7 +2406,7 @@ single_gather_shared_backward_auto(
     auto result = single_gather_shared_backward_auto(
         torch::cat({dY,extra},1),torch::cat({Q,extra},1),R,S,Vr,Vs,
         torch::cat({Y,extra},1),torch::cat({m,extra_stats},1),
-        torch::cat({l,torch::ones_like(extra_stats)},1),mask,window,4);
+        torch::cat({l,torch::ones_like(extra_stats)},1),mask,window);
     std::get<0>(result) = std::get<0>(result).narrow(1,0,heads).contiguous();
     return result;
   }
@@ -2502,7 +2467,7 @@ single_gather_shared_backward_auto(
         bp(R),bp(Vr),bp(Q),bp(dY),bp(S),bp(Vs),fp(m),fp(l),fp(delta),
         pR.data_ptr<at::BFloat16>(),pVr.data_ptr<at::BFloat16>(),
         pS.data_ptr<at::BFloat16>(),pVs.data_ptr<at::BFloat16>(),
-        B,H,N,win,scale,stream,support_ptr,packed_ptr,true));
+        B,H,N,win,scale,stream,support_ptr,packed_ptr));
     used_hopper_rs = used_retained = true;
   }
   if (!used_retained && major == 9 && minor == 0 && win == 64 && H % 4 == 0
@@ -2511,7 +2476,7 @@ single_gather_shared_backward_auto(
         bp(R),bp(Vr),bp(Q),bp(dY),bp(S),bp(Vs),fp(m),fp(l),fp(delta),
         pR.data_ptr<at::BFloat16>(),pVr.data_ptr<at::BFloat16>(),
         pS.data_ptr<at::BFloat16>(),pVs.data_ptr<at::BFloat16>(),
-        B,H,N,win,scale,stream,support_ptr,packed_ptr,true));
+        B,H,N,win,scale,stream,support_ptr,packed_ptr));
     used_hopper_rs = used_retained = true;
   }
 #endif
@@ -2531,7 +2496,7 @@ single_gather_shared_backward_auto(
   auto dR = torch::empty_like(R), dS = torch::empty_like(S),
        dVr = torch::empty_like(Vr), dVs = torch::empty_like(Vs);
   auto outp = [](at::Tensor& t) { return reinterpret_cast<bf16*>(t.data_ptr<at::BFloat16>()); };
-  AT_CUDA_CHECK((cudaError_t)fusion_reduce_split(8,
+  AT_CUDA_CHECK((cudaError_t)fusion_reduce_split(
       fp(gQ), reinterpret_cast<float*>(pR.data_ptr<at::BFloat16>()), reinterpret_cast<float*>(pS.data_ptr<at::BFloat16>()), reinterpret_cast<float*>(pVr.data_ptr<at::BFloat16>()), reinterpret_cast<float*>(pVs.data_ptr<at::BFloat16>()),
       outp(dQ), outp(dR), outp(dS), outp(dVr), outp(dVs), B,H,N*D,stream));
   auto& st = att3_tc::state();
@@ -2555,7 +2520,7 @@ single_gather_shared_backward_cuda(
     c10::cuda::CUDAGuard auto_guard(Q.device());
     int major = 0;
     AT_CUDA_CHECK(cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,Q.device().index()));
-    if (major == 9) return single_gather_shared_backward_auto(dY,Q,R,S,Vr,Vs,Y,m,l,mask,window,4);
+    if (major == 9) return single_gather_shared_backward_auto(dY,Q,R,S,Vr,Vs,Y,m,l,mask,window);
     rs_group = 1;
   }
   single_gather_shared_check(Q, {R, S, Vr, Vs}, mask, window, rs_group);
